@@ -4,10 +4,30 @@ Windows 端的多协议终端工作台：SSH（基于 tmux 的会话持久化）
 
 ## 当前状态
 
-方案设计阶段，尚未开始编码。
+**M0 技术验证 + M1 骨架已完成，可直接试用**：本地终端（PowerShell / CMD / WSL）、SSH 连接、tmux 会话附加均已实测跑通。
 
 - 技术设计文档：[docs/design.md](docs/design.md)
+- 决策与待确认事项：[docs/decisions.md](docs/decisions.md)
 - 界面交互草稿：[layout-preview.html](layout-preview.html)（双击用浏览器打开）
+
+### 产出物
+
+- 免安装版：`src-tauri/target/release/zeeai-terminal.exe`
+- 安装包：`src-tauri/target/release/bundle/nsis/ZeeAI Terminal_0.1.0_x64-setup.exe`
+
+### 运行
+
+```powershell
+npm run tauri dev      # 开发模式（热更新）
+npm run tauri build    # 打包 exe + NSIS 安装包
+```
+
+端到端探针（验证 PTY + ssh + tmux，不需要开 GUI）：
+
+```powershell
+cd src-tauri
+cargo run --release --example pty_probe -- <host> <user>
+```
 
 ## 技术栈
 

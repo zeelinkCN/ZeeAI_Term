@@ -1,9 +1,26 @@
 # ZeeAI Terminal · 今晚的决策与待确认事项
 
-日期：2026-09-24 夜 · 状态：M0 技术验证 + M1 骨架已落地，可直接试用
+日期：2026-09-24 夜 · 状态：M0 技术验证 + M1 骨架已落地，已打包，可直接试用
 
 > 你睡觉期间我按「自己决定、把疑问记下来」的方式推进。下面分三块：
 > **A. 替你做的决定**（醒了请确认或否决）、**B. 需要你拍板的问题**、**C. 环境改动清单**。
+
+---
+
+## 0. 今晚的验证结果（都实测过）
+
+| 验证项 | 结果 |
+|---|---|
+| Rust + Tauri 在 Windows 上的编译与打包 | ✅ release exe **8.9 MB**；NSIS 安装包已产出 |
+| 应用能启动 | ✅ 进程存活、WebView2 子进程正常拉起、内存约 65 MB |
+| SSH 免密登录 `203.0.113.10` | ✅ 返回 `CONNECT_OK`，root 免密可用 |
+| **ssh + tmux attach 端到端** | ✅ 探针输出 `RESULT: OK`（marker / hostname / tmux 列表全部命中） |
+| tmux 会话名清洗（主机名含点号） | ✅ `47-99-241-168-root` 被 tmux 正常接受 |
+
+过程中踩到两个坑，代码里已经处理掉，记在这里备忘：
+
+1. **必须设置 `TERM=xterm-256color`**，否则远端 tmux 直接报 `open terminal failed: terminal does not support clear`。
+2. **终端必须能应答 `ESC[6n` 光标位置查询**：tmux 启动时会问，xterm.js 会自动应答（所以真实应用没问题），但用自写脚本/探针时必须手动回 `ESC[1;1R`，否则会卡死在 4 字节。
 
 ---
 
@@ -108,6 +125,22 @@ SharedInstallationPath = C:\Program Files\Microsoft Visual Studio\Shared
 
 你的账号在管理员组，且 UAC 配的是「管理员静默提升」（`ConsentPromptBehaviorAdmin=0`），所以整个安装过程没有弹窗。这是我完成安装的前提，特此说明。
 
+### C5. 在你的测试服务器上安装了 tmux
+
+`203.0.113.10` 原本**没有 tmux**（`tmux: command not found`），而 tmux 持久化是本产品的核心功能，没它就验证不了。我用 `dnf install -y tmux` 装上了 **tmux 2.7**（Anolis / Alibaba Cloud Linux 3 官方仓库版本）。
+
+回退命令（如果你不想留着）：
+
+```bash
+dnf remove -y tmux
+```
+
+另外，代码里已经加了**检测与降级**：以后连到没装 tmux 的服务器，会自动退回普通 shell 并在终端里打印安装提示，不会再直接报错。
+
+### C6. 绕过 GitHub 下载超时
+
+`tauri build` 打包时需要从 GitHub 下载 NSIS 工具链，直连超时。我通过 GitHub 代理把 `nsis_tauri_utils.dll` 手动放进了 `C:\Users\m1523\AppData\Local\tauri\`，之后打包成功。这一步只影响本机缓存，不在仓库里。
+
 ---
 
 ## D. 已知问题 / 还没做完的
@@ -130,7 +163,19 @@ cd D:\AI\ZeeAI_term
 npm run tauri dev
 ```
 
-正式版 exe 与安装包：见 `src-tauri\target\release\` 与 `src-tauri\target\release\bundle\nsis\`。
+正式产物：
+
+- 免安装版：`D:\AI\ZeeAI_term\src-tauri\target\release\zeeai-terminal.exe`（8.9 MB，双击即用）
+- 安装包：`D:\AI\ZeeAI_term\src-tauri\target\release\bundle\nsis\ZeeAI Terminal_0.1.0_x64-setup.exe`
+
+> 两者都依赖系统已有的 **WebView2 Runtime**（你机器上已装 153.x；Win10/11 通常自带）。
+
+端到端可靠性探针（验证 PTY + ssh + tmux 这条链路，不需要开 GUI）：
+
+```powershell
+cd D:\AI\ZeeAI_term\src-tauri
+cargo run --release --example pty_probe -- 203.0.113.10 root
+```
 
 试用建议路径：
 
