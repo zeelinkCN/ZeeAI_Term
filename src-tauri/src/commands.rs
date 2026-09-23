@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::{pty, ssh, tmux, SessionEvent, SessionRegistry};
+use crate::core::{pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
 use crate::store::{self, ConnectionProfile};
 
 #[derive(Serialize)]
@@ -244,4 +244,50 @@ pub async fn tmux_kill(profile_id: String, name: String) -> Result<(), String> {
     );
     let _ = run_ssh_capture(&args).await?;
     Ok(())
+}
+
+/// 列出远端目录（不传 path 则用登录后的家目录）。
+#[tauri::command]
+pub async fn fs_list(
+    profile_id: String,
+    path: Option<String>,
+) -> Result<remote_fs::RemoteListing, String> {
+    log::info!("ipc: fs_list profile_id={profile_id} path={path:?}");
+    let cfg = ssh_config(&profile_id)?;
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        &remote_fs::list_remote_command(path.as_deref()),
+    );
+    let out = run_ssh_capture(&args).await?;
+    let listing = remote_fs::parse_listing(&out);
+    log::info!(
+        "ipc: fs_list -> {} entries at {}",
+        listing.entries.len(),
+        listing.path
+    );
+    Ok(listing)
+}
+
+/// 读取远端文件，返回 base64（二进制安全），最多 max_bytes 字节。
+#[tauri::command]
+pub async fn fs_read(
+    profile_id: String,
+    path: String,
+    max_bytes: Option<u64>,
+) -> Result<String, String> {
+    log::info!("ipc: fs_read profile_id={profile_id} path={path}");
+    let cfg = ssh_config(&profile_id)?;
+    let limit = max_bytes.unwrap_or(512 * 1024);
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        &remote_fs::read_remote_command(&path, limit),
+    );
+    let out = run_ssh_capture(&args).await?;
+    Ok(out.trim().to_string())
 }

@@ -9,6 +9,11 @@ Windows 端的多协议终端工作台：SSH（基于 tmux 的会话持久化）
 已实现：VS Code 风格外壳、多会话标签、本地终端、SSH（免密/密钥，复用系统 OpenSSH）、
 tmux 持久会话自动附加、tmux 会话管理面板（列表 / attach / kill）。
 
+以及：远端文件浏览（跟随当前会话）、Markdown 渲染预览（四套样式 + 源码切换）、
+HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开的文件（终端为主标签，文件为二级副标签）。
+
+无人值守自检：设置 `ZEEAI_SELFTEST=1` 启动，会自动验证 tmux / 文件命令链路后退出。
+
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)
 - 界面交互草稿：[layout-preview.html](layout-preview.html)（双击用浏览器打开）

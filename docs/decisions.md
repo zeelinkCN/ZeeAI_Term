@@ -19,6 +19,9 @@
 | **正式版 exe 的界面真的渲染并调用了后端** | ✅ 启动 5 秒内生成配置，日志出现 `ipc: list_profiles -> 1 entries` |
 | tmux 列举/结束命令（面板底层） | ✅ 实测：创建会话 → 列出 `zeeai-panel-demo\|1\|0` → kill → 列表为空 |
 | Rust 单元测试 | ✅ 3 passed（tmux 输出解析的三种边界情况） |
+| 远端目录列举（文件窗格底层） | ✅ 实测返回 `/root` + 制表符分隔条目 |
+| 远端文件读取（预览底层） | ✅ 实测 base64 往返正确（解码得到主机名） |
+| **命令层整体自检（走 Tauri，非手工命令）** | ✅ `tmux_list ok -> 0 sessions` / `fs_list ok -> 19 entries at /root` |
 
 过程中踩到两个坑，代码里已经处理掉，记在这里备忘：
 
@@ -88,6 +91,26 @@
 - `ssh::ssh_exec_args()`：非交互式一次性 ssh 调用（tmux 列表/kill 用）；
 - `core::tmux`：tmux 输出解析 + 单元测试；
 - 打包流程固定为「先 `cargo clean -p` 再 `npm run tauri build`」，避免前端资源不更新的坑。
+
+### F2. 远程文件浏览 + MD/HTML 预览（你的需求 2 主体）
+
+你列的第二条需求（远程文件管理 + 双击预览 md/html）也做进来了：
+
+- 侧栏「远程 → 文件」窗格**跟随当前会话**所在服务器，支持进入目录 / 返回上级 / 回家目录 / 刷新；
+- 点文件即在主区打开：**每个会话各自维护自己打开的文件**，终端是主标签、文件是会话下的二级副标签（与之前确认的形态一致）；
+- 预览：Markdown 默认渲染，支持 **GitHub / 简洁 / 深色 / 文档** 四套样式，可一键切「源码」；HTML 在**沙箱 iframe**（`sandbox=""`）里渲染，脚本不执行、样式不外泄；图片走 data URL；代码/文本用等宽视图；
+- 底层复用系统 `ssh`：`find` 列目录、`head | base64` 读内容（二进制安全，路径做了单引号转义）；
+- 单文件读取上限 1MB（超出只取前 1MB），后续可改流式。
+
+### F3. 自检开关
+
+新增 `ZEEAI_SELFTEST=1`：启动后自动跑一遍 `tmux_list` 与 `fs_list`，把结果写进日志并自动退出，
+用于在不打开界面的情况下验证「命令层是否真的通」（也方便以后接 CI）：
+
+```powershell
+$env:ZEEAI_SELFTEST = '1'
+.\src-tauri\target\release\zeeai-terminal.exe
+```
 
 ---
 

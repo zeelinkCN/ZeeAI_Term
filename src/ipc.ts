@@ -4,6 +4,7 @@ import type {
   SessionEvent,
   SessionInfo,
   TmuxSession,
+  RemoteListing,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -60,6 +61,30 @@ export async function tmuxList(profileId: string): Promise<TmuxSession[]> {
 /** 结束服务器上的某个 tmux 会话 */
 export async function tmuxKill(profileId: string, name: string): Promise<void> {
   return invoke("tmux_kill", { profileId, name });
+}
+
+/** 列出远端目录；path 传 null 表示登录后的家目录 */
+export async function fsList(
+  profileId: string,
+  path?: string,
+): Promise<RemoteListing> {
+  return invoke<RemoteListing>("fs_list", {
+    profileId,
+    path: path ?? null,
+  });
+}
+
+/** 读取远端文件，返回 base64 */
+export async function fsRead(
+  profileId: string,
+  path: string,
+  maxBytes?: number,
+): Promise<string> {
+  return invoke<string>("fs_read", {
+    profileId,
+    path,
+    maxBytes: maxBytes ?? null,
+  });
 }
 
 export async function sessionWrite(id: string, dataB64: string): Promise<void> {

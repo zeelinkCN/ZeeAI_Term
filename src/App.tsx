@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import MarkdownIt from "markdown-it";
+import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
 import { SessionBus } from "./sessionBus";
 import {
   deleteProfile,
+  fsList,
+  fsRead,
   listProfiles,
   openLocal,
   openSsh,
@@ -14,6 +18,7 @@ import {
 import { b64ToBytes, uid } from "./util";
 import type {
   ConnectionProfile,
+  RemoteEntry,
   SessionEvent,
   SessionState,
   TmuxSession,
@@ -22,6 +27,8 @@ import {
   IconActivity,
   IconCable,
   IconClose,
+  IconFile,
+  IconFolder,
   IconGear,
   IconGit,
   IconLinux,
@@ -33,6 +40,15 @@ import {
 } from "./components/Icons";
 
 type ModuleKey = "remote" | "powershell" | "cmd" | "wsl" | "git" | "serial" | "adb";
+type FileKind = "md" | "html" | "img" | "code" | "text";
+type MdStyle = "github" | "minimal" | "dark" | "paper";
+
+interface OpenFile {
+  name: string;
+  path: string;
+  kind: FileKind;
+  b64: string;
+}
 
 interface OpenSession {
   id: string;
@@ -40,6 +56,8 @@ interface OpenSession {
   kind: ModuleKey;
   profileId?: string;
   state: SessionState;
+  openFiles: OpenFile[];
+  activeTab: string; // "terminal" 或文件名
 }
 
 const MODULES: { key: ModuleKey; label: string; node: JSX.Element }[] = [
@@ -62,6 +80,10 @@ const MODULE_LABEL: Record<ModuleKey, string> = {
   adb: "ADB",
 };
 
+const EMPTY_PROFILE = { name: "", host: "", port: 22, user: "root", group: "默认" };
+
+const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
+
 function moduleIcon(kind: ModuleKey, size = 14): JSX.Element {
   switch (kind) {
     case "remote":
@@ -81,13 +103,75 @@ function moduleIcon(kind: ModuleKey, size = 14): JSX.Element {
   }
 }
 
-const EMPTY_PROFILE = {
-  name: "",
-  host: "",
-  port: 22,
-  user: "root",
-  group: "默认",
-};
+function extOf(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+function fileKind(name: string): FileKind {
+  const ext = extOf(name);
+  if (ext === "md" || ext === "markdown") return "md";
+  if (ext === "html" || ext === "htm") return "html";
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico"].includes(ext)) return "img";
+  if (
+    [
+      "json", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "sh", "bash", "rs", "go",
+      "java", "c", "cc", "cpp", "h", "hpp", "yml", "yaml", "toml", "ini", "conf",
+      "css", "scss", "sql", "xml", "env", "gitignore", "dockerfile",
+    ].includes(ext)
+  ) {
+    return "code";
+  }
+  return "text";
+}
+
+function imgMime(name: string): string {
+  switch (extOf(name)) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "bmp":
+      return "image/bmp";
+    case "svg":
+      return "image/svg+xml";
+    case "ico":
+      return "image/x-icon";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function decodeB64Text(b64: string): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: false }).decode(b64ToBytes(b64));
+  } catch {
+    return "";
+  }
+}
+
+function humanSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function joinPath(dir: string, name: string): string {
+  if (!dir) return `/${name}`;
+  return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
+}
+
+function parentOf(path: string): string {
+  if (!path || path === "/") return "/";
+  const trimmed = path.replace(/\/+$/, "");
+  const i = trimmed.lastIndexOf("/");
+  return i <= 0 ? "/" : trimmed.slice(0, i);
+}
 
 export default function App() {
   const busRef = useRef(new SessionBus());
@@ -101,13 +185,37 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
+
   const [tmuxTarget, setTmuxTarget] = useState<ConnectionProfile | null>(null);
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
   const [tmuxLoading, setTmuxLoading] = useState(false);
 
+  const [fsPath, setFsPath] = useState("");
+  const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
+  const [fsLoading, setFsLoading] = useState(false);
+
   useEffect(() => {
     void refresh();
   }, []);
+
+  const activeSession = sessions.find((s) => s.id === activeId) ?? null;
+  const activeFile =
+    activeSession && activeSession.activeTab !== "terminal"
+      ? activeSession.openFiles.find((f) => f.name === activeSession.activeTab) ?? null
+      : null;
+
+  const fileProfileId = activeSession?.profileId ?? null;
+  const fileProfile = profiles.find((p) => p.id === fileProfileId) ?? null;
+
+  useEffect(() => {
+    if (!fileProfileId) {
+      setFsPath("");
+      setFsEntries([]);
+      return;
+    }
+    void loadDir(fileProfileId, undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileProfileId]);
 
   async function refresh() {
     try {
@@ -129,17 +237,13 @@ export default function App() {
         break;
       case "title":
         setSessions((prev) =>
-          prev.map((s) =>
-            s.id === sessionId ? { ...s, title: e.title || s.title } : s,
-          ),
+          prev.map((s) => (s.id === sessionId ? { ...s, title: e.title || s.title } : s)),
         );
         break;
       case "error":
         setToast(e.message);
         setSessions((prev) =>
-          prev.map((s) =>
-            s.id === sessionId ? { ...s, state: "error" } : s,
-          ),
+          prev.map((s) => (s.id === sessionId ? { ...s, state: "error" } : s)),
         );
         break;
       case "cwd":
@@ -152,51 +256,43 @@ export default function App() {
     setActiveId(s.id);
   }
 
-  async function openLocalSession(
-    shell: "powershell" | "cmd" | "wsl",
-    distro?: string,
-  ) {
+  async function openLocalSession(shell: "powershell" | "cmd" | "wsl", distro?: string) {
     const id = uid();
     const title =
-      shell === "wsl"
-        ? "WSL" + (distro ? " · " + distro : "")
-        : shell === "cmd"
-          ? "命令提示符"
-          : "PowerShell";
-    addSession({ id, title, kind: shell, state: "connecting" });
+      shell === "wsl" ? "WSL" + (distro ? " · " + distro : "") : shell === "cmd" ? "命令提示符" : "PowerShell";
+    addSession({ id, title, kind: shell, state: "connecting", openFiles: [], activeTab: "terminal" });
     try {
       const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro);
       setSessions((prev) =>
-        prev.map((s) =>
-          s.id === id ? { ...s, title: info.title || title } : s,
-        ),
+        prev.map((s) => (s.id === id ? { ...s, title: info.title || title } : s)),
       );
     } catch (e) {
       setToast("打开本地终端失败：" + String(e));
     }
   }
 
-  async function openSshSession(profile: ConnectionProfile) {
+  async function openSshSession(profile: ConnectionProfile, tmuxSessionName?: string) {
     const id = uid();
+    const title = tmuxSessionName ? `${profile.name} · ${tmuxSessionName}` : profile.name;
     addSession({
       id,
-      title: profile.name,
+      title,
       kind: "remote",
       profileId: profile.id,
       state: "connecting",
+      openFiles: [],
+      activeTab: "terminal",
     });
     try {
-      const info = await openSsh(id, profile.id, (e) => handleEvent(id, e));
+      const info = await openSsh(id, profile.id, (e) => handleEvent(id, e), tmuxSessionName);
       setSessions((prev) =>
         prev.map((s) =>
-          s.id === id ? { ...s, title: info.title || profile.name } : s,
+          s.id === id ? { ...s, title: tmuxSessionName ? title : info.title || title } : s,
         ),
       );
     } catch (e) {
       setToast("SSH 连接失败：" + String(e));
-      setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)),
-      );
+      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
   }
 
@@ -204,7 +300,7 @@ export default function App() {
     try {
       await sessionClose(id);
     } catch {
-      /* 已经断开则忽略 */
+      /* 已断开则忽略 */
     }
     bus.drop(id);
     setSessions((prev) => prev.filter((s) => s.id !== id));
@@ -261,25 +357,6 @@ export default function App() {
     }
   }
 
-  async function attachTmux(profile: ConnectionProfile, name: string) {
-    const id = uid();
-    addSession({
-      id,
-      title: `${profile.name} · ${name}`,
-      kind: "remote",
-      profileId: profile.id,
-      state: "connecting",
-    });
-    try {
-      await openSsh(id, profile.id, (e) => handleEvent(id, e), name);
-    } catch (e) {
-      setToast("附加 tmux 会话失败：" + String(e));
-      setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)),
-      );
-    }
-  }
-
   async function killTmux(profile: ConnectionProfile, name: string) {
     try {
       await tmuxKill(profile.id, name);
@@ -287,6 +364,62 @@ export default function App() {
     } catch (e) {
       setToast("结束 tmux 会话失败：" + String(e));
     }
+  }
+
+  async function loadDir(profileId: string, path?: string) {
+    setFsLoading(true);
+    try {
+      const listing = await fsList(profileId, path);
+      setFsPath(listing.path);
+      setFsEntries(listing.entries);
+    } catch (e) {
+      setToast("读取远端目录失败：" + String(e));
+      setFsEntries([]);
+    } finally {
+      setFsLoading(false);
+    }
+  }
+
+  async function openRemoteFile(profileId: string, name: string) {
+    if (!activeId) {
+      setToast("请先打开一个 SSH 会话");
+      return;
+    }
+    const path = joinPath(fsPath, name);
+    const kind = fileKind(name);
+    try {
+      const b64 = await fsRead(profileId, path, 1024 * 1024);
+      if (!b64) {
+        setToast("文件为空或无法读取（可能是目录或二进制文件）");
+        return;
+      }
+      const sessionId = activeId;
+      setSessions((prev) =>
+        prev.map((s) => {
+          if (s.id !== sessionId) return s;
+          const exists = s.openFiles.some((f) => f.path === path);
+          const openFiles = exists ? s.openFiles : [...s.openFiles, { name, path, kind, b64 }];
+          return { ...s, openFiles, activeTab: name };
+        }),
+      );
+    } catch (e) {
+      setToast("读取文件失败：" + String(e));
+    }
+  }
+
+  function selectTab(sessionId: string, tab: string) {
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, activeTab: tab } : s)));
+  }
+
+  function closeFile(sessionId: string, name: string) {
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== sessionId) return s;
+        const openFiles = s.openFiles.filter((f) => f.name !== name);
+        const activeTab = s.activeTab === name ? "terminal" : s.activeTab;
+        return { ...s, openFiles, activeTab };
+      }),
+    );
   }
 
   const grouped = useMemo(() => {
@@ -297,8 +430,6 @@ export default function App() {
     }
     return Array.from(map.entries());
   }, [profiles]);
-
-  const activeSession = sessions.find((s) => s.id === activeId) ?? null;
 
   return (
     <div className="app">
@@ -371,14 +502,11 @@ export default function App() {
             {module === "remote" && sideTab === "sessions" && (
               <>
                 <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => setShowForm((v) => !v)}
-                  >
+                  <button type="button" className="btn" onClick={() => setShowForm((v) => !v)}>
                     <IconPlus size={14} /> 新建连接
                   </button>
                 </div>
+
                 {showForm && (
                   <div className="form">
                     <label>
@@ -386,9 +514,7 @@ export default function App() {
                       <input
                         value={form.name}
                         placeholder="可留空"
-                        onChange={(e) =>
-                          setForm({ ...form, name: e.target.value })
-                        }
+                        onChange={(e) => setForm({ ...form, name: e.target.value })}
                       />
                     </label>
                     <label>
@@ -396,9 +522,7 @@ export default function App() {
                       <input
                         value={form.host}
                         placeholder="例如 203.0.113.10"
-                        onChange={(e) =>
-                          setForm({ ...form, host: e.target.value })
-                        }
+                        onChange={(e) => setForm({ ...form, host: e.target.value })}
                       />
                     </label>
                     <div className="row">
@@ -406,18 +530,14 @@ export default function App() {
                         端口
                         <input
                           value={form.port}
-                          onChange={(e) =>
-                            setForm({ ...form, port: Number(e.target.value) })
-                          }
+                          onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
                         />
                       </label>
                       <label className="grow">
                         用户
                         <input
                           value={form.user}
-                          onChange={(e) =>
-                            setForm({ ...form, user: e.target.value })
-                          }
+                          onChange={(e) => setForm({ ...form, user: e.target.value })}
                         />
                       </label>
                     </div>
@@ -425,20 +545,15 @@ export default function App() {
                       分组
                       <input
                         value={form.group}
-                        onChange={(e) =>
-                          setForm({ ...form, group: e.target.value })
-                        }
+                        onChange={(e) => setForm({ ...form, group: e.target.value })}
                       />
                     </label>
-                    <button
-                      type="button"
-                      className="btn primary"
-                      onClick={() => void submitProfile()}
-                    >
+                    <button type="button" className="btn primary" onClick={() => void submitProfile()}>
                       保存
                     </button>
                   </div>
                 )}
+
                 {grouped.length === 0 && !showForm && (
                   <div className="hint">
                     还没有连接。点「新建连接」添加一台服务器，
@@ -446,10 +561,11 @@ export default function App() {
                     认证使用你本机已配置的 SSH 密钥。
                   </div>
                 )}
+
                 {tmuxTarget && (
                   <div className="tmux-panel">
                     <div className="tmux-head">
-                      <span>tmux 会话 · {tmuxTarget.name}</span>
+                      <span>tmux · {tmuxTarget.name}</span>
                       <span className="tmux-actions">
                         <button
                           type="button"
@@ -469,9 +585,7 @@ export default function App() {
                     </div>
                     {tmuxLoading && <div className="hint">正在读取…</div>}
                     {!tmuxLoading && tmuxSessions.length === 0 && (
-                      <div className="hint">
-                        没有 tmux 会话（或服务器未安装 tmux）。
-                      </div>
+                      <div className="hint">没有 tmux 会话（或服务器未安装 tmux）。</div>
                     )}
                     {tmuxSessions.map((s) => (
                       <div key={s.name} className="tmux-row">
@@ -482,7 +596,7 @@ export default function App() {
                         <button
                           type="button"
                           className="mini-btn"
-                          onClick={() => void attachTmux(tmuxTarget, s.name)}
+                          onClick={() => void openSshSession(tmuxTarget, s.name)}
                         >
                           连接
                         </button>
@@ -497,6 +611,7 @@ export default function App() {
                     ))}
                   </div>
                 )}
+
                 {grouped.map(([group, list]) => (
                   <div key={group}>
                     <div className="tree-group">{group}</div>
@@ -541,38 +656,80 @@ export default function App() {
             )}
 
             {module === "remote" && sideTab === "files" && (
-              <div className="hint">
-                远程文件窗格（M3）。
-                <br />
-                打开一个 SSH 会话后，这里会显示该会话工作目录的文件。
-              </div>
+              <>
+                {!fileProfile && (
+                  <div className="hint">
+                    先打开一个 SSH 会话。
+                    <br />
+                    「文件」窗格会跟随当前会话所在服务器的目录。
+                  </div>
+                )}
+                {fileProfile && (
+                  <>
+                    <div className="fs-toolbar">
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => void loadDir(fileProfile.id, parentOf(fsPath))}
+                      >
+                        ↑ 上级
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => void loadDir(fileProfile.id, fsPath)}
+                      >
+                        刷新
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => void loadDir(fileProfile.id, undefined)}
+                      >
+                        家目录
+                      </button>
+                    </div>
+                    <div className="fs-path" title={fsPath}>
+                      {fsLoading ? "读取中…" : fsPath}
+                    </div>
+                    <div className="fs-list">
+                      {fsEntries.map((en) => (
+                        <div
+                          key={en.name}
+                          className="fs-row"
+                          onClick={() =>
+                            en.isDir
+                              ? void loadDir(fileProfile.id, joinPath(fsPath, en.name))
+                              : void openRemoteFile(fileProfile.id, en.name)
+                          }
+                          title={en.isDir ? "进入目录" : "预览文件"}
+                        >
+                          {en.isDir ? <IconFolder size={15} /> : <IconFile size={15} />}
+                          <span className="grow">{en.name}</span>
+                          <span className="dim">{en.isDir ? "" : humanSize(en.size)}</span>
+                        </div>
+                      ))}
+                      {!fsLoading && fsEntries.length === 0 && (
+                        <div className="hint">目录为空，或没有读取权限。</div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </>
             )}
 
             {module === "powershell" && (
-              <LocalModule
-                label="PowerShell"
-                onOpen={() => void openLocalSession("powershell")}
-              />
+              <LocalModule label="PowerShell" onOpen={() => void openLocalSession("powershell")} />
             )}
             {module === "cmd" && (
-              <LocalModule
-                label="命令提示符"
-                onOpen={() => void openLocalSession("cmd")}
-              />
+              <LocalModule label="命令提示符" onOpen={() => void openLocalSession("cmd")} />
             )}
             {module === "wsl" && (
-              <LocalModule
-                label="WSL"
-                onOpen={() => void openLocalSession("wsl")}
-              />
+              <LocalModule label="WSL" onOpen={() => void openLocalSession("wsl")} />
             )}
-            {module === "git" && (
-              <div className="hint">Git 面板（M5）。</div>
-            )}
-            {module === "serial" && (
-              <div className="hint">串口（M4）。</div>
-            )}
-            {module === "adb" && <div className="hint">ADB（M4）。</div>}
+            {module === "git" && <div className="hint">Git 面板（M5，尚未实现）。</div>}
+            {module === "serial" && <div className="hint">串口（M4，尚未实现）。</div>}
+            {module === "adb" && <div className="hint">ADB（M4，尚未实现）。</div>}
           </div>
         </aside>
 
@@ -604,6 +761,38 @@ export default function App() {
             )}
           </div>
 
+          {activeSession && activeSession.openFiles.length > 0 && (
+            <div className="sub-tabs">
+              <button
+                type="button"
+                className={"sub-tab term" + (activeSession.activeTab === "terminal" ? " active" : "")}
+                onClick={() => selectTab(activeSession.id, "terminal")}
+              >
+                <IconTerminal size={14} /> 终端
+              </button>
+              {activeSession.openFiles.map((f) => (
+                <button
+                  key={f.path}
+                  type="button"
+                  className={"sub-tab file" + (activeSession.activeTab === f.name ? " active" : "")}
+                  onClick={() => selectTab(activeSession.id, f.name)}
+                >
+                  <IconFile size={14} />
+                  <span>{f.name}</span>
+                  <span
+                    className="tab-x"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeFile(activeSession.id, f.name);
+                    }}
+                  >
+                    <IconClose size={11} />
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="pane">
             {sessions.length === 0 ? (
               <div className="empty">
@@ -617,15 +806,23 @@ export default function App() {
                 <div
                   key={s.id}
                   className="term-wrap"
-                  style={{ display: s.id === activeId ? "block" : "none" }}
+                  style={{
+                    display:
+                      s.id === activeId && s.activeTab === "terminal" ? "block" : "none",
+                  }}
                 >
                   <TerminalView
                     sessionId={s.id}
                     bus={bus}
-                    active={s.id === activeId}
+                    active={s.id === activeId && s.activeTab === "terminal"}
                   />
                 </div>
               ))
+            )}
+            {activeFile && (
+              <div className="file-wrap">
+                <FileView key={activeFile.path} file={activeFile} />
+              </div>
             )}
           </div>
         </main>
@@ -639,6 +836,7 @@ export default function App() {
             : "就绪"}
         </span>
         <span className="spacer" />
+        {activeFile && <span className="stat">{activeFile.path}</span>}
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
       </div>
@@ -667,13 +865,7 @@ function stateText(s: SessionState): string {
   }
 }
 
-function LocalModule({
-  label,
-  onOpen,
-}: {
-  label: string;
-  onOpen: () => void;
-}) {
+function LocalModule({ label, onOpen }: { label: string; onOpen: () => void }) {
   return (
     <div className="local-module">
       <button type="button" className="btn primary" onClick={onOpen}>
@@ -682,4 +874,111 @@ function LocalModule({
       <div className="hint">本地终端也可以开多个，各自是独立的工作区。</div>
     </div>
   );
+}
+
+const MD_STYLES: { key: MdStyle; label: string }[] = [
+  { key: "github", label: "GitHub" },
+  { key: "minimal", label: "简洁" },
+  { key: "dark", label: "深色" },
+  { key: "paper", label: "文档" },
+];
+
+function FileView({ file }: { file: OpenFile }) {
+  const [preview, setPreview] = useState(true);
+  const [mdStyle, setMdStyle] = useState<MdStyle>("github");
+
+  const isMd = file.kind === "md";
+  const isHtml = file.kind === "html";
+  const isImg = file.kind === "img";
+  const text = isImg ? "" : decodeB64Text(file.b64);
+
+  const mdHtml = useMemo(
+    () => (isMd ? DOMPurify.sanitize(md.render(text)) : ""),
+    [isMd, text],
+  );
+  const htmlDoc = useMemo(() => {
+    if (!isHtml) return "";
+    const clean = DOMPurify.sanitize(text, { FORBID_TAGS: ["script"], FORBID_ATTR: ["srcdoc"] });
+    return `<!doctype html><html><head><meta charset="utf-8"><style>
+      body{margin:16px;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#222;background:#fff;}
+      pre{background:#f5f5f5;padding:10px;border-radius:6px;overflow:auto;}
+      a{color:#0b6cff;} img{max-width:100%;}
+    </style></head><body>${clean}</body></html>`;
+  }, [isHtml, text]);
+
+  return (
+    <div className="file-view">
+      <div className="file-toolbar">
+        <span className="file-name" title={file.path}>
+          {file.name}
+        </span>
+        <span className="grow" />
+        {isMd && preview && (
+          <span className="md-styles">
+            {MD_STYLES.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                className={"md-style" + (mdStyle === s.key ? " active" : "")}
+                onClick={() => setMdStyle(s.key)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </span>
+        )}
+        {(isMd || isHtml) && (
+          <button
+            type="button"
+            className={"mini-btn" + (preview ? " active" : "")}
+            onClick={() => setPreview((v) => !v)}
+          >
+            {preview ? "预览" : "源码"}
+          </button>
+        )}
+        <span className="file-kind">{kindLabel(file.kind)}</span>
+      </div>
+
+      <div className="file-body">
+        {isImg && (
+          <div className="img-preview">
+            <img src={`data:${imgMime(file.name)};base64,${file.b64}`} alt={file.name} />
+          </div>
+        )}
+
+        {isMd &&
+          (preview ? (
+            <div className={"md-preview md-" + mdStyle} dangerouslySetInnerHTML={{ __html: mdHtml }} />
+          ) : (
+            <pre className="src-view">{text}</pre>
+          ))}
+
+        {isHtml &&
+          (preview ? (
+            <iframe className="html-preview" sandbox="" srcDoc={htmlDoc} title={file.name} />
+          ) : (
+            <pre className="src-view">{text}</pre>
+          ))}
+
+        {(file.kind === "code" || file.kind === "text") && (
+          <pre className="src-view">{text}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function kindLabel(kind: FileKind): string {
+  switch (kind) {
+    case "md":
+      return "Markdown";
+    case "html":
+      return "HTML";
+    case "img":
+      return "图片";
+    case "code":
+      return "代码";
+    default:
+      return "文本";
+  }
 }

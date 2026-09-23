@@ -53,3 +53,14 @@ export interface TmuxSession {
   windows: number;
   attached: boolean;
 }
+
+export interface RemoteEntry {
+  name: string;
+  isDir: boolean;
+  size: number;
+}
+
+export interface RemoteListing {
+  path: string;
+  entries: RemoteEntry[];
+}
