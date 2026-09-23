@@ -16,11 +16,13 @@
 | SSH 免密登录 `203.0.113.10` | ✅ 返回 `CONNECT_OK`，root 免密可用 |
 | **ssh + tmux attach 端到端** | ✅ 探针输出 `RESULT: OK`（marker / hostname / tmux 列表全部命中） |
 | tmux 会话名清洗（主机名含点号） | ✅ `47-99-241-168-root` 被 tmux 正常接受 |
+| **正式版 exe 的界面真的渲染并调用了后端** | ✅ 启动 5 秒内生成配置，日志出现 `ipc: list_profiles -> 1 entries` |
 
 过程中踩到两个坑，代码里已经处理掉，记在这里备忘：
 
 1. **必须设置 `TERM=xterm-256color`**，否则远端 tmux 直接报 `open terminal failed: terminal does not support clear`。
 2. **终端必须能应答 `ESC[6n` 光标位置查询**：tmux 启动时会问，xterm.js 会自动应答（所以真实应用没问题），但用自写脚本/探针时必须手动回 `ESC[1;1R`，否则会卡死在 4 字节。
+3. **构建务必用 `npm run tauri build`，不要只跑 `cargo build --release`**：直接跑 cargo 时前端产物（`dist/`）的变更未必会被重新嵌入，结果是「能启动但白屏」的 exe（我踩到过，已修复）。若怀疑资源是旧的，先执行 `cargo clean -p zeeai-terminal` 再打包。
 
 ---
 

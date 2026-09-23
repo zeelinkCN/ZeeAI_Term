@@ -18,7 +18,10 @@ pub struct SessionInfo {
 
 #[tauri::command]
 pub fn list_profiles() -> Result<Vec<ConnectionProfile>, String> {
-    store::load()
+    log::info!("ipc: list_profiles");
+    let profiles = store::load()?;
+    log::info!("ipc: list_profiles -> {} entries", profiles.len());
+    Ok(profiles)
 }
 
 #[tauri::command]
@@ -46,6 +49,7 @@ pub fn open_local(
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
+    log::info!("ipc: open_local shell={} distro={:?}", shell, distro);
     let (program, args, title) = match shell.as_str() {
         "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
         "wsl" => {
@@ -85,6 +89,7 @@ pub fn open_ssh(
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
+    log::info!("ipc: open_ssh profile_id={}", profile_id);
     let profiles = store::load()?;
     let profile = profiles
         .into_iter()

@@ -22,6 +22,9 @@ npm run tauri dev      # 开发模式（热更新）
 npm run tauri build    # 打包 exe + NSIS 安装包
 ```
 
+> 打包请始终使用 `npm run tauri build`。只跑 `cargo build --release` 时前端资源可能不会被重新嵌入，
+> 会得到「能启动但白屏」的 exe。
+
 端到端探针（验证 PTY + ssh + tmux，不需要开 GUI）：
 
 ```powershell
