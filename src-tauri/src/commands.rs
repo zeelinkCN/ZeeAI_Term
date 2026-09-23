@@ -1,0 +1,175 @@
+use base64::Engine as _;
+use portable_pty::PtySize;
+use serde::Serialize;
+use tauri::ipc::Channel;
+use tauri::State;
+
+use crate::core::{pty, ssh, SessionEvent, SessionRegistry};
+use crate::store::{self, ConnectionProfile};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub id: String,
+    pub profile_id: String,
+    pub title: String,
+    pub kind: String,
+}
+
+#[tauri::command]
+pub fn list_profiles() -> Result<Vec<ConnectionProfile>, String> {
+    store::load()
+}
+
+#[tauri::command]
+pub fn save_profile(profile: ConnectionProfile) -> Result<(), String> {
+    let mut all = store::load()?;
+    match all.iter_mut().find(|p| p.id == profile.id) {
+        Some(existing) => *existing = profile,
+        None => all.push(profile),
+    }
+    store::save(&all)
+}
+
+#[tauri::command]
+pub fn delete_profile(id: String) -> Result<(), String> {
+    let mut all = store::load()?;
+    all.retain(|p| p.id != id);
+    store::save(&all)
+}
+
+#[tauri::command]
+pub fn open_local(
+    id: String,
+    shell: String,
+    distro: Option<String>,
+    on_event: Channel<SessionEvent>,
+    registry: State<'_, SessionRegistry>,
+) -> Result<SessionInfo, String> {
+    let (program, args, title) = match shell.as_str() {
+        "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
+        "wsl" => {
+            let mut args: Vec<String> = vec![];
+            if let Some(d) = distro.as_ref().filter(|d| !d.trim().is_empty()) {
+                args.push("-d".into());
+                args.push(d.clone());
+            }
+            ("wsl.exe".to_string(), args, "WSL".to_string())
+        }
+        _ => (
+            "powershell.exe".to_string(),
+            vec!["-NoLogo".to_string()],
+            "PowerShell".to_string(),
+        ),
+    };
+
+    let handle = pty::spawn("local", &title, &program, &args, None, 110, 30, on_event)?;
+    registry
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), handle);
+
+    Ok(SessionInfo {
+        id,
+        profile_id: String::new(),
+        title,
+        kind: "local".into(),
+    })
+}
+
+#[tauri::command]
+pub fn open_ssh(
+    id: String,
+    profile_id: String,
+    on_event: Channel<SessionEvent>,
+    registry: State<'_, SessionRegistry>,
+) -> Result<SessionInfo, String> {
+    let profiles = store::load()?;
+    let profile = profiles
+        .into_iter()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| "连接配置不存在".to_string())?;
+    let cfg = profile
+        .ssh
+        .clone()
+        .ok_or_else(|| "该配置不是 SSH 类型".to_string())?;
+
+    let remote_cmd = if cfg.tmux_enabled {
+        let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user);
+        Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
+    } else {
+        None
+    };
+
+    let args = ssh::ssh_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        remote_cmd.as_deref(),
+    );
+    let program = ssh::ssh_exe();
+    let title = format!("{} · {}", profile.name, cfg.host);
+
+    let handle = pty::spawn("ssh", &title, &program, &args, None, 110, 30, on_event)?;
+    registry
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), handle);
+
+    Ok(SessionInfo {
+        id,
+        profile_id,
+        title,
+        kind: "ssh".into(),
+    })
+}
+
+#[tauri::command]
+pub fn session_write(
+    id: String,
+    data_b64: String,
+    registry: State<'_, SessionRegistry>,
+) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("解码输入失败: {e}"))?;
+    let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+    let handle = sessions.get(&id).ok_or_else(|| "会话不存在".to_string())?;
+    let mut writer = handle.writer.lock().map_err(|e| e.to_string())?;
+    writer.write_all(&bytes).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_resize(
+    id: String,
+    cols: u16,
+    rows: u16,
+    registry: State<'_, SessionRegistry>,
+) -> Result<(), String> {
+    let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+    let handle = sessions.get(&id).ok_or_else(|| "会话不存在".to_string())?;
+    let master = handle.master.lock().map_err(|e| e.to_string())?;
+    master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_close(id: String, registry: State<'_, SessionRegistry>) -> Result<(), String> {
+    let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+    if let Some(handle) = sessions.remove(&id) {
+        if let Ok(mut child) = handle.child.lock() {
+            let _ = child.kill();
+        }
+    }
+    Ok(())
+}
