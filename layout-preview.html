@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeeAI Terminal · VS Code 风格布局草稿</title>
+<style>
+  :root{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{margin:0;background:#161618;color:#cccccc;font-family:"Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;font-size:13px;line-height:1.5;}
+  [hidden]{display:none !important;}
+  .icon{width:16px;height:16px;flex:none;}
+  .spacer{flex:1;}
+  .page{padding:18px 12px 32px;}
+  .page-head{max-width:1200px;margin:0 auto 12px;color:#9d9d9d;font-size:12.5px;}
+  .page-head b{color:#e0e0e0;font-weight:500;}
+  .app{--bg:#1e1e1e;--sidebar:#252526;--titlebar:#323233;--tab:#2d2d2d;--border:#3c3c3c;--fg:#cccccc;--muted:#9d9d9d;--accent:#3794ff;--accent-soft:rgba(55,148,255,.16);--term-bg:#181818;--term-fg:#d4d4d4;--green:#89d185;--blue:#3794ff;--amber:#e2c08d;--purple:#c586c0;--dim:#6a6a6a;--status:#007acc;display:flex;flex-direction:column;height:720px;max-width:1200px;margin:0 auto;border:1px solid #000;border-radius:8px;overflow:hidden;background:var(--bg);color:var(--fg);font-size:13px;box-shadow:0 22px 60px rgba(0,0,0,.5);}
+  .titlebar{display:flex;align-items:center;gap:12px;height:34px;padding:0 8px;background:var(--titlebar);border-bottom:1px solid var(--border);}
+  .menus{display:flex;gap:2px;color:var(--muted);font-size:12px;white-space:nowrap;}
+  .menus span{padding:0 7px;border-radius:4px;}
+  .menus span:hover{background:rgba(255,255,255,.08);color:var(--fg);}
+  .title{flex:1;text-align:center;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .titlebar-actions{display:flex;align-items:center;gap:5px;}
+  .tmux-toggle{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--muted);font-size:12px;}
+  .tmux-toggle input{display:none;}
+  .tmux-toggle .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:1px solid var(--border);border-radius:5px;}
+  .tmux-toggle input:checked + .pill{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);}
+  .win-controls{display:flex;margin-left:2px;color:var(--muted);}
+  .win-controls .icon{display:grid;place-items:center;width:34px;height:34px;padding:9px;}
+  .win-controls .icon:hover{background:rgba(255,255,255,.12);color:var(--fg);}
+  .workbench{display:flex;flex:1;min-height:0;}
+  .activitybar{width:48px;display:flex;flex-direction:column;align-items:center;gap:1px;padding:6px 0;background:var(--sidebar);border-right:1px solid var(--border);min-height:0;}
+  .activitybar .act{position:relative;width:48px;height:46px;display:grid;place-items:center;border:0;background:transparent;color:#858585;cursor:pointer;}
+  .activitybar .act .icon{width:22px;height:22px;}
+  .activitybar .act:hover{color:var(--fg);}
+  .activitybar .act.active{color:var(--accent);}
+  .activitybar .act.active::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:2px;background:var(--accent);}
+  .act-sep{width:28px;height:1px;background:var(--border);margin:5px 0;}
+  .act-foot{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:1px;}
+  .sidebar{width:230px;display:flex;flex-direction:column;background:var(--sidebar);border-right:1px solid var(--border);min-height:0;}
+  .side-head{padding:9px 12px 8px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .side-subtabs{display:flex;border-bottom:1px solid var(--border);}
+  .side-subtabs button{flex:1;padding:6px 0;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12.5px;cursor:pointer;position:relative;}
+  .side-subtabs button.active{color:var(--fg);}
+  .side-subtabs button.active::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--accent);}
+  .side-body{flex:1;overflow:auto;padding:4px 0;min-height:0;}
+  .tree-group{display:flex;align-items:center;gap:5px;padding:5px 10px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);}
+  .tree-group .count{margin-left:auto;font-size:11px;}
+  .tree-item{display:flex;align-items:center;gap:7px;padding:5px 10px;margin:0 4px;border-radius:4px;color:var(--fg);white-space:nowrap;cursor:pointer;}
+  .tree-item:hover{background:rgba(255,255,255,.06);}
+  .tree-item.active{background:rgba(255,255,255,.10);}
+  .tree-item.child{padding-left:26px;color:var(--muted);}
+  .tree-item .dim{color:var(--muted);font-size:11px;}
+  .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:var(--accent-soft);color:var(--accent);}
+  .dot{width:7px;height:7px;border-radius:50%;margin-left:auto;}
+  .dot.ok{background:var(--green);}
+  .dot.off{background:#5a5a5a;}
+  .files-breadcrumb{display:flex;align-items:center;gap:2px;flex-wrap:wrap;padding:6px 10px;font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);}
+  .crumb{color:var(--blue);cursor:pointer;white-space:nowrap;}
+  .crumb:hover{text-decoration:underline;}
+  .crumb-sep{color:var(--muted);}
+  .file-list{flex:1;overflow:auto;padding:4px 0;min-height:0;}
+  .file-row{display:flex;align-items:center;gap:8px;padding:5px 10px;margin:0 4px;border-radius:4px;color:var(--fg);cursor:pointer;white-space:nowrap;}
+  .file-row:hover{background:rgba(255,255,255,.06);}
+  .file-row.active{background:rgba(255,255,255,.10);}
+  .c-folder{color:var(--amber);}.c-md{color:var(--blue);}.c-html{color:var(--purple);}.c-py{color:#b5cea8;}.c-img{color:#c586c0;}
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg);}
+  .view{flex:1;display:flex;flex-direction:column;min-height:0;}
+  .session-tabs{display:flex;align-items:stretch;background:var(--titlebar);border-bottom:1px solid var(--border);min-height:36px;overflow:hidden;}
+  .session-tab{position:relative;display:flex;align-items:center;gap:7px;padding:0 14px;border-right:1px solid var(--border);color:var(--muted);font-size:12.5px;background:transparent;cursor:pointer;white-space:nowrap;}
+  .session-tab:hover{color:var(--fg);}
+  .session-tab.active{color:var(--fg);}
+  .session-tab.active::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--accent);}
+  .session-tab .tmux-dot{width:6px;height:6px;border-radius:50%;background:var(--green);}
+  .session-add{border:0;background:transparent;color:var(--muted);cursor:pointer;padding:0 12px;font-size:15px;}
+  .sub-tabs{display:flex;align-items:stretch;background:var(--tab);border-bottom:1px solid var(--border);min-height:35px;overflow:hidden;}
+  .sub-tab{position:relative;display:flex;align-items:center;gap:6px;padding:0 13px;border-right:1px solid var(--border);font-size:12.5px;cursor:pointer;white-space:nowrap;}
+  .sub-tab.term{background:var(--accent-soft);color:var(--accent);font-weight:500;}
+  .sub-tab.term::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--accent);}
+  .sub-tab.file{background:transparent;color:var(--muted);}
+  .sub-tab.file.active{color:var(--fg);}
+  .sub-tab.file.active::after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:var(--accent);}
+  .sub-tab .x{border:0;background:transparent;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:0;opacity:.7;}
+  .pane{flex:1;display:flex;flex-direction:column;min-height:0;}
+  .terminal{flex:1;display:flex;flex-direction:column;background:var(--term-bg);min-height:0;font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:13px;line-height:1.6;color:var(--term-fg);}
+  .term-scroll{flex:1;overflow:auto;padding:12px 16px;min-height:0;}
+  .term-scroll pre{margin:0;white-space:pre-wrap;font:inherit;color:var(--term-fg);}
+  .t-dim{color:var(--dim);}
+  .t-user{color:var(--green);}
+  .t-path{color:var(--blue);}
+  .t-cmd{color:var(--term-fg);}
+  .t-ok{color:var(--green);}
+  .t-link{color:var(--blue);text-decoration:underline;}
+  .cursor{color:var(--term-fg);animation:blink 1.1s steps(1) infinite;}
+  @keyframes blink{50%{opacity:0;}}
+  @media (prefers-reduced-motion:reduce){.cursor{animation:none;}}
+  .tmux-bar{display:flex;align-items:center;background:#0f3d2e;color:#8be9c4;font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:11.5px;padding:2px 8px;}
+  .tmux-left,.tmux-right{opacity:.85;}
+  .tmux-win{padding:0 8px;border-right:1px solid rgba(139,233,196,.2);}
+  .tmux-win.active{background:#123f2f;font-weight:600;}
+  .tmux-right{margin-left:auto;}
+  .editor{flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg);}
+  .editor-toolbar{display:flex;align-items:center;gap:8px;padding:4px 10px;background:var(--titlebar);border-bottom:1px solid var(--border);min-height:33px;}
+  .file-badge{display:inline-flex;align-items:center;gap:6px;font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:12px;color:var(--fg);}
+  .md-styles{display:inline-flex;border:1px solid var(--border);border-radius:4px;overflow:hidden;}
+  .md-styles .style{padding:3px 9px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;border-right:1px solid var(--border);}
+  .md-styles .style:last-child{border-right:0;}
+  .md-styles .style.active{background:var(--accent-soft);color:var(--accent);}
+  .preview-toggle{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;}
+  .preview-toggle.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent);}
+  .editor-body{flex:1;overflow:auto;padding:24px 30px;min-height:0;}
+  .editor-body h1{font-size:20px;margin:0 0 6px;color:var(--fg);font-weight:600;}
+  .editor-body h2{font-size:16px;margin:0 0 6px;color:var(--fg);font-weight:600;}
+  .editor-body p{color:var(--fg);}
+  .editor-body .sub{color:var(--muted);font-size:12px;margin:0 0 16px;}
+  .editor-body ul{margin:0 0 16px;padding-left:22px;}
+  .editor-body a{color:var(--blue);}
+  .editor-body .code,.editor-body .src{font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:12.5px;background:#1e1e1e;border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:#d4d4d4;white-space:pre-wrap;margin:0;}
+  .editor-body blockquote{margin:0 0 14px;padding:2px 14px;border-left:3px solid #555;color:var(--muted);}
+  .img-placeholder{display:grid;place-items:center;height:200px;border:1px dashed var(--border);border-radius:8px;color:var(--muted);font-size:12px;}
+  .md-github h1{font-size:1.55em;padding-bottom:6px;border-bottom:1px solid var(--border);}
+  .md-minimal h1{font-size:1.3em;border:0;padding:0;}
+  .md-minimal .code{background:transparent;border:1px solid var(--border);}
+  .md-dark h1{color:#c678dd;border:0;}
+  .md-dark .code{background:#0d0d0d;border:1px solid #333;color:#98c379;}
+  .md-dark blockquote{border-left-color:#c678dd;color:#abb2bf;}
+  .md-paper{background:#fbfaf7;color:#333;font-family:Georgia,"Songti SC","STSong",serif;}
+  .md-paper h1{color:#111;border-bottom:1px solid #ddd;padding-bottom:6px;font-size:1.7em;}
+  .md-paper h2{color:#111;}
+  .md-paper p{color:#333;}
+  .md-paper .sub{color:#888;}
+  .md-paper .code{background:#f1f0ec;border:1px solid #e2e0d8;color:#333;}
+  .md-paper blockquote{border-left-color:#ccc;color:#666;}
+  .git-panel{flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg);}
+  .git-head{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;font-size:12.5px;font-weight:600;border-bottom:1px solid var(--border);}
+  .git-list{flex:1;overflow:auto;padding:6px 0;}
+  .git-row{display:flex;align-items:center;gap:8px;padding:5px 14px;font-family:"Cascadia Mono","Consolas",Menlo,monospace;font-size:12.5px;color:var(--fg);white-space:nowrap;}
+  .git-row .st{color:var(--amber);font-weight:700;width:14px;}
+  .git-commit{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--border);}
+  .git-commit input{flex:1;background:#3c3c3c;border:1px solid var(--border);border-radius:4px;color:var(--fg);font:inherit;padding:5px 8px;outline:none;}
+  .statusbar{display:flex;align-items:center;height:24px;background:var(--status);color:#fff;font-size:12px;}
+  .statusbar .stat{display:flex;align-items:center;gap:5px;padding:0 9px;height:100%;white-space:nowrap;}
+  .statusbar .stat:hover{background:rgba(255,255,255,.12);}
+  .statusbar .spacer{flex:1;}
+  @media (max-width:720px){.sidebar{display:none;}.titlebar-search{display:none;}.menus{display:none;}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-terminal" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 12 4 7"/><line x1="12" y1="19" x2="20" y2="19"/></g></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></g></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></g></symbol>
+  <symbol id="i-command" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></g></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></g></symbol>
+  <symbol id="i-square" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="1"/></g></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></g></symbol>
+  <symbol id="i-split" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="1"/><line x1="12" y1="3" x2="12" y2="21"/></g></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 12 12 17 22 12"/><polyline points="2 17 12 22 22 17"/></g></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="1"/><rect x="2" y="14" width="20" height="8" rx="1"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></g></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></g></symbol>
+  <symbol id="i-cable" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9h14v6H5z"/><path d="M8 6v3"/><path d="M16 6v3"/><path d="M8 15v3"/><path d="M16 15v3"/></g></symbol>
+  <symbol id="i-smartphone" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></g></symbol>
+  <symbol id="i-window" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="8" y1="6.5" x2="8.01" y2="6.5"/></g></symbol>
+  <symbol id="i-git-branch" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></g></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></g></symbol>
+  <symbol id="i-folder-open" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"/><path d="M3 7v11a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2H9l-2-2z"/></g></symbol>
+  <symbol id="i-file-text" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></g></symbol>
+  <symbol id="i-file-code" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="10 13 8 15 10 17"/><polyline points="14 13 16 15 14 17"/></g></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></g></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></g></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></g></symbol>
+  <symbol id="i-corner-up-left" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></g></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></g></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></g></symbol>
+  <symbol id="i-linux" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="8.5" rx="5.5" ry="6.5"/><path d="M6.5 15c0 3 2.5 5 5.5 5s5.5-2 5.5-5"/><circle cx="9.5" cy="7.5" r="1"/><circle cx="14.5" cy="7.5" r="1"/><path d="M12 10l-1.2 2.2L12 13l1.2-.8z"/></g></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v2.5M12 19.5V22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M2 12h2.5M19.5 12H22M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></g></symbol>
+</svg>
+
+<div class="page">
+  <div class="page-head"><b>ZeeAI Terminal · VS Code 风格布局</b> · 左侧仅「远程」入口；工作区（SSH / 串口 / ADB）在顶部标签栏，终端为主标签、文件为副标签</div>
+  <div id="terminal-workbench" class="app">
+    <div class="titlebar">
+      <div class="menus"><span>文件</span><span>编辑</span><span>视图</span><span>连接</span><span>终端</span><span>帮助</span></div>
+      <div class="title">ZeeAI Terminal — prod-web-01 · tmux:ai-claude</div>
+      <div class="titlebar-actions">
+        <button type="button" class="icon-btn" title="命令面板" style="background:transparent;border:0;color:var(--muted);cursor:pointer;display:inline-grid;place-items:center;width:26px;height:26px;border-radius:4px;"><svg class="icon" aria-hidden="true"><use href="#i-command"/></svg></button>
+        <label class="tmux-toggle"><input type="checkbox" checked><span class="pill"><svg class="icon" aria-hidden="true"><use href="#i-layers"/></svg> tmux</span></label>
+        <span class="win-controls" aria-hidden="true"><svg class="icon"><use href="#i-minus"/></svg><svg class="icon"><use href="#i-square"/></svg><svg class="icon"><use href="#i-x"/></svg></span>
+      </div>
+    </div>
+    <div class="workbench">
+      <nav class="activitybar" aria-label="模块">
+        <button type="button" class="act active" data-panel="panel-sessions" data-view="view-remote" data-label="远程" title="远程连接"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg></button>
+        <div class="act-sep"></div>
+        <button type="button" class="act" data-panel="panel-powershell" data-view="view-powershell" data-label="PowerShell" title="PowerShell"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg></button>
+        <button type="button" class="act" data-panel="panel-cmd" data-view="view-cmd" data-label="CMD" title="CMD"><svg class="icon" aria-hidden="true"><use href="#i-window"/></svg></button>
+        <button type="button" class="act" data-panel="panel-wsl" data-view="view-wsl" data-label="WSL" title="WSL"><svg class="icon" aria-hidden="true"><use href="#i-linux"/></svg></button>
+        <button type="button" class="act" data-panel="panel-git" data-view="view-git" data-label="Git" title="Git"><svg class="icon" aria-hidden="true"><use href="#i-git-branch"/></svg></button>
+        <button type="button" class="act" data-panel="panel-serial" data-view="view-serial" data-label="串口" title="串口"><svg class="icon" aria-hidden="true"><use href="#i-cable"/></svg></button>
+        <button type="button" class="act" data-panel="panel-adb" data-view="view-adb" data-label="ADB" title="ADB"><svg class="icon" aria-hidden="true"><use href="#i-smartphone"/></svg></button>
+        <div class="act-sep"></div>
+        <div class="act-foot">
+          <button type="button" class="act" title="设置"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg></button>
+        </div>
+      </nav>
+      <aside class="sidebar">
+        <div class="side-head" id="side-title">远程</div>
+        <div class="side-subtabs" id="side-subtabs">
+          <button type="button" class="active" data-panel="panel-sessions">会话</button>
+          <button type="button" data-panel="panel-files">文件</button>
+        </div>
+        <div class="side-body" id="side-body">
+          <div id="panel-sessions" class="tab-panel">
+            <div class="tree-group"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg> 生产环境 <span class="count">2</span></div>
+            <div class="tree-item active"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> prod-web-01 <span class="tag">tmux</span></div>
+            <div class="tree-item child"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg> ai-claude（会话）</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> prod-db-01</div>
+            <div class="tree-group"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg> 测试环境 <span class="count">1</span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> staging-01</div>
+          </div>
+          <div id="panel-files" class="tab-panel" hidden>
+            <div class="files-breadcrumb" id="files-breadcrumb"></div>
+            <div class="file-list" id="files-list"></div>
+          </div>
+          <div id="panel-powershell" class="tab-panel" hidden>
+            <div class="tree-group">本地终端</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg> 新建 PowerShell 会话</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg> D:\AI\ZeeAI_term</div>
+          </div>
+          <div id="panel-cmd" class="tab-panel" hidden>
+            <div class="tree-group">命令提示符</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg> 新建 CMD 会话</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-window"/></svg> C:\Users\m1523</div>
+          </div>
+          <div id="panel-wsl" class="tab-panel" hidden>
+            <div class="tree-group">WSL 发行版</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-linux"/></svg> Ubuntu-22.04 <span class="dot ok"></span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-linux"/></svg> Debian <span class="dot off"></span></div>
+          </div>
+          <div id="panel-git" class="tab-panel" hidden>
+            <div class="tree-group">最近仓库</div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-git-branch"/></svg> ZeeAI_term <span class="dim">main</span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-git-branch"/></svg> my-webapp <span class="dim">dev</span></div>
+          </div>
+          <div id="panel-serial" class="tab-panel" hidden>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-cable"/></svg> COM3 <span class="dim">115200</span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-cable"/></svg> COM5 <span class="dim">9600</span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg> 刷新设备列表</div>
+          </div>
+          <div id="panel-adb" class="tab-panel" hidden>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-smartphone"/></svg> Pixel 8 <span class="dot ok"></span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-smartphone"/></svg> emulator-5554 <span class="dot ok"></span></div>
+            <div class="tree-item"><svg class="icon" aria-hidden="true"><use href="#i-smartphone"/></svg> Redmi Note 12 <span class="dot off"></span></div>
+          </div>
+        </div>
+      </aside>
+      <main class="main" id="main-views">
+        <div class="view" id="view-remote">
+          <div class="session-tabs" id="conn-tabs">
+            <button type="button" class="session-tab active" data-conn="prod-web-01 · tmux:ai-claude"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> prod-web-01 <span class="tmux-dot"></span></button>
+            <button type="button" class="session-tab" data-conn="prod-web-01 #2"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> prod-web-01 #2</button>
+            <button type="button" class="session-tab" data-conn="prod-db-01"><svg class="icon" aria-hidden="true"><use href="#i-server"/></svg> prod-db-01</button>
+            <span class="spacer"></span>
+            <button type="button" class="session-add" title="新建连接">+</button>
+          </div>
+          <div class="sub-tabs" id="sub-tabs"></div>
+          <div class="pane">
+            <div class="terminal" id="terminal-pane">
+              <div class="term-scroll" id="term-scroll"></div>
+              <div class="tmux-bar" id="tmux-bar"></div>
+            </div>
+            <div class="editor" id="editor-pane" hidden>
+              <div class="editor-toolbar" id="editor-toolbar">
+                <span class="file-badge" id="file-badge"><svg class="icon" aria-hidden="true"><use href="#i-file-text"/></svg> report.md</span>
+                <span class="spacer"></span>
+                <div class="md-styles" id="md-styles">
+                  <button type="button" class="style active" data-style="github">GitHub</button>
+                  <button type="button" class="style" data-style="minimal">简洁</button>
+                  <button type="button" class="style" data-style="dark">深色</button>
+                  <button type="button" class="style" data-style="paper">文档</button>
+                </div>
+                <button type="button" class="preview-toggle active" id="preview-toggle"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg> 预览</button>
+              </div>
+              <div class="editor-body md-github" id="editor-body"></div>
+            </div>
+          </div>
+        </div>
+        <div class="view" id="view-serial" hidden>
+          <div class="terminal">
+            <div class="term-scroll"><pre><span class="t-dim">[COM3 已打开 · 115200 8N1 · 无流控]</span>
+<span class="t-cmd">AT+CSQ</span>
+<span class="t-ok">+CSQ: 23,99</span>
+<span class="t-ok">OK</span>
+<span class="t-cmd">AT+CGSN</span>
+<span class="t-ok">860123456789012</span>
+<span class="t-dim">&gt;</span> <span class="cursor">█</span></pre></div>
+          </div>
+        </div>
+        <div class="view" id="view-adb" hidden>
+          <div class="terminal">
+            <div class="term-scroll"><pre><span class="t-dim">$ adb shell</span>
+<span class="t-user">pixel8</span>:<span class="t-path">/</span>$ <span class="t-cmd">ls /sdcard/ai-work</span>
+<span class="t-link">report.md</span>  <span class="t-link">report.html</span>  <span class="t-link">chart.png</span>
+<span class="t-user">pixel8</span>:<span class="t-path">/</span>$ <span class="cursor">█</span></pre></div>
+          </div>
+        </div>
+        <div class="view" id="view-powershell" hidden>
+          <div class="terminal">
+            <div class="term-scroll"><pre><span class="t-dim">Windows PowerShell 7.4.6</span>
+<span class="t-user">PS</span> <span class="t-path">D:\AI\ZeeAI_term</span>&gt; <span class="t-cmd">git status --short</span>
+<span class="t-dim"> M layout-preview.html</span>
+<span class="t-user">PS</span> <span class="t-path">D:\AI\ZeeAI_term</span>&gt; <span class="cursor">█</span></pre></div>
+          </div>
+        </div>
+        <div class="view" id="view-cmd" hidden>
+          <div class="terminal">
+            <div class="term-scroll"><pre><span class="t-dim">Microsoft Windows [版本 10.0.22631]</span>
+<span class="t-user">C:\Users\m1523</span>&gt;<span class="t-cmd">dir</span>
+<span class="t-dim">2026/09/24  14:20    &lt;DIR&gt;          .codex</span>
+<span class="t-user">C:\Users\m1523</span>&gt;<span class="cursor">█</span></pre></div>
+          </div>
+        </div>
+        <div class="view" id="view-wsl" hidden>
+          <div class="terminal">
+            <div class="term-scroll"><pre><span class="t-dim">Welcome to Ubuntu 22.04.5 LTS</span>
+<span class="t-user">ubuntu@DESKTOP</span>:<span class="t-path">~</span>$ <span class="t-cmd">ls</span>
+<span class="t-link">ai-work</span>  <span class="t-link">projects</span>
+<span class="t-user">ubuntu@DESKTOP</span>:<span class="t-path">~</span>$ <span class="cursor">█</span></pre></div>
+          </div>
+        </div>
+        <div class="view" id="view-git" hidden>
+          <div class="git-panel">
+            <div class="git-head"><span>源代码管理 · ZeeAI_term</span><span style="font-weight:400;font-size:11px;color:var(--muted)">main*</span></div>
+            <div class="git-list">
+              <div class="git-row"><span class="st">M</span> layout-preview.html</div>
+              <div class="git-row"><span class="st">M</span> README.md</div>
+              <div class="git-row"><span class="st">U</span> src/terminal.ts</div>
+            </div>
+            <div class="git-commit"><input type="text" placeholder="提交信息（Ctrl+Enter 提交）" readonly></div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div class="statusbar">
+      <span class="stat"><svg class="icon" aria-hidden="true"><use href="#i-activity"/></svg> SSH: prod-web-01</span>
+      <span class="stat"><svg class="icon" aria-hidden="true"><use href="#i-git-branch"/></svg> main*</span>
+      <span class="spacer"></span>
+      <span class="stat">0 ▲ 0 ▼</span>
+      <span class="stat">UTF-8</span>
+      <span class="stat">LF</span>
+      <span class="stat">Markdown</span>
+      <span class="stat">100×30</span>
+    </div>
+  </div>
+</div>
+<script>
+  (function () {
+    var FS = {
+      '/': [ {name:'home', type:'dir'} ],
+      '/home': [ {name:'ubuntu', type:'dir'} ],
+      '/home/ubuntu': [ {name:'ai-work', type:'dir'}, {name:'.bashrc', type:'text'} ],
+      '/home/ubuntu/ai-work': [
+        {name:'logs', type:'dir'},
+        {name:'report.md', type:'md'},
+        {name:'report.html', type:'html'},
+        {name:'script.py', type:'code'},
+        {name:'chart.png', type:'img'}
+      ],
+      '/home/ubuntu/ai-work/logs': [ {name:'app.log', type:'text'}, {name:'error.log', type:'text'} ]
+    };
+    var ICON = {dir:'folder', md:'file-text', html:'file-code', code:'file-code', img:'image', text:'file-text', up:'corner-up-left'};
+    var CCOL = {dir:'c-folder', md:'c-md', html:'c-html', code:'c-py', img:'c-img', text:'', up:''};
+    var curPath = '/home/ubuntu/ai-work';
+    var crumbEl = document.getElementById('files-breadcrumb');
+    var listEl = document.getElementById('files-list');
+    var bodyEl = document.getElementById('editor-body');
+    var badgeEl = document.getElementById('file-badge');
+    var stylesEl = document.getElementById('md-styles');
+    var toggleBtn = document.getElementById('preview-toggle');
+    var editorPane = document.getElementById('editor-pane');
+    var terminalPane = document.getElementById('terminal-pane');
+    var termScroll = document.getElementById('term-scroll');
+    var tmuxBar = document.getElementById('tmux-bar');
+    var connTabsEl = document.getElementById('conn-tabs');
+    var subTabsEl = document.getElementById('sub-tabs');
+    var activityBar = document.querySelector('.activitybar');
+    var sideSubTabs = document.getElementById('side-subtabs');
+    var mainViews = document.getElementById('main-views');
+    var sideBody = document.getElementById('side-body');
+    var sideTitle = document.getElementById('side-title');
+
+    var connections = [
+      {id:'prod-web-01 · tmux:ai-claude', type:'ssh', tmux:true},
+      {id:'prod-web-01 #2', type:'ssh'},
+      {id:'prod-db-01', type:'ssh'}
+    ];
+    var openedFiles = {
+      'prod-web-01 · tmux:ai-claude': [ {name:'report.md', type:'md'}, {name:'report.html', type:'html'} ],
+      'prod-web-01 #2': [],
+      'prod-db-01': []
+    };
+    var activeConnId = connections[0].id;
+    var activeTab = 'terminal';
+    var current = null;
+    var previewOn = true;
+    var currentStyle = 'github';
+
+    var MD_RENDERED = '<h1>本周运维周报</h1><p class="sub">2026-09-24 · prod-web-01 · 由 AI 生成</p><p>本周完成以下变更：</p><ul><li>修复登录接口偶发超时</li><li>CPU 峰值 78% → 42%</li><li>滚动更新 3 个服务镜像</li></ul><p class="code">kubectl rollout status deploy/api</p><blockquote>镜像已推送至 prod registry，可直接灰度。</blockquote>';
+    var MD_SOURCE = '# 本周运维周报\n\n- 修复登录接口偶发超时\n- CPU 峰值 78% → 42%\n- 滚动更新 3 个服务镜像\n\n```bash\nkubectl rollout status deploy/api\n```\n\n> 镜像已推送至 prod registry。';
+    var HTML_RENDERED = '<h2>周报</h2><p class="sub">report.html · 沙箱渲染（脚本/外链已禁用）</p><p>这是一段渲染后的 HTML 正文：<strong>加粗</strong>、链接、以及一张示例图。</p>';
+    var HTML_SOURCE = '<!doctype html>\n<html>\n<head><title>周报</title></head>\n<body>\n  <h1>周报</h1>\n  <p>这是正文。</p>\n</body>\n</html>';
+
+    function segments(p){ return p.split('/').filter(Boolean); }
+    function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function activeConn(){
+      for (var i=0;i<connections.length;i++){ if (connections[i].id === activeConnId) return connections[i]; }
+      return connections[0];
+    }
+    function rowHTML(name, type, key){
+      var ic = ICON[type] || 'file-text', cc = CCOL[type] || '';
+      return '<div class="file-row" data-key="'+key+'" data-type="'+type+'">' +
+        '<svg class="icon '+cc+'" aria-hidden="true"><use href="#i-'+ic+'"/></svg><span>'+name+'</span></div>';
+    }
+    function renderFiles(){
+      var segs = segments(curPath), h = '<span class="crumb" data-path="/">/</span>', acc = '';
+      segs.forEach(function(s, i){ acc += '/'+s; h += '<span class="crumb" data-path="'+acc+'">'+s+'</span>'; if(i<segs.length-1) h += '<span class="crumb-sep">/</span>'; });
+      crumbEl.innerHTML = h;
+      var html = '';
+      if (segs.length > 0) html += rowHTML('..', 'up', '..');
+      (FS[curPath] || []).forEach(function(f){ html += rowHTML(f.name, f.type, f.name); });
+      listEl.innerHTML = html;
+    }
+    function findFile(name){
+      var arr = openedFiles[activeConnId] || [];
+      for (var i=0;i<arr.length;i++){ if (arr[i].name === name) return arr[i]; }
+      return null;
+    }
+    function renderSubTabs(){
+      var c = activeConn();
+      if (!c || c.type !== 'ssh') { subTabsEl.innerHTML = ''; return; }
+      var html = '<div class="sub-tab term'+(activeTab==='terminal'?' active':'')+'" data-tab="terminal"><svg class="icon" aria-hidden="true"><use href="#i-terminal"/></svg> 终端</div>';
+      (openedFiles[activeConnId] || []).forEach(function(f){
+        var ic = f.type === 'md' ? 'file-text' : (f.type === 'html' ? 'file-code' : 'file-text');
+        var cc = f.type === 'md' ? 'c-md' : (f.type === 'html' ? 'c-html' : '');
+        html += '<div class="sub-tab file'+(activeTab===f.name?' active':'')+'" data-tab="'+f.name+'"><svg class="icon '+cc+'" aria-hidden="true"><use href="#i-'+ic+'"/></svg> '+f.name+'<button type="button" class="x" data-close="'+f.name+'">×</button></div>';
+      });
+      subTabsEl.innerHTML = html;
+    }
+    function renderTerminal(){
+      var c = activeConn();
+      if (!c) return;
+      var html = '';
+      var showBar = false;
+      if (c.type === 'ssh' && c.tmux) {
+        html = '<span class="t-dim">Last login: Thu Sep 24 14:28:11 2026 · 已附加 tmux 会话 ai-claude</span>\n<span class="t-user">ubuntu@prod-web-01</span>:<span class="t-path">~/ai-work</span>$ <span class="t-cmd">ai "把今天的日志整理成周报"</span>\n<span class="t-dim">◐ 正在读取 logs/ 目录…</span>\n<span class="t-ok">✓</span> 已生成 <span class="t-link">report.md</span> 和 <span class="t-link">report.html</span>\n<span class="t-user">ubuntu@prod-web-01</span>:<span class="t-path">~/ai-work</span>$ <span class="cursor">█</span>';
+        showBar = true;
+      } else if (c.type === 'ssh') {
+        var host = c.id.split(' ')[0];
+        html = '<span class="t-user">ubuntu@'+host+'</span>:<span class="t-path">~</span>$ <span class="cursor">█</span>';
+      } else if (c.type === 'serial') {
+        html = '<span class="t-dim">[COM3 已打开 · 115200 8N1 · 无流控]</span>\n<span class="t-cmd">AT+CSQ</span>\n<span class="t-ok">+CSQ: 23,99</span>\n<span class="t-ok">OK</span>\n<span class="t-cmd">AT+CGSN</span>\n<span class="t-ok">860123456789012</span>\n<span class="t-dim">&gt;</span> <span class="cursor">█</span>';
+      } else if (c.type === 'adb') {
+        html = '<span class="t-dim">$ adb shell</span>\n<span class="t-user">pixel8</span>:<span class="t-path">/</span>$ <span class="t-cmd">ls /sdcard/ai-work</span>\n<span class="t-link">report.md</span>  <span class="t-link">report.html</span>  <span class="t-link">chart.png</span>\n<span class="t-user">pixel8</span>:<span class="t-path">/</span>$ <span class="cursor">█</span>';
+      }
+      termScroll.innerHTML = '<pre>'+html+'</pre>';
+      if (showBar) {
+        tmuxBar.hidden = false;
+        tmuxBar.innerHTML = '<span class="tmux-left">[ai-claude]</span><span class="tmux-win">0:bash</span><span class="tmux-win active">1:ai*</span><span class="tmux-win">2:logs</span><span class="tmux-right">prod-web-01 · 14:32</span>';
+      } else {
+        tmuxBar.hidden = true;
+      }
+    }
+    function renderEditor(){
+      var type = current ? current.type : 'md';
+      var isPreviewable = (type === 'md' || type === 'html');
+      badgeEl.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-file-text"/></svg> ' + (current ? current.name : '');
+      stylesEl.querySelectorAll('.style').forEach(function(s){ s.classList.toggle('active', s.getAttribute('data-style') === currentStyle); });
+      stylesEl.hidden = !(previewOn && type === 'md');
+      toggleBtn.hidden = !isPreviewable;
+      toggleBtn.classList.toggle('active', previewOn);
+      toggleBtn.innerHTML = previewOn ? '<svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg> 预览' : '<svg class="icon" aria-hidden="true"><use href="#i-code"/></svg> 源码';
+      var cls = 'editor-body';
+      if (isPreviewable) {
+        if (previewOn) {
+          cls += ' md-' + currentStyle;
+          bodyEl.innerHTML = (type === 'md') ? MD_RENDERED : HTML_RENDERED;
+        } else {
+          cls += ' source-mode';
+          bodyEl.innerHTML = '<pre class="src">' + escapeHtml(type === 'md' ? MD_SOURCE : HTML_SOURCE) + '</pre>';
+        }
+      } else if (type === 'img') {
+        bodyEl.innerHTML = '<div class="img-placeholder">' + (current ? current.name : '') + '<br>（图片预览）</div>';
+      } else if (type === 'code') {
+        bodyEl.innerHTML = '<pre class="src">import json\n\nfor line in open("logs/app.log"):\n    if "ERROR" in line:\n        print(line.strip())</pre>';
+      } else {
+        bodyEl.innerHTML = '<pre class="src">2026-09-24 14:30:01 INFO  started\n2026-09-24 14:31:22 WARN  slow query 1.8s\n2026-09-24 14:32:10 ERROR timeout</pre>';
+      }
+      bodyEl.className = cls;
+    }
+    function renderContent(){
+      var c = activeConn();
+      if (c && c.type === 'ssh' && activeTab !== 'terminal') {
+        current = findFile(activeTab);
+        terminalPane.hidden = true;
+        editorPane.hidden = false;
+        renderEditor();
+      } else {
+        editorPane.hidden = true;
+        terminalPane.hidden = false;
+        renderTerminal();
+      }
+    }
+    function renderConnTabs(){
+      connTabsEl.querySelectorAll('.session-tab').forEach(function(t){ t.classList.toggle('active', t.getAttribute('data-conn') === activeConnId); });
+    }
+    function showTerminal(){
+      activeTab = 'terminal';
+      renderSubTabs();
+      renderContent();
+    }
+    function openFile(name, type){
+      var arr = openedFiles[activeConnId] || [];
+      if (!arr.some(function(f){ return f.name === name; })) arr.push({name:name, type:type});
+      openedFiles[activeConnId] = arr;
+      activeTab = name;
+      current = {name:name, type:type};
+      previewOn = true;
+      if (type !== 'md') currentStyle = 'github';
+      renderSubTabs();
+      renderContent();
+      listEl.querySelectorAll('.file-row').forEach(function(r){ r.classList.toggle('active', r.getAttribute('data-key') === name && r.getAttribute('data-type') !== 'up'); });
+    }
+
+    connTabsEl.addEventListener('click', function(e){
+      var b = e.target.closest('[data-conn]'); if (!b) return;
+      activeConnId = b.getAttribute('data-conn');
+      activeTab = 'terminal';
+      renderConnTabs();
+      renderSubTabs();
+      renderContent();
+    });
+    subTabsEl.addEventListener('click', function(e){
+      var close = e.target.closest('[data-close]');
+      if (close) {
+        var nm = close.getAttribute('data-close');
+        openedFiles[activeConnId] = (openedFiles[activeConnId]||[]).filter(function(f){ return f.name !== nm; });
+        if (activeTab === nm) showTerminal(); else renderSubTabs();
+        return;
+      }
+      var b = e.target.closest('[data-tab]'); if (!b) return;
+      var tab = b.getAttribute('data-tab');
+      if (tab === 'terminal') showTerminal();
+      else { activeTab = tab; renderSubTabs(); renderContent(); }
+    });
+    listEl.addEventListener('click', function(e){
+      var row = e.target.closest('.file-row'); if (!row) return;
+      var key = row.getAttribute('data-key'), type = row.getAttribute('data-type');
+      if (key === '..') { var s = segments(curPath); s.pop(); curPath = s.length ? '/'+s.join('/') : '/'; renderFiles(); return; }
+      if (type === 'dir') { curPath = (curPath === '/' ? '' : curPath) + '/' + key; renderFiles(); return; }
+      openFile(key, type);
+    });
+    crumbEl.addEventListener('click', function(e){
+      var c = e.target.closest('.crumb'); if (!c) return;
+      curPath = c.getAttribute('data-path'); renderFiles();
+    });
+    toggleBtn.addEventListener('click', function(){ previewOn = !previewOn; renderEditor(); });
+    stylesEl.addEventListener('click', function(e){
+      var b = e.target.closest('.style'); if (!b) return;
+      currentStyle = b.getAttribute('data-style');
+      if (current && current.type === 'md' && previewOn) renderEditor();
+    });
+
+    function setSideSubTab(panelId){
+      sideSubTabs.querySelectorAll('button').forEach(function(b){ b.classList.toggle('active', b.getAttribute('data-panel') === panelId); });
+      sideBody.querySelectorAll('.tab-panel').forEach(function(p){ p.hidden = p.id !== panelId; });
+    }
+    activityBar.addEventListener('click', function(e){
+      var btn = e.target.closest('[data-panel]'); if (!btn) return;
+      activityBar.querySelectorAll('.act').forEach(function(b){ b.classList.toggle('active', b === btn); });
+      var panelId = btn.getAttribute('data-panel');
+      sideBody.querySelectorAll('.tab-panel').forEach(function(p){ p.hidden = p.id !== panelId; });
+      var viewId = btn.getAttribute('data-view');
+      mainViews.querySelectorAll('.view').forEach(function(v){ v.hidden = v.id !== viewId; });
+      sideTitle.textContent = btn.getAttribute('data-label') || '';
+      var isRemote = btn.getAttribute('data-label') === '远程';
+      sideSubTabs.hidden = !isRemote;
+      if (isRemote) setSideSubTab('panel-sessions');
+    });
+    sideSubTabs.addEventListener('click', function(e){
+      var b = e.target.closest('[data-panel]'); if (!b) return;
+      setSideSubTab(b.getAttribute('data-panel'));
+    });
+
+    renderFiles();
+    renderSubTabs();
+    renderContent();
+  })();
+</script>
+</body>
+</html>
