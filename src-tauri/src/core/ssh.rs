@@ -91,3 +91,32 @@ else printf '\\n[ZeeAI] tmux not found on this server - falling back to a plain 
 exec \"${{SHELL:-/bin/bash}}\"; fi"
     )
 }
+
+/// 组装一次非交互式 `ssh <host> "<cmd>"` 调用（用于 tmux 列表 / kill 这类一次性命令）。
+pub fn ssh_exec_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    key_path: Option<&str>,
+    remote_command: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-p".into(),
+        port.to_string(),
+    ];
+    if let Some(k) = key_path {
+        if !k.trim().is_empty() {
+            args.push("-i".into());
+            args.push(k.to_string());
+        }
+    }
+    args.push(format!("{user}@{host}"));
+    args.push(remote_command.to_string());
+    args
+}

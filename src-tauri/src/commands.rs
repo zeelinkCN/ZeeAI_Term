@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::{pty, ssh, SessionEvent, SessionRegistry};
+use crate::core::{pty, ssh, tmux, SessionEvent, SessionRegistry};
 use crate::store::{self, ConnectionProfile};
 
 #[derive(Serialize)]
@@ -86,10 +86,15 @@ pub fn open_local(
 pub fn open_ssh(
     id: String,
     profile_id: String,
+    tmux_session: Option<String>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
-    log::info!("ipc: open_ssh profile_id={}", profile_id);
+    log::info!(
+        "ipc: open_ssh profile_id={} tmux_session={:?}",
+        profile_id,
+        tmux_session
+    );
     let profiles = store::load()?;
     let profile = profiles
         .into_iter()
@@ -100,8 +105,11 @@ pub fn open_ssh(
         .clone()
         .ok_or_else(|| "该配置不是 SSH 类型".to_string())?;
 
-    let remote_cmd = if cfg.tmux_enabled {
-        let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user);
+    let remote_cmd = if cfg.tmux_enabled || tmux_session.is_some() {
+        let name = match tmux_session.as_ref().filter(|s| !s.trim().is_empty()) {
+            Some(explicit) => explicit.clone(),
+            None => ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user),
+        };
         Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
     } else {
         None
@@ -176,5 +184,64 @@ pub fn session_close(id: String, registry: State<'_, SessionRegistry>) -> Result
             let _ = child.kill();
         }
     }
+    Ok(())
+}
+
+fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {
+    let profiles = store::load()?;
+    let profile = profiles
+        .into_iter()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| "连接配置不存在".to_string())?;
+    profile
+        .ssh
+        .ok_or_else(|| "该配置不是 SSH 类型".to_string())
+}
+
+async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
+    let exe = ssh::ssh_exe();
+    let output = tokio::process::Command::new(exe)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("执行 ssh 失败: {e}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(text)
+}
+
+/// 列出服务器上的 tmux 会话（通过一次性 ssh 命令）。
+#[tauri::command]
+pub async fn tmux_list(profile_id: String) -> Result<Vec<tmux::TmuxSession>, String> {
+    log::info!("ipc: tmux_list profile_id={profile_id}");
+    let cfg = ssh_config(&profile_id)?;
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        &tmux::list_remote_command(),
+    );
+    let out = run_ssh_capture(&args).await?;
+    let sessions = tmux::parse_list(&out);
+    log::info!("ipc: tmux_list -> {} sessions", sessions.len());
+    Ok(sessions)
+}
+
+/// 结束服务器上的某个 tmux 会话。
+#[tauri::command]
+pub async fn tmux_kill(profile_id: String, name: String) -> Result<(), String> {
+    log::info!("ipc: tmux_kill profile_id={profile_id} name={name}");
+    let cfg = ssh_config(&profile_id)?;
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        &tmux::kill_remote_command(&name),
+    );
+    let _ = run_ssh_capture(&args).await?;
     Ok(())
 }

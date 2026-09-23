@@ -8,12 +8,15 @@ import {
   openSsh,
   saveProfile,
   sessionClose,
+  tmuxKill,
+  tmuxList,
 } from "./ipc";
 import { b64ToBytes, uid } from "./util";
 import type {
   ConnectionProfile,
   SessionEvent,
   SessionState,
+  TmuxSession,
 } from "./types";
 import {
   IconActivity,
@@ -98,6 +101,9 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
+  const [tmuxTarget, setTmuxTarget] = useState<ConnectionProfile | null>(null);
+  const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
+  const [tmuxLoading, setTmuxLoading] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -240,6 +246,46 @@ export default function App() {
       await refresh();
     } catch (e) {
       setToast("删除失败：" + String(e));
+    }
+  }
+
+  async function refreshTmux(profile: ConnectionProfile) {
+    setTmuxLoading(true);
+    try {
+      setTmuxSessions(await tmuxList(profile.id));
+    } catch (e) {
+      setToast("读取 tmux 会话失败：" + String(e));
+      setTmuxSessions([]);
+    } finally {
+      setTmuxLoading(false);
+    }
+  }
+
+  async function attachTmux(profile: ConnectionProfile, name: string) {
+    const id = uid();
+    addSession({
+      id,
+      title: `${profile.name} · ${name}`,
+      kind: "remote",
+      profileId: profile.id,
+      state: "connecting",
+    });
+    try {
+      await openSsh(id, profile.id, (e) => handleEvent(id, e), name);
+    } catch (e) {
+      setToast("附加 tmux 会话失败：" + String(e));
+      setSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)),
+      );
+    }
+  }
+
+  async function killTmux(profile: ConnectionProfile, name: string) {
+    try {
+      await tmuxKill(profile.id, name);
+      await refreshTmux(profile);
+    } catch (e) {
+      setToast("结束 tmux 会话失败：" + String(e));
     }
   }
 
@@ -400,6 +446,57 @@ export default function App() {
                     认证使用你本机已配置的 SSH 密钥。
                   </div>
                 )}
+                {tmuxTarget && (
+                  <div className="tmux-panel">
+                    <div className="tmux-head">
+                      <span>tmux 会话 · {tmuxTarget.name}</span>
+                      <span className="tmux-actions">
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void refreshTmux(tmuxTarget)}
+                        >
+                          刷新
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => setTmuxTarget(null)}
+                        >
+                          关闭
+                        </button>
+                      </span>
+                    </div>
+                    {tmuxLoading && <div className="hint">正在读取…</div>}
+                    {!tmuxLoading && tmuxSessions.length === 0 && (
+                      <div className="hint">
+                        没有 tmux 会话（或服务器未安装 tmux）。
+                      </div>
+                    )}
+                    {tmuxSessions.map((s) => (
+                      <div key={s.name} className="tmux-row">
+                        <IconTerminal size={14} />
+                        <span className="grow">{s.name}</span>
+                        <span className="dim">{s.windows} 窗口</span>
+                        {s.attached && <span className="tag">已连接</span>}
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void attachTmux(tmuxTarget, s.name)}
+                        >
+                          连接
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void killTmux(tmuxTarget, s.name)}
+                        >
+                          结束
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {grouped.map(([group, list]) => (
                   <div key={group}>
                     <div className="tree-group">{group}</div>
@@ -413,6 +510,18 @@ export default function App() {
                         <IconServer size={15} />
                         <span className="grow">{p.name}</span>
                         {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
+                        <button
+                          type="button"
+                          className="mini-x"
+                          title="tmux 会话"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTmuxTarget(p);
+                            void refreshTmux(p);
+                          }}
+                        >
+                          ≡
+                        </button>
                         <button
                           type="button"
                           className="mini-x"

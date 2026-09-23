@@ -6,6 +6,9 @@ Windows 端的多协议终端工作台：SSH（基于 tmux 的会话持久化）
 
 **M0 技术验证 + M1 骨架已完成，可直接试用**：本地终端（PowerShell / CMD / WSL）、SSH 连接、tmux 会话附加均已实测跑通。
 
+已实现：VS Code 风格外壳、多会话标签、本地终端、SSH（免密/密钥，复用系统 OpenSSH）、
+tmux 持久会话自动附加、tmux 会话管理面板（列表 / attach / kill）。
+
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)
 - 界面交互草稿：[layout-preview.html](layout-preview.html)（双击用浏览器打开）

@@ -22,6 +22,8 @@ pub fn run() {
       commands::session_write,
       commands::session_resize,
       commands::session_close,
+      commands::tmux_list,
+      commands::tmux_kill,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

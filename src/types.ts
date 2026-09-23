@@ -47,3 +47,9 @@ export interface OpenSession {
   info: SessionInfo;
   state: SessionState;
 }
+
+export interface TmuxSession {
+  name: string;
+  windows: number;
+  attached: boolean;
+}

@@ -349,6 +349,65 @@ body {
   padding: 10px 12px;
 }
 
+.tmux-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 4px 0 8px;
+  margin-bottom: 6px;
+}
+
+.tmux-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tmux-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.mini-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+.mini-btn:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.tmux-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin: 0 4px;
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.tmux-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.tmux-row .dim {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .main {
   flex: 1;
   display: flex;
