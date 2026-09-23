@@ -2,6 +2,9 @@
 
 Windows 端的多协议终端工作台：SSH（基于 tmux 的会话持久化）、远程文件管理（SFTP + MD/HTML 预览）、串口、ADB，以及本地终端（PowerShell / CMD / WSL）。
 
+> **想直接试用**：双击 `src-tauri/target/release/zeeai-terminal.exe`。
+> 交付说明与待确认事项见 [docs/decisions.md](docs/decisions.md)（开头有 30 秒版）。
+
 ## 当前状态
 
 **M0 技术验证 + M1 骨架已完成，可直接试用**：本地终端（PowerShell / CMD / WSL）、SSH 连接、tmux 会话附加均已实测跑通。
