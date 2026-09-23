@@ -3,6 +3,7 @@ mod core;
 mod store;
 
 use core::SessionRegistry;
+use tauri::Emitter;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,6 +14,15 @@ pub fn run() {
         .build(),
     )
     .setup(|app| {
+      // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
+      // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
+      if std::env::var("ZEEAI_AUTODEMO").is_ok() {
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+          std::thread::sleep(std::time::Duration::from_secs(4));
+          let _ = handle.emit("zeeai://autodemo", ());
+        });
+      }
       // 无人值守自检：设置 ZEEAI_SELFTEST=1 启动时，对第一条 SSH 配置跑一遍
       // tmux 列表与远端目录列举，把结果写进日志后退出。便于 CI/夜里验证。
       if std::env::var("ZEEAI_SELFTEST").is_ok() {

@@ -200,8 +200,15 @@ fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {
 
 async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
     let exe = ssh::ssh_exe();
-    let output = tokio::process::Command::new(exe)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(args);
+    // 关键：一次性 ssh 命令不能弹出控制台窗口（否则界面上会闪一个黑框甚至挡住操作）
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("执行 ssh 失败: {e}"))?;

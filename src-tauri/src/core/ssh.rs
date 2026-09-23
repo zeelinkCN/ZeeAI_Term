@@ -104,8 +104,6 @@ pub fn ssh_exec_args(
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
-        "ConnectTimeout=10".into(),
-        "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-p".into(),
         port.to_string(),

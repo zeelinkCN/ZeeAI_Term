@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
@@ -199,11 +200,46 @@ export default function App() {
   const [tmuxLoading, setTmuxLoading] = useState(false);
 
   const [fsPath, setFsPath] = useState("");
+  const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
   const [fsLoading, setFsLoading] = useState(false);
+  // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
+  const fsPathRef = useRef(fsPath);
+  fsPathRef.current = fsPath;
 
   useEffect(() => {
     void refresh();
+  }, []);
+
+  // 自动化演示（ZEEAI_AUTODEMO=1）：连接 → 切到文件 → 打开 md/html 预览，
+  // 供无人值守截图验证。仅在演示模式下触发，正常使用不会走到这里。
+  const demoRef = useRef({ profiles, started: false });
+  demoRef.current.profiles = profiles;
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen("zeeai://autodemo", () => {
+      void (async () => {
+        if (demoRef.current.started) return;
+        demoRef.current.started = true;
+        const list = demoRef.current.profiles;
+        const profile = list.find((p) => p.ssh) ?? list[0];
+        if (!profile) return;
+        const id = await openSshSession(profile);
+        await new Promise((r) => setTimeout(r, 13000));
+        setSideTab("files");
+        await loadDir(profile.id, "/tmp/zeeai-demo");
+        await new Promise((r) => setTimeout(r, 5000));
+        await openRemoteFile(profile.id, "README-demo.md", id);
+        await new Promise((r) => setTimeout(r, 7000));
+        await openRemoteFile(profile.id, "demo.html", id);
+      })();
+    }).then((f) => {
+      unlisten = f;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
@@ -279,7 +315,10 @@ export default function App() {
     }
   }
 
-  async function openSshSession(profile: ConnectionProfile, tmuxSessionName?: string) {
+  async function openSshSession(
+    profile: ConnectionProfile,
+    tmuxSessionName?: string,
+  ): Promise<string> {
     const id = uid();
     const title = tmuxSessionName ? `${profile.name} · ${tmuxSessionName}` : profile.name;
     addSession({
@@ -303,6 +342,7 @@ export default function App() {
       setToast("SSH 连接失败：" + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
+    return id;
   }
 
   async function closeSession(id: string) {
@@ -400,6 +440,7 @@ export default function App() {
     try {
       const listing = await fsList(profileId, path);
       setFsPath(listing.path);
+      setFsInput(listing.path);
       setFsEntries(listing.entries);
     } catch (e) {
       setToast("读取远端目录失败：" + String(e));
@@ -409,12 +450,17 @@ export default function App() {
     }
   }
 
-  async function openRemoteFile(profileId: string, name: string) {
-    if (!activeId) {
+  async function openRemoteFile(
+    profileId: string,
+    name: string,
+    sessionIdOverride?: string,
+  ) {
+    const sessionId = sessionIdOverride ?? activeId;
+    if (!sessionId) {
       setToast("请先打开一个 SSH 会话");
       return;
     }
-    const path = joinPath(fsPath, name);
+    const path = joinPath(fsPathRef.current, name);
     const kind = fileKind(name);
     try {
       const b64 = await fsRead(profileId, path, 1024 * 1024);
@@ -422,7 +468,6 @@ export default function App() {
         setToast("文件为空或无法读取（可能是目录或二进制文件）");
         return;
       }
-      const sessionId = activeId;
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== sessionId) return s;
@@ -726,9 +771,18 @@ export default function App() {
                         家目录
                       </button>
                     </div>
-                    <div className="fs-path" title={fsPath}>
-                      {fsLoading ? "读取中…" : fsPath}
-                    </div>
+                    <input
+                      className="fs-path-input"
+                      value={fsInput}
+                      spellCheck={false}
+                      placeholder="/path/to/dir  回车跳转"
+                      onChange={(e) => setFsInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          void loadDir(fileProfile.id, fsInput.trim() || undefined);
+                        }
+                      }}
+                    />
                     <div className="fs-list">
                       {fsEntries.map((en) => (
                         <div

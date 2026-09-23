@@ -425,6 +425,24 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+.fs-path-input {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 0 8px 6px;
+  padding: 3px 6px;
+  background: #3c3c3c;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11.5px;
+  outline: none;
+}
+
+.fs-path-input:focus {
+  border-color: var(--accent);
+}
+
 .fs-list {
   overflow: auto;
   padding: 4px 0;

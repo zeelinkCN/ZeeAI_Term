@@ -13,6 +13,9 @@ tmux 持久会话自动附加、tmux 会话管理面板（列表 / attach / kill
 HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开的文件（终端为主标签，文件为二级副标签）。
 
 无人值守自检：设置 `ZEEAI_SELFTEST=1` 启动，会自动验证 tmux / 文件命令链路后退出。
+界面级演示：设置 `ZEEAI_AUTODEMO=1` 启动，应用会自己走一遍「连接 → 文件 → 预览」流程（便于截图/回归）。
+
+> 已知坑：Windows OpenSSH 传 `-o ConnectTimeout=N` 会额外等待 N 秒，一次性 ssh 调用不要带这个参数。
 
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)
