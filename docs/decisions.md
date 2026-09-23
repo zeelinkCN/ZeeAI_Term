@@ -28,6 +28,7 @@
 1. **必须设置 `TERM=xterm-256color`**，否则远端 tmux 直接报 `open terminal failed: terminal does not support clear`。
 2. **终端必须能应答 `ESC[6n` 光标位置查询**：tmux 启动时会问，xterm.js 会自动应答（所以真实应用没问题），但用自写脚本/探针时必须手动回 `ESC[1;1R`，否则会卡死在 4 字节。
 3. **构建务必用 `npm run tauri build`，不要只跑 `cargo build --release`**：直接跑 cargo 时前端产物（`dist/`）的变更未必会被重新嵌入，结果是「能启动但白屏」的 exe（我踩到过，已修复）。若怀疑资源是旧的，先执行 `cargo clean -p zeeai-terminal` 再打包。
+4. **改完前端后要确认 exe 真的重建了**：判据不是「构建成功」，而是 exe 里引用的 JS 文件名与 `dist/assets/` 里的一致（可用二进制搜索 `index-XXXX.js` 验证）。若不确定，先 `cargo clean -p zeeai-terminal` 或 touch 一下 `src-tauri/src/lib.rs` 再打包。
 
 ---
 

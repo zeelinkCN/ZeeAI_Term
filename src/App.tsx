@@ -55,6 +55,7 @@ interface OpenSession {
   title: string;
   kind: ModuleKey;
   profileId?: string;
+  tmuxName?: string;
   state: SessionState;
   openFiles: OpenFile[];
   activeTab: string; // "terminal" 或文件名
@@ -80,7 +81,14 @@ const MODULE_LABEL: Record<ModuleKey, string> = {
   adb: "ADB",
 };
 
-const EMPTY_PROFILE = { name: "", host: "", port: 22, user: "root", group: "默认" };
+const EMPTY_PROFILE = {
+  name: "",
+  host: "",
+  port: 22,
+  user: "root",
+  group: "默认",
+  keyPath: "",
+};
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
@@ -279,6 +287,7 @@ export default function App() {
       title,
       kind: "remote",
       profileId: profile.id,
+      tmuxName: tmuxSessionName,
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
@@ -307,6 +316,25 @@ export default function App() {
     setActiveId((cur) => (cur === id ? null : cur));
   }
 
+  /** 断线后重连：复用同一个会话 id 与终端，替换后端已被 kill 的进程。 */
+  async function reconnectSession(s: OpenSession) {
+    if (!s.profileId) return;
+    try {
+      await sessionClose(s.id);
+    } catch {
+      /* 已经断开 */
+    }
+    setSessions((prev) =>
+      prev.map((x) => (x.id === s.id ? { ...x, state: "reconnecting" } : x)),
+    );
+    try {
+      await openSsh(s.id, s.profileId, (e) => handleEvent(s.id, e), s.tmuxName);
+    } catch (e) {
+      setToast("重连失败：" + String(e));
+      setSessions((prev) => prev.map((x) => (x.id === s.id ? { ...x, state: "error" } : x)));
+    }
+  }
+
   async function submitProfile() {
     if (!form.host.trim()) {
       setToast("请填写主机地址");
@@ -322,6 +350,7 @@ export default function App() {
         port: Number(form.port) || 22,
         user: form.user.trim() || "root",
         authKind: "key",
+        keyPath: form.keyPath.trim() || undefined,
         tmuxEnabled: true,
         tmuxTemplate: "{host}-{user}",
       },
@@ -548,6 +577,14 @@ export default function App() {
                         onChange={(e) => setForm({ ...form, group: e.target.value })}
                       />
                     </label>
+                    <label>
+                      私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
+                      <input
+                        value={form.keyPath}
+                        placeholder="C:\Users\me\.ssh\id_ed25519"
+                        onChange={(e) => setForm({ ...form, keyPath: e.target.value })}
+                      />
+                    </label>
                     <button type="button" className="btn primary" onClick={() => void submitProfile()}>
                       保存
                     </button>
@@ -745,6 +782,18 @@ export default function App() {
                 {moduleIcon(s.kind)}
                 <span>{s.title}</span>
                 <span className={"status-dot " + s.state} />
+                {(s.state === "closed" || s.state === "error") && s.profileId && (
+                  <span
+                    className="tab-x"
+                    title="重新连接"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void reconnectSession(s);
+                    }}
+                  >
+                    ↻
+                  </span>
+                )}
                 <span
                   className="tab-x"
                   onClick={(e) => {
