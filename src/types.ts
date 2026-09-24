@@ -82,3 +82,9 @@ export interface AppSettings {
   tmuxDefault: boolean;
   theme: "dark" | "light";
 }
+
+export interface AdbDevice {
+  serial: string;
+  state: string;
+  model?: string | null;
+}

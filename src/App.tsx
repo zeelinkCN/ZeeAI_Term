@@ -6,6 +6,8 @@ import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
 import { SessionBus } from "./sessionBus";
 import {
+  adbDevices,
+  adbVersion,
   deleteProfile,
   fsList,
   fsRead,
@@ -14,6 +16,7 @@ import {
   historySave,
   listProfiles,
   openLocal,
+  openAdbShell,
   openSsh,
   saveProfile,
   sessionClose,
@@ -25,6 +28,7 @@ import {
 } from "./ipc";
 import { b64ToBytes, bytesToB64, uid } from "./util";
 import type {
+  AdbDevice,
   AppSettings,
   ConnectionProfile,
   HistoryEntry,
@@ -246,6 +250,10 @@ export default function App() {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
 
+  const [adbList, setAdbList] = useState<AdbDevice[]>([]);
+  const [adbVer, setAdbVer] = useState("");
+  const [adbLoading, setAdbLoading] = useState(false);
+
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
@@ -275,6 +283,21 @@ export default function App() {
     })();
   }, []);
 
+  useEffect(() => {
+    // 只探测版本（不会启动 adb server，也就不会弹防火墙授权框）；
+    // 设备列表要等用户主动点「刷新设备」——那一步才会启动 adb server。
+    if (module === "adb") {
+      void (async () => {
+        try {
+          setAdbVer(await adbVersion());
+        } catch {
+          setAdbVer("");
+        }
+      })();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [module]);
+
   // 自动化演示（ZEEAI_AUTODEMO=1）：连接 → 切到文件 → 打开 md/html 预览，
   // 供无人值守截图验证。仅在演示模式下触发，正常使用不会走到这里。
   const demoRef = useRef({ profiles, started: false });
@@ -296,8 +319,10 @@ export default function App() {
         await openRemoteFile(profile.id, "README-demo.md", id);
         await new Promise((r) => setTimeout(r, 7000));
         await openRemoteFile(profile.id, "demo.html", id);
-        // 顺便把菜单与设置界面也展示出来，便于无人值守截图验证
         await new Promise((r) => setTimeout(r, 6000));
+        // 顺便把 ADB 面板、菜单、设置界面都展示一遍，便于无人值守截图验证
+        setModule("adb");
+        await new Promise((r) => setTimeout(r, 9000));
         setOpenMenu("conn");
         await new Promise((r) => setTimeout(r, 6000));
         setOpenMenu(null);
@@ -624,6 +649,38 @@ export default function App() {
       setHistory(await historyRemove(id));
     } catch (e) {
       setToast("删除历史失败：" + String(e));
+    }
+  }
+
+  async function refreshAdb() {
+    setAdbLoading(true);
+    try {
+      setAdbVer(await adbVersion());
+      setAdbList(await adbDevices());
+    } catch (e) {
+      setToast("ADB 不可用：" + String(e));
+      setAdbVer("");
+      setAdbList([]);
+    } finally {
+      setAdbLoading(false);
+    }
+  }
+
+  async function openAdbSession(serial: string) {
+    const id = uid();
+    addSession({
+      id,
+      title: `ADB · ${serial}`,
+      kind: "adb",
+      state: "connecting",
+      openFiles: [],
+      activeTab: "terminal",
+    });
+    try {
+      await openAdbShell(id, serial, (e) => handleEvent(id, e));
+    } catch (e) {
+      setToast("打开 ADB shell 失败：" + String(e));
+      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
   }
 
@@ -1214,7 +1271,41 @@ export default function App() {
             )}
             {module === "git" && <div className="hint">Git 面板（M5，尚未实现）。</div>}
             {module === "serial" && <div className="hint">串口（M4，尚未实现）。</div>}
-            {module === "adb" && <div className="hint">ADB（M4，尚未实现）。</div>}
+            {module === "adb" && (
+              <>
+                <div className="side-actions">
+                  <button type="button" className="btn" onClick={() => void refreshAdb()}>
+                    <IconPlus size={14} /> 刷新设备
+                  </button>
+                </div>
+                <div className="hint">
+                  {adbVer
+                    ? `adb 已就绪：${adbVer}`
+                    : adbLoading
+                      ? "正在检测 adb…"
+                      : "未检测到 adb（应内置在应用里）"}
+                </div>
+                {!adbLoading && adbList.length === 0 && adbVer !== "" && (
+                  <div className="hint">
+                    没有已连接的 Android 设备。
+                    <br />
+                    用 USB 连接手机并打开「USB 调试」后再刷新。
+                  </div>
+                )}
+                {adbList.map((d) => (
+                  <div
+                    key={d.serial}
+                    className="tree-item"
+                    onClick={() => void openAdbSession(d.serial)}
+                    title={`${d.serial} · ${d.state} — 点击打开 adb shell`}
+                  >
+                    <IconPhone size={15} />
+                    <span className="grow">{d.model || d.serial}</span>
+                    <span className={d.state === "device" ? "dot ok" : "dot off"} />
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         </aside>
 

@@ -45,6 +45,10 @@ pub fn run() {
                 ),
                 Err(e) => log::error!("SELFTEST: fs_list failed -> {e}"),
               }
+              match crate::commands::adb_devices(handle.clone()).await {
+                Ok(list) => log::info!("SELFTEST: adb_devices ok -> {} devices", list.len()),
+                Err(e) => log::error!("SELFTEST: adb_devices failed -> {e}"),
+              }
             }
             None => log::warn!("SELFTEST: no ssh profile found"),
           }
@@ -73,6 +77,9 @@ pub fn run() {
       commands::history_remove,
       commands::settings_get,
       commands::settings_set,
+      commands::adb_version,
+      commands::adb_devices,
+      commands::open_adb_shell,
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")

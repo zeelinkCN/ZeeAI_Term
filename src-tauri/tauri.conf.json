@@ -27,6 +27,7 @@
   },
   "bundle": {
     "active": true,
+    "resources": ["resources/platform-tools/*"],
     "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",

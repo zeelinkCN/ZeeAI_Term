@@ -1,3 +1,4 @@
+pub mod adb;
 pub mod job;
 pub mod pty;
 pub mod remote_fs;

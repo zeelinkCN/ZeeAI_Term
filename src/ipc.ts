@@ -7,6 +7,7 @@ import type {
   RemoteListing,
   HistoryEntry,
   AppSettings,
+  AdbDevice,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -83,6 +84,32 @@ export async function settingsGet(): Promise<AppSettings> {
 
 export async function settingsSet(settings: AppSettings): Promise<void> {
   return invoke("settings_set", { settings });
+}
+
+export async function adbVersion(): Promise<string> {
+  return invoke<string>("adb_version");
+}
+
+export async function adbDevices(): Promise<AdbDevice[]> {
+  return invoke<AdbDevice[]>("adb_devices");
+}
+
+export async function openAdbShell(
+  id: string,
+  serial: string,
+  onEvent: (e: SessionEvent) => void,
+  cols?: number,
+  rows?: number,
+): Promise<SessionInfo> {
+  const ch = new Channel<SessionEvent>();
+  ch.onmessage = onEvent;
+  return invoke<SessionInfo>("open_adb_shell", {
+    id,
+    serial,
+    cols: cols ?? null,
+    rows: rows ?? null,
+    onEvent: ch,
+  });
 }
 
 /** 列出服务器上的 tmux 会话 */

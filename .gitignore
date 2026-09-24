@@ -31,3 +31,7 @@ Thumbs.db
 
 # 临时目录
 /tmp/
+
+# 打包产物（便携版 zip 等）
+/portable/*.zip
+/portable/ZeeAI-Terminal/

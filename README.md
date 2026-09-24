@@ -20,6 +20,19 @@ HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开�
 
 > 已知坑：Windows OpenSSH 传 `-o ConnectTimeout=N` 会额外等待 N 秒，一次性 ssh 调用不要带这个参数。
 
+### 便携版
+
+`portable/ZeeAI-Terminal-0.1.0-portable.zip`（解压即用，内含内置 platform-tools，
+ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
+
+### 功能现状
+
+已实现：VS Code 风格外壳与真实可用的菜单栏、设置对话框（字体/主题/默认终端/tmux/历史）、
+会话列表（已保存服务器 + 会话历史，可逐条删除）、新建会话对话框（可选是否 tmux、新建或附加已有会话）、
+SSH + tmux 持久会话、远程文件浏览与 Markdown/HTML 预览、本地终端（PS/CMD/WSL）、ADB（内置 platform-tools）。
+
+未实现：串口、Git 面板、SSH 自动重连（当前为手动一键重连）。
+
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)
 - 界面交互草稿：[layout-preview.html](layout-preview.html)（双击用浏览器打开）

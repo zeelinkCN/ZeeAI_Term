@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::{pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
+use crate::core::{adb, pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
 #[derive(Serialize)]
@@ -244,7 +244,12 @@ fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {
 
 async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
     let exe = ssh::ssh_exe();
-    let mut cmd = tokio::process::Command::new(exe);
+    run_capture(std::path::Path::new(&exe), args).await
+}
+
+/// 跑一个外部命令并拿到输出（隐藏控制台窗口）。
+async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     // 关键：一次性 ssh 命令不能弹出控制台窗口（否则界面上会闪一个黑框甚至挡住操作）
     #[cfg(windows)]
@@ -255,12 +260,90 @@ async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
     let output = cmd
         .output()
         .await
-        .map_err(|e| format!("执行 ssh 失败: {e}"))?;
+        .map_err(|e| format!("执行命令失败: {e}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
     Ok(text)
+}
+
+// ---------- ADB ----------
+
+/// 优先用随应用内置的 platform-tools，其次用 PATH 里的 adb。
+fn adb_exe(app: &tauri::AppHandle) -> std::path::PathBuf {
+    use tauri::Manager;
+    if let Ok(dir) = app.path().resource_dir() {
+        let bundled = dir
+            .join("resources")
+            .join("platform-tools")
+            .join("adb.exe");
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    std::path::PathBuf::from("adb")
+}
+
+#[tauri::command]
+pub async fn adb_version(app: tauri::AppHandle) -> Result<String, String> {
+    let exe = adb_exe(&app);
+    let out = run_capture(&exe, &["version".into()]).await?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" · "))
+}
+
+#[tauri::command]
+pub async fn adb_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevice>, String> {
+    let exe = adb_exe(&app);
+    log::info!("ipc: adb_devices exe={:?}", exe);
+    let out = run_capture(&exe, &["devices".into(), "-l".into()]).await?;
+    let devices = adb::parse_devices(&out);
+    log::info!("ipc: adb_devices -> {} devices", devices.len());
+    Ok(devices)
+}
+
+#[tauri::command]
+pub fn open_adb_shell(
+    id: String,
+    serial: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    on_event: Channel<SessionEvent>,
+    app: tauri::AppHandle,
+    registry: State<'_, SessionRegistry>,
+) -> Result<SessionInfo, String> {
+    let exe = adb_exe(&app);
+    log::info!("ipc: open_adb_shell serial={serial} exe={exe:?}");
+    let args = adb::shell_args(&serial);
+    let program = exe.to_string_lossy().to_string();
+    let title = format!("ADB · {serial}");
+    let handle = pty::spawn(
+        "adb",
+        &title,
+        &program,
+        &args,
+        None,
+        cols.unwrap_or(110),
+        rows.unwrap_or(30),
+        on_event,
+    )?;
+    registry
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), handle);
+    Ok(SessionInfo {
+        id,
+        profile_id: String::new(),
+        title,
+        kind: "adb".into(),
+        tmux_session: None,
+    })
 }
 
 /// 列出服务器上的 tmux 会话（通过一次性 ssh 命令）。
