@@ -622,6 +622,148 @@ body {
   background: var(--border);
 }
 
+.tree-item.child-empty {
+  cursor: default;
+  color: var(--muted);
+  font-size: 11.5px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+.tree-item.child-empty:hover {
+  background: transparent;
+}
+
+/* ---------- Git 面板 ---------- */
+
+.git-commit-box {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 4px 10px 8px;
+}
+
+.git-commit-msg {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  padding: 4px 6px;
+  background: #3c3c3c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.app.light .git-commit-msg {
+  background: #ffffff;
+}
+
+.git-commit-btn {
+  flex: none;
+  align-self: stretch;
+}
+
+.git-st {
+  flex: none;
+  width: 20px;
+  text-align: center;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--amber);
+}
+
+.git-st.staged {
+  color: var(--green);
+}
+
+.git-hash {
+  flex: none;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.tree-item.current {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.tree-item.git-file .mini-x,
+.tree-item.git-commit .mini-x {
+  opacity: 0;
+}
+
+.tree-item.git-file:hover .mini-x {
+  opacity: 1;
+}
+
+.git-branches {
+  padding-bottom: 4px;
+}
+
+.git-newbranch {
+  display: flex;
+  gap: 6px;
+  padding: 4px 10px 6px;
+}
+
+.git-newbranch input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  background: #3c3c3c;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.app.light .git-newbranch input {
+  background: #ffffff;
+}
+
+.diff-modal {
+  width: 900px;
+}
+
+.diff-body {
+  padding: 0;
+  max-height: 66vh;
+}
+
+.diff-pre {
+  margin: 0;
+  padding: 8px 6px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-line.add {
+  background: rgba(70, 149, 74, 0.22);
+  color: var(--green);
+}
+
+.diff-line.del {
+  background: rgba(200, 70, 70, 0.2);
+  color: #f08a8a;
+}
+
+.diff-line.hunk {
+  color: var(--accent);
+}
+
+.diff-line.meta {
+  color: var(--muted);
+}
+
 .form-check {
   display: flex;
   align-items: center;

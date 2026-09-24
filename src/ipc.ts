@@ -10,6 +10,8 @@ import type {
   AdbDevice,
   SerialPortInfo,
   GitStatus,
+  GitCommit,
+  GitBranch,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -171,6 +173,52 @@ export async function fastbootDevices(): Promise<AdbDevice[]> {
 
 export async function gitStatus(path: string): Promise<GitStatus> {
   return invoke<GitStatus>("git_status", { path });
+}
+
+/** 在指定目录 git init（目录不存在时自动创建） */
+export async function gitInit(path: string, createDir?: boolean): Promise<string> {
+  return invoke<string>("git_init", { path, createDir: createDir ?? true });
+}
+
+/** 暂存（files 为空表示全部） */
+export async function gitAdd(path: string, files?: string[]): Promise<void> {
+  return invoke("git_add", { path, files: files && files.length ? files : null });
+}
+
+export async function gitUnstage(path: string, files: string[]): Promise<void> {
+  return invoke("git_unstage", { path, files });
+}
+
+export async function gitDiscard(path: string, files: string[]): Promise<void> {
+  return invoke("git_discard", { path, files });
+}
+
+export async function gitCommit(path: string, message: string): Promise<string> {
+  return invoke<string>("git_commit", { path, message });
+}
+
+export async function gitLog(path: string, limit?: number): Promise<GitCommit[]> {
+  return invoke<GitCommit[]>("git_log", { path, limit: limit ?? null });
+}
+
+export async function gitBranches(path: string): Promise<GitBranch[]> {
+  return invoke<GitBranch[]>("git_branches", { path });
+}
+
+export async function gitCheckout(
+  path: string,
+  branch: string,
+  create?: boolean,
+): Promise<string> {
+  return invoke<string>("git_checkout", { path, branch, create: create ?? false });
+}
+
+export async function gitDiff(path: string, file: string, staged?: boolean): Promise<string> {
+  return invoke<string>("git_diff", { path, file, staged: staged ?? false });
+}
+
+export async function gitShow(path: string, rev: string): Promise<string> {
+  return invoke<string>("git_show", { path, rev });
 }
 
 /** 列出服务器上的 tmux 会话 */

@@ -12,6 +12,19 @@ interface Props {
   active: boolean;
   fontSize?: number;
   light?: boolean;
+  /** shell 通过 OSC 7 上报当前工作目录时回调（非 tmux 会话也能跟踪 cwd） */
+  onCwd?: (path: string) => void;
+}
+
+/** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
+export function parseOsc7(data: string): string | null {
+  const m = /^file:\/\/[^/]*(\/.*)$/.exec(data.trim());
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return m[1];
+  }
 }
 
 const THEME = {
@@ -71,10 +84,14 @@ export default function TerminalView({
   active,
   fontSize = 13,
   light = false,
+  onCwd,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
+  const onCwdRef = useRef<Props["onCwd"]>(onCwd);
+  onCwdRef.current = onCwd;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -133,6 +150,14 @@ export default function TerminalView({
       void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(data)));
     });
 
+    // OSC 7：shell 每次显示提示符时上报当前目录，例如
+    // ESC ] 7 ; file://host/tmp/zeeai-demo ESC \
+    const osc7 = term.parser.registerOscHandler(7, (data) => {
+      const path = parseOsc7(data);
+      if (path) onCwdRef.current?.(path);
+      return true; // 已消费，不要在屏幕上打印
+    });
+
     const ro = new ResizeObserver(() => doFit());
     ro.observe(host);
 
@@ -141,6 +166,7 @@ export default function TerminalView({
       for (const t of timers) window.clearTimeout(t);
       ro.disconnect();
       sub.dispose();
+      osc7.dispose();
       bus.detach(sessionId);
       term.dispose();
       termRef.current = null;

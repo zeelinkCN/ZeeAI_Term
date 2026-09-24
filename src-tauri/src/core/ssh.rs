@@ -154,6 +154,17 @@ exec \"${{SHELL:-/bin/bash}}\"; fi"
     )
 }
 
+/// 普通 shell（不用 tmux）时用的远端命令：
+/// 先让 bash 每次显示提示符时用 OSC 7 上报当前目录，再 exec 真 shell。
+/// 这样「文件面板同步终端目录」在非 tmux 会话里也能用——
+/// 你在终端里 `cd` 到哪儿，面板点一下同步就跟过去。
+///
+/// PROMPT_COMMAND 通过 export 传进去：bash 启动时会从环境导入它，
+/// 交互式运行时每次画提示符都会执行，所以不需要改服务器上任何 rc 文件。
+pub fn shell_with_cwd_report() -> String {
+    r#"if [ -n "$BASH_VERSION" ] || [ "$(basename "${SHELL:-bash}")" = "bash" ]; then PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; export PROMPT_COMMAND; fi; exec "${SHELL:-/bin/bash}""#.to_string()
+}
+
 /// 组装一次非交互式 `ssh <host> "<cmd>"` 调用（用于 tmux 列表 / kill 这类一次性命令）。
 pub fn ssh_exec_args(
     host: &str,

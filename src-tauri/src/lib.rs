@@ -294,6 +294,16 @@ pub fn run() {
       commands::fastboot_version,
       commands::fastboot_devices,
       commands::git_status,
+      commands::git_init,
+      commands::git_add,
+      commands::git_unstage,
+      commands::git_discard,
+      commands::git_commit,
+      commands::git_log,
+      commands::git_branches,
+      commands::git_checkout,
+      commands::git_diff,
+      commands::git_show,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

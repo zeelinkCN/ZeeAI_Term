@@ -12,6 +12,16 @@ import {
   fastbootDevices,
   fastbootVersion,
   gitStatus,
+  gitInit,
+  gitAdd,
+  gitUnstage,
+  gitDiscard,
+  gitCommit,
+  gitLog,
+  gitBranches,
+  gitCheckout,
+  gitDiff,
+  gitShow,
   deleteProfile,
   fsList,
   fsRead,
@@ -43,6 +53,8 @@ import type {
   AdbDevice,
   AppSettings,
   ConnectionProfile,
+  GitBranch,
+  GitCommit,
   GitStatus,
   HistoryEntry,
   RemoteEntry,
@@ -92,6 +104,8 @@ interface OpenSession {
   user?: string;
   tmuxName?: string;
   tmuxMode?: "default" | "none" | "name";
+  /** 终端当前工作目录（OSC 7 或 tmux 上报） */
+  cwd?: string;
   state: SessionState;
   openFiles: OpenFile[];
   activeTab: string; // "terminal" 或文件名
@@ -277,7 +291,8 @@ export default function App() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
 
-  const [expandedServers, setExpandedServers] = useState<string[]>([]);
+  // 记录「被折叠」的服务器（默认全展开，新加的服务器也是展开的）
+  const [collapsedServers, setCollapsedServers] = useState<string[]>([]);
   const [ctxMenu, setCtxMenu] = useState<{
     profile: ConnectionProfile;
     x: number;
@@ -374,6 +389,14 @@ export default function App() {
   const [gitPath, setGitPath] = useState("");
   const [gitState, setGitState] = useState<GitStatus | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
+  const [gitInitDialog, setGitInitDialog] = useState<{ path: string } | null>(null);
+  const [gitMessage, setGitMessage] = useState("");
+  const [gitCommits, setGitCommits] = useState<GitCommit[]>([]);
+  const [gitBranchList, setGitBranchList] = useState<GitBranch[]>([]);
+  const [gitBusy, setGitBusy] = useState(false);
+  const [showBranches, setShowBranches] = useState(false);
+  const [newBranch, setNewBranch] = useState("");
+  const [diffDialog, setDiffDialog] = useState<{ title: string; text: string } | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -475,8 +498,11 @@ export default function App() {
             },
           };
           try {
-            await saveProfile(demoSerial);
-            await refresh();
+            const cur = await listProfiles();
+            if (!cur.some((p) => p.type === "serial" && p.serial?.path === sp.path)) {
+              await saveProfile(demoSerial);
+              await refresh();
+            }
           } catch {
             /* 演示用，存不下也继续 */
           }
@@ -502,13 +528,26 @@ export default function App() {
           local: { shell: settings.defaultShell, cwd: repo },
         };
         try {
-          await saveProfile(demoWs);
-          await refresh();
+          // 演示重复跑的时候别把同一条工作空间塞进去好几次
+          const cur = await listProfiles();
+          if (!cur.some((p) => p.type === "local" && p.local?.cwd === repo)) {
+            await saveProfile(demoWs);
+            await refresh();
+          }
         } catch {
           /* 演示用 */
         }
         await openLocalSession(settings.defaultShell, undefined, repo, "ZeeAI_term · git");
         await new Promise((r) => setTimeout(r, 14000));
+        // 本地终端模块：开几个会话，验证侧栏能列出「已打开的会话」
+        setModule("powershell");
+        await openLocalSession("powershell", undefined, repo);
+        await new Promise((r) => setTimeout(r, 8000));
+        setModule("cmd");
+        await openLocalSession("cmd", undefined, repo);
+        await new Promise((r) => setTimeout(r, 8000));
+        setModule("powershell");
+        await new Promise((r) => setTimeout(r, 10000));
         setModule("remote");
         setSideTab("sessions");
         openNewSessionDialog(profile);
@@ -547,7 +586,7 @@ export default function App() {
       setFsEntries([]);
       return;
     }
-    void refreshFs(fileProfileId, activeTmuxName, undefined);
+    void refreshFs(fileProfileId, activeTmuxName, activeSession?.cwd, undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileProfileId, activeId, activeTmuxName, settings.fsFollowTerminal]);
 
@@ -582,8 +621,24 @@ export default function App() {
         );
         break;
       case "cwd":
+        setSessions((prev) =>
+          prev.map((s) => (s.id === sessionId ? { ...s, cwd: e.path } : s)),
+        );
         break;
     }
+  }
+
+  /**
+   * shell 通过 OSC 7 上报的当前目录（非 tmux 会话也能拿到）。
+   * 只更新会话状态，不主动跳转目录——跳转由「同步终端目录」按钮触发。
+   */
+  function handleTerminalCwd(sessionId: string, path: string) {
+    const clean = path.replace(/\/+$/, "") || "/";
+    setSessions((prev) => {
+      const cur = prev.find((s) => s.id === sessionId);
+      if (!cur || cur.cwd === clean) return prev;
+      return prev.map((s) => (s.id === sessionId ? { ...s, cwd: clean } : s));
+    });
   }
 
   function addSession(s: OpenSession) {
@@ -600,7 +655,9 @@ export default function App() {
     const id = uid();
     const base =
       shell === "wsl" ? "WSL" + (distro ? " · " + distro : "") : shell === "cmd" ? "命令提示符" : "PowerShell";
-    const title = titleOverride?.trim() || base;
+    // 同一个模块开多个时编号，方便在侧栏/标签里区分（PowerShell、PowerShell 2、…）
+    const sameKind = sessionsRef.current.filter((s) => s.kind === shell).length + 1;
+    const title = titleOverride?.trim() || (sameKind > 1 ? `${base} ${sameKind}` : base);
     addSession({ id, title, kind: shell, state: "connecting", openFiles: [], activeTab: "terminal" });
     try {
       const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
@@ -763,7 +820,7 @@ export default function App() {
   }
 
   function toggleServer(id: string) {
-    setExpandedServers((prev) =>
+    setCollapsedServers((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
     );
   }
@@ -1088,6 +1145,135 @@ export default function App() {
     }
   }
 
+  /** 刷新 Git 的全部信息：工作区状态 + 提交历史 + 分支 */
+  async function refreshGitAll(pathArg?: string) {
+    const path = (pathArg ?? gitPath).trim();
+    if (!path) {
+      setToast("请先选一个仓库");
+      return;
+    }
+    setGitBusy(true);
+    try {
+      const st = await gitStatus(path);
+      setGitState(st);
+      if (st.ok) {
+        const [log, brs] = await Promise.all([gitLog(path, 30), gitBranches(path)]);
+        setGitCommits(log);
+        setGitBranchList(brs);
+      } else {
+        setGitCommits([]);
+        setGitBranchList([]);
+      }
+    } catch (e) {
+      setToast("读取 Git 状态失败：" + String(e));
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function doGitAdd(files?: string[]) {
+    const path = gitPath.trim();
+    if (!path) return;
+    try {
+      await gitAdd(path, files);
+      await refreshGitAll(path);
+    } catch (e) {
+      setToast("暂存失败：" + String(e));
+    }
+  }
+
+  async function doGitUnstage(files: string[]) {
+    const path = gitPath.trim();
+    if (!path) return;
+    try {
+      await gitUnstage(path, files);
+      await refreshGitAll(path);
+    } catch (e) {
+      setToast("取消暂存失败：" + String(e));
+    }
+  }
+
+  function askGitDiscard(files: string[]) {
+    setConfirmDialog({
+      title: "丢弃改动",
+      message: `确定丢弃这些文件的未提交改动吗？\n${files.join("\n")}\n\n改完就找不回来了。`,
+      onOk: () => void doGitDiscard(files),
+    });
+  }
+
+  async function doGitDiscard(files: string[]) {
+    const path = gitPath.trim();
+    if (!path) return;
+    try {
+      await gitDiscard(path, files);
+      await refreshGitAll(path);
+      setToast("已丢弃改动");
+    } catch (e) {
+      setToast("丢弃失败：" + String(e));
+    }
+  }
+
+  async function doGitCommit() {
+    const path = gitPath.trim();
+    if (!path) return;
+    if (!gitMessage.trim()) {
+      setToast("先写提交信息");
+      return;
+    }
+    setGitBusy(true);
+    try {
+      const out = await gitCommit(path, gitMessage);
+      setGitMessage("");
+      setToast(out.split("\n")[0] || "已提交");
+      await refreshGitAll(path);
+    } catch (e) {
+      setToast("提交失败：" + String(e));
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function doGitCheckout(branch: string, create = false) {
+    const path = gitPath.trim();
+    if (!path || !branch.trim()) return;
+    setGitBusy(true);
+    try {
+      const out = await gitCheckout(path, branch, create);
+      setNewBranch("");
+      setToast(out.trim().split("\n").pop() || `已切到 ${branch}`);
+      await refreshGitAll(path);
+    } catch (e) {
+      setToast("切换分支失败：" + String(e));
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function showFileDiff(file: string, staged: boolean) {
+    const path = gitPath.trim();
+    if (!path) return;
+    try {
+      const text = await gitDiff(path, file, staged);
+      setDiffDialog({
+        title: `${staged ? "已暂存 · " : ""}${file}`,
+        text: text || "(没有 diff，可能已提交或只有模式变化)",
+      });
+    } catch (e) {
+      setToast("读取 diff 失败：" + String(e));
+    }
+  }
+
+  async function showCommitDiff(hash: string, subject: string) {
+    const path = gitPath.trim();
+    if (!path) return;
+    try {
+      const text = await gitShow(path, hash);
+      setDiffDialog({ title: `${hash.slice(0, 8)} ${subject}`, text });
+    } catch (e) {
+      setToast("读取提交失败：" + String(e));
+    }
+  }
+
   /**
    * 「打开本地 Git 仓库」：选一个本地目录 → 确认是 Git 仓库 →
    * 存成一个工作空间（本地终端就起在这个目录），并顺手打开它的终端。
@@ -1145,6 +1331,55 @@ export default function App() {
     } catch (e) {
       setToast("删除失败：" + String(e));
     }
+  }
+
+  /** 在一个目录里新建 git 仓库（git init），然后存成工作空间并开终端 */
+  async function createGitRepo(rawPath: string) {
+    const dir = rawPath.trim();
+    if (!dir) {
+      setToast("请先填要创建仓库的目录，例如 D:\\code\\my-repo");
+      return;
+    }
+    try {
+      await gitInit(dir, true);
+    } catch (e) {
+      setToast("git init 失败：" + String(e));
+      return;
+    }
+    setGitInitDialog(null);
+    setGitPath(dir);
+    try {
+      setGitState(await gitStatus(dir));
+    } catch {
+      /* 刚 init 的仓库状态读不到也无所谓 */
+    }
+    const name = dir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || dir;
+    const shell = settings.defaultShell;
+    if (!profiles.some((p) => p.type === "local" && p.local?.cwd === dir)) {
+      try {
+        await saveProfile({
+          id: uid(),
+          type: "local",
+          name: `${name} · git`,
+          group: "Git 工作空间",
+          local: { shell, cwd: dir },
+        });
+        await refresh();
+      } catch (e) {
+        setToast("保存工作空间失败：" + String(e));
+      }
+    }
+    await openLocalSession(shell, undefined, dir, `${name} · git`);
+    setToast(`已在 ${dir} 建好仓库并打开终端（可以 git add . 然后 commit）`);
+  }
+
+  /** 在某个目录直接开一个新的本地终端（Git 面板用） */
+  async function openGitTerminal(dir: string, title?: string) {
+    if (!dir.trim()) {
+      setToast("先选一个仓库目录");
+      return;
+    }
+    await openLocalSession(settings.defaultShell, undefined, dir, title);
   }
 
   /** 远程会话意外断开时自动重连（会重新附加 tmux），最多 5 次指数退避。 */
@@ -1405,18 +1640,54 @@ export default function App() {
    * （就是你终端里 `pwd` 的那个），然后直接列那里——这样在终端里 cd 完，
    * 点一下刷新文件列表就跟过去了，不用手输路径。
    */
-  async function refreshFs(profileId: string, tmuxName?: string, fallback?: string) {
-    if (!settings.fsFollowTerminal || !tmuxName) {
+  /**
+   * 问终端要当前目录。两条路：
+   * 1) shell 自己用 OSC 7 上报过（普通 shell 也有）→ 直接用；
+   * 2) tmux 会话 → 问 tmux 的 pane_current_path。
+   * 都拿不到就返回 null。
+   */
+  async function resolveTerminalCwd(
+    profileId: string,
+    tmuxName?: string,
+    cwd?: string,
+  ): Promise<string | null> {
+    if (cwd) return cwd;
+    if (!tmuxName) return null;
+    try {
+      return await remotePwd(profileId, tmuxName, activeUserRef.current ?? null);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 切换会话时自动同步（受「跟随终端」开关控制） */
+  async function refreshFs(
+    profileId: string,
+    tmuxName?: string,
+    cwd?: string,
+    fallback?: string,
+  ) {
+    if (!settings.fsFollowTerminal) {
       await loadDir(profileId, fallback);
       return;
     }
-    try {
-      const pwd = await remotePwd(profileId, tmuxName, activeUserRef.current ?? null);
-      await loadDir(profileId, pwd);
-    } catch {
-      // 拿不到就保持原来的位置，别把用户扔到别处
-      await loadDir(profileId, fallback);
+    const target = await resolveTerminalCwd(profileId, tmuxName, cwd);
+    await loadDir(profileId, target ?? fallback);
+  }
+
+  /** 「同步终端目录」按钮：一键跳到终端当前所在目录 */
+  async function syncFsToTerminal(
+    profileId: string,
+    tmuxName?: string,
+    cwd?: string,
+  ) {
+    const target = await resolveTerminalCwd(profileId, tmuxName, cwd);
+    if (!target) {
+      setToast("这个会话还没上报工作目录：在终端里按一下回车，或先 cd 一次再点同步");
+      return;
     }
+    await loadDir(profileId, target);
+    setToast(`已同步到终端目录：${target}`);
   }
 
   async function loadDir(profileId: string, path?: string) {
@@ -1636,6 +1907,37 @@ export default function App() {
     () => profiles.filter((p) => p.type === "local" && !!p.local?.cwd),
     [profiles],
   );
+
+  // 把 git status 的结果拆成「已暂存」「未暂存/未跟踪」两组（VS Code 那种分法）
+  const stagedFiles = useMemo(() => {
+    if (!gitState?.ok) return [];
+    const seen = new Set<string>();
+    const out: { path: string; st: string }[] = [];
+    for (const f of gitState.files) {
+      const idx = f.status[0] ?? " ";
+      if (idx !== " " && idx !== "?" && !seen.has(f.path)) {
+        seen.add(f.path);
+        out.push({ path: f.path, st: idx.trim() || "M" });
+      }
+    }
+    return out;
+  }, [gitState]);
+
+  const changedFiles = useMemo(() => {
+    if (!gitState?.ok) return [];
+    const seen = new Set<string>();
+    const out: { path: string; st: string }[] = [];
+    for (const f of gitState.files) {
+      const idx = f.status[0] ?? " ";
+      const work = f.status[1] ?? " ";
+      const isUntracked = idx === "?";
+      if ((isUntracked || work !== " ") && !seen.has(f.path)) {
+        seen.add(f.path);
+        out.push({ path: f.path, st: isUntracked ? "U" : work.trim() || "M" });
+      }
+    }
+    return out;
+  }, [gitState]);
 
   return (
     <div
@@ -1893,31 +2195,31 @@ export default function App() {
                     <div className="tree-subgroup">{group}</div>
                     {list.map((p) => {
                       const items = history.filter((h) => h.profileId === p.id);
-                      const expanded = expandedServers.includes(p.id);
+                      const expanded = !collapsedServers.includes(p.id);
                       return (
                         <div key={p.id}>
                           <div
                             className="tree-item"
-                            onClick={() => openNewSessionDialog(p)}
+                            onClick={() => toggleServer(p.id)}
+                            onDoubleClick={() => openEditDialog(p)}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               setCtxMenu({ profile: p, x: e.clientX, y: e.clientY });
                             }}
-                            title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port}\n左键：新建会话　右键：编辑服务器`}
+                            title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port}\n单击：展开/收起会话历史　双击或右键：服务器设置`}
                           >
                             <span
-                              className={"chev" + (items.length ? "" : " empty")}
+                              className="chev"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (items.length) toggleServer(p.id);
+                                toggleServer(p.id);
                               }}
                             >
-                              {items.length > 0 &&
-                                (expanded ? (
-                                  <IconChevronDown size={12} />
-                                ) : (
-                                  <IconChevronRight size={12} />
-                                ))}
+                              {expanded ? (
+                                <IconChevronDown size={12} />
+                              ) : (
+                                <IconChevronRight size={12} />
+                              )}
                             </span>
                             <IconServer size={15} />
                             {p.color && (
@@ -1967,6 +2269,11 @@ export default function App() {
                                 </button>
                               </div>
                             ))}
+                          {expanded && items.length === 0 && (
+                            <div className="tree-item child hint child-empty">
+                              还没有会话历史。双击服务器可以新建/编辑连接。
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -1997,10 +2304,24 @@ export default function App() {
                       <button
                         type="button"
                         className="mini-btn"
-                        title="跟随终端目录时，会跳到 tmux 会话当前的目录"
-                        onClick={() => void refreshFs(fileProfile.id, activeTmuxName, fsPath)}
+                        title="重新读取当前目录"
+                        onClick={() => void loadDir(fileProfile.id, fsPath)}
                       >
                         刷新
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        title="跳到终端当前所在目录（你在终端里 cd 到哪儿就同步到哪儿）"
+                        onClick={() =>
+                          void syncFsToTerminal(
+                            fileProfile.id,
+                            activeTmuxName,
+                            activeSession?.cwd,
+                          )
+                        }
+                      >
+                        ⤓ 同步终端目录
                       </button>
                       <button
                         type="button"
@@ -2120,13 +2441,34 @@ export default function App() {
             )}
 
             {module === "powershell" && (
-              <LocalModule label="PowerShell" onOpen={() => void openLocalSession("powershell")} />
+              <LocalModule
+                label="PowerShell"
+                sessions={sessions.filter((s) => s.kind === "powershell")}
+                activeId={activeId}
+                onOpen={() => void openLocalSession("powershell")}
+                onActivate={setActiveId}
+                onClose={(id) => void closeSession(id)}
+              />
             )}
             {module === "cmd" && (
-              <LocalModule label="命令提示符" onOpen={() => void openLocalSession("cmd")} />
+              <LocalModule
+                label="命令提示符"
+                sessions={sessions.filter((s) => s.kind === "cmd")}
+                activeId={activeId}
+                onOpen={() => void openLocalSession("cmd")}
+                onActivate={setActiveId}
+                onClose={(id) => void closeSession(id)}
+              />
             )}
             {module === "wsl" && (
-              <LocalModule label="WSL" onOpen={() => void openLocalSession("wsl")} />
+              <LocalModule
+                label="WSL"
+                sessions={sessions.filter((s) => s.kind === "wsl")}
+                activeId={activeId}
+                onOpen={() => void openLocalSession("wsl")}
+                onActivate={setActiveId}
+                onClose={(id) => void closeSession(id)}
+              />
             )}
             {module === "git" && (
               <>
@@ -2139,6 +2481,14 @@ export default function App() {
                   >
                     <IconPlus size={14} /> 打开本地仓库
                   </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    title="在一个目录里执行 git init，建好后直接打开终端"
+                    onClick={() => setGitInitDialog({ path: "" })}
+                  >
+                    新建仓库
+                  </button>
                 </div>
                 <div className="tree-group">Git 工作空间</div>
                 <div className="hint" style={{ paddingTop: 0 }}>
@@ -2146,7 +2496,7 @@ export default function App() {
                 </div>
                 {gitWorkspaces.length === 0 && (
                   <div className="hint">
-                    还没有工作空间。点「＋ 打开本地仓库」选一个目录即可。
+                    还没有工作空间。点「＋ 打开本地仓库」选一个已有仓库，或用「新建仓库」git init 一个。
                   </div>
                 )}
                 {gitWorkspaces.map((p) => (
@@ -2157,16 +2507,7 @@ export default function App() {
                     onClick={() => {
                       const dir = p.local?.cwd ?? "";
                       setGitPath(dir);
-                      void (async () => {
-                        setGitLoading(true);
-                        try {
-                          setGitState(await gitStatus(dir));
-                        } catch (e) {
-                          setToast("读取 Git 状态失败：" + String(e));
-                        } finally {
-                          setGitLoading(false);
-                        }
-                      })();
+                      void refreshGitAll(dir);
                     }}
                   >
                     <IconGit size={14} />
@@ -2174,7 +2515,7 @@ export default function App() {
                     <button
                       type="button"
                       className="mini-btn"
-                      title="在这个目录打开本地终端"
+                      title="在这个目录再开一个新的本地终端（可以开任意多个）"
                       onClick={(e) => {
                         e.stopPropagation();
                         const dir = p.local?.cwd ?? "";
@@ -2182,11 +2523,11 @@ export default function App() {
                           p.local?.shell ?? settings.defaultShell,
                           p.local?.distro,
                           dir,
-                          p.name,
+                          `${p.name}`,
                         );
                       }}
                     >
-                      终端
+                      新终端
                     </button>
                     <button
                       type="button"
@@ -2210,13 +2551,37 @@ export default function App() {
                     placeholder="D:\AI\ZeeAI_term"
                     onChange={(e) => setGitPath(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") void refreshGit();
+                      if (e.key === "Enter") void refreshGitAll();
                     }}
                   />
                 </label>
                 <div className="side-actions">
-                  <button type="button" className="btn" onClick={() => void refreshGit()}>
-                    <IconPlus size={14} /> 刷新状态
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={gitBusy}
+                    onClick={() => void refreshGitAll()}
+                  >
+                    {gitBusy ? "读取中…" : "刷新"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    title="在当前仓库目录打开一个新的本地终端"
+                    onClick={() => void openGitTerminal(gitPath, undefined)}
+                  >
+                    开终端
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!gitState?.ok}
+                    onClick={() => {
+                      setShowBranches((v) => !v);
+                      if (!gitBranchList.length && gitState?.ok) void refreshGitAll();
+                    }}
+                  >
+                    分支 {gitState?.branch ? `(${gitState.branch})` : ""}
                   </button>
                 </div>
                 {gitLoading && <div className="hint">正在读取…</div>}
@@ -2225,19 +2590,180 @@ export default function App() {
                 )}
                 {!gitLoading && gitState?.ok && (
                   <>
+                    {/* 分支列表 */}
+                    {showBranches && (
+                      <div className="git-branches">
+                        {gitBranchList.map((b) => (
+                          <div
+                            key={b.name}
+                            className={"tree-item" + (b.current ? " current" : "")}
+                            title={`${b.name}${b.upstream ? ` → ${b.upstream}` : ""}　${b.when}`}
+                            onClick={() => {
+                              if (!b.current) void doGitCheckout(b.name);
+                            }}
+                          >
+                            <IconGit size={13} />
+                            <span className="grow ellipsis">{b.name}</span>
+                            {b.current && <span className="tag">当前</span>}
+                            <span className="dim">{b.when}</span>
+                          </div>
+                        ))}
+                        <div className="git-newbranch">
+                          <input
+                            value={newBranch}
+                            placeholder="新分支名"
+                            onChange={(e) => setNewBranch(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && newBranch.trim())
+                                void doGitCheckout(newBranch, true);
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            disabled={!newBranch.trim()}
+                            onClick={() => void doGitCheckout(newBranch, true)}
+                          >
+                            新建并切换
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="git-commit-box">
+                      <textarea
+                        className="git-commit-msg"
+                        rows={2}
+                        placeholder="提交信息（Ctrl+Enter 提交）"
+                        value={gitMessage}
+                        onChange={(e) => setGitMessage(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                            e.preventDefault();
+                            void doGitCommit();
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="btn primary git-commit-btn"
+                        disabled={gitBusy || !gitMessage.trim()}
+                        onClick={() => void doGitCommit()}
+                      >
+                        提交
+                      </button>
+                    </div>
+
+                    {/* 已暂存 */}
+                    {stagedFiles.length > 0 && (
+                      <>
+                        <div className="tree-group">
+                          已暂存（{stagedFiles.length}）
+                          <button
+                            type="button"
+                            className="mini-x"
+                            style={{ marginLeft: "auto", opacity: 1 }}
+                            title="全部取消暂存"
+                            onClick={() => void doGitUnstage(stagedFiles.map((f) => f.path))}
+                          >
+                            −
+                          </button>
+                        </div>
+                        {stagedFiles.map((f) => (
+                          <div
+                            key={"s" + f.path}
+                            className="tree-item git-file"
+                            title={`${f.path}（点击看 diff）`}
+                            onClick={() => void showFileDiff(f.path, true)}
+                          >
+                            <span className="git-st staged">{f.st}</span>
+                            <span className="grow ellipsis">{f.path}</span>
+                            <button
+                              type="button"
+                              className="mini-x"
+                              title="取消暂存"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void doGitUnstage([f.path]);
+                              }}
+                            >
+                              −
+                            </button>
+                          </div>
+                        ))}
+                      </>
+                    )}
+
+                    {/* 更改 */}
+                    <div className="tree-group">
+                      更改（{changedFiles.length}）
+                      <button
+                        type="button"
+                        className="mini-x"
+                        style={{ marginLeft: "auto", opacity: 1 }}
+                        title="全部暂存"
+                        onClick={() => void doGitAdd()}
+                      >
+                        ＋
+                      </button>
+                    </div>
+                    {changedFiles.length === 0 && (
+                      <div className="hint">没有未暂存的改动。</div>
+                    )}
+                    {changedFiles.map((f) => (
+                      <div
+                        key={"c" + f.path}
+                        className="tree-item git-file"
+                        title={`${f.path}（点击看 diff）`}
+                        onClick={() => void showFileDiff(f.path, false)}
+                      >
+                        <span className="git-st">{f.st}</span>
+                        <span className="grow ellipsis">{f.path}</span>
+                        <button
+                          type="button"
+                          className="mini-x"
+                          title="暂存这个文件"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void doGitAdd([f.path]);
+                          }}
+                        >
+                          ＋
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-x"
+                          title="丢弃改动（不可撤销）"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            askGitDiscard([f.path]);
+                          }}
+                        >
+                          ↺
+                        </button>
+                      </div>
+                    ))}
+
                     <div className="hint">
                       分支 {gitState.branch || "(未知)"}
                       {gitState.upstream ? ` → ${gitState.upstream}` : ""}
                       {gitState.ahead > 0 ? ` · 领先 ${gitState.ahead}` : ""}
                       {gitState.behind > 0 ? ` · 落后 ${gitState.behind}` : ""}
                     </div>
-                    {gitState.files.length === 0 && (
-                      <div className="hint">没有未提交的改动。</div>
-                    )}
-                    {gitState.files.map((f) => (
-                      <div key={f.path} className="tree-item" title={f.path}>
-                        <span className="git-st">{f.status}</span>
-                        <span className="grow ellipsis">{f.path}</span>
+
+                    {/* 历史 */}
+                    <div className="tree-group">提交历史（{gitCommits.length}）</div>
+                    {gitCommits.length === 0 && <div className="hint">还没有提交。</div>}
+                    {gitCommits.map((cm) => (
+                      <div
+                        key={cm.hash}
+                        className="tree-item git-commit"
+                        title={`${cm.hash}\n${cm.author} · ${cm.when}\n点击查看这次提交的 diff`}
+                        onClick={() => void showCommitDiff(cm.hash, cm.subject)}
+                      >
+                        <span className="git-hash">{cm.short}</span>
+                        <span className="grow ellipsis">{cm.subject}</span>
+                        <span className="dim">{cm.when}</span>
                       </div>
                     ))}
                   </>
@@ -2459,6 +2985,7 @@ export default function App() {
                     active={s.id === activeId && s.activeTab === "terminal"}
                     fontSize={settings.fontSize}
                     light={themeKind(settings.theme) === "light"}
+                    onCwd={(path) => handleTerminalCwd(s.id, path)}
                   />
                 </div>
               ))
@@ -2560,6 +3087,103 @@ export default function App() {
             >
               删除
             </button>
+          </div>
+        </div>
+      )}
+
+      {gitInitDialog && (
+        <div className="modal-backdrop" onClick={() => setGitInitDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">新建 Git 仓库</div>
+            <div className="modal-body">
+              <label className="modal-field">
+                仓库目录（不存在会自动创建）
+                <input
+                  autoFocus
+                  value={gitInitDialog.path}
+                  placeholder="D:\code\my-repo"
+                  onChange={(e) => setGitInitDialog({ path: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void createGitRepo(gitInitDialog.path);
+                    if (e.key === "Escape") setGitInitDialog(null);
+                  }}
+                />
+              </label>
+              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => {
+                    void (async () => {
+                      const picked = await openLocalDialog({
+                        directory: true,
+                        title: "选一个目录（可以是空目录）",
+                      });
+                      if (picked && !Array.isArray(picked)) {
+                        setGitInitDialog({ path: picked });
+                      }
+                    })();
+                  }}
+                >
+                  浏览目录…
+                </button>
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  会在该目录执行 <code>git init -b main</code>，然后开一个终端。
+                </span>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setGitInitDialog(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => void createGitRepo(gitInitDialog.path)}
+              >
+                创建并打开终端
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {diffDialog && (
+        <div className="modal-backdrop" onClick={() => setDiffDialog(null)}>
+          <div className="modal wide diff-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head ellipsis" title={diffDialog.title}>
+              {diffDialog.title}
+            </div>
+            <div className="modal-body diff-body">
+              <pre className="diff-pre">
+                {diffDialog.text.split("\n").map((line, i) => (
+                  <div
+                    key={i}
+                    className={
+                      "diff-line" +
+                      (line.startsWith("+") && !line.startsWith("+++")
+                        ? " add"
+                        : line.startsWith("-") && !line.startsWith("---")
+                          ? " del"
+                          : line.startsWith("@@")
+                            ? " hunk"
+                            : line.startsWith("diff ") ||
+                                line.startsWith("index ") ||
+                                line.startsWith("commit ")
+                              ? " meta"
+                              : "")
+                    }
+                  >
+                    {line || " "}
+                  </div>
+                ))}
+              </pre>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setDiffDialog(null)}>
+                关闭
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -3644,13 +4268,63 @@ function stateText(s: SessionState): string {
   }
 }
 
-function LocalModule({ label, onOpen }: { label: string; onOpen: () => void }) {
+/**
+ * 本地终端模块（PowerShell / CMD / WSL）的侧栏。
+ * 关键点：这里要**列出这个模块已经打开的会话**，点一下就切过去，
+ * 不用去顶部标签栏一个个找。
+ */
+function LocalModule({
+  label,
+  sessions,
+  activeId,
+  onOpen,
+  onActivate,
+  onClose,
+}: {
+  label: string;
+  sessions: OpenSession[];
+  activeId: string | null;
+  onOpen: () => void;
+  onActivate: (id: string) => void;
+  onClose: (id: string) => void;
+}) {
   return (
     <div className="local-module">
-      <button type="button" className="btn primary" onClick={onOpen}>
-        <IconPlus size={14} /> 新建 {label} 会话
-      </button>
-      <div className="hint">本地终端也可以开多个，各自是独立的工作区。</div>
+      <div className="side-actions">
+        <button type="button" className="btn primary" onClick={onOpen}>
+          <IconPlus size={14} /> 新建 {label}
+        </button>
+      </div>
+      <div className="tree-group">已打开的 {label}（{sessions.length}）</div>
+      {sessions.length === 0 && (
+        <div className="hint">
+          还没有打开。点上面「新建 {label}」开一个，开多少个都会列在这里。
+        </div>
+      )}
+      {sessions.map((s) => (
+        <div
+          key={s.id}
+          className={"tree-item" + (s.id === activeId ? " current" : "")}
+          onClick={() => onActivate(s.id)}
+          title={`${s.title}　点击切换到该会话`}
+        >
+          <IconTerminal size={14} />
+          <span className="grow ellipsis">{s.title}</span>
+          <span className={"status-dot " + s.state} />
+          <button
+            type="button"
+            className="mini-x"
+            title="关闭这个会话"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose(s.id);
+            }}
+          >
+            <IconClose size={11} />
+          </button>
+        </div>
+      ))}
+      <div className="hint">本地终端可以开多个，各自是独立的工作区。</div>
     </div>
   );
 }

@@ -19,6 +19,72 @@ pub struct GitStatus {
     pub message: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommit {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    pub when: String,
+    pub subject: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+    pub upstream: String,
+    pub when: String,
+}
+
+/// 解析 `git log --pretty=format:%H%x09%h%x09%an%x09%ar%x09%s`
+pub fn parse_log(output: &str) -> Vec<GitCommit> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            let hash = it.next()?.trim().to_string();
+            let short = it.next().unwrap_or("").trim().to_string();
+            let author = it.next().unwrap_or("").trim().to_string();
+            let when = it.next().unwrap_or("").trim().to_string();
+            let subject = it.next().unwrap_or("").trim().to_string();
+            Some(GitCommit {
+                hash,
+                short,
+                author,
+                when,
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// 解析 `git branch --format=%(refname:short)%09%(HEAD)%09%(upstream:short)%09%(committerdate:relative)`
+pub fn parse_branches(output: &str) -> Vec<GitBranch> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            let name = it.next()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let head = it.next().unwrap_or("").trim().to_string();
+            let upstream = it.next().unwrap_or("").trim().to_string();
+            let when = it.next().unwrap_or("").trim().to_string();
+            Some(GitBranch {
+                name,
+                current: head == "*",
+                upstream,
+                when,
+            })
+        })
+        .collect()
+}
+
 /// 解析 `git status --porcelain=v1 -b` 的输出。
 pub fn parse_status(output: &str) -> GitStatus {
     let mut branch = String::new();

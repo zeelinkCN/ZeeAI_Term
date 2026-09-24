@@ -43,6 +43,15 @@ SSH + tmux 持久会话、远程文件浏览与 Markdown/HTML 预览、本地终
 Git 面板可「打开本地仓库」并直接在仓库目录开本地终端（Git 工作空间会保存下来）。
 文件面板有「跟随终端目录」开关：刷新时跳到 tmux 会话当前所在目录。
 
+远端文件走**真正的 SFTP**（纯 Rust `russh` + `russh-sftp`，不再借道 scp）：列目录、读文件、
+上传/下载（目录递归）、新建目录、重命名、删除。探测脚本：`cargo run --example sftp_spike -- <host> <user>`。
+
+目录跟随：tmux 会话走 `tmux display-message`，普通 shell 走 **OSC 7**（启动时注入 PROMPT_COMMAND，
+不改服务器文件）；文件面板有「⤓ 同步终端目录」按钮一键跳过去。
+
+Git 面板已经能干活：新建仓库（`git init -b main`）、暂存/取消暂存/丢弃、提交（Ctrl+Enter）、
+提交历史 + diff 查看、分支列表/切换/新建、在每个工作空间目录开新终端。
+
 补充：服务器右键可编辑配置；会话历史按服务器折叠在各自节点下；设置里可选关闭行为（退出/托盘）
 与更新检查；主题支持 VS Code 深/浅、GitHub、微信绿、Teams 紫、Dracula；
 串口已支持枚举与打开，ADB 与 Fastboot 均使用内置 platform-tools；Git 面板（分支/上游/改动列表）；

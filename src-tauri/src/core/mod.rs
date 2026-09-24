@@ -5,6 +5,7 @@ pub mod pty;
 pub mod remote_fs;
 pub mod serial;
 pub mod session;
+pub mod sftp;
 pub mod ssh;
 pub mod tmux;
 

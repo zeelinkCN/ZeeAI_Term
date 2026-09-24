@@ -121,6 +121,21 @@ export interface GitStatus {
   message: string;
 }
 
+export interface GitCommit {
+  hash: string;
+  short: string;
+  author: string;
+  when: string;
+  subject: string;
+}
+
+export interface GitBranch {
+  name: string;
+  current: boolean;
+  upstream: string;
+  when: string;
+}
+
 export interface AdbDevice {
   serial: string;
   state: string;
