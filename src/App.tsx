@@ -63,6 +63,7 @@ import type {
   SessionEvent,
   SessionState,
   TmuxSession,
+  TransferEvent,
 } from "./types";
 import {
   IconActivity,
@@ -75,7 +76,7 @@ import {
   IconFolder,
   IconGear,
   IconGit,
-  IconLogoTile,
+  IconLogoRadio,
   IconPlus,
   IconPowerShell,
   IconSerial,
@@ -371,6 +372,7 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     message: string;
+    okLabel?: string;
     onOk: () => void;
   } | null>(null);
   const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
@@ -397,6 +399,17 @@ export default function App() {
   const [showBranches, setShowBranches] = useState(false);
   const [newBranch, setNewBranch] = useState("");
   const [diffDialog, setDiffDialog] = useState<{ title: string; text: string } | null>(null);
+  // 文件传输进度（右下角那个小面板）
+  const [transfers, setTransfers] = useState<
+    {
+      id: string;
+      name: string;
+      done: number;
+      total: number;
+      status: "running" | "done" | "failed";
+      message?: string;
+    }[]
+  >([]);
 
   useEffect(() => {
     void refresh();
@@ -407,6 +420,60 @@ export default function App() {
         /* 设置读取失败就用默认值 */
       }
     })();
+  }, []);
+
+  // 文件传输进度：后端用 emit 推过来，这里维护右下角那个进度面板
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<TransferEvent>("zeeai://transfer", (ev) => {
+      const e = ev.payload;
+      if (e.kind === "allDone") {
+        // 整批结束后留一会儿再收起来，让用户看得到结果
+        window.setTimeout(() => {
+          setTransfers((cur) => cur.filter((t) => !t.id.startsWith(`${e.task}:`)));
+        }, 3500);
+        return;
+      }
+      const key = `${e.task}:${e.name}`;
+      setTransfers((prev) => {
+        const idx = prev.findIndex((t) => t.id === key);
+        const next = [...prev];
+        if (e.kind === "start") {
+          if (idx < 0) {
+            next.push({
+              id: key,
+              name: e.name,
+              done: 0,
+              total: e.total,
+              status: "running",
+            });
+          }
+          return next;
+        }
+        if (idx < 0) {
+          next.push({ id: key, name: e.name, done: 0, total: 0, status: "running" });
+        }
+        const i = next.findIndex((t) => t.id === key);
+        if (e.kind === "progress") {
+          next[i] = { ...next[i], done: e.done, total: e.total, status: "running" };
+        } else if (e.kind === "fileDone") {
+          next[i] = {
+            ...next[i],
+            done: e.bytes || next[i].done,
+            total: next[i].total || e.bytes,
+            status: "done",
+          };
+        } else if (e.kind === "fileFailed") {
+          next[i] = { ...next[i], status: "failed", message: e.message };
+        }
+        return next;
+      });
+    }).then((f) => {
+      unlisten = f;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, []);
 
   // 让 Windows 原生的标题栏（最上面那条）也跟着主题走。
@@ -550,6 +617,14 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 10000));
         setModule("remote");
         setSideTab("sessions");
+        // 演示文件传输进度条：把一个十几 MB 的文件传上去，进度能看清楚
+        try {
+          const bigLocal = "D:\\AI\\ZeeAI_term\\src-tauri\\target\\release\\zeeai-terminal.exe";
+          await fsUpload(profile.id, [bigLocal], "/tmp/zeeai-demo", null, uid());
+        } catch {
+          /* 演示用：传不上去也不影响后面流程 */
+        }
+        await new Promise((r) => setTimeout(r, 12000));
         openNewSessionDialog(profile);
         await new Promise((r) => setTimeout(r, 16000));
         setNewDialog(null);
@@ -750,6 +825,40 @@ export default function App() {
     bus.drop(id);
     setSessions((prev) => prev.filter((s) => s.id !== id));
     setActiveId((cur) => (cur === id ? null : cur));
+  }
+
+  /** 一次关掉一批会话（「关闭全部本地终端」「关闭全部会话」用这个） */
+  async function closeSessions(list: OpenSession[], what: string) {
+    if (list.length === 0) {
+      setToast(`现在没有打开的${what}`);
+      return;
+    }
+    const reallyDo = async () => {
+      for (const s of list) {
+        try {
+          await sessionClose(s.id);
+        } catch {
+          /* 已经断开 */
+        }
+        bus.drop(s.id);
+      }
+      const ids = new Set(list.map((s) => s.id));
+      setSessions((prev) => prev.filter((s) => !ids.has(s.id)));
+      setActiveId((cur) => (cur && ids.has(cur) ? null : cur));
+      setToast(`已关闭 ${list.length} 个${what}`);
+    };
+    if (list.length === 1) {
+      await reallyDo();
+      return;
+    }
+    setConfirmDialog({
+      title: `关闭全部${what}`,
+      message:
+        `要关闭这 ${list.length} 个${what}吗？` +
+        (what === "会话" ? "\n（SSH 里的 tmux 会话还在服务器上，重连就能回来）" : ""),
+      okLabel: "全部关闭",
+      onOk: () => void reallyDo(),
+    });
   }
 
   /** 断线后重连：复用同一个会话 id 与终端，替换后端已被 kill 的进程。 */
@@ -1083,6 +1192,19 @@ export default function App() {
     if (!profile) {
       setToast("这条历史对应的连接配置已被删除");
       return;
+    }
+    // 已经在标签里开着的 tmux 会话：直接切过去，不要再 attach 一次。
+    // 理由：同一个 tmux 会话被两个客户端 attach 时，tmux 会把窗口尺寸
+    // 迁就最小的那个客户端，两边会互相挤（就是我们之前遇到的"显示不全"）。
+    if (h.tmuxSession) {
+      const opened = sessions.find(
+        (s) => s.profileId === h.profileId && s.tmuxName === h.tmuxSession,
+      );
+      if (opened) {
+        setActiveId(opened.id);
+        setToast(`「${h.title?.trim() || h.tmuxSession}」已经开着了，已帮你切过去`);
+        return;
+      }
     }
     const custom = h.title?.trim() || undefined;
     if (h.tmuxSession) {
@@ -1624,6 +1746,16 @@ export default function App() {
               if (activeId) void closeSession(activeId);
             },
           },
+          {
+            sep: false,
+            label: `关闭全部本地终端（${localTerminals.length}）`,
+            action: () => void closeSessions(localTerminals, "本地终端"),
+          },
+          {
+            sep: false,
+            label: `关闭全部会话（${sessions.length}，含 SSH）`,
+            action: () => void closeSessions(sessions, "会话"),
+          },
         ],
       },
       {
@@ -1756,6 +1888,7 @@ export default function App() {
         localPaths,
         fsPathRef.current,
         activeUserRef.current ?? null,
+        uid(),
       );
       setToast(msg);
       await loadDir(profileId, fsPathRef.current);
@@ -1780,6 +1913,7 @@ export default function App() {
         [joinPath(fsPath, name)],
         dir,
         activeUserRef.current ?? null,
+        uid(),
       );
       setToast(msg);
     } catch (e) {
@@ -1906,6 +2040,12 @@ export default function App() {
   const gitWorkspaces = useMemo(
     () => profiles.filter((p) => p.type === "local" && !!p.local?.cwd),
     [profiles],
+  );
+
+  /** 已经打开的本地终端（PowerShell / CMD / WSL） */
+  const localTerminals = useMemo(
+    () => sessions.filter((s) => s.kind === "powershell" || s.kind === "cmd" || s.kind === "wsl"),
+    [sessions],
   );
 
   // 把 git status 的结果拆成「已暂存」「未暂存/未跟踪」两组（VS Code 那种分法）
@@ -2244,31 +2384,50 @@ export default function App() {
                             </button>
                           </div>
                           {expanded &&
-                            items.map((h) => (
-                              <div
-                                key={h.id}
-                                className="tree-item child"
-                                onClick={() => void connectFromHistory(h)}
-                                title={`${h.tmuxSession ?? "普通 shell"}　${relTime(h.lastUsed)}`}
-                              >
-                                <IconTerminal size={13} />
-                                <span className="grow ellipsis">
-                                  {h.title?.trim() || h.tmuxSession || "普通 shell"}
-                                </span>
-                                <span className="dim">{relTime(h.lastUsed)}</span>
-                                <button
-                                  type="button"
-                                  className="mini-x"
-                                  title="从历史中移除"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    void removeHistoryEntry(h.id);
-                                  }}
+                            items.map((h) => {
+                              // tmux 会话能精确判断"是不是已经在标签里开着"
+                              const opened = h.tmuxSession
+                                ? sessions.find(
+                                    (s) =>
+                                      s.profileId === h.profileId &&
+                                      s.tmuxName === h.tmuxSession,
+                                  )
+                                : undefined;
+                              return (
+                                <div
+                                  key={h.id}
+                                  className={"tree-item child" + (opened ? " opened" : "")}
+                                  onClick={() => void connectFromHistory(h)}
+                                  title={
+                                    (h.tmuxSession ?? "普通 shell") +
+                                    `　${relTime(h.lastUsed)}` +
+                                    (opened ? "\n已经开着了 —— 点一下切到那个标签" : "")
+                                  }
                                 >
-                                  ×
-                                </button>
-                              </div>
-                            ))}
+                                  <span
+                                    className={"open-dot" + (opened ? " on" : "")}
+                                    title={opened ? "已打开" : "未打开"}
+                                  />
+                                  <IconTerminal size={13} />
+                                  <span className="grow ellipsis">
+                                    {h.title?.trim() || h.tmuxSession || "普通 shell"}
+                                  </span>
+                                  {opened && <span className="tag">已打开</span>}
+                                  <span className="dim">{relTime(h.lastUsed)}</span>
+                                  <button
+                                    type="button"
+                                    className="mini-x"
+                                    title="从历史中移除"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void removeHistoryEntry(h.id);
+                                    }}
+                                  >
+                                    ×
+                                  </button>
+                                </div>
+                              );
+                            })}
                           {expanded && items.length === 0 && (
                             <div className="tree-item child hint child-empty">
                               还没有会话历史。双击服务器可以新建/编辑连接。
@@ -3018,6 +3177,54 @@ export default function App() {
         </div>
       )}
 
+      {transfers.length > 0 && (
+        <div className="transfer-dock">
+          <div className="transfer-head">
+            <span>文件传输（{transfers.filter((t) => t.status === "running").length} 进行中）</span>
+            <button
+              type="button"
+              className="mini-x"
+              style={{ opacity: 1 }}
+              title="清空列表"
+              onClick={() => setTransfers([])}
+            >
+              ✕
+            </button>
+          </div>
+          {transfers.map((t) => {
+            const pct =
+              t.total > 0 ? Math.min(100, Math.round((t.done / t.total) * 100)) : 0;
+            return (
+              <div key={t.id} className={"transfer-item " + t.status}>
+                <div className="transfer-line">
+                  <span className="grow ellipsis" title={t.name}>
+                    {t.name}
+                  </span>
+                  <span className="dim">
+                    {t.status === "done"
+                      ? "完成"
+                      : t.status === "failed"
+                        ? "失败"
+                        : `${pct}%`}
+                  </span>
+                </div>
+                <div className="transfer-bar">
+                  <div
+                    className="transfer-fill"
+                    style={{ width: t.status === "done" ? "100%" : `${pct}%` }}
+                  />
+                </div>
+                <div className="transfer-meta">
+                  {humanSize(t.done)}
+                  {t.total > 0 ? ` / ${humanSize(t.total)}` : ""}
+                  {t.message ? ` · ${t.message}` : ""}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
 
       {serialMenu && (
@@ -3615,7 +3822,7 @@ export default function App() {
                   fn();
                 }}
               >
-                确定删除
+                {confirmDialog.okLabel ?? "确定"}
               </button>
             </div>
           </div>
@@ -4041,7 +4248,7 @@ export default function App() {
             <div className="modal-head">关于 ZeeAI Terminal</div>
             <div className="modal-body">
               <div className="about-row">
-                <IconLogoTile size={56} />
+                <IconLogoRadio size={56} />
               </div>
               <div className="hint">
                 <b>ZeeAI Terminal</b> 0.1.0

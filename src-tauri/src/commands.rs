@@ -906,6 +906,8 @@ pub async fn fs_upload(
     local_paths: Vec<String>,
     remote_dir: String,
     user_override: Option<String>,
+    task_id: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<String, String> {
     log::info!("ipc: fs_upload -> {} items to {}", local_paths.len(), remote_dir);
     if local_paths.is_empty() {
@@ -925,6 +927,11 @@ pub async fn fs_upload(
 
     let mut done = 0usize;
     let mut bytes = 0u64;
+    let task = task_id.unwrap_or_else(|| "upload".to_string());
+    let emit = |ev: TransferEvent| {
+        use tauri::Emitter;
+        let _ = app.emit("zeeai://transfer", ev);
+    };
     let mut failed: Vec<String> = Vec::new();
     for lp in &local_paths {
         let p = std::path::Path::new(lp);
@@ -941,14 +948,52 @@ pub async fn fs_upload(
         } else {
             format!("{dir}/{name}")
         };
-        match sftp::upload(&conn, p, &remote_path).await {
+        emit(TransferEvent::Start {
+            task: task.clone(),
+            name: name.clone(),
+            total: 0,
+        });
+        let name_for_sink = name.clone();
+        let task_for_sink = task.clone();
+        let app_for_sink = app.clone();
+        let progress = move |d: u64, t: u64| {
+            use tauri::Emitter;
+            let _ = app_for_sink.emit(
+                "zeeai://transfer",
+                TransferEvent::Progress {
+                    task: task_for_sink.clone(),
+                    name: name_for_sink.clone(),
+                    done: d,
+                    total: t,
+                },
+            );
+        };
+        match sftp::upload(&conn, p, &remote_path, &progress).await {
             Ok(n) => {
                 done += 1;
                 bytes += n;
+                emit(TransferEvent::FileDone {
+                    task: task.clone(),
+                    name: name.clone(),
+                    bytes: n,
+                });
             }
-            Err(e) => failed.push(format!("{name}: {e}")),
+            Err(e) => {
+                emit(TransferEvent::FileFailed {
+                    task: task.clone(),
+                    name: name.clone(),
+                    message: e.clone(),
+                });
+                failed.push(format!("{name}: {e}"));
+            }
         }
     }
+
+    emit(TransferEvent::AllDone {
+        task: task.clone(),
+        ok: done,
+        failed: failed.len(),
+    });
 
     if failed.is_empty() {
         Ok(format!("已上传 {done} 项（{}）到 {dir}", human_size(bytes)))
@@ -970,6 +1015,8 @@ pub async fn fs_download(
     remote_paths: Vec<String>,
     local_dir: String,
     user_override: Option<String>,
+    task_id: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<String, String> {
     log::info!("ipc: fs_download -> {} items to {}", remote_paths.len(), local_dir);
     if remote_paths.is_empty() {
@@ -990,6 +1037,11 @@ pub async fn fs_download(
 
     let mut done = 0usize;
     let mut bytes = 0u64;
+    let task = task_id.unwrap_or_else(|| "download".to_string());
+    let emit = |ev: TransferEvent| {
+        use tauri::Emitter;
+        let _ = app.emit("zeeai://transfer", ev);
+    };
     let mut failed: Vec<String> = Vec::new();
     for rp in &remote_paths {
         if !sftp::exists(&conn, rp).await {
@@ -1003,14 +1055,52 @@ pub async fn fs_download(
             .unwrap_or("download")
             .to_string();
         let target = std::path::Path::new(&local_dir).join(&name);
-        match sftp::download(&conn, rp, &target).await {
+        emit(TransferEvent::Start {
+            task: task.clone(),
+            name: name.clone(),
+            total: 0,
+        });
+        let task_for_sink = task.clone();
+        let name_for_sink = name.clone();
+        let app_for_sink = app.clone();
+        let progress = move |d: u64, t: u64| {
+            use tauri::Emitter;
+            let _ = app_for_sink.emit(
+                "zeeai://transfer",
+                TransferEvent::Progress {
+                    task: task_for_sink.clone(),
+                    name: name_for_sink.clone(),
+                    done: d,
+                    total: t,
+                },
+            );
+        };
+        match sftp::download(&conn, rp, &target, &progress).await {
             Ok(n) => {
                 done += 1;
                 bytes += n;
+                emit(TransferEvent::FileDone {
+                    task: task.clone(),
+                    name: name.clone(),
+                    bytes: n,
+                });
             }
-            Err(e) => failed.push(format!("{rp}: {e}")),
+            Err(e) => {
+                emit(TransferEvent::FileFailed {
+                    task: task.clone(),
+                    name: name.clone(),
+                    message: e.clone(),
+                });
+                failed.push(format!("{rp}: {e}"));
+            }
         }
     }
+
+    emit(TransferEvent::AllDone {
+        task: task.clone(),
+        ok: done,
+        failed: failed.len(),
+    });
 
     if failed.is_empty() {
         Ok(format!("已下载 {done} 项（{}）到 {local_dir}", human_size(bytes)))
@@ -1023,6 +1113,35 @@ pub async fn fs_download(
             failed.join("；")
         ))
     }
+}
+
+/// 传输进度事件：前端拿它画进度条
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum TransferEvent {
+    /// 开始处理某个文件
+    Start { task: String, name: String, total: u64 },
+    /// 传输中
+    Progress {
+        task: String,
+        name: String,
+        done: u64,
+        total: u64,
+    },
+    /// 某个文件完成
+    FileDone { task: String, name: String, bytes: u64 },
+    /// 某个文件失败
+    FileFailed {
+        task: String,
+        name: String,
+        message: String,
+    },
+    /// 整批完成
+    AllDone {
+        task: String,
+        ok: usize,
+        failed: usize,
+    },
 }
 
 fn human_size(n: u64) -> String {

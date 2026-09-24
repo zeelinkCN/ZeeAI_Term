@@ -4,11 +4,11 @@ interface IconProps {
 }
 
 /**
- * 产品图标：立体麻将「红中」。
- * 和打包用的 icons/*.png 是同一套几何（48 单位的画布），
- * 说明里说的「立体的麻将红中、字要正、简洁但一看就懂」就指这个。
+ * 产品图标：对讲机。
+ * 和打包用的 icons/*.png / icon.ico 是同一套几何（48 单位画布）：
+ * 深色圆角底 + 白色机身 + 深色屏幕/格栅 + 橙色 PTT，缩到 16px 也认得出。
  */
-export const IconLogoTile = ({ size = 18, className }: IconProps) => (
+export const IconLogoRadio = ({ size = 18, className }: IconProps) => (
   <svg
     className={"icon" + (className ? " " + className : "")}
     width={size}
@@ -17,50 +17,26 @@ export const IconLogoTile = ({ size = 18, className }: IconProps) => (
     aria-hidden="true"
   >
     <defs>
-      <linearGradient id="zeeai-tile-face" x1="0" y1="0" x2="0.7" y2="1">
-        <stop offset="0" stopColor="#fffdf7" />
-        <stop offset="1" stopColor="#e9e2d1" />
+      <linearGradient id="zeeai-radio-bg" x1="0" y1="0" x2="0.6" y2="1">
+        <stop offset="0" stopColor="#25384d" />
+        <stop offset="1" stopColor="#101a24" />
       </linearGradient>
     </defs>
-    {/* 厚度（右下偏移 = 立体） */}
-    <rect x="5.6" y="6.6" width="37" height="38" rx="6.6" fill="#a69d84" />
-    {/* 正面 */}
-    <rect
-      x="4"
-      y="4"
-      width="37"
-      height="38"
-      rx="6.6"
-      fill="url(#zeeai-tile-face)"
-      stroke="rgba(120,110,92,0.30)"
-      strokeWidth="1.1"
-    />
-    <rect
-      x="6.9"
-      y="6.9"
-      width="31.2"
-      height="32.2"
-      rx="4.6"
+    <rect x="3" y="3" width="42" height="42" rx="10" fill="url(#zeeai-radio-bg)" />
+    {/* 天线 */}
+    <path
+      d="M19.5 14.5V6.2"
+      stroke="#f4f9fd"
+      strokeWidth="4"
+      strokeLinecap="round"
       fill="none"
-      stroke="rgba(120,110,90,0.14)"
-      strokeWidth="1"
     />
-    {/* 红中：先白后红，做出刻出来的立体感 */}
-    <text
-      x="22.6"
-      y="24.2"
-      textAnchor="middle"
-      dominantBaseline="central"
-      fontFamily="'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
-      fontSize="26.6"
-      fontWeight="700"
-      fill="#c81a20"
-      stroke="rgba(255,255,255,0.92)"
-      strokeWidth="1.6"
-      paintOrder="stroke"
-    >
-      中
-    </text>
+    {/* 机身（实心，缩到 16px 也立得住） */}
+    <rect x="14" y="12.4" width="19.6" height="28.8" rx="5.4" fill="#f4f9fd" />
+    {/* 屏幕（镂空） */}
+    <rect x="18.2" y="19.2" width="11.2" height="5" rx="1.8" fill="#121c28" />
+    {/* PTT 按键 */}
+    <rect x="33.6" y="21" width="5.2" height="10.4" rx="2.2" fill="#ff9a3c" />
   </svg>
 );
 

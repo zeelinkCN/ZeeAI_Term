@@ -279,12 +279,14 @@ export async function fsUpload(
   localPaths: string[],
   remoteDir: string,
   userOverride?: string | null,
+  taskId?: string,
 ): Promise<string> {
   return invoke<string>("fs_upload", {
     profileId,
     localPaths,
     remoteDir,
     userOverride: userOverride ?? null,
+    taskId: taskId ?? null,
   });
 }
 
@@ -294,12 +296,14 @@ export async function fsDownload(
   remotePaths: string[],
   localDir: string,
   userOverride?: string | null,
+  taskId?: string,
 ): Promise<string> {
   return invoke<string>("fs_download", {
     profileId,
     remotePaths,
     localDir,
     userOverride: userOverride ?? null,
+    taskId: taskId ?? null,
   });
 }
 

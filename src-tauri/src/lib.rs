@@ -183,6 +183,8 @@ pub fn run() {
                   vec![local_up.to_string_lossy().to_string()],
                   remote_dir.clone(),
                   None,
+                  None,
+                  handle.clone(),
                 )
                 .await
                 {
@@ -208,6 +210,8 @@ pub fn run() {
                   vec![remote_file.clone()],
                   local_down_dir.to_string_lossy().to_string(),
                   None,
+                  None,
+                  handle.clone(),
                 )
                 .await
                 {

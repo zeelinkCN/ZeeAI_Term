@@ -136,6 +136,14 @@ export interface GitBranch {
   when: string;
 }
 
+/** 文件传输进度事件（后端通过 zeeai://transfer 推过来） */
+export type TransferEvent =
+  | { kind: "start"; task: string; name: string; total: number }
+  | { kind: "progress"; task: string; name: string; done: number; total: number }
+  | { kind: "fileDone"; task: string; name: string; bytes: number }
+  | { kind: "fileFailed"; task: string; name: string; message: string }
+  | { kind: "allDone"; task: string; ok: number; failed: number };
+
 export interface AdbDevice {
   serial: string;
   state: string;

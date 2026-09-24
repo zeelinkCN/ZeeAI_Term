@@ -17,6 +17,12 @@ use serde::Serialize;
 /// 单块读写大小（以后做进度/续传就靠它切分）
 const CHUNK: usize = 64 * 1024;
 
+/// 传输进度回调：(已传字节, 总字节)。总字节可能是估算值（目录会边算边传）。
+pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
+
+/// 什么都不做的回调（不需要进度时用）
+pub fn no_progress(_done: u64, _total: u64) {}
+
 pub struct Client;
 
 impl client::Handler for Client {
@@ -190,32 +196,107 @@ pub async fn read_file(conn: &SftpConn, path: &str, max: u64) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-async fn write_remote(conn: &SftpConn, remote: &str, data: &[u8]) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    let mut f = conn
-        .sftp
-        .create(remote)
+/// 把本地文件写到远端，按 64KB 分块并回调进度。
+/// `offset` 用于断点续传：远端已有这么多字节时，从这里继续追加。
+async fn write_remote_stream(
+    conn: &SftpConn,
+    remote: &str,
+    path: &Path,
+    offset: u64,
+    base_done: u64,
+    total: u64,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| format!("创建 {remote} 失败: {e}"))?;
-    for chunk in data.chunks(CHUNK) {
-        f.write_all(chunk)
+        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+    if offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("定位本地文件失败: {e}"))?;
+    }
+
+    let mut f = if offset > 0 {
+        conn.sftp
+            .open_with_flags(
+                remote,
+                russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::APPEND,
+            )
+            .await
+            .map_err(|e| format!("打开远端文件（续传）失败: {e}"))?
+    } else {
+        conn.sftp
+            .create(remote)
+            .await
+            .map_err(|e| format!("创建 {remote} 失败: {e}"))?
+    };
+
+    let mut done = base_done;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("读本地文件失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n])
             .await
             .map_err(|e| format!("写入 {remote} 失败: {e}"))?;
+        done += n as u64;
+        sink(done, total.max(done));
     }
     f.flush().await.map_err(|e| format!("刷新 {remote} 失败: {e}"))?;
     let _ = f.shutdown().await;
-    Ok(())
+    Ok(done - base_done)
 }
 
-/// 上传本地文件或目录（目录递归）
-pub async fn upload(conn: &SftpConn, local: &Path, remote: &str) -> Result<u64, String> {
-    let mut total = 0u64;
+/// 预先算一下本地文件/目录一共多少字节（给进度条用）
+fn local_size(path: &Path) -> u64 {
+    if path.is_dir() {
+        let mut sum = 0u64;
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for e in rd.flatten() {
+                sum += local_size(&e.path());
+            }
+        }
+        sum
+    } else {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+/// 上传本地文件或目录（目录递归），带进度回调。
+/// 远端已存在且比本地短时，会从断点继续（断点续传）。
+pub async fn upload(
+    conn: &SftpConn,
+    local: &Path,
+    remote: &str,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
+    let total = local_size(local);
+    upload_inner(conn, local, remote, total, 0, sink).await
+}
+
+async fn upload_inner(
+    conn: &SftpConn,
+    local: &Path,
+    remote: &str,
+    total: u64,
+    done: u64,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
     if local.is_dir() {
-        // 先建目录（已存在会报错，忽略）
-        let _ = conn.sftp.create_dir(remote).await;
+        let _ = conn.sftp.create_dir(remote).await; // 已存在会报错，忽略
         let mut rd = tokio::fs::read_dir(local)
             .await
             .map_err(|e| format!("读取本地目录失败: {e}"))?;
+        let mut sent = 0u64;
+        let mut acc = done;
         while let Some(entry) = rd
             .next_entry()
             .await
@@ -223,21 +304,76 @@ pub async fn upload(conn: &SftpConn, local: &Path, remote: &str) -> Result<u64, 
         {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
-            total += Box::pin(upload(conn, &entry.path(), &child_remote)).await?;
+            let n = Box::pin(upload_inner(
+                conn,
+                &entry.path(),
+                &child_remote,
+                total,
+                acc,
+                sink,
+            ))
+            .await?;
+            sent += n;
+            acc += n;
         }
-        return Ok(total);
+        return Ok(sent);
     }
 
-    let data = tokio::fs::read(local)
-        .await
-        .map_err(|e| format!("读取本地文件失败: {e}"))?;
-    write_remote(conn, remote, &data).await?;
-    total += data.len() as u64;
-    Ok(total)
+    let local_len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+    // 断点续传：远端已有前缀就接着写
+    let mut offset = 0u64;
+    if let Ok(md) = conn.sftp.metadata(remote).await {
+        let remote_len = md.size.unwrap_or(0);
+        if remote_len > 0 && remote_len < local_len {
+            offset = remote_len;
+            log::info!("sftp 续传 {remote}: 从 {offset} 字节继续");
+        }
+    }
+    let written = write_remote_stream(conn, remote, local, offset, done + offset, total, sink).await?;
+    Ok(written)
 }
 
-/// 下载远端文件或目录到本地（目录递归）
-pub async fn download(conn: &SftpConn, remote: &str, local: &Path) -> Result<u64, String> {
+/// 先递归算远端总大小（进度条用）
+async fn remote_size(conn: &SftpConn, remote: &str) -> u64 {
+    match conn.sftp.metadata(remote).await {
+        Ok(md) if md.is_dir() => {
+            let mut sum = 0u64;
+            if let Ok(raw) = conn.sftp.read_dir(remote).await {
+                for e in raw {
+                    let name = e.file_name();
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let child = format!("{}/{}", remote.trim_end_matches('/'), name);
+                    sum += Box::pin(remote_size(conn, &child)).await;
+                }
+            }
+            sum
+        }
+        Ok(md) => md.size.unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// 下载远端文件或目录到本地（目录递归），带进度回调 + 断点续传
+pub async fn download(
+    conn: &SftpConn,
+    remote: &str,
+    local: &Path,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
+    let total = remote_size(conn, remote).await;
+    download_inner(conn, remote, local, total, 0, sink).await
+}
+
+async fn download_inner(
+    conn: &SftpConn,
+    remote: &str,
+    local: &Path,
+    total: u64,
+    done: u64,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
     let md = conn
         .sftp
         .metadata(remote)
@@ -253,26 +389,99 @@ pub async fn download(conn: &SftpConn, remote: &str, local: &Path) -> Result<u64
             .read_dir(remote)
             .await
             .map_err(|e| format!("读取远端目录失败: {e}"))?;
-        let mut total = 0u64;
+        let mut sent = 0u64;
+        let mut acc = done;
         for e in raw {
             let name = e.file_name();
             if name == "." || name == ".." {
                 continue;
             }
             let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
-            total += Box::pin(download(conn, &child_remote, &local.join(&name))).await?;
+            let n = Box::pin(download_inner(
+                conn,
+                &child_remote,
+                &local.join(&name),
+                total,
+                acc,
+                sink,
+            ))
+            .await?;
+            sent += n;
+            acc += n;
         }
-        return Ok(total);
+        return Ok(sent);
     }
 
-    let data = read_file(conn, remote, u64::MAX).await?;
     if let Some(parent) = local.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    tokio::fs::write(local, &data)
+    // 断点续传：本地已有前缀就接着下
+    let local_len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+    let remote_len = md.size.unwrap_or(0);
+    let offset = if local_len > 0 && local_len < remote_len {
+        log::info!("sftp 续传下载 {remote}: 从 {local_len} 字节继续");
+        local_len
+    } else if local_len == remote_len && remote_len > 0 {
+        // 已经下完了，直接算完成
+        sink(done + remote_len, total.max(done + remote_len));
+        return Ok(0);
+    } else {
+        0
+    };
+    read_to_local(conn, remote, local, offset, done + offset, total, sink).await
+}
+
+/// 从远端读一段并追加写到本地，边写边报进度
+async fn read_to_local(
+    conn: &SftpConn,
+    remote: &str,
+    local: &Path,
+    offset: u64,
+    base_done: u64,
+    total: u64,
+    sink: ProgressSink<'_>,
+) -> Result<u64, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut f = conn
+        .sftp
+        .open(remote)
         .await
-        .map_err(|e| format!("写入本地文件失败: {e}"))?;
-    Ok(data.len() as u64)
+        .map_err(|e| format!("打开 {remote} 失败: {e}"))?;
+    if offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        f.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("定位远端文件失败: {e}"))?;
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(offset > 0)
+        .write(true)
+        .truncate(offset == 0)
+        .open(local)
+        .await
+        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+
+    let mut done = base_done;
+    let mut buf = vec![0u8; CHUNK];
+    let mut written = 0u64;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("读取 {remote} 失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("写入本地文件失败: {e}"))?;
+        done += n as u64;
+        written += n as u64;
+        sink(done, total.max(done));
+    }
+    out.flush().await.map_err(|e| format!("刷新本地文件失败: {e}"))?;
+    Ok(written)
 }
 
 pub async fn mkdir(conn: &SftpConn, path: &str) -> Result<(), String> {
