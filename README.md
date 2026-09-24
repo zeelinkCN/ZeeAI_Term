@@ -31,7 +31,11 @@ ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 会话列表（已保存服务器 + 会话历史，可逐条删除）、新建会话对话框（可选是否 tmux、新建或附加已有会话）、
 SSH + tmux 持久会话、远程文件浏览与 Markdown/HTML 预览、本地终端（PS/CMD/WSL）、ADB（内置 platform-tools）。
 
-未实现：串口、Git 面板、SSH 自动重连（当前为手动一键重连）。
+未实现：Git 面板、SSH 自动重连（当前为手动一键重连）。
+
+补充：服务器右键可编辑配置；会话历史按服务器折叠在各自节点下；设置里可选关闭行为（退出/托盘）
+与更新检查；主题支持 VS Code 深/浅、GitHub、微信绿、Teams 紫、Dracula；
+串口已支持枚举与打开，ADB 与 Fastboot 均使用内置 platform-tools。
 
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)

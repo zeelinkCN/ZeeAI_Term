@@ -8,6 +8,7 @@ import type {
   HistoryEntry,
   AppSettings,
   AdbDevice,
+  SerialPortInfo,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -110,6 +111,29 @@ export async function openAdbShell(
     rows: rows ?? null,
     onEvent: ch,
   });
+}
+
+export async function serialList(): Promise<SerialPortInfo[]> {
+  return invoke<SerialPortInfo[]>("serial_list");
+}
+
+export async function openSerial(
+  id: string,
+  path: string,
+  baud: number,
+  onEvent: (e: SessionEvent) => void,
+): Promise<SessionInfo> {
+  const ch = new Channel<SessionEvent>();
+  ch.onmessage = onEvent;
+  return invoke<SessionInfo>("open_serial", { id, path, baud, onEvent: ch });
+}
+
+export async function fastbootVersion(): Promise<string> {
+  return invoke<string>("fastboot_version");
+}
+
+export async function fastbootDevices(): Promise<AdbDevice[]> {
+  return invoke<AdbDevice[]>("fastboot_devices");
 }
 
 /** 列出服务器上的 tmux 会话 */

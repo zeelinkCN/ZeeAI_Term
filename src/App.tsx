@@ -8,6 +8,8 @@ import { SessionBus } from "./sessionBus";
 import {
   adbDevices,
   adbVersion,
+  fastbootDevices,
+  fastbootVersion,
   deleteProfile,
   fsList,
   fsRead,
@@ -17,9 +19,11 @@ import {
   listProfiles,
   openLocal,
   openAdbShell,
+  openSerial,
   openSsh,
   saveProfile,
   sessionClose,
+  serialList,
   sessionWrite,
   settingsGet,
   settingsSet,
@@ -33,24 +37,28 @@ import type {
   ConnectionProfile,
   HistoryEntry,
   RemoteEntry,
+  SerialPortInfo,
   SessionEvent,
   SessionState,
   TmuxSession,
 } from "./types";
 import {
   IconActivity,
-  IconCable,
+  IconAndroid,
+  IconChevronDown,
+  IconChevronRight,
   IconClose,
+  IconCmd,
   IconFile,
   IconFolder,
   IconGear,
   IconGit,
-  IconLinux,
-  IconPhone,
   IconPlus,
+  IconPowerShell,
+  IconSerial,
   IconServer,
   IconTerminal,
-  IconWindow,
+  IconWsl,
 } from "./components/Icons";
 
 type ModuleKey = "remote" | "powershell" | "cmd" | "wsl" | "git" | "serial" | "adb";
@@ -84,12 +92,12 @@ interface MenuItem {
 
 const MODULES: { key: ModuleKey; label: string; node: JSX.Element }[] = [
   { key: "remote", label: "远程", node: <IconServer size={22} /> },
-  { key: "powershell", label: "PowerShell", node: <IconTerminal size={22} /> },
-  { key: "cmd", label: "CMD", node: <IconWindow size={22} /> },
-  { key: "wsl", label: "WSL", node: <IconLinux size={22} /> },
+  { key: "powershell", label: "PowerShell", node: <IconPowerShell size={22} /> },
+  { key: "cmd", label: "CMD", node: <IconCmd size={22} /> },
+  { key: "wsl", label: "WSL", node: <IconWsl size={22} /> },
   { key: "git", label: "Git", node: <IconGit size={22} /> },
-  { key: "serial", label: "串口", node: <IconCable size={22} /> },
-  { key: "adb", label: "ADB", node: <IconPhone size={22} /> },
+  { key: "serial", label: "串口", node: <IconSerial size={22} /> },
+  { key: "adb", label: "ADB", node: <IconAndroid size={22} /> },
 ];
 
 const MODULE_LABEL: Record<ModuleKey, string> = {
@@ -117,7 +125,24 @@ const DEFAULT_SETTINGS: AppSettings = {
   recordHistory: true,
   tmuxDefault: true,
   theme: "dark",
+  closeAction: "exit",
+  updateUrl: "",
 };
+
+const APP_VERSION = "0.1.0";
+
+const THEMES: { key: string; label: string; kind: "dark" | "light" }[] = [
+  { key: "dark", label: "VS Code 深色", kind: "dark" },
+  { key: "light", label: "VS Code 浅色", kind: "light" },
+  { key: "github", label: "GitHub 浅色", kind: "light" },
+  { key: "wechat", label: "微信绿", kind: "dark" },
+  { key: "teams", label: "Teams 紫", kind: "dark" },
+  { key: "dracula", label: "Dracula", kind: "dark" },
+];
+
+function themeKind(key: string): "dark" | "light" {
+  return THEMES.find((t) => t.key === key)?.kind ?? "dark";
+}
 
 const SHELL_LABEL: Record<AppSettings["defaultShell"], string> = {
   powershell: "PowerShell",
@@ -132,15 +157,15 @@ function moduleIcon(kind: ModuleKey, size = 14): JSX.Element {
     case "remote":
       return <IconServer size={size} />;
     case "cmd":
-      return <IconWindow size={size} />;
+      return <IconCmd size={size} />;
     case "wsl":
-      return <IconLinux size={size} />;
+      return <IconWsl size={size} />;
     case "git":
       return <IconGit size={size} />;
     case "serial":
-      return <IconCable size={size} />;
+      return <IconSerial size={size} />;
     case "adb":
-      return <IconPhone size={size} />;
+      return <IconAndroid size={size} />;
     default:
       return <IconTerminal size={size} />;
   }
@@ -229,6 +254,17 @@ export default function App() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
 
+  const [expandedServers, setExpandedServers] = useState<string[]>([]);
+  const [ctxMenu, setCtxMenu] = useState<{
+    profile: ConnectionProfile;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [editDialog, setEditDialog] = useState<{
+    draft: ConnectionProfile;
+    isNew: boolean;
+  } | null>(null);
+
   const [tmuxTarget, setTmuxTarget] = useState<ConnectionProfile | null>(null);
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
   const [tmuxLoading, setTmuxLoading] = useState(false);
@@ -249,10 +285,17 @@ export default function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
+  const [updateMsg, setUpdateMsg] = useState("");
+  const [updateBusy, setUpdateBusy] = useState(false);
 
   const [adbList, setAdbList] = useState<AdbDevice[]>([]);
   const [adbVer, setAdbVer] = useState("");
   const [adbLoading, setAdbLoading] = useState(false);
+  const [fbVer, setFbVer] = useState("");
+  const [fbList, setFbList] = useState<AdbDevice[]>([]);
+  const [serialPorts, setSerialPorts] = useState<SerialPortInfo[]>([]);
+  const [serialBaud, setSerialBaud] = useState(115200);
+  const [serialLoading, setSerialLoading] = useState(false);
 
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
@@ -295,6 +338,7 @@ export default function App() {
         }
       })();
     }
+    if (module === "serial") void refreshSerial();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [module]);
 
@@ -323,6 +367,8 @@ export default function App() {
         // 顺便把 ADB 面板、菜单、设置界面都展示一遍，便于无人值守截图验证
         setModule("adb");
         await new Promise((r) => setTimeout(r, 9000));
+        setModule("serial");
+        await new Promise((r) => setTimeout(r, 7000));
         setOpenMenu("conn");
         await new Promise((r) => setTimeout(r, 6000));
         setOpenMenu(null);
@@ -547,6 +593,86 @@ export default function App() {
     }
   }
 
+  function toggleServer(id: string) {
+    setExpandedServers((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  }
+
+  function openEditDialog(profile?: ConnectionProfile) {
+    if (profile) {
+      setEditDialog({ draft: JSON.parse(JSON.stringify(profile)), isNew: false });
+      return;
+    }
+    setEditDialog({
+      isNew: true,
+      draft: {
+        id: "",
+        type: "ssh",
+        name: "",
+        group: "默认",
+        ssh: {
+          host: "",
+          port: 22,
+          user: "root",
+          authKind: "key",
+          tmuxEnabled: settings.tmuxDefault,
+          tmuxTemplate: "{host}-{user}",
+        },
+      },
+    });
+  }
+
+  async function saveEditDialog() {
+    if (!editDialog) return;
+    const p = editDialog.draft;
+    if (!p.ssh?.host.trim()) {
+      setToast("请填写主机地址");
+      return;
+    }
+    const finalProfile: ConnectionProfile = {
+      ...p,
+      id: p.id || uid(),
+      name: p.name.trim() || p.ssh.host.trim(),
+      group: p.group.trim() || "默认",
+    };
+    try {
+      await saveProfile(finalProfile);
+      setEditDialog(null);
+      await refresh();
+    } catch (e) {
+      setToast("保存失败：" + String(e));
+    }
+  }
+
+  async function duplicateProfile(p: ConnectionProfile) {
+    const copy: ConnectionProfile = {
+      ...JSON.parse(JSON.stringify(p)),
+      id: uid(),
+      name: `${p.name} 副本`,
+    };
+    try {
+      await saveProfile(copy);
+      await refresh();
+    } catch (e) {
+      setToast("复制失败：" + String(e));
+    }
+  }
+
+  function patchDraft(
+    patch: Partial<ConnectionProfile>,
+    sshPatch?: Partial<NonNullable<ConnectionProfile["ssh"]>>,
+  ) {
+    setEditDialog((prev) => {
+      if (!prev) return prev;
+      const draft: ConnectionProfile = { ...prev.draft, ...patch };
+      if (sshPatch && draft.ssh) {
+        draft.ssh = { ...draft.ssh, ...sshPatch };
+      }
+      return { ...prev, draft };
+    });
+  }
+
   async function refreshTmux(profile: ConnectionProfile) {
     setTmuxLoading(true);
     try {
@@ -657,12 +783,47 @@ export default function App() {
     try {
       setAdbVer(await adbVersion());
       setAdbList(await adbDevices());
+      setFbVer(await fastbootVersion());
+      setFbList(await fastbootDevices());
     } catch (e) {
       setToast("ADB 不可用：" + String(e));
       setAdbVer("");
       setAdbList([]);
     } finally {
       setAdbLoading(false);
+    }
+  }
+
+  async function refreshSerial() {
+    setSerialLoading(true);
+    try {
+      setSerialPorts(await serialList());
+    } catch (e) {
+      setToast("枚举串口失败：" + String(e));
+      setSerialPorts([]);
+    } finally {
+      setSerialLoading(false);
+    }
+  }
+
+  async function openSerialSession(path: string) {
+    const id = uid();
+    addSession({
+      id,
+      title: `串口 · ${path}`,
+      kind: "serial",
+      state: "connecting",
+      openFiles: [],
+      activeTab: "terminal",
+    });
+    try {
+      const info = await openSerial(id, path, serialBaud, (e) => handleEvent(id, e));
+      setSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, title: info.title || s.title } : s)),
+      );
+    } catch (e) {
+      setToast("打开串口失败：" + String(e));
+      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
   }
 
@@ -716,11 +877,39 @@ export default function App() {
     void sessionWrite(activeSession.id, bytesToB64(new TextEncoder().encode("\u000c")));
   }
 
+  async function checkForUpdates() {
+    const url = settings.updateUrl.trim();
+    if (!url) {
+      setUpdateMsg("请先填写更新源地址（返回 JSON，含 tag_name 或 version 字段）。");
+      return;
+    }
+    setUpdateBusy(true);
+    setUpdateMsg("正在检查…");
+    try {
+      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as Record<string, unknown>;
+      const latest = String(data.tag_name ?? data.version ?? data.latest ?? "")
+        .replace(/^v/i, "")
+        .trim();
+      if (!latest) throw new Error("返回内容里没有 tag_name / version 字段");
+      setUpdateMsg(
+        latest === APP_VERSION
+          ? `已是最新版本（${APP_VERSION}）`
+          : `发现新版本 ${latest}（当前 ${APP_VERSION}）`,
+      );
+    } catch (e) {
+      setUpdateMsg("检查失败：" + String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
   function buildMenus(): { key: string; label: string; items: MenuItem[] }[] {
     const openConnectionForm = () => {
       setModule("remote");
       setSideTab("sessions");
-      setShowForm(true);
+      openEditDialog();
     };
     return [
       {
@@ -885,7 +1074,11 @@ export default function App() {
   }, [profiles]);
 
   return (
-    <div className={"app" + (settings.theme === "light" ? " light" : "")}>
+    <div
+      className={
+        "app theme-" + settings.theme + (themeKind(settings.theme) === "light" ? " light" : "")
+      }
+    >
       <div className="titlebar">
         <div className="menus">
           {buildMenus().map((menu) => (
@@ -991,9 +1184,6 @@ export default function App() {
                     onClick={() => openNewSessionDialog()}
                   >
                     <IconPlus size={14} /> 新建会话
-                  </button>
-                  <button type="button" className="btn" onClick={() => setShowForm((v) => !v)}>
-                    <IconPlus size={14} /> 新建连接
                   </button>
                 </div>
 
@@ -1112,77 +1302,75 @@ export default function App() {
 
                 <div className="tree-group">已保存的服务器</div>
                 {grouped.length === 0 && (
-                  <div className="hint">还没有服务器。点上面的「新建连接」添加一台。</div>
+                  <div className="hint">还没有服务器。点「新建会话」时可以直接新建一台。</div>
                 )}
                 {grouped.map(([group, list]) => (
                   <div key={group}>
                     <div className="tree-subgroup">{group}</div>
-                    {list.map((p) => (
-                      <div
-                        key={p.id}
-                        className="tree-item"
-                        onClick={() => openNewSessionDialog(p)}
-                        title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port} — 点击新建会话`}
-                      >
-                        <IconServer size={15} />
-                        <span className="grow">{p.name}</span>
-                        {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
-                        <button
-                          type="button"
-                          className="mini-x"
-                          title="管理服务器上的 tmux 会话"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setTmuxTarget(p);
-                            void refreshTmux(p);
-                          }}
-                        >
-                          ≡
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-x"
-                          title="删除连接"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void removeProfile(p);
-                          }}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-
-                <div className="tree-group">会话历史</div>
-                {history.length === 0 && (
-                  <div className="hint">还没有会话历史。连接过之后会出现在这里。</div>
-                )}
-                {history.map((h) => (
-                  <div
-                    key={h.id}
-                    className="tree-item"
-                    onClick={() => void connectFromHistory(h)}
-                    title={h.host}
-                  >
-                    <IconTerminal size={15} />
-                    <span className="grow">
-                      {h.profileName}
-                      {h.tmuxSession ? ` · ${h.tmuxSession}` : ""}
-                    </span>
-                    <span className="dim">{relTime(h.lastUsed)}</span>
-                    <button
-                      type="button"
-                      className="mini-x"
-                      title="从历史中移除"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void removeHistoryEntry(h.id);
-                      }}
-                    >
-                      ×
-                    </button>
+                    {list.map((p) => {
+                      const items = history.filter((h) => h.profileId === p.id);
+                      const expanded = expandedServers.includes(p.id);
+                      return (
+                        <div key={p.id}>
+                          <div
+                            className="tree-item"
+                            onClick={() => openNewSessionDialog(p)}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              setCtxMenu({ profile: p, x: e.clientX, y: e.clientY });
+                            }}
+                            title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port}\n左键：新建会话　右键：编辑服务器`}
+                          >
+                            <span
+                              className={"chev" + (items.length ? "" : " empty")}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (items.length) toggleServer(p.id);
+                              }}
+                            >
+                              {items.length > 0 &&
+                                (expanded ? (
+                                  <IconChevronDown size={12} />
+                                ) : (
+                                  <IconChevronRight size={12} />
+                                ))}
+                            </span>
+                            <IconServer size={15} />
+                            <span className="grow ellipsis">{p.name}</span>
+                            {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
+                            {items.length > 0 && (
+                              <span className="dim count">{items.length}</span>
+                            )}
+                          </div>
+                          {expanded &&
+                            items.map((h) => (
+                              <div
+                                key={h.id}
+                                className="tree-item child"
+                                onClick={() => void connectFromHistory(h)}
+                                title={`${h.tmuxSession ?? "普通 shell"}　${relTime(h.lastUsed)}`}
+                              >
+                                <IconTerminal size={13} />
+                                <span className="grow ellipsis">
+                                  {h.tmuxSession ?? "普通 shell"}
+                                </span>
+                                <span className="dim">{relTime(h.lastUsed)}</span>
+                                <button
+                                  type="button"
+                                  className="mini-x"
+                                  title="从历史中移除"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void removeHistoryEntry(h.id);
+                                  }}
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            ))}
+                        </div>
+                      );
+                    })}
                   </div>
                 ))}
               </>
@@ -1270,7 +1458,48 @@ export default function App() {
               <LocalModule label="WSL" onOpen={() => void openLocalSession("wsl")} />
             )}
             {module === "git" && <div className="hint">Git 面板（M5，尚未实现）。</div>}
-            {module === "serial" && <div className="hint">串口（M4，尚未实现）。</div>}
+            {module === "serial" && (
+              <>
+                <div className="side-actions">
+                  <button type="button" className="btn" onClick={() => void refreshSerial()}>
+                    <IconPlus size={14} /> 刷新串口
+                  </button>
+                </div>
+                <label className="modal-field" style={{ paddingTop: 0 }}>
+                  波特率
+                  <select
+                    value={serialBaud}
+                    onChange={(e) => setSerialBaud(Number(e.target.value))}
+                  >
+                    {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {serialLoading && <div className="hint">正在枚举串口…</div>}
+                {!serialLoading && serialPorts.length === 0 && (
+                  <div className="hint">
+                    没有检测到串口设备。
+                    <br />
+                    插入 USB 转串口模块后点「刷新串口」。
+                  </div>
+                )}
+                {serialPorts.map((p) => (
+                  <div
+                    key={p.path}
+                    className="tree-item"
+                    onClick={() => void openSerialSession(p.path)}
+                    title={`${p.path} — ${p.label}（点击以 ${serialBaud} 波特率打开）`}
+                  >
+                    <IconSerial size={15} />
+                    <span className="grow ellipsis">{p.path}</span>
+                    <span className="dim ellipsis">{p.label}</span>
+                  </div>
+                ))}
+              </>
+            )}
             {module === "adb" && (
               <>
                 <div className="side-actions">
@@ -1299,9 +1528,25 @@ export default function App() {
                     onClick={() => void openAdbSession(d.serial)}
                     title={`${d.serial} · ${d.state} — 点击打开 adb shell`}
                   >
-                    <IconPhone size={15} />
+                    <IconAndroid size={15} />
                     <span className="grow">{d.model || d.serial}</span>
                     <span className={d.state === "device" ? "dot ok" : "dot off"} />
+                  </div>
+                ))}
+                <div className="tree-group">Fastboot（bootloader 模式）</div>
+                <div className="hint">
+                  {fbVer ? `fastboot 已就绪：${fbVer}` : "未检测到 fastboot"}
+                </div>
+                {fbList.length === 0 && (
+                  <div className="hint">
+                    没有 fastboot 设备。手机进 bootloader（`adb reboot bootloader`）后点「刷新设备」。
+                  </div>
+                )}
+                {fbList.map((d) => (
+                  <div key={d.serial} className="tree-item" title={`${d.serial} · ${d.state}`}>
+                    <IconAndroid size={15} />
+                    <span className="grow ellipsis">{d.serial}</span>
+                    <span className="tag">fastboot</span>
                   </div>
                 ))}
               </>
@@ -1404,7 +1649,7 @@ export default function App() {
                     bus={bus}
                     active={s.id === activeId && s.activeTab === "terminal"}
                     fontSize={settings.fontSize}
-                    light={settings.theme === "light"}
+                    light={themeKind(settings.theme) === "light"}
                   />
                 </div>
               ))
@@ -1439,6 +1684,168 @@ export default function App() {
 
       {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
 
+      {ctxMenu && (
+        <div
+          className="ctx-backdrop"
+          onClick={() => setCtxMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setCtxMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(ctxMenu.x, Math.max(0, window.innerWidth - 230)),
+              top: Math.min(ctxMenu.y, Math.max(0, window.innerHeight - 220)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                openNewSessionDialog(p);
+              }}
+            >
+              新建会话
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                openEditDialog(p);
+              }}
+            >
+              编辑服务器…
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                void duplicateProfile(p);
+              }}
+            >
+              复制服务器
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                setTmuxTarget(p);
+                void refreshTmux(p);
+              }}
+            >
+              管理 tmux 会话
+            </button>
+            <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                void removeProfile(p);
+              }}
+            >
+              删除服务器
+            </button>
+          </div>
+        </div>
+      )}
+
+      {editDialog && (
+        <div className="modal-backdrop" onClick={() => setEditDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              {editDialog.isNew ? "新建服务器" : "编辑服务器"}
+            </div>
+            <div className="modal-body">
+              <label className="modal-field">
+                名称
+                <input
+                  value={editDialog.draft.name}
+                  placeholder="显示名，如 生产 Web"
+                  onChange={(e) => patchDraft({ name: e.target.value })}
+                />
+              </label>
+              <label className="modal-field">
+                分组
+                <input
+                  value={editDialog.draft.group}
+                  onChange={(e) => patchDraft({ group: e.target.value })}
+                />
+              </label>
+              <label className="modal-field">
+                主机
+                <input
+                  value={editDialog.draft.ssh?.host ?? ""}
+                  placeholder="IP 或域名"
+                  onChange={(e) => patchDraft({}, { host: e.target.value })}
+                />
+              </label>
+              <div className="modal-row">
+                <label className="modal-field">
+                  端口
+                  <input
+                    value={editDialog.draft.ssh?.port ?? 22}
+                    onChange={(e) =>
+                      patchDraft({}, { port: Number(e.target.value) || 22 })
+                    }
+                  />
+                </label>
+                <label className="modal-field">
+                  用户名
+                  <input
+                    value={editDialog.draft.ssh?.user ?? ""}
+                    onChange={(e) => patchDraft({}, { user: e.target.value })}
+                  />
+                </label>
+              </div>
+              <label className="modal-field">
+                私钥路径（可选，留空则用 ~/.ssh 默认密钥）
+                <input
+                  value={editDialog.draft.ssh?.keyPath ?? ""}
+                  placeholder="C:\Users\me\.ssh\id_ed25519"
+                  onChange={(e) => patchDraft({}, { keyPath: e.target.value })}
+                />
+              </label>
+              <label className="modal-field">
+                tmux 会话名模板
+                <input
+                  value={editDialog.draft.ssh?.tmuxTemplate ?? "{host}-{user}"}
+                  onChange={(e) => patchDraft({}, { tmuxTemplate: e.target.value })}
+                />
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={editDialog.draft.ssh?.tmuxEnabled ?? true}
+                  onChange={(e) => patchDraft({}, { tmuxEnabled: e.target.checked })}
+                />
+                <span>默认使用 tmux（新建会话时仍可临时改）</span>
+              </label>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setEditDialog(null)}>
+                取消
+              </button>
+              <button type="button" className="btn primary" onClick={() => void saveEditDialog()}>
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showSettings && (
         <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1472,15 +1879,16 @@ export default function App() {
               </label>
 
               <label className="modal-field">
-                主题
+                主题配色
                 <select
                   value={settings.theme}
-                  onChange={(e) =>
-                    void updateSettings({ theme: e.target.value as AppSettings["theme"] })
-                  }
+                  onChange={(e) => void updateSettings({ theme: e.target.value })}
                 >
-                  <option value="dark">深色</option>
-                  <option value="light">浅色</option>
+                  {THEMES.map((t) => (
+                    <option key={t.key} value={t.key}>
+                      {t.label}
+                    </option>
+                  ))}
                 </select>
               </label>
 
@@ -1502,7 +1910,47 @@ export default function App() {
                 <span>记录会话历史</span>
               </label>
 
-              <div className="hint">设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。</div>
+              <label className="modal-field">
+                关闭窗口时
+                <select
+                  value={settings.closeAction}
+                  onChange={(e) =>
+                    void updateSettings({
+                      closeAction: e.target.value as AppSettings["closeAction"],
+                    })
+                  }
+                >
+                  <option value="exit">退出应用</option>
+                  <option value="tray">收进系统托盘（后台继续运行）</option>
+                </select>
+              </label>
+
+              <label className="modal-field">
+                更新源（返回 JSON 的地址，含 tag_name 或 version 字段）
+                <input
+                  value={settings.updateUrl}
+                  placeholder="https://api.github.com/repos/you/zeeai-terminal/releases/latest"
+                  onChange={(e) => void updateSettings({ updateUrl: e.target.value })}
+                />
+              </label>
+              <div className="modal-inline-action">
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={updateBusy}
+                  onClick={() => void checkForUpdates()}
+                >
+                  {updateBusy ? "检查中…" : "检查更新"}
+                </button>
+                <span className="hint" style={{ padding: "0 0 0 8px" }}>
+                  当前版本 {APP_VERSION}
+                </span>
+                {updateMsg && <div className="hint">{updateMsg}</div>}
+              </div>
+
+              <div className="hint">
+                设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
+              </div>
             </div>
             <div className="modal-actions">
               <button type="button" className="btn primary" onClick={() => setShowSettings(false)}>
@@ -1563,6 +2011,18 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <div className="modal-inline-action">
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => {
+                    setNewDialog(null);
+                    openEditDialog();
+                  }}
+                >
+                  ＋ 新建服务器
+                </button>
+              </div>
 
               <label className="form-check">
                 <input

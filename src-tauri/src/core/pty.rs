@@ -89,7 +89,7 @@ pub fn spawn(
         kind: kind.to_string(),
         title: title.to_string(),
         writer: Arc::new(Mutex::new(writer)),
-        master: Arc::new(Mutex::new(pair.master)),
-        child: Arc::new(Mutex::new(child)),
+        master: Some(Arc::new(Mutex::new(pair.master))),
+        child: Some(Arc::new(Mutex::new(child))),
     })
 }

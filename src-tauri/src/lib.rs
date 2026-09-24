@@ -15,6 +15,33 @@ pub fn run() {
         .build(),
     )
     .setup(|app| {
+      // 系统托盘：配合「关闭时收进托盘」使用，也能快速唤回窗口
+      {
+        use tauri::menu::{Menu, MenuItem};
+        use tauri::tray::TrayIconBuilder;
+        let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "退出 ZeeAI Terminal", true, None::<&str>)?;
+        let menu = Menu::with_items(app, &[&show, &quit])?;
+        let mut builder = TrayIconBuilder::with_id("main-tray")
+          .tooltip("ZeeAI Terminal")
+          .menu(&menu)
+          .show_menu_on_left_click(false)
+          .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+              if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+              }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+          });
+        if let Some(icon) = app.default_window_icon() {
+          builder = builder.icon(icon.clone());
+        }
+        let _ = builder.build(app);
+      }
       // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
       // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
       if std::env::var("ZEEAI_AUTODEMO").is_ok() {
@@ -49,6 +76,14 @@ pub fn run() {
                 Ok(list) => log::info!("SELFTEST: adb_devices ok -> {} devices", list.len()),
                 Err(e) => log::error!("SELFTEST: adb_devices failed -> {e}"),
               }
+              match crate::commands::fastboot_devices(handle.clone()).await {
+                Ok(list) => log::info!("SELFTEST: fastboot ok -> {} devices", list.len()),
+                Err(e) => log::error!("SELFTEST: fastboot failed -> {e}"),
+              }
+              match crate::commands::serial_list() {
+                Ok(list) => log::info!("SELFTEST: serial_list ok -> {} ports", list.len()),
+                Err(e) => log::error!("SELFTEST: serial_list failed -> {e}"),
+              }
             }
             None => log::warn!("SELFTEST: no ssh profile found"),
           }
@@ -80,7 +115,22 @@ pub fn run() {
       commands::adb_version,
       commands::adb_devices,
       commands::open_adb_shell,
+      commands::serial_list,
+      commands::open_serial,
+      commands::fastboot_version,
+      commands::fastboot_devices,
     ])
+    .on_window_event(|window, event| {
+      // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）
+      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        let settings = crate::store::load_settings();
+        if settings.close_action == "tray" {
+          api.prevent_close();
+          let _ = window.hide();
+          log::info!("window close intercepted -> hidden to tray");
+        }
+      }
+    })
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
@@ -93,8 +143,10 @@ pub fn run() {
           Err(_) => Vec::new(),
         };
         for handle in handles {
-          if let Ok(mut child) = handle.child.lock() {
-            let _ = child.kill();
+          if let Some(child) = handle.child.as_ref() {
+            if let Ok(mut child) = child.lock() {
+              let _ = child.kill();
+            }
           }
         }
       }

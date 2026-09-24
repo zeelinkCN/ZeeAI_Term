@@ -44,6 +44,26 @@ pub fn shell_args(serial: &str) -> Vec<String> {
     vec!["-s".into(), serial.to_string(), "shell".into()]
 }
 
+/// `fastboot devices` 输出是 `序列号\tfastboot` 一行一个。
+pub fn parse_fastboot_devices(output: &str) -> Vec<AdbDevice> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List of devices") || line.starts_with('<') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(serial) = parts.next() else { continue };
+        let state = parts.next().unwrap_or("fastboot").to_string();
+        out.push(AdbDevice {
+            serial: serial.to_string(),
+            state,
+            model: None,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +85,13 @@ emulator-5554\toffline\n";
     #[test]
     fn handles_empty() {
         assert!(parse_devices("List of devices attached\n").is_empty());
+    }
+
+    #[test]
+    fn parses_fastboot_devices() {
+        let v = parse_fastboot_devices("R3CT90XXXX\tfastboot\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].serial, "R3CT90XXXX");
+        assert_eq!(v[0].state, "fastboot");
     }
 }

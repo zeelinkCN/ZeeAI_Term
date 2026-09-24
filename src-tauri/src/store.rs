@@ -94,6 +94,10 @@ pub struct Settings {
     pub record_history: bool,
     pub tmux_default: bool,
     pub theme: String,
+    /// 关闭窗口时的行为："exit" 退出应用；"tray" 收进托盘继续后台运行
+    pub close_action: String,
+    /// 更新检查地址（返回 JSON，含 tag_name 或 version 字段）；留空表示未配置
+    pub update_url: String,
 }
 
 impl Default for Settings {
@@ -104,6 +108,8 @@ impl Default for Settings {
             record_history: true,
             tmux_default: true,
             theme: "dark".into(),
+            close_action: "exit".into(),
+            update_url: String::new(),
         }
     }
 }

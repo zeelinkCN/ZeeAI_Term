@@ -80,11 +80,18 @@ export interface AppSettings {
   defaultShell: "powershell" | "cmd" | "wsl";
   recordHistory: boolean;
   tmuxDefault: boolean;
-  theme: "dark" | "light";
+  theme: string;
+  closeAction: "exit" | "tray";
+  updateUrl: string;
 }
 
 export interface AdbDevice {
   serial: string;
   state: string;
   model?: string | null;
+}
+
+export interface SerialPortInfo {
+  path: string;
+  label: string;
 }

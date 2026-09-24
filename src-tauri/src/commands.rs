@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::{adb, pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
+use crate::core::{adb, pty, remote_fs, serial, ssh, tmux, SessionEvent, SessionRegistry};
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
 #[derive(Serialize)]
@@ -209,7 +209,11 @@ pub fn session_resize(
 ) -> Result<(), String> {
     let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
     let handle = sessions.get(&id).ok_or_else(|| "会话不存在".to_string())?;
-    let master = handle.master.lock().map_err(|e| e.to_string())?;
+    let master = handle
+        .master
+        .as_ref()
+        .ok_or_else(|| "该会话不支持调整尺寸（例如串口）".to_string())?;
+    let master = master.lock().map_err(|e| e.to_string())?;
     master
         .resize(PtySize {
             rows,
@@ -224,11 +228,68 @@ pub fn session_resize(
 pub fn session_close(id: String, registry: State<'_, SessionRegistry>) -> Result<(), String> {
     let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
     if let Some(handle) = sessions.remove(&id) {
-        if let Ok(mut child) = handle.child.lock() {
-            let _ = child.kill();
+        if let Some(child) = handle.child.as_ref() {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
         }
     }
     Ok(())
+}
+
+// ---------- 串口 ----------
+
+#[tauri::command]
+pub fn serial_list() -> Result<Vec<serial::SerialPortInfo>, String> {
+    log::info!("ipc: serial_list");
+    let ports = serial::list();
+    if let Ok(list) = &ports {
+        log::info!("ipc: serial_list -> {} ports", list.len());
+    }
+    ports
+}
+
+#[tauri::command]
+pub fn open_serial(
+    id: String,
+    path: String,
+    baud: u32,
+    on_event: Channel<SessionEvent>,
+    registry: State<'_, SessionRegistry>,
+) -> Result<SessionInfo, String> {
+    log::info!("ipc: open_serial path={path} baud={baud}");
+    let title = format!("串口 · {path} · {baud}");
+    let handle = serial::open(&path, baud, &title, on_event)?;
+    registry
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), handle);
+    Ok(SessionInfo {
+        id,
+        profile_id: String::new(),
+        title,
+        kind: "serial".into(),
+        tmux_session: None,
+    })
+}
+
+// ---------- Fastboot ----------
+
+#[tauri::command]
+pub async fn fastboot_version(app: tauri::AppHandle) -> Result<String, String> {
+    let exe = adb_exe(&app).with_file_name("fastboot.exe");
+    let out = run_capture(&exe, &["--version".into()]).await?;
+    Ok(out.lines().next().unwrap_or("").trim().to_string())
+}
+
+#[tauri::command]
+pub async fn fastboot_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevice>, String> {
+    let exe = adb_exe(&app).with_file_name("fastboot.exe");
+    let out = run_capture(&exe, &["devices".into()]).await?;
+    let devices = adb::parse_fastboot_devices(&out);
+    log::info!("ipc: fastboot_devices -> {} devices", devices.len());
+    Ok(devices)
 }
 
 fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {

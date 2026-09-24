@@ -23,8 +23,10 @@ pub struct SessionHandle {
     #[allow(dead_code)]
     pub title: String,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// 只有 PTY 会话有；串口会话为 None
+    pub master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    /// 只有子进程会话有；串口会话为 None
+    pub child: Option<Arc<Mutex<Box<dyn Child + Send + Sync>>>>,
 }
 
 pub struct SessionRegistry {
