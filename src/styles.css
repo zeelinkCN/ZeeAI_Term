@@ -73,6 +73,88 @@ body {
   color: var(--fg);
 }
 
+.menu {
+  position: relative;
+}
+
+.menu-label {
+  cursor: default;
+}
+
+.menu-label.open {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--fg);
+}
+
+.menu-drop {
+  position: absolute;
+  top: 24px;
+  left: 0;
+  min-width: 200px;
+  padding: 4px;
+  background: var(--sidebar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  z-index: 60;
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+.menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+}
+
+.app.light {
+  --bg: #ffffff;
+  --sidebar: #f3f3f3;
+  --titlebar: #e4e4e4;
+  --tab: #ececec;
+  --border: #cfcfcf;
+  --fg: #1f1f1f;
+  --muted: #6a6a6a;
+  --accent: #0a66c2;
+  --accent-soft: rgba(10, 102, 194, 0.12);
+}
+
+.app.light .form input,
+.app.light .modal-input,
+.app.light .modal-field select,
+.app.light .fs-path-input,
+.app.light .git-commit input {
+  background: #ffffff;
+  color: var(--fg);
+}
+
+.app.light .attach-list {
+  background: #ffffff;
+}
+
 .title {
   flex: 1;
   text-align: center;

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
@@ -16,11 +17,15 @@ import {
   openSsh,
   saveProfile,
   sessionClose,
+  sessionWrite,
+  settingsGet,
+  settingsSet,
   tmuxKill,
   tmuxList,
 } from "./ipc";
-import { b64ToBytes, uid } from "./util";
+import { b64ToBytes, bytesToB64, uid } from "./util";
 import type {
+  AppSettings,
   ConnectionProfile,
   HistoryEntry,
   RemoteEntry,
@@ -67,6 +72,12 @@ interface OpenSession {
   activeTab: string; // "terminal" 或文件名
 }
 
+interface MenuItem {
+  sep: boolean;
+  label?: string;
+  action?: () => void;
+}
+
 const MODULES: { key: ModuleKey; label: string; node: JSX.Element }[] = [
   { key: "remote", label: "远程", node: <IconServer size={22} /> },
   { key: "powershell", label: "PowerShell", node: <IconTerminal size={22} /> },
@@ -94,6 +105,20 @@ const EMPTY_PROFILE = {
   user: "root",
   group: "默认",
   keyPath: "",
+};
+
+const DEFAULT_SETTINGS: AppSettings = {
+  fontSize: 13,
+  defaultShell: "powershell",
+  recordHistory: true,
+  tmuxDefault: true,
+  theme: "dark",
+};
+
+const SHELL_LABEL: Record<AppSettings["defaultShell"], string> = {
+  powershell: "PowerShell",
+  cmd: "CMD",
+  wsl: "WSL",
 };
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
@@ -215,6 +240,12 @@ export default function App() {
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
 
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [showSidebar, setShowSidebar] = useState(true);
+
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
@@ -225,6 +256,13 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
+    void (async () => {
+      try {
+        setSettings({ ...DEFAULT_SETTINGS, ...(await settingsGet()) });
+      } catch {
+        /* 设置读取失败就用默认值 */
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -258,6 +296,12 @@ export default function App() {
         await openRemoteFile(profile.id, "README-demo.md", id);
         await new Promise((r) => setTimeout(r, 7000));
         await openRemoteFile(profile.id, "demo.html", id);
+        // 顺便把菜单与设置界面也展示出来，便于无人值守截图验证
+        await new Promise((r) => setTimeout(r, 6000));
+        setOpenMenu("conn");
+        await new Promise((r) => setTimeout(r, 6000));
+        setOpenMenu(null);
+        setShowSettings(true);
       })();
     }).then((f) => {
       unlisten = f;
@@ -379,20 +423,22 @@ export default function App() {
             : s,
         ),
       );
-      // 记录到会话历史（用户可在侧栏里删掉不想留的）
-      try {
-        setHistory(
-          await historySave({
-            id: "",
-            profileId: profile.id,
-            profileName: profile.name,
-            host: profile.ssh?.host ?? "",
-            tmuxSession: info.tmuxSession ?? null,
-            lastUsed: 0,
-          }),
-        );
-      } catch {
-        /* 历史写入失败不影响会话使用 */
+      // 记录到会话历史（可在设置里关闭，也可在侧栏里逐条删除）
+      if (settings.recordHistory) {
+        try {
+          setHistory(
+            await historySave({
+              id: "",
+              profileId: profile.id,
+              profileName: profile.name,
+              host: profile.ssh?.host ?? "",
+              tmuxSession: info.tmuxSession ?? null,
+              lastUsed: 0,
+            }),
+          );
+        } catch {
+          /* 历史写入失败不影响会话使用 */
+        }
       }
     } catch (e) {
       setToast("SSH 连接失败：" + String(e));
@@ -453,7 +499,7 @@ export default function App() {
         user: form.user.trim() || "root",
         authKind: "key",
         keyPath: form.keyPath.trim() || undefined,
-        tmuxEnabled: true,
+        tmuxEnabled: settings.tmuxDefault,
         tmuxTemplate: "{host}-{user}",
       },
     };
@@ -525,7 +571,7 @@ export default function App() {
       setToast("请先新建一个连接配置");
       return;
     }
-    const useTmux = target.ssh?.tmuxEnabled ?? false;
+    const useTmux = target.ssh?.tmuxEnabled ?? settings.tmuxDefault;
     setNewDialog({
       profileId: target.id,
       useTmux,
@@ -588,6 +634,127 @@ export default function App() {
     if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
     if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
     return `${Math.floor(diff / 86400)} 天前`;
+  }
+
+  async function updateSettings(patch: Partial<AppSettings>) {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    try {
+      await settingsSet(next);
+    } catch (e) {
+      setToast("保存设置失败：" + String(e));
+    }
+  }
+
+  function bumpFont(delta: number) {
+    const next = Math.min(26, Math.max(8, settings.fontSize + delta));
+    void updateSettings({ fontSize: next });
+  }
+
+  function clearActiveTerminal() {
+    if (!activeSession) {
+      setToast("当前没有会话");
+      return;
+    }
+    void sessionWrite(activeSession.id, bytesToB64(new TextEncoder().encode("\u000c")));
+  }
+
+  function buildMenus(): { key: string; label: string; items: MenuItem[] }[] {
+    const openConnectionForm = () => {
+      setModule("remote");
+      setSideTab("sessions");
+      setShowForm(true);
+    };
+    return [
+      {
+        key: "file",
+        label: "文件",
+        items: [
+          { sep: false, label: "新建会话…", action: () => openNewSessionDialog() },
+          { sep: false, label: "新建连接", action: openConnectionForm },
+          { sep: true },
+          {
+            sep: false,
+            label: "退出",
+            action: () => {
+              void getCurrentWindow().close();
+            },
+          },
+        ],
+      },
+      {
+        key: "edit",
+        label: "编辑",
+        items: [
+          { sep: false, label: "清空当前终端", action: clearActiveTerminal },
+          {
+            sep: false,
+            label: "重新连接当前会话",
+            action: () => {
+              if (activeSession) void reconnectSession(activeSession);
+            },
+          },
+        ],
+      },
+      {
+        key: "view",
+        label: "视图",
+        items: [
+          { sep: false, label: "放大字体", action: () => bumpFont(1) },
+          { sep: false, label: "缩小字体", action: () => bumpFont(-1) },
+          { sep: false, label: "重置字体", action: () => void updateSettings({ fontSize: 13 }) },
+          { sep: true },
+          {
+            sep: false,
+            label: showSidebar ? "隐藏侧栏" : "显示侧栏",
+            action: () => setShowSidebar((v) => !v),
+          },
+          {
+            sep: false,
+            label: settings.theme === "dark" ? "切换到浅色主题" : "切换到深色主题",
+            action: () =>
+              void updateSettings({ theme: settings.theme === "dark" ? "light" : "dark" }),
+          },
+        ],
+      },
+      {
+        key: "conn",
+        label: "连接",
+        items: [
+          { sep: false, label: "新建会话…", action: () => openNewSessionDialog() },
+          { sep: false, label: "新建连接", action: openConnectionForm },
+          { sep: true },
+          { sep: false, label: "设置…", action: () => setShowSettings(true) },
+        ],
+      },
+      {
+        key: "term",
+        label: "终端",
+        items: [
+          {
+            sep: false,
+            label: `新建默认终端（${SHELL_LABEL[settings.defaultShell]}）`,
+            action: () => void openLocalSession(settings.defaultShell),
+          },
+          { sep: false, label: "新建 PowerShell", action: () => void openLocalSession("powershell") },
+          { sep: false, label: "新建 CMD", action: () => void openLocalSession("cmd") },
+          { sep: false, label: "新建 WSL", action: () => void openLocalSession("wsl") },
+          { sep: true },
+          {
+            sep: false,
+            label: "关闭当前会话",
+            action: () => {
+              if (activeId) void closeSession(activeId);
+            },
+          },
+        ],
+      },
+      {
+        key: "help",
+        label: "帮助",
+        items: [{ sep: false, label: "关于 ZeeAI Terminal", action: () => setShowAbout(true) }],
+      },
+    ];
   }
 
   async function loadDir(profileId: string, path?: string) {
@@ -661,15 +828,40 @@ export default function App() {
   }, [profiles]);
 
   return (
-    <div className="app">
+    <div className={"app" + (settings.theme === "light" ? " light" : "")}>
       <div className="titlebar">
         <div className="menus">
-          <span>文件</span>
-          <span>编辑</span>
-          <span>视图</span>
-          <span>连接</span>
-          <span>终端</span>
-          <span>帮助</span>
+          {buildMenus().map((menu) => (
+            <div key={menu.key} className="menu">
+              <span
+                className={"menu-label" + (openMenu === menu.key ? " open" : "")}
+                onClick={() => setOpenMenu(openMenu === menu.key ? null : menu.key)}
+              >
+                {menu.label}
+              </span>
+              {openMenu === menu.key && (
+                <div className="menu-drop">
+                  {menu.items.map((item, i) =>
+                    item.sep ? (
+                      <div key={"sep" + i} className="menu-sep" />
+                    ) : (
+                      <button
+                        key={item.label}
+                        type="button"
+                        className="menu-item"
+                        onClick={() => {
+                          setOpenMenu(null);
+                          item.action?.();
+                        }}
+                      >
+                        {item.label}
+                      </button>
+                    ),
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
         <div className="title">
           ZeeAI Terminal{activeSession ? " — " + activeSession.title : ""}
@@ -699,13 +891,18 @@ export default function App() {
           ))}
           <div className="act-sep" />
           <div className="act-foot">
-            <button type="button" className="act" title="设置">
+            <button
+              type="button"
+              className="act"
+              title="设置"
+              onClick={() => setShowSettings(true)}
+            >
               <IconGear size={22} />
             </button>
           </div>
         </nav>
 
-        <aside className="sidebar">
+      <aside className="sidebar" style={{ display: showSidebar ? undefined : "none" }}>
           <div className="side-head">{MODULE_LABEL[module]}</div>
 
           {module === "remote" && (
@@ -1115,6 +1312,8 @@ export default function App() {
                     sessionId={s.id}
                     bus={bus}
                     active={s.id === activeId && s.activeTab === "terminal"}
+                    fontSize={settings.fontSize}
+                    light={settings.theme === "light"}
                   />
                 </div>
               ))
@@ -1144,6 +1343,105 @@ export default function App() {
       {toast && (
         <div className="toast" onClick={() => setToast(null)}>
           {toast}
+        </div>
+      )}
+
+      {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
+
+      {showSettings && (
+        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">设置</div>
+            <div className="modal-body">
+              <label className="modal-field">
+                终端字体大小：{settings.fontSize}px
+                <input
+                  type="range"
+                  min={8}
+                  max={26}
+                  value={settings.fontSize}
+                  onChange={(e) => void updateSettings({ fontSize: Number(e.target.value) })}
+                />
+              </label>
+
+              <label className="modal-field">
+                默认终端
+                <select
+                  value={settings.defaultShell}
+                  onChange={(e) =>
+                    void updateSettings({
+                      defaultShell: e.target.value as AppSettings["defaultShell"],
+                    })
+                  }
+                >
+                  <option value="powershell">PowerShell</option>
+                  <option value="cmd">CMD</option>
+                  <option value="wsl">WSL</option>
+                </select>
+              </label>
+
+              <label className="modal-field">
+                主题
+                <select
+                  value={settings.theme}
+                  onChange={(e) =>
+                    void updateSettings({ theme: e.target.value as AppSettings["theme"] })
+                  }
+                >
+                  <option value="dark">深色</option>
+                  <option value="light">浅色</option>
+                </select>
+              </label>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.tmuxDefault}
+                  onChange={(e) => void updateSettings({ tmuxDefault: e.target.checked })}
+                />
+                <span>新建连接时默认启用 tmux</span>
+              </label>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.recordHistory}
+                  onChange={(e) => void updateSettings({ recordHistory: e.target.checked })}
+                />
+                <span>记录会话历史</span>
+              </label>
+
+              <div className="hint">设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。</div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn primary" onClick={() => setShowSettings(false)}>
+                完成
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showAbout && (
+        <div className="modal-backdrop" onClick={() => setShowAbout(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">关于 ZeeAI Terminal</div>
+            <div className="modal-body">
+              <div className="hint">
+                <b>ZeeAI Terminal</b> 0.1.0
+                <br />
+                Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
+                <br />
+                <br />
+                技术栈：Tauri 2 + Rust + React + xterm.js
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setShowAbout(false)}>
+                关闭
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

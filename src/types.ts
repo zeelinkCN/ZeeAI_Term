@@ -74,3 +74,11 @@ export interface HistoryEntry {
   tmuxSession?: string | null;
   lastUsed: number;
 }
+
+export interface AppSettings {
+  fontSize: number;
+  defaultShell: "powershell" | "cmd" | "wsl";
+  recordHistory: boolean;
+  tmuxDefault: boolean;
+  theme: "dark" | "light";
+}

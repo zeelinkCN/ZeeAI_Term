@@ -6,6 +6,7 @@ import type {
   TmuxSession,
   RemoteListing,
   HistoryEntry,
+  AppSettings,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -74,6 +75,14 @@ export async function historySave(entry: HistoryEntry): Promise<HistoryEntry[]> 
 
 export async function historyRemove(id: string): Promise<HistoryEntry[]> {
   return invoke<HistoryEntry[]>("history_remove", { id });
+}
+
+export async function settingsGet(): Promise<AppSettings> {
+  return invoke<AppSettings>("settings_get");
+}
+
+export async function settingsSet(settings: AppSettings): Promise<void> {
+  return invoke("settings_set", { settings });
 }
 
 /** 列出服务器上的 tmux 会话 */

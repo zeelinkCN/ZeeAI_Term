@@ -5,7 +5,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
-use crate::store::{self, ConnectionProfile, HistoryEntry};
+use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -371,4 +371,17 @@ pub fn history_save(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String
 pub fn history_remove(id: String) -> Result<Vec<HistoryEntry>, String> {
     log::info!("ipc: history_remove id={id}");
     store::remove_history(&id)
+}
+
+// ---------- 设置 ----------
+
+#[tauri::command]
+pub fn settings_get() -> Settings {
+    store::load_settings()
+}
+
+#[tauri::command]
+pub fn settings_set(settings: Settings) -> Result<(), String> {
+    log::info!("ipc: settings_set theme={} font={}", settings.theme, settings.font_size);
+    store::save_settings(&settings)
 }

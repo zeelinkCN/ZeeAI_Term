@@ -10,6 +10,8 @@ interface Props {
   sessionId: string;
   bus: SessionBus;
   active: boolean;
+  fontSize?: number;
+  light?: boolean;
 }
 
 const THEME = {
@@ -35,12 +37,41 @@ const THEME = {
   brightWhite: "#e5e5e5",
 };
 
+const LIGHT_THEME = {
+  background: "#ffffff",
+  foreground: "#1f1f1f",
+  cursor: "#1f1f1f",
+  selectionBackground: "#add6ff",
+  black: "#000000",
+  red: "#cd3131",
+  green: "#00bc00",
+  yellow: "#949800",
+  blue: "#0451a5",
+  magenta: "#bc05bc",
+  cyan: "#0598bc",
+  white: "#555555",
+  brightBlack: "#666666",
+  brightRed: "#cd3131",
+  brightGreen: "#14ce14",
+  brightYellow: "#b5ba00",
+  brightBlue: "#0451a5",
+  brightMagenta: "#bc05bc",
+  brightCyan: "#0598bc",
+  brightWhite: "#a5a5a5",
+};
+
 // 小于这个尺寸的 resize 一律不发：界面首次布局时容器可能是 0 尺寸，
 // 一旦把 12x4 这种尺寸发给 tmux，窗口会被压变形（表现为满屏花点）。
 const MIN_COLS = 20;
 const MIN_ROWS = 5;
 
-export default function TerminalView({ sessionId, bus, active }: Props) {
+export default function TerminalView({
+  sessionId,
+  bus,
+  active,
+  fontSize = 13,
+  light = false,
+}: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -51,12 +82,12 @@ export default function TerminalView({ sessionId, bus, active }: Props) {
 
     const term = new Terminal({
       fontFamily: '"Cascadia Mono", "Consolas", "Courier New", monospace',
-      fontSize: 13,
+      fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,
-      theme: THEME,
+      theme: light ? LIGHT_THEME : THEME,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -131,6 +162,22 @@ export default function TerminalView({ sessionId, bus, active }: Props) {
       term.focus();
     }
   }, [active, sessionId]);
+
+  // 字体大小 / 主题变化时热更新（不重建终端，保留回滚缓冲与连接状态）
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontSize = fontSize;
+    term.options.theme = light ? LIGHT_THEME : THEME;
+    try {
+      fitRef.current?.fit();
+    } catch {
+      /* ignore */
+    }
+    if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
+      void sessionResize(sessionId, term.cols, term.rows);
+    }
+  }, [fontSize, light, sessionId]);
 
   return <div className="terminal-host" ref={hostRef} />;
 }

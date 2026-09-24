@@ -81,6 +81,47 @@ fn history_file() -> PathBuf {
     store_dir().join("history.json")
 }
 
+fn settings_file() -> PathBuf {
+    store_dir().join("settings.json")
+}
+
+/// 应用设置。所有字段都有默认值，方便版本升级时兼容旧文件。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Settings {
+    pub font_size: u32,
+    pub default_shell: String,
+    pub record_history: bool,
+    pub tmux_default: bool,
+    pub theme: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            font_size: 13,
+            default_shell: "powershell".into(),
+            record_history: true,
+            tmux_default: true,
+            theme: "dark".into(),
+        }
+    }
+}
+
+pub fn load_settings() -> Settings {
+    let Ok(text) = fs::read_to_string(settings_file()) else {
+        return Settings::default();
+    };
+    serde_json::from_str::<Settings>(&text).unwrap_or_default()
+}
+
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    let dir = store_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let text = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化失败: {e}"))?;
+    fs::write(settings_file(), text).map_err(|e| format!("写入设置失败: {e}"))
+}
+
 /// 一条会话历史：记录「用哪个配置、附加了哪个 tmux 会话、什么时候用过」。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
