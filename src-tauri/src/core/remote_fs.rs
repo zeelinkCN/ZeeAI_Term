@@ -16,7 +16,7 @@ pub struct RemoteListing {
 }
 
 /// 单引号包裹，避免路径里的空格/特殊字符被 shell 解释。
-fn sq(s: &str) -> String {
+pub fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -36,6 +36,29 @@ pub fn list_remote_command(path: Option<&str>) -> String {
 pub fn read_remote_command(path: &str, max_bytes: u64) -> String {
     let p = sq(path);
     format!("if [ -f {p} ]; then head -c {max_bytes} {p} | base64 -w 0; fi")
+}
+
+/// 新建目录（已存在也不报错）。
+pub fn mkdir_remote_command(path: &str) -> String {
+    format!("mkdir -p {} && echo OK", sq(path))
+}
+
+/// 删除文件或目录（递归）。
+pub fn remove_remote_command(path: &str) -> String {
+    format!("rm -rf {} && echo OK", sq(path))
+}
+
+/// 重命名 / 移动。
+pub fn rename_remote_command(from: &str, to: &str) -> String {
+    format!("mv -f {} {} && echo OK", sq(from), sq(to))
+}
+
+/// 看看目标存在不存在、是文件还是目录（上传/下载前后确认用）。
+pub fn stat_remote_command(path: &str) -> String {
+    format!(
+        "if [ -e {p} ]; then if [ -d {p} ]; then echo dir; else echo file; fi; else echo missing; fi",
+        p = sq(path)
+    )
 }
 
 pub fn parse_listing(output: &str) -> RemoteListing {

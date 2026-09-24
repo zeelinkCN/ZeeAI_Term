@@ -14,6 +14,7 @@ pub fn run() {
         .level(log::LevelFilter::Info)
         .build(),
     )
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       // 系统托盘：配合「关闭时收进托盘」使用，也能快速唤回窗口
       {
@@ -116,6 +117,109 @@ pub fn run() {
                 Ok(list) => log::info!("SELFTEST: serial_list ok -> {} ports", list.len()),
                 Err(e) => log::error!("SELFTEST: serial_list failed -> {e}"),
               }
+              // 真机串口验证：ZEEAI_SELFTEST_SERIAL=COM5 指定端口（默认自动挑一个非蓝牙口），
+              // 打开读 4 秒，看能不能真收到设备发出来的数据。
+              {
+                let wanted = std::env::var("ZEEAI_SELFTEST_SERIAL").unwrap_or_default();
+                let ports = crate::core::serial::list().unwrap_or_default();
+                let pick = if !wanted.trim().is_empty() {
+                  ports.iter().find(|p| p.path.eq_ignore_ascii_case(wanted.trim()))
+                } else {
+                  ports
+                    .iter()
+                    .find(|p| !p.label.contains("蓝牙"))
+                    .or_else(|| ports.first())
+                };
+                match pick {
+                  Some(p) => match crate::core::serial::probe(&p.path, 115200, 4000) {
+                    Ok((n, preview)) => log::info!(
+                      "SELFTEST: serial_probe {} ({}) ok -> {} bytes | {}",
+                      p.path,
+                      p.label,
+                      n,
+                      preview
+                    ),
+                    Err(e) => log::error!("SELFTEST: serial_probe {} failed -> {e}", p.path),
+                  },
+                  None => log::warn!("SELFTEST: no serial port to probe"),
+                }
+              }
+              // M3 文件传输链路：新建目录 → 上传 → 列目录 → 下载回来比对 → 改名 → 删除
+              {
+                let pid = profile.id.clone();
+                let remote_dir = "/tmp/zeeai-selftest".to_string();
+                let local_up = std::env::temp_dir().join("zeeai-selftest-up.txt");
+                let local_down_dir = std::env::temp_dir().join("zeeai-selftest-dl");
+                let payload = b"zeeai transfer selftest\n";
+                let _ = std::fs::create_dir_all(&local_down_dir);
+                let _ = std::fs::write(&local_up, payload);
+                let _ = std::fs::remove_file(local_down_dir.join("zeeai-selftest-up.txt"));
+
+                match crate::commands::fs_mkdir(pid.clone(), remote_dir.clone(), None).await {
+                  Ok(()) => log::info!("SELFTEST: fs_mkdir ok -> {remote_dir}"),
+                  Err(e) => log::error!("SELFTEST: fs_mkdir failed -> {e}"),
+                }
+                match crate::commands::fs_upload(
+                  pid.clone(),
+                  vec![local_up.to_string_lossy().to_string()],
+                  remote_dir.clone(),
+                  None,
+                )
+                .await
+                {
+                  Ok(msg) => log::info!("SELFTEST: fs_upload ok -> {msg}"),
+                  Err(e) => log::error!("SELFTEST: fs_upload failed -> {e}"),
+                }
+                let remote_file = format!("{remote_dir}/zeeai-selftest-up.txt");
+                match crate::commands::fs_list(pid.clone(), Some(remote_dir.clone()), None).await {
+                  Ok(listing) => log::info!(
+                    "SELFTEST: fs_upload verify -> {} entries ({})",
+                    listing.entries.len(),
+                    listing
+                      .entries
+                      .iter()
+                      .map(|e| e.name.clone())
+                      .collect::<Vec<_>>()
+                      .join(",")
+                  ),
+                  Err(e) => log::error!("SELFTEST: fs_upload verify failed -> {e}"),
+                }
+                match crate::commands::fs_download(
+                  pid.clone(),
+                  vec![remote_file.clone()],
+                  local_down_dir.to_string_lossy().to_string(),
+                  None,
+                )
+                .await
+                {
+                  Ok(msg) => {
+                    let got = std::fs::read(local_down_dir.join("zeeai-selftest-up.txt"))
+                      .unwrap_or_default();
+                    log::info!(
+                      "SELFTEST: fs_download ok -> {msg} (roundtrip match = {})",
+                      got == payload
+                    );
+                  }
+                  Err(e) => log::error!("SELFTEST: fs_download failed -> {e}"),
+                }
+                match crate::commands::fs_rename(
+                  pid.clone(),
+                  remote_file.clone(),
+                  format!("{remote_dir}/renamed.txt"),
+                  None,
+                )
+                .await
+                {
+                  Ok(()) => log::info!("SELFTEST: fs_rename ok"),
+                  Err(e) => log::error!("SELFTEST: fs_rename failed -> {e}"),
+                }
+                match crate::commands::fs_remove(pid.clone(), remote_dir.clone(), None).await {
+                  Ok(()) => log::info!("SELFTEST: fs_remove ok -> {remote_dir}"),
+                  Err(e) => log::error!("SELFTEST: fs_remove failed -> {e}"),
+                }
+                let _ = std::fs::remove_file(&local_up);
+                let _ = std::fs::remove_dir_all(&local_down_dir);
+              }
               let probe_dir = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -152,6 +256,11 @@ pub fn run() {
       commands::tmux_kill,
       commands::fs_list,
       commands::fs_read,
+      commands::fs_upload,
+      commands::fs_download,
+      commands::fs_mkdir,
+      commands::fs_remove,
+      commands::fs_rename,
       commands::history_list,
       commands::history_save,
       commands::history_remove,

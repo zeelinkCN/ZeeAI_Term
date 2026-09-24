@@ -195,6 +195,61 @@ export async function fsRead(
   });
 }
 
+/** 上传本机文件（或整个目录）到远端目录 */
+export async function fsUpload(
+  profileId: string,
+  localPaths: string[],
+  remoteDir: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("fs_upload", {
+    profileId,
+    localPaths,
+    remoteDir,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 把远端文件/目录下载到本机目录 */
+export async function fsDownload(
+  profileId: string,
+  remotePaths: string[],
+  localDir: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("fs_download", {
+    profileId,
+    remotePaths,
+    localDir,
+    userOverride: userOverride ?? null,
+  });
+}
+
+export async function fsMkdir(
+  profileId: string,
+  path: string,
+  userOverride?: string | null,
+): Promise<void> {
+  return invoke("fs_mkdir", { profileId, path, userOverride: userOverride ?? null });
+}
+
+export async function fsRemove(
+  profileId: string,
+  path: string,
+  userOverride?: string | null,
+): Promise<void> {
+  return invoke("fs_remove", { profileId, path, userOverride: userOverride ?? null });
+}
+
+export async function fsRename(
+  profileId: string,
+  from: string,
+  to: string,
+  userOverride?: string | null,
+): Promise<void> {
+  return invoke("fs_rename", { profileId, from, to, userOverride: userOverride ?? null });
+}
+
 export async function sessionWrite(id: string, dataB64: string): Promise<void> {
   return invoke("session_write", { id, dataB64 });
 }

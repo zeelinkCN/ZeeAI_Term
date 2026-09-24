@@ -35,7 +35,9 @@ pub fn list() -> Result<Vec<SerialPortInfo>, String> {
                 }
                 serialport::SerialPortType::BluetoothPort => "蓝牙串口".into(),
                 serialport::SerialPortType::PciPort => "PCI 串口".into(),
-                serialport::SerialPortType::Unknown => "串口设备".into(),
+                serialport::SerialPortType::Unknown => {
+                    "串口（未识别型号，可能是蓝牙或虚拟串口）".into()
+                }
             };
             SerialPortInfo {
                 path: p.port_name,
@@ -43,6 +45,39 @@ pub fn list() -> Result<Vec<SerialPortInfo>, String> {
             }
         })
         .collect())
+}
+
+/// 无人值守自检用：打开串口读一会儿，返回 (收到字节数, 去掉 ANSI 转义的预览)。
+/// 用来验证「接上真实设备时能不能收到数据」，不需要开界面。
+pub fn probe(path: &str, baud: u32, millis: u64) -> Result<(usize, String), String> {
+    let mut port = serialport::new(path, baud)
+        .timeout(Duration::from_millis(50))
+        .open()
+        .map_err(|e| format!("打开串口 {path} 失败: {e}"))?;
+    let start = std::time::Instant::now();
+    let mut total = 0usize;
+    let mut preview: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    while start.elapsed() < Duration::from_millis(millis) {
+        match port.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                total += n;
+                if preview.len() < 260 {
+                    let take = (260 - preview.len()).min(n);
+                    preview.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&preview)
+        .replace('\u{1b}', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok((total, text))
 }
 
 /// 打开串口并把它桥接成一个终端会话（原始字节流 ↔ xterm）。

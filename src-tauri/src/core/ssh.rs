@@ -14,6 +14,63 @@ pub fn ssh_exe() -> String {
     "ssh".to_string()
 }
 
+/// 找到系统自带的 scp（文件上传/下载用，和 ssh 同一个目录）。
+pub fn scp_exe() -> String {
+    let candidates = [
+        r"C:\Windows\System32\OpenSSH\scp.exe",
+        r"C:\Program Files\Git\usr\bin\scp.exe",
+    ];
+    for c in candidates {
+        if Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+    "scp".to_string()
+}
+
+/// 组装 scp 参数。注意 scp 的端口是 `-P`（大写），和 ssh 的 `-p` 不一样。
+/// Windows 自带的是 OpenSSH 8.1，走的还是老 SCP 协议，远端路径会被远端 shell 解释，
+/// 所以调用方必须把远端路径用单引号包好（见 remote_fs::sq）。
+pub fn scp_args(
+    port: u16,
+    key_path: Option<&str>,
+    recursive: bool,
+    source: &str,
+    target: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-q".into(),
+        // -T：关掉「收到的文件名必须和请求的一致」这个检查。
+        // 我们为了支持带空格/特殊字符的路径会给远端路径加单引号，
+        // 本地 scp 会把这串字面量当成请求名去比对，于是下载必然报
+        // "protocol error: filename does not match request"。加 -T 即可。
+        "-T".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-P".into(),
+        port.to_string(),
+    ];
+    if recursive {
+        args.push("-r".into());
+    }
+    if let Some(k) = key_path {
+        if !k.trim().is_empty() {
+            args.push("-i".into());
+            args.push(k.to_string());
+        }
+    }
+    args.push(source.to_string());
+    args.push(target.to_string());
+    args
+}
+
+/// scp 的远端路径写法：`user@host:'/绝对/路径'`（单引号给远端 shell 用）。
+pub fn scp_remote(host: &str, user: &str, remote_path: &str) -> String {
+    format!("{user}@{host}:{}", crate::core::remote_fs::sq(remote_path))
+}
+
 /// 组装 ssh 命令行。复用用户本机已经配好的密钥/agent/config，
 /// 因此不在这里处理密码认证（交给 ssh 自己在终端里提示）。
 pub fn ssh_args(

@@ -392,6 +392,33 @@ async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
     run_capture(std::path::Path::new(&exe), args).await
 }
 
+/// 跑一次 scp，失败时把 stderr 原样带出来（方便前端显示为什么没传上去）。
+async fn run_scp(args: &[String]) -> Result<(), String> {
+    let exe = ssh::scp_exe();
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("启动 scp 失败（本机需要 OpenSSH 客户端）: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let mut msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if msg.is_empty() {
+        msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    }
+    if msg.is_empty() {
+        msg = format!("scp 退出码 {:?}", out.status.code());
+    }
+    Err(msg)
+}
+
 /// 跑一个外部命令并拿到输出（隐藏控制台窗口）。
 async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(program);
@@ -580,6 +607,174 @@ pub async fn fs_read(
     );
     let out = run_ssh_capture(&args).await?;
     Ok(out.trim().to_string())
+}
+
+// ---------- 远端文件写操作（上传 / 下载 / 新建目录 / 重命名 / 删除） ----------
+
+/// 上传本地文件（或整个目录）到远端某个目录。返回一句人话结果。
+#[tauri::command]
+pub async fn fs_upload(
+    profile_id: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    log::info!("ipc: fs_upload -> {} items to {}", local_paths.len(), remote_dir);
+    if local_paths.is_empty() {
+        return Err("没有选择要上传的文件".into());
+    }
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let dir = remote_dir.trim_end_matches('/').to_string();
+    let dir = if dir.is_empty() { "/".to_string() } else { dir };
+
+    let mut done = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for lp in &local_paths {
+        let p = std::path::Path::new(lp);
+        if !p.exists() {
+            failed.push(format!("{lp}: 本地不存在"));
+            continue;
+        }
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            failed.push(format!("{lp}: 无法识别文件名"));
+            continue;
+        };
+        let remote_path = if dir == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir}/{name}")
+        };
+        let target = ssh::scp_remote(&cfg.host, &cfg.user, &remote_path);
+        let args = ssh::scp_args(
+            cfg.port,
+            cfg.key_path.as_deref(),
+            p.is_dir(),
+            lp,
+            &target,
+        );
+        match run_scp(&args).await {
+            Ok(()) => done += 1,
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+    }
+
+    if failed.is_empty() {
+        Ok(format!("已上传 {done} 项到 {dir}"))
+    } else if done == 0 {
+        Err(format!("上传失败：{}", failed.join("；")))
+    } else {
+        Ok(format!(
+            "已上传 {done} 项，{} 项失败：{}",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
+}
+
+/// 把远端文件/目录下载到本地某个目录。
+#[tauri::command]
+pub async fn fs_download(
+    profile_id: String,
+    remote_paths: Vec<String>,
+    local_dir: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    log::info!("ipc: fs_download -> {} items to {}", remote_paths.len(), local_dir);
+    if remote_paths.is_empty() {
+        return Err("没有选择要下载的文件".into());
+    }
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    if !std::path::Path::new(&local_dir).is_dir() {
+        return Err(format!("本地目录不存在: {local_dir}"));
+    }
+
+    let mut done = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for rp in &remote_paths {
+        // 远端是文件还是目录得先问一下，决定要不要 -r
+        let stat_args = ssh::ssh_exec_args(
+            &cfg.host,
+            cfg.port,
+            &cfg.user,
+            cfg.key_path.as_deref(),
+            &remote_fs::stat_remote_command(rp),
+        );
+        let kind = run_ssh_capture(&stat_args).await.unwrap_or_default();
+        if kind.trim() == "missing" {
+            failed.push(format!("{rp}: 远端不存在"));
+            continue;
+        }
+        let recursive = kind.trim() == "dir";
+        let source = ssh::scp_remote(&cfg.host, &cfg.user, rp);
+        let args = ssh::scp_args(cfg.port, cfg.key_path.as_deref(), recursive, &source, &local_dir);
+        match run_scp(&args).await {
+            Ok(()) => done += 1,
+            Err(e) => failed.push(format!("{rp}: {e}")),
+        }
+    }
+
+    if failed.is_empty() {
+        Ok(format!("已下载 {done} 项到 {local_dir}"))
+    } else if done == 0 {
+        Err(format!("下载失败：{}", failed.join("；")))
+    } else {
+        Ok(format!(
+            "已下载 {done} 项，{} 项失败：{}",
+            failed.len(),
+            failed.join("；")
+        ))
+    }
+}
+
+/// 跑一条「改远端文件系统」的一次性 ssh 命令，必须看到 OK 才算成功。
+async fn run_remote_op(cfg: &store::SshConfig, remote_command: &str) -> Result<(), String> {
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        remote_command,
+    );
+    let out = run_ssh_capture(&args).await?;
+    if out.contains("OK") {
+        Ok(())
+    } else {
+        Err(out.trim().to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn fs_mkdir(
+    profile_id: String,
+    path: String,
+    user_override: Option<String>,
+) -> Result<(), String> {
+    log::info!("ipc: fs_mkdir path={path}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    run_remote_op(&cfg, &remote_fs::mkdir_remote_command(&path)).await
+}
+
+#[tauri::command]
+pub async fn fs_remove(
+    profile_id: String,
+    path: String,
+    user_override: Option<String>,
+) -> Result<(), String> {
+    log::info!("ipc: fs_remove path={path}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    run_remote_op(&cfg, &remote_fs::remove_remote_command(&path)).await
+}
+
+#[tauri::command]
+pub async fn fs_rename(
+    profile_id: String,
+    from: String,
+    to: String,
+    user_override: Option<String>,
+) -> Result<(), String> {
+    log::info!("ipc: fs_rename from={from} to={to}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    run_remote_op(&cfg, &remote_fs::rename_remote_command(&from, &to)).await
 }
 
 // ---------- 会话历史 ----------

@@ -598,6 +598,21 @@ body {
   flex-shrink: 0;
 }
 
+.menu-head {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+  max-width: 220px;
+}
+
+.mini-btn:disabled,
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .mini-btn.danger {
   color: #ff8a8a;
   border-color: rgba(255, 138, 138, 0.4);
@@ -833,6 +848,8 @@ body {
   font: inherit;
   font-size: 11px;
   padding: 1px 6px;
+  white-space: nowrap;
+  flex: 0 0 auto;
   cursor: pointer;
 }
 
@@ -865,6 +882,7 @@ body {
 
 .fs-toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   padding: 2px 8px 6px;
 }

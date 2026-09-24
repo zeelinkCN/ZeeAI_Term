@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
@@ -14,6 +15,11 @@ import {
   deleteProfile,
   fsList,
   fsRead,
+  fsUpload,
+  fsDownload,
+  fsMkdir,
+  fsRemove,
+  fsRename,
   historyList,
   historyRemove,
   historySave,
@@ -312,11 +318,32 @@ export default function App() {
   const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
   const [fsLoading, setFsLoading] = useState(false);
+  const [fsBusy, setFsBusy] = useState(false);
+  const [fsMenu, setFsMenu] = useState<{
+    profileId: string;
+    name: string;
+    isDir: boolean;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [nameDialog, setNameDialog] = useState<{
+    mode: "mkdir" | "rename";
+    profileId: string;
+    dir: string;
+    from: string;
+    value: string;
+  } | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    onOk: () => void;
+  } | null>(null);
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
   fsPathRef.current = fsPath;
   const sessionsRef = useRef<OpenSession[]>(sessions);
   sessionsRef.current = sessions;
+  const serialPortsRef = useRef<SerialPortInfo[]>([]);
   // 远程文件浏览器属于「当前会话」，所以读目录/读文件也要用当前会话实际登录的用户
   const activeUserRef = useRef<string | undefined>(undefined);
   const reconnectTimers = useRef<Record<string, number>>({});
@@ -377,29 +404,38 @@ export default function App() {
         const profile = list.find((p) => p.ssh) ?? list[0];
         if (!profile) return;
         const id = await openSshSession(profile);
-        await new Promise((r) => setTimeout(r, 13000));
+        await new Promise((r) => setTimeout(r, 15000));
         setSideTab("files");
         await loadDir(profile.id, "/tmp/zeeai-demo");
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, 8000));
         await openRemoteFile(profile.id, "README-demo.md", id);
-        await new Promise((r) => setTimeout(r, 7000));
+        await new Promise((r) => setTimeout(r, 10000));
         await openRemoteFile(profile.id, "demo.html", id);
-        await new Promise((r) => setTimeout(r, 7000));
+        await new Promise((r) => setTimeout(r, 10000));
         // 顺便把 ADB 面板、菜单、设置界面都展示一遍，便于无人值守截图验证
         setModule("adb");
-        await new Promise((r) => setTimeout(r, 9000));
+        await new Promise((r) => setTimeout(r, 12000));
         setModule("serial");
-        await new Promise((r) => setTimeout(r, 8000));
+        await new Promise((r) => setTimeout(r, 14000));
+        // 接上一块真实开发板（比如 ESP32）时，把串口日志也开一个终端，
+        // 截图里就能看到真实设备输出的启动日志。
+        const sp =
+          serialPortsRef.current.find((p) => /usb|ch3|cp21|ftdi|silicon/i.test(p.label)) ??
+          serialPortsRef.current.find((p) => !/蓝牙|bluetooth/i.test(p.label));
+        if (sp) {
+          await openSerialSession(sp.path);
+          await new Promise((r) => setTimeout(r, 14000));
+        }
         setModule("remote");
         setSideTab("sessions");
         openNewSessionDialog(profile);
-        await new Promise((r) => setTimeout(r, 14000));
+        await new Promise((r) => setTimeout(r, 16000));
         setNewDialog(null);
         setShowServers(true);
-        await new Promise((r) => setTimeout(r, 12000));
+        await new Promise((r) => setTimeout(r, 16000));
         setShowServers(false);
         setShowSettings(true);
-        await new Promise((r) => setTimeout(r, 12000));
+        await new Promise((r) => setTimeout(r, 16000));
       })();
     }).then((f) => {
       unlisten = f;
@@ -419,6 +455,7 @@ export default function App() {
   const fileProfileId = activeSession?.profileId ?? null;
   const fileProfile = profiles.find((p) => p.id === fileProfileId) ?? null;
   activeUserRef.current = activeSession?.user;
+  serialPortsRef.current = serialPorts;
 
   useEffect(() => {
     if (!fileProfileId) {
@@ -1167,6 +1204,55 @@ export default function App() {
     setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, activeTab: tab } : s)));
   }
 
+  /** 上传本机文件/文件夹到当前远端目录 */
+  async function uploadToRemote(profileId: string) {
+    const picked = await openLocalDialog({
+      multiple: true,
+      title: "选择要上传到服务器的文件（可多选；选中的文件夹会整个上传）",
+    });
+    if (!picked) return;
+    const localPaths = Array.isArray(picked) ? picked : [picked];
+    if (localPaths.length === 0) return;
+    setFsBusy(true);
+    try {
+      const msg = await fsUpload(
+        profileId,
+        localPaths,
+        fsPathRef.current,
+        activeUserRef.current ?? null,
+      );
+      setToast(msg);
+      await loadDir(profileId, fsPathRef.current);
+    } catch (e) {
+      setToast("上传失败：" + String(e));
+    } finally {
+      setFsBusy(false);
+    }
+  }
+
+  /** 把远端某个文件/目录下载到本机目录 */
+  async function downloadFromRemote(profileId: string, name: string) {
+    const dir = await openLocalDialog({
+      directory: true,
+      title: `选择保存「${name}」的本机目录`,
+    });
+    if (!dir || Array.isArray(dir)) return;
+    setFsBusy(true);
+    try {
+      const msg = await fsDownload(
+        profileId,
+        [joinPath(fsPath, name)],
+        dir,
+        activeUserRef.current ?? null,
+      );
+      setToast(msg);
+    } catch (e) {
+      setToast("下载失败：" + String(e));
+    } finally {
+      setFsBusy(false);
+    }
+  }
+
   function closeFile(sessionId: string, name: string) {
     setSessions((prev) =>
       prev.map((s) => {
@@ -1176,6 +1262,51 @@ export default function App() {
         return { ...s, openFiles, activeTab };
       }),
     );
+  }
+
+  /** 新建远端文件夹 / 重命名，共用一个输入弹窗 */
+  async function confirmNameDialog() {
+    if (!nameDialog) return;
+    const value = nameDialog.value.trim();
+    if (!value) {
+      setToast("名字不能为空");
+      return;
+    }
+    const dir = nameDialog.dir;
+    setFsBusy(true);
+    try {
+      if (nameDialog.mode === "mkdir") {
+        await fsMkdir(nameDialog.profileId, joinPath(dir, value), activeUserRef.current ?? null);
+        setToast(`已新建 ${value}`);
+      } else {
+        await fsRename(
+          nameDialog.profileId,
+          joinPath(dir, nameDialog.from),
+          joinPath(dir, value),
+          activeUserRef.current ?? null,
+        );
+        setToast(`已重命名为 ${value}`);
+      }
+      setNameDialog(null);
+      await loadDir(nameDialog.profileId, dir);
+    } catch (e) {
+      setToast("操作失败：" + String(e));
+    } finally {
+      setFsBusy(false);
+    }
+  }
+
+  async function doRemoveRemote(profileId: string, name: string) {
+    setFsBusy(true);
+    try {
+      await fsRemove(profileId, joinPath(fsPath, name), activeUserRef.current ?? null);
+      setToast(`已删除 ${name}`);
+      await loadDir(profileId, fsPath);
+    } catch (e) {
+      setToast("删除失败：" + String(e));
+    } finally {
+      setFsBusy(false);
+    }
   }
 
   const grouped = useMemo(() => {
@@ -1558,6 +1689,32 @@ export default function App() {
                       >
                         家目录
                       </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={fsBusy}
+                        title="把本机文件上传到当前目录"
+                        onClick={() => void uploadToRemote(fileProfile.id)}
+                      >
+                        上传
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={fsBusy}
+                        title="在当前目录新建文件夹"
+                        onClick={() =>
+                          setNameDialog({
+                            mode: "mkdir",
+                            profileId: fileProfile.id,
+                            dir: fsPath,
+                            from: "",
+                            value: "新建文件夹",
+                          })
+                        }
+                      >
+                        新建文件夹
+                      </button>
                     </div>
                     <input
                       className="fs-path-input"
@@ -1581,11 +1738,42 @@ export default function App() {
                               ? void loadDir(fileProfile.id, joinPath(fsPath, en.name))
                               : void openRemoteFile(fileProfile.id, en.name)
                           }
-                          title={en.isDir ? "进入目录" : "预览文件"}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setFsMenu({
+                              profileId: fileProfile.id,
+                              name: en.name,
+                              isDir: en.isDir,
+                              x: e.clientX,
+                              y: e.clientY,
+                            });
+                          }}
+                          title={
+                            (en.isDir ? "进入目录" : "预览文件") +
+                            "　（右键：下载 / 重命名 / 删除）"
+                          }
                         >
                           {en.isDir ? <IconFolder size={15} /> : <IconFile size={15} />}
                           <span className="grow">{en.name}</span>
                           <span className="dim">{en.isDir ? "" : humanSize(en.size)}</span>
+                          <button
+                            type="button"
+                            className="mini-x"
+                            title="下载 / 重命名 / 删除"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const r = (e.target as HTMLElement).getBoundingClientRect();
+                              setFsMenu({
+                                profileId: fileProfile.id,
+                                name: en.name,
+                                isDir: en.isDir,
+                                x: r.left - 150,
+                                y: r.bottom + 4,
+                              });
+                            }}
+                          >
+                            ⋯
+                          </button>
                         </div>
                       ))}
                       {!fsLoading && fsEntries.length === 0 && (
@@ -1879,6 +2067,159 @@ export default function App() {
       )}
 
       {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
+
+      {fsMenu && (
+        <div
+          className="ctx-backdrop"
+          onClick={() => setFsMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setFsMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(Math.max(0, fsMenu.x), Math.max(0, window.innerWidth - 210)),
+              top: Math.min(Math.max(0, fsMenu.y), Math.max(0, window.innerHeight - 190)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="menu-head ellipsis" title={fsMenu.name}>
+              {fsMenu.name}
+            </div>
+            {!fsMenu.isDir && (
+              <button
+                type="button"
+                className="menu-item"
+                onClick={() => {
+                  const m = fsMenu;
+                  setFsMenu(null);
+                  void openRemoteFile(m.profileId, m.name);
+                }}
+              >
+                打开预览
+              </button>
+            )}
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const m = fsMenu;
+                setFsMenu(null);
+                void downloadFromRemote(m.profileId, m.name);
+              }}
+            >
+              下载到本机…
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const m = fsMenu;
+                setFsMenu(null);
+                setNameDialog({
+                  mode: "rename",
+                  profileId: m.profileId,
+                  dir: fsPath,
+                  from: m.name,
+                  value: m.name,
+                });
+              }}
+            >
+              重命名…
+            </button>
+            <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const m = fsMenu;
+                setFsMenu(null);
+                setConfirmDialog({
+                  title: m.isDir ? "删除目录" : "删除文件",
+                  message:
+                    `确定要删除服务器上的 ${joinPath(fsPath, m.name)} 吗？` +
+                    (m.isDir ? "目录会被递归删除。" : "") +
+                    "此操作不可撤销。",
+                  onOk: () => void doRemoveRemote(m.profileId, m.name),
+                });
+              }}
+            >
+              删除（不可撤销）
+            </button>
+          </div>
+        </div>
+      )}
+
+      {nameDialog && (
+        <div className="modal-backdrop" onClick={() => setNameDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              {nameDialog.mode === "mkdir" ? "新建文件夹" : "重命名"}
+            </div>
+            <div className="modal-body">
+              <label className="modal-field">
+                {nameDialog.mode === "mkdir" ? "文件夹名" : "新名字"}
+                <input
+                  autoFocus
+                  value={nameDialog.value}
+                  onChange={(e) => setNameDialog({ ...nameDialog, value: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void confirmNameDialog();
+                    if (e.key === "Escape") setNameDialog(null);
+                  }}
+                />
+              </label>
+              <div className="hint" style={{ padding: "0 14px" }}>
+                位置：{nameDialog.dir || "/"}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setNameDialog(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                disabled={fsBusy}
+                onClick={() => void confirmNameDialog()}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDialog && (
+        <div className="modal-backdrop" onClick={() => setConfirmDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">{confirmDialog.title}</div>
+            <div className="modal-body">
+              <div className="hint" style={{ padding: "0 14px" }}>
+                {confirmDialog.message}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setConfirmDialog(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => {
+                  const fn = confirmDialog.onOk;
+                  setConfirmDialog(null);
+                  fn();
+                }}
+              >
+                确定删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {ctxMenu && (
         <div
