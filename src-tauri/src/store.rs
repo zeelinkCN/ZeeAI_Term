@@ -11,6 +11,10 @@ pub struct SshConfig {
     pub user: String,
     #[serde(default = "default_auth_kind")]
     pub auth_kind: String,
+    /// true = 允许 ssh 在终端里提示输入密码（BatchMode 关闭）；
+    /// false = 只用密钥/agent，连不上就直接报错，避免卡在密码提示。
+    #[serde(default)]
+    pub allow_password: bool,
     #[serde(default)]
     pub key_path: Option<String>,
     #[serde(default = "default_true")]
@@ -98,6 +102,8 @@ pub struct Settings {
     pub close_action: String,
     /// 更新检查地址（返回 JSON，含 tag_name 或 version 字段）；留空表示未配置
     pub update_url: String,
+    /// SSH 会话意外断开时是否自动重连（并重新附加 tmux）
+    pub auto_reconnect: bool,
 }
 
 impl Default for Settings {
@@ -110,6 +116,7 @@ impl Default for Settings {
             theme: "dark".into(),
             close_action: "exit".into(),
             update_url: String::new(),
+            auto_reconnect: true,
         }
     }
 }
@@ -198,6 +205,7 @@ fn seed() -> Vec<ConnectionProfile> {
             port: 22,
             user: "root".into(),
             auth_kind: "key".into(),
+            allow_password: false,
             key_path: None,
             tmux_enabled: true,
             tmux_template: "{host}-{user}".into(),

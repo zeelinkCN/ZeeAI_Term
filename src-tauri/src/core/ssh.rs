@@ -22,6 +22,7 @@ pub fn ssh_args(
     user: &str,
     key_path: Option<&str>,
     remote_cmd: Option<&str>,
+    batch_mode: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-tt".into(),
@@ -34,6 +35,10 @@ pub fn ssh_args(
         "-p".into(),
         port.to_string(),
     ];
+    if batch_mode {
+        args.push("-o".into());
+        args.push("BatchMode=yes".into());
+    }
     if let Some(k) = key_path {
         if !k.trim().is_empty() {
             args.push("-i".into());

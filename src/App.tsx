@@ -10,6 +10,7 @@ import {
   adbVersion,
   fastbootDevices,
   fastbootVersion,
+  gitStatus,
   deleteProfile,
   fsList,
   fsRead,
@@ -35,6 +36,7 @@ import type {
   AdbDevice,
   AppSettings,
   ConnectionProfile,
+  GitStatus,
   HistoryEntry,
   RemoteEntry,
   SerialPortInfo,
@@ -77,6 +79,8 @@ interface OpenSession {
   title: string;
   kind: ModuleKey;
   profileId?: string;
+  /** 该会话实际登录的用户名（可能来自新建会话时的临时覆盖） */
+  user?: string;
   tmuxName?: string;
   tmuxMode?: "default" | "none" | "name";
   state: SessionState;
@@ -127,6 +131,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark",
   closeAction: "exit",
   updateUrl: "",
+  autoReconnect: true,
 };
 
 const APP_VERSION = "0.1.0";
@@ -276,6 +281,8 @@ export default function App() {
     tmuxKind: "new" | "attach";
     tmuxName: string;
     attachTarget: string;
+    user: string;
+    rememberUser: boolean;
   } | null>(null);
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
@@ -283,6 +290,10 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [showSettings, setShowSettings] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showServers, setShowServers] = useState(false);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // 在「新建会话」弹窗里点「＋ 新建服务器」时，保存后要回到新建会话弹窗
+  const [reopenNewAfterSave, setReopenNewAfterSave] = useState(false);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
   const [updateMsg, setUpdateMsg] = useState("");
@@ -304,6 +315,16 @@ export default function App() {
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
   fsPathRef.current = fsPath;
+  const sessionsRef = useRef<OpenSession[]>(sessions);
+  sessionsRef.current = sessions;
+  // 远程文件浏览器属于「当前会话」，所以读目录/读文件也要用当前会话实际登录的用户
+  const activeUserRef = useRef<string | undefined>(undefined);
+  const reconnectTimers = useRef<Record<string, number>>({});
+  const reconnectTries = useRef<Record<string, number>>({});
+
+  const [gitPath, setGitPath] = useState("");
+  const [gitState, setGitState] = useState<GitStatus | null>(null);
+  const [gitLoading, setGitLoading] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -363,16 +384,22 @@ export default function App() {
         await openRemoteFile(profile.id, "README-demo.md", id);
         await new Promise((r) => setTimeout(r, 7000));
         await openRemoteFile(profile.id, "demo.html", id);
-        await new Promise((r) => setTimeout(r, 6000));
+        await new Promise((r) => setTimeout(r, 7000));
         // 顺便把 ADB 面板、菜单、设置界面都展示一遍，便于无人值守截图验证
         setModule("adb");
         await new Promise((r) => setTimeout(r, 9000));
         setModule("serial");
-        await new Promise((r) => setTimeout(r, 7000));
-        setOpenMenu("conn");
-        await new Promise((r) => setTimeout(r, 6000));
-        setOpenMenu(null);
+        await new Promise((r) => setTimeout(r, 8000));
+        setModule("remote");
+        setSideTab("sessions");
+        openNewSessionDialog(profile);
+        await new Promise((r) => setTimeout(r, 14000));
+        setNewDialog(null);
+        setShowServers(true);
+        await new Promise((r) => setTimeout(r, 12000));
+        setShowServers(false);
         setShowSettings(true);
+        await new Promise((r) => setTimeout(r, 12000));
       })();
     }).then((f) => {
       unlisten = f;
@@ -391,6 +418,7 @@ export default function App() {
 
   const fileProfileId = activeSession?.profileId ?? null;
   const fileProfile = profiles.find((p) => p.id === fileProfileId) ?? null;
+  activeUserRef.current = activeSession?.user;
 
   useEffect(() => {
     if (!fileProfileId) {
@@ -419,6 +447,7 @@ export default function App() {
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, state: e.state } : s)),
         );
+        if (e.state === "closed") scheduleReconnect(sessionId);
         break;
       case "title":
         setSessions((prev) =>
@@ -460,6 +489,7 @@ export default function App() {
     profile: ConnectionProfile,
     tmuxMode: "default" | "none" | "name" = "default",
     tmuxName?: string | null,
+    userOverride?: string | null,
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
@@ -469,6 +499,7 @@ export default function App() {
       title,
       kind: "remote",
       profileId: profile.id,
+      user: userOverride ?? profile.ssh?.user,
       tmuxName: explicitName ?? undefined,
       tmuxMode,
       state: "connecting",
@@ -482,6 +513,9 @@ export default function App() {
         (e) => handleEvent(id, e),
         tmuxMode,
         tmuxName ?? null,
+        undefined,
+        undefined,
+        userOverride ?? null,
       );
       setSessions((prev) =>
         prev.map((s) =>
@@ -490,6 +524,7 @@ export default function App() {
                 ...s,
                 title: explicitName ? title : info.title || title,
                 tmuxName: info.tmuxSession ?? undefined,
+                user: info.user ?? s.user,
               }
             : s,
         ),
@@ -547,6 +582,9 @@ export default function App() {
         (e) => handleEvent(s.id, e),
         s.tmuxMode ?? "default",
         s.tmuxName ?? null,
+        undefined,
+        undefined,
+        s.user ?? null,
       );
     } catch (e) {
       setToast("重连失败：" + String(e));
@@ -640,6 +678,10 @@ export default function App() {
       await saveProfile(finalProfile);
       setEditDialog(null);
       await refresh();
+      if (reopenNewAfterSave) {
+        setReopenNewAfterSave(false);
+        openNewSessionDialog(finalProfile);
+      }
     } catch (e) {
       setToast("保存失败：" + String(e));
     }
@@ -676,7 +718,7 @@ export default function App() {
   async function refreshTmux(profile: ConnectionProfile) {
     setTmuxLoading(true);
     try {
-      setTmuxSessions(await tmuxList(profile.id));
+      setTmuxSessions(await tmuxList(profile.id, profile.ssh?.user ?? null));
     } catch (e) {
       setToast("读取 tmux 会话失败：" + String(e));
       setTmuxSessions([]);
@@ -687,16 +729,16 @@ export default function App() {
 
   async function killTmux(profile: ConnectionProfile, name: string) {
     try {
-      await tmuxKill(profile.id, name);
+      await tmuxKill(profile.id, name, profile.ssh?.user ?? null);
       await refreshTmux(profile);
     } catch (e) {
       setToast("结束 tmux 会话失败：" + String(e));
     }
   }
 
-  function defaultTmuxName(profile: ConnectionProfile): string {
+  function defaultTmuxName(profile: ConnectionProfile, userOverride?: string): string {
     const host = profile.ssh?.host ?? "";
-    const user = profile.ssh?.user ?? "";
+    const user = userOverride?.trim() || profile.ssh?.user || "";
     const tpl = profile.ssh?.tmuxTemplate || "{host}-{user}";
     return tpl
       .replace("{host}", host)
@@ -704,10 +746,10 @@ export default function App() {
       .replace(/[.:/\\ ]/g, "-");
   }
 
-  async function loadDialogTmux(profileId: string) {
+  async function loadDialogTmux(profileId: string, user?: string) {
     setDialogBusy(true);
     try {
-      setDialogTmux(await tmuxList(profileId));
+      setDialogTmux(await tmuxList(profileId, user ?? null));
     } catch (e) {
       setToast("读取 tmux 会话失败：" + String(e));
       setDialogTmux([]);
@@ -729,8 +771,10 @@ export default function App() {
       tmuxKind: "new",
       tmuxName: defaultTmuxName(target),
       attachTarget: "",
+      user: target.ssh?.user ?? "",
+      rememberUser: true,
     });
-    if (useTmux) void loadDialogTmux(target.id);
+    if (useTmux) void loadDialogTmux(target.id, target.ssh?.user);
   }
 
   async function confirmNewSession() {
@@ -743,13 +787,22 @@ export default function App() {
     }
     setDialogBusy(true);
     try {
+      const wantedUser = newDialog.user.trim();
+      if (wantedUser && wantedUser !== (profile.ssh?.user ?? "") && newDialog.rememberUser) {
+        await saveProfile({
+          ...profile,
+          ssh: { ...(profile.ssh as NonNullable<ConnectionProfile["ssh"]>), user: wantedUser },
+        });
+        await refresh();
+      }
+      const userOverride = wantedUser || null;
       if (!newDialog.useTmux) {
-        await openSshSession(profile, "none");
+        await openSshSession(profile, "none", null, userOverride);
       } else if (newDialog.tmuxKind === "new") {
         const name = newDialog.tmuxName.trim() || defaultTmuxName(profile);
-        await openSshSession(profile, "name", name);
+        await openSshSession(profile, "name", name, userOverride);
       } else {
-        await openSshSession(profile, "name", newDialog.attachTarget);
+        await openSshSession(profile, "name", newDialog.attachTarget, userOverride);
       }
       setNewDialog(null);
     } finally {
@@ -803,6 +856,66 @@ export default function App() {
       setSerialPorts([]);
     } finally {
       setSerialLoading(false);
+    }
+  }
+
+  async function refreshGit() {
+    const path = gitPath.trim();
+    if (!path) {
+      setToast("请先填写仓库路径");
+      return;
+    }
+    setGitLoading(true);
+    try {
+      setGitState(await gitStatus(path));
+    } catch (e) {
+      setToast("读取 Git 状态失败：" + String(e));
+      setGitState(null);
+    } finally {
+      setGitLoading(false);
+    }
+  }
+
+  /** 远程会话意外断开时自动重连（会重新附加 tmux），最多 5 次指数退避。 */
+  function scheduleReconnect(sessionId: string) {
+    const s = sessionsRef.current.find((x) => x.id === sessionId);
+    if (!s || !s.profileId) return;
+    if (!settings.autoReconnect) return;
+    const tries = reconnectTries.current[sessionId] ?? 0;
+    if (tries >= 5) {
+      setToast("自动重连已尝试 5 次，先停下。点标签上的 ↻ 可以手动重试。");
+      return;
+    }
+    reconnectTries.current[sessionId] = tries + 1;
+    const delay = Math.min(3000 * (tries + 1), 15000);
+    setSessions((prev) =>
+      prev.map((x) => (x.id === sessionId ? { ...x, state: "reconnecting" } : x)),
+    );
+    window.clearTimeout(reconnectTimers.current[sessionId]);
+    reconnectTimers.current[sessionId] = window.setTimeout(() => {
+      void doReconnect(sessionId);
+    }, delay);
+  }
+
+  async function doReconnect(sessionId: string) {
+    const s = sessionsRef.current.find((x) => x.id === sessionId);
+    if (!s || !s.profileId) return;
+    try {
+      await sessionClose(sessionId);
+    } catch {
+      /* 已经断开 */
+    }
+    try {
+      await openSsh(
+        sessionId,
+        s.profileId,
+        (e) => handleEvent(sessionId, e),
+        s.tmuxMode ?? "default",
+        s.tmuxName ?? null,
+      );
+      reconnectTries.current[sessionId] = 0;
+    } catch {
+      scheduleReconnect(sessionId);
     }
   }
 
@@ -968,7 +1081,8 @@ export default function App() {
         label: "连接",
         items: [
           { sep: false, label: "新建会话…", action: () => openNewSessionDialog() },
-          { sep: false, label: "新建连接", action: openConnectionForm },
+          { sep: false, label: "新建服务器…", action: openConnectionForm },
+          { sep: false, label: "服务器管理…", action: () => setShowServers(true) },
           { sep: true },
           { sep: false, label: "设置…", action: () => setShowSettings(true) },
         ],
@@ -1006,7 +1120,7 @@ export default function App() {
   async function loadDir(profileId: string, path?: string) {
     setFsLoading(true);
     try {
-      const listing = await fsList(profileId, path);
+      const listing = await fsList(profileId, path, activeUserRef.current ?? null);
       setFsPath(listing.path);
       setFsInput(listing.path);
       setFsEntries(listing.entries);
@@ -1031,7 +1145,7 @@ export default function App() {
     const path = joinPath(fsPathRef.current, name);
     const kind = fileKind(name);
     try {
-      const b64 = await fsRead(profileId, path, 1024 * 1024);
+      const b64 = await fsRead(profileId, path, 1024 * 1024, activeUserRef.current ?? null);
       if (!b64) {
         setToast("文件为空或无法读取（可能是目录或二进制文件）");
         return;
@@ -1300,7 +1414,27 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="tree-group">已保存的服务器</div>
+                <div className="tree-group">
+                  已保存的服务器
+                  <button
+                    type="button"
+                    className="mini-x"
+                    style={{ marginLeft: "auto", opacity: 1 }}
+                    title="新建服务器"
+                    onClick={() => openEditDialog()}
+                  >
+                    ＋
+                  </button>
+                  <button
+                    type="button"
+                    className="mini-x"
+                    style={{ opacity: 1 }}
+                    title="服务器管理（编辑 / 复制 / 删除）"
+                    onClick={() => setShowServers(true)}
+                  >
+                    ⋯
+                  </button>
+                </div>
                 {grouped.length === 0 && (
                   <div className="hint">还没有服务器。点「新建会话」时可以直接新建一台。</div>
                 )}
@@ -1336,11 +1470,26 @@ export default function App() {
                                 ))}
                             </span>
                             <IconServer size={15} />
+                            {p.color && (
+                              <span className="color-dot" style={{ background: p.color }} />
+                            )}
                             <span className="grow ellipsis">{p.name}</span>
                             {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
                             {items.length > 0 && (
                               <span className="dim count">{items.length}</span>
                             )}
+                            <button
+                              type="button"
+                              className="mini-x"
+                              title="服务器管理（编辑 / 复制 / 删除）"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const r = (e.target as HTMLElement).getBoundingClientRect();
+                                setCtxMenu({ profile: p, x: r.left - 170, y: r.bottom + 4 });
+                              }}
+                            >
+                              ⋯
+                            </button>
                           </div>
                           {expanded &&
                             items.map((h) => (
@@ -1457,7 +1606,54 @@ export default function App() {
             {module === "wsl" && (
               <LocalModule label="WSL" onOpen={() => void openLocalSession("wsl")} />
             )}
-            {module === "git" && <div className="hint">Git 面板（M5，尚未实现）。</div>}
+            {module === "git" && (
+              <>
+                <label className="modal-field" style={{ paddingTop: 4 }}>
+                  仓库路径
+                  <input
+                    value={gitPath}
+                    placeholder="D:\AI\ZeeAI_term"
+                    onChange={(e) => setGitPath(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void refreshGit();
+                    }}
+                  />
+                </label>
+                <div className="side-actions">
+                  <button type="button" className="btn" onClick={() => void refreshGit()}>
+                    <IconPlus size={14} /> 刷新状态
+                  </button>
+                </div>
+                {gitLoading && <div className="hint">正在读取…</div>}
+                {!gitLoading && gitState && !gitState.ok && (
+                  <div className="hint">{gitState.message}</div>
+                )}
+                {!gitLoading && gitState?.ok && (
+                  <>
+                    <div className="hint">
+                      分支 {gitState.branch || "(未知)"}
+                      {gitState.upstream ? ` → ${gitState.upstream}` : ""}
+                      {gitState.ahead > 0 ? ` · 领先 ${gitState.ahead}` : ""}
+                      {gitState.behind > 0 ? ` · 落后 ${gitState.behind}` : ""}
+                    </div>
+                    {gitState.files.length === 0 && (
+                      <div className="hint">没有未提交的改动。</div>
+                    )}
+                    {gitState.files.map((f) => (
+                      <div key={f.path} className="tree-item" title={f.path}>
+                        <span className="git-st">{f.status}</span>
+                        <span className="grow ellipsis">{f.path}</span>
+                      </div>
+                    ))}
+                  </>
+                )}
+                {!gitLoading && !gitState && (
+                  <div className="hint">
+                    填一个本地仓库路径（本机需安装 Git），回车或点「刷新状态」查看分支与改动。
+                  </div>
+                )}
+              </>
+            )}
             {module === "serial" && (
               <>
                 <div className="side-actions">
@@ -1762,6 +1958,114 @@ export default function App() {
         </div>
       )}
 
+      {showServers && (
+        <div className="modal-backdrop" onClick={() => setShowServers(false)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">服务器管理</div>
+            <div className="modal-body">
+              <div className="srv-toolbar">
+                <button type="button" className="btn primary" onClick={() => openEditDialog()}>
+                  ＋ 新建服务器
+                </button>
+                <span className="hint">共 {profiles.length} 台</span>
+              </div>
+              {profiles.length === 0 && (
+                <div className="hint" style={{ padding: "0 14px" }}>
+                  还没有服务器，点「＋ 新建服务器」添加第一台。
+                </div>
+              )}
+              {profiles.map((p) => (
+                <div className="srv-row" key={p.id}>
+                  <span
+                    className="color-dot"
+                    style={{ background: p.color ?? "#4f8cff" }}
+                  />
+                  <div className="srv-main">
+                    <div className="srv-name">
+                      <span className="ellipsis">{p.name}</span>
+                      {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
+                    </div>
+                    <div className="srv-meta">
+                      {p.ssh
+                        ? `${p.ssh.user}@${p.ssh.host}:${p.ssh.port}`
+                        : p.type.toUpperCase()}
+                      {p.group ? ` · ${p.group}` : ""}
+                      {p.ssh
+                        ? p.ssh.allowPassword
+                          ? " · 允许输入密码"
+                          : " · 只用密钥/agent"
+                        : ""}
+                    </div>
+                  </div>
+                  <div className="srv-actions">
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="用这台服务器开一个新会话"
+                      onClick={() => {
+                        setShowServers(false);
+                        openNewSessionDialog(p);
+                      }}
+                    >
+                      新建会话
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="编辑名称 / 主机 / 用户 / 密钥 / tmux"
+                      onClick={() => openEditDialog(p)}
+                    >
+                      编辑
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => void duplicateProfile(p)}
+                    >
+                      复制
+                    </button>
+                    {confirmDel === p.id ? (
+                      <>
+                        <button
+                          type="button"
+                          className="mini-btn danger"
+                          onClick={() => {
+                            setConfirmDel(null);
+                            void removeProfile(p);
+                          }}
+                        >
+                          确认删除
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => setConfirmDel(null)}
+                        >
+                          取消
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => setConfirmDel(p.id)}
+                      >
+                        删除
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setShowServers(false)}>
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {editDialog && (
         <div className="modal-backdrop" onClick={() => setEditDialog(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1832,6 +2136,25 @@ export default function App() {
                   onChange={(e) => patchDraft({}, { tmuxEnabled: e.target.checked })}
                 />
                 <span>默认使用 tmux（新建会话时仍可临时改）</span>
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={editDialog.draft.ssh?.allowPassword ?? false}
+                  onChange={(e) => patchDraft({}, { allowPassword: e.target.checked })}
+                />
+                <span>
+                  允许在终端里输入密码（默认关闭：只用密钥/agent，连不上直接报错而不是卡住）
+                </span>
+              </label>
+              <label className="modal-field">
+                标签颜色（可选，显示在服务器名前）
+                <input
+                  type="color"
+                  className="color-input"
+                  value={editDialog.draft.color ?? "#4f8cff"}
+                  onChange={(e) => patchDraft({ color: e.target.value })}
+                />
               </label>
             </div>
             <div className="modal-actions">
@@ -1908,6 +2231,15 @@ export default function App() {
                   onChange={(e) => void updateSettings({ recordHistory: e.target.checked })}
                 />
                 <span>记录会话历史</span>
+              </label>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.autoReconnect}
+                  onChange={(e) => void updateSettings({ autoReconnect: e.target.checked })}
+                />
+                <span>SSH 断开后自动重连（会重新附加 tmux，最多重试 5 次）</span>
               </label>
 
               <label className="modal-field">
@@ -1998,10 +2330,13 @@ export default function App() {
                     setNewDialog({
                       ...newDialog,
                       profileId: e.target.value,
-                      tmuxName: picked ? defaultTmuxName(picked) : newDialog.tmuxName,
+                      tmuxName: picked
+                        ? defaultTmuxName(picked, newDialog.user)
+                        : newDialog.tmuxName,
                       attachTarget: "",
                     });
-                    if (newDialog.useTmux) void loadDialogTmux(e.target.value);
+                    if (newDialog.useTmux)
+                      void loadDialogTmux(e.target.value, newDialog.user);
                   }}
                 >
                   {profiles.map((p) => (
@@ -2017,12 +2352,65 @@ export default function App() {
                   className="mini-btn"
                   onClick={() => {
                     setNewDialog(null);
+                    setReopenNewAfterSave(true);
                     openEditDialog();
                   }}
                 >
                   ＋ 新建服务器
                 </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  style={{ marginLeft: 6 }}
+                  onClick={() => {
+                    const cur = profiles.find((p) => p.id === newDialog.profileId);
+                    setNewDialog(null);
+                    openEditDialog(cur);
+                  }}
+                >
+                  编辑当前服务器
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  style={{ marginLeft: 6 }}
+                  onClick={() => {
+                    setNewDialog(null);
+                    setShowServers(true);
+                  }}
+                >
+                  服务器管理
+                </button>
               </div>
+
+              <label className="modal-field">
+                登录用户
+                <input
+                  value={newDialog.user}
+                  placeholder="例如 root / ubuntu"
+                  onChange={(e) => {
+                    const nextUser = e.target.value;
+                    const picked = profiles.find((x) => x.id === newDialog.profileId);
+                    setNewDialog({
+                      ...newDialog,
+                      user: nextUser,
+                      tmuxName: picked
+                        ? defaultTmuxName(picked, nextUser)
+                        : newDialog.tmuxName,
+                    });
+                  }}
+                />
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={newDialog.rememberUser}
+                  onChange={(e) =>
+                    setNewDialog({ ...newDialog, rememberUser: e.target.checked })
+                  }
+                />
+                <span>把这个用户名保存到该服务器的配置里</span>
+              </label>
 
               <label className="form-check">
                 <input
@@ -2030,7 +2418,8 @@ export default function App() {
                   checked={newDialog.useTmux}
                   onChange={(e) => {
                     setNewDialog({ ...newDialog, useTmux: e.target.checked });
-                    if (e.target.checked) void loadDialogTmux(newDialog.profileId);
+                    if (e.target.checked)
+                      void loadDialogTmux(newDialog.profileId, newDialog.user);
                   }}
                 />
                 <span>使用 tmux（断网后可回到同一个会话）</span>
@@ -2063,7 +2452,7 @@ export default function App() {
                       checked={newDialog.tmuxKind === "attach"}
                       onChange={() => {
                         setNewDialog({ ...newDialog, tmuxKind: "attach" });
-                        void loadDialogTmux(newDialog.profileId);
+                        void loadDialogTmux(newDialog.profileId, newDialog.user);
                       }}
                     />
                     <span>附加到已有 tmux 会话</span>

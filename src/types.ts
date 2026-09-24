@@ -5,6 +5,7 @@ export interface SshConfig {
   port: number;
   user: string;
   authKind: "password" | "key" | "agent";
+  allowPassword?: boolean;
   keyPath?: string;
   tmuxEnabled: boolean;
   tmuxTemplate: string;
@@ -35,6 +36,9 @@ export interface SessionInfo {
   title: string;
   kind: ConnType;
   tmuxSession?: string | null;
+  /** SSH 会话实际使用的登录用户名（可能来自本次会话的临时覆盖） */
+  user?: string | null;
+  host?: string | null;
 }
 
 export type SessionEvent =
@@ -83,6 +87,22 @@ export interface AppSettings {
   theme: string;
   closeAction: "exit" | "tray";
   updateUrl: string;
+  autoReconnect: boolean;
+}
+
+export interface GitFile {
+  status: string;
+  path: string;
+}
+
+export interface GitStatus {
+  ok: boolean;
+  branch: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  files: GitFile[];
+  message: string;
 }
 
 export interface AdbDevice {

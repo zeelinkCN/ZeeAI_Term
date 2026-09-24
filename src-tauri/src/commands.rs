@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::{adb, pty, remote_fs, serial, ssh, tmux, SessionEvent, SessionRegistry};
+use crate::core::{adb, git, pty, remote_fs, serial, ssh, tmux, SessionEvent, SessionRegistry};
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
 #[derive(Serialize)]
@@ -16,6 +16,11 @@ pub struct SessionInfo {
     pub kind: String,
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// SSH 会话实际使用的登录用户名（可能来自本次会话的临时覆盖）
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[tauri::command]
@@ -93,6 +98,8 @@ pub fn open_local(
         title,
         kind: "local".into(),
         tmux_session: None,
+        user: None,
+        host: None,
     })
 }
 
@@ -102,6 +109,7 @@ pub fn open_ssh(
     profile_id: String,
     tmux_mode: Option<String>,
     tmux_name: Option<String>,
+    user_override: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
@@ -122,6 +130,12 @@ pub fn open_ssh(
         .ssh
         .clone()
         .ok_or_else(|| "该配置不是 SSH 类型".to_string())?;
+    // 允许在新建会话时临时改用户名（不改配置也能用别的账号登录）
+    let effective_user = user_override
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| cfg.user.clone());
 
     // "none" = 明确不用 tmux（直接给普通 shell）；"name" = 指定会话名；
     // 其他 = 按配置里的默认策略（开了就用模板名，没开就普通 shell）。
@@ -140,7 +154,7 @@ pub fn open_ssh(
         }
         _ => {
             if cfg.tmux_enabled {
-                let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user);
+                let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &effective_user);
                 resolved_tmux = Some(name.clone());
                 Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
             } else {
@@ -152,9 +166,10 @@ pub fn open_ssh(
     let args = ssh::ssh_args(
         &cfg.host,
         cfg.port,
-        &cfg.user,
+        &effective_user,
         cfg.key_path.as_deref(),
         remote_cmd.as_deref(),
+        !cfg.allow_password,
     );
     let program = ssh::ssh_exe();
     let title = format!("{} · {}", profile.name, cfg.host);
@@ -181,6 +196,8 @@ pub fn open_ssh(
         title,
         kind: "ssh".into(),
         tmux_session: resolved_tmux,
+        user: Some(effective_user),
+        host: Some(cfg.host.clone()),
     })
 }
 
@@ -271,6 +288,8 @@ pub fn open_serial(
         title,
         kind: "serial".into(),
         tmux_session: None,
+        user: None,
+        host: None,
     })
 }
 
@@ -292,6 +311,54 @@ pub async fn fastboot_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevic
     Ok(devices)
 }
 
+// ---------- Git ----------
+
+#[tauri::command]
+pub async fn git_status(path: String) -> Result<git::GitStatus, String> {
+    log::info!("ipc: git_status path={path}");
+    let args = vec![
+        "-C".to_string(),
+        path.clone(),
+        "status".to_string(),
+        "--porcelain=v1".to_string(),
+        "-b".to_string(),
+    ];
+    match run_capture(std::path::Path::new("git"), &args).await {
+        Ok(out) => {
+            let text = out.trim();
+            if text.contains("not a git repository") {
+                return Ok(git::GitStatus {
+                    ok: false,
+                    branch: String::new(),
+                    upstream: String::new(),
+                    ahead: 0,
+                    behind: 0,
+                    files: Vec::new(),
+                    message: "这个目录不是 Git 仓库".into(),
+                });
+            }
+            let mut status = git::parse_status(&out);
+            if status.branch.is_empty() && status.files.is_empty() {
+                status.message = if text.is_empty() {
+                    "仓库干净，没有改动".into()
+                } else {
+                    text.lines().take(3).collect::<Vec<_>>().join(" / ")
+                };
+            }
+            Ok(status)
+        }
+        Err(e) => Ok(git::GitStatus {
+            ok: false,
+            branch: String::new(),
+            upstream: String::new(),
+            ahead: 0,
+            behind: 0,
+            files: Vec::new(),
+            message: format!("执行 git 失败（本机需要安装 Git）: {e}"),
+        }),
+    }
+}
+
 fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {
     let profiles = store::load()?;
     let profile = profiles
@@ -301,6 +368,23 @@ fn ssh_config(profile_id: &str) -> Result<store::SshConfig, String> {
     profile
         .ssh
         .ok_or_else(|| "该配置不是 SSH 类型".to_string())
+}
+
+/// 会话级的用户名覆盖：同一条服务器配置可以用不同账号登录，
+/// 远程文件浏览 / tmux 列表必须跟着这个会话实际用的账号走，否则普通用户
+/// 登录后侧栏还在按配置里的 root 去读文件，权限和家目录都会对不上。
+fn ssh_config_for(
+    profile_id: &str,
+    user_override: Option<String>,
+) -> Result<store::SshConfig, String> {
+    let mut cfg = ssh_config(profile_id)?;
+    if let Some(u) = user_override {
+        let u = u.trim().to_string();
+        if !u.is_empty() {
+            cfg.user = u;
+        }
+    }
+    Ok(cfg)
 }
 
 async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
@@ -404,14 +488,19 @@ pub fn open_adb_shell(
         title,
         kind: "adb".into(),
         tmux_session: None,
+        user: None,
+        host: None,
     })
 }
 
 /// 列出服务器上的 tmux 会话（通过一次性 ssh 命令）。
 #[tauri::command]
-pub async fn tmux_list(profile_id: String) -> Result<Vec<tmux::TmuxSession>, String> {
-    log::info!("ipc: tmux_list profile_id={profile_id}");
-    let cfg = ssh_config(&profile_id)?;
+pub async fn tmux_list(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<Vec<tmux::TmuxSession>, String> {
+    log::info!("ipc: tmux_list profile_id={profile_id} user={user_override:?}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
     let args = ssh::ssh_exec_args(
         &cfg.host,
         cfg.port,
@@ -427,9 +516,13 @@ pub async fn tmux_list(profile_id: String) -> Result<Vec<tmux::TmuxSession>, Str
 
 /// 结束服务器上的某个 tmux 会话。
 #[tauri::command]
-pub async fn tmux_kill(profile_id: String, name: String) -> Result<(), String> {
+pub async fn tmux_kill(
+    profile_id: String,
+    name: String,
+    user_override: Option<String>,
+) -> Result<(), String> {
     log::info!("ipc: tmux_kill profile_id={profile_id} name={name}");
-    let cfg = ssh_config(&profile_id)?;
+    let cfg = ssh_config_for(&profile_id, user_override)?;
     let args = ssh::ssh_exec_args(
         &cfg.host,
         cfg.port,
@@ -446,9 +539,10 @@ pub async fn tmux_kill(profile_id: String, name: String) -> Result<(), String> {
 pub async fn fs_list(
     profile_id: String,
     path: Option<String>,
+    user_override: Option<String>,
 ) -> Result<remote_fs::RemoteListing, String> {
     log::info!("ipc: fs_list profile_id={profile_id} path={path:?}");
-    let cfg = ssh_config(&profile_id)?;
+    let cfg = ssh_config_for(&profile_id, user_override)?;
     let args = ssh::ssh_exec_args(
         &cfg.host,
         cfg.port,
@@ -472,9 +566,10 @@ pub async fn fs_read(
     profile_id: String,
     path: String,
     max_bytes: Option<u64>,
+    user_override: Option<String>,
 ) -> Result<String, String> {
     log::info!("ipc: fs_read profile_id={profile_id} path={path}");
-    let cfg = ssh_config(&profile_id)?;
+    let cfg = ssh_config_for(&profile_id, user_override)?;
     let limit = max_bytes.unwrap_or(512 * 1024);
     let args = ssh::ssh_exec_args(
         &cfg.host,

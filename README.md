@@ -31,11 +31,16 @@ ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 会话列表（已保存服务器 + 会话历史，可逐条删除）、新建会话对话框（可选是否 tmux、新建或附加已有会话）、
 SSH + tmux 持久会话、远程文件浏览与 Markdown/HTML 预览、本地终端（PS/CMD/WSL）、ADB（内置 platform-tools）。
 
-未实现：Git 面板、SSH 自动重连（当前为手动一键重连）。
+服务器管理：独立的「服务器管理」窗口（新建 / 编辑 / 复制 / 删除，删除有二次确认），
+服务器右键菜单；新建会话时可**临时指定登录用户**（不改配置），远程文件与 tmux 会话
+都跟随该会话实际登录的用户；配置里可选「允许在终端里输入密码」。
 
 补充：服务器右键可编辑配置；会话历史按服务器折叠在各自节点下；设置里可选关闭行为（退出/托盘）
 与更新检查；主题支持 VS Code 深/浅、GitHub、微信绿、Teams 紫、Dracula；
-串口已支持枚举与打开，ADB 与 Fastboot 均使用内置 platform-tools。
+串口已支持枚举与打开，ADB 与 Fastboot 均使用内置 platform-tools；Git 面板（分支/上游/改动列表）；
+SSH 断线自动重连（指数退避，可关）。
+
+未实现：SFTP 上传/下载（文件面板目前只读）、密码登录的服务器读远程文件、Git 面板的写操作。
 
 - 技术设计文档：[docs/design.md](docs/design.md)
 - 决策与待确认事项：[docs/decisions.md](docs/decisions.md)

@@ -9,6 +9,7 @@ import type {
   AppSettings,
   AdbDevice,
   SerialPortInfo,
+  GitStatus,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -53,6 +54,7 @@ export async function openSsh(
   tmuxName?: string | null,
   cols?: number,
   rows?: number,
+  userOverride?: string | null,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -61,6 +63,7 @@ export async function openSsh(
     profileId,
     tmuxMode,
     tmuxName: tmuxName ?? null,
+    userOverride: userOverride ?? null,
     cols: cols ?? null,
     rows: rows ?? null,
     onEvent: ch,
@@ -136,24 +139,44 @@ export async function fastbootDevices(): Promise<AdbDevice[]> {
   return invoke<AdbDevice[]>("fastboot_devices");
 }
 
+export async function gitStatus(path: string): Promise<GitStatus> {
+  return invoke<GitStatus>("git_status", { path });
+}
+
 /** 列出服务器上的 tmux 会话 */
-export async function tmuxList(profileId: string): Promise<TmuxSession[]> {
-  return invoke<TmuxSession[]>("tmux_list", { profileId });
+export async function tmuxList(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<TmuxSession[]> {
+  return invoke<TmuxSession[]>("tmux_list", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
 }
 
 /** 结束服务器上的某个 tmux 会话 */
-export async function tmuxKill(profileId: string, name: string): Promise<void> {
-  return invoke("tmux_kill", { profileId, name });
+export async function tmuxKill(
+  profileId: string,
+  name: string,
+  userOverride?: string | null,
+): Promise<void> {
+  return invoke("tmux_kill", {
+    profileId,
+    name,
+    userOverride: userOverride ?? null,
+  });
 }
 
 /** 列出远端目录；path 传 null 表示登录后的家目录 */
 export async function fsList(
   profileId: string,
   path?: string,
+  userOverride?: string | null,
 ): Promise<RemoteListing> {
   return invoke<RemoteListing>("fs_list", {
     profileId,
     path: path ?? null,
+    userOverride: userOverride ?? null,
   });
 }
 
@@ -162,11 +185,13 @@ export async function fsRead(
   profileId: string,
   path: string,
   maxBytes?: number,
+  userOverride?: string | null,
 ): Promise<string> {
   return invoke<string>("fs_read", {
     profileId,
     path,
     maxBytes: maxBytes ?? null,
+    userOverride: userOverride ?? null,
   });
 }
 

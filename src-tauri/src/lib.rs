@@ -60,17 +60,49 @@ pub fn run() {
           match profiles.iter().find(|p| p.ssh.is_some()) {
             Some(profile) => {
               log::info!("SELFTEST: using profile {}", profile.name);
-              match crate::commands::tmux_list(profile.id.clone()).await {
+              match crate::commands::tmux_list(profile.id.clone(), None).await {
                 Ok(list) => log::info!("SELFTEST: tmux_list ok -> {} sessions", list.len()),
                 Err(e) => log::error!("SELFTEST: tmux_list failed -> {e}"),
               }
-              match crate::commands::fs_list(profile.id.clone(), None).await {
+              match crate::commands::fs_list(profile.id.clone(), None, None).await {
                 Ok(listing) => log::info!(
                   "SELFTEST: fs_list ok -> {} entries at {}",
                   listing.entries.len(),
                   listing.path
                 ),
                 Err(e) => log::error!("SELFTEST: fs_list failed -> {e}"),
+              }
+              // 以另一个普通用户登录时，远程文件必须跟着这个用户走（家目录不同）。
+              // 设 ZEEAI_SELFTEST_ALTUSER=zeeai 可验证「选用户登录」这条链路。
+              if let Ok(alt_user) = std::env::var("ZEEAI_SELFTEST_ALTUSER") {
+                if !alt_user.trim().is_empty() {
+                  match crate::commands::fs_list(
+                    profile.id.clone(),
+                    None,
+                    Some(alt_user.clone()),
+                  )
+                  .await
+                  {
+                    Ok(listing) => log::info!(
+                      "SELFTEST: fs_list as {alt_user} ok -> {} entries at {}",
+                      listing.entries.len(),
+                      listing.path
+                    ),
+                    Err(e) => log::error!("SELFTEST: fs_list as {alt_user} failed -> {e}"),
+                  }
+                  match crate::commands::tmux_list(
+                    profile.id.clone(),
+                    Some(alt_user.clone()),
+                  )
+                  .await
+                  {
+                    Ok(list) => log::info!(
+                      "SELFTEST: tmux_list as {alt_user} ok -> {} sessions",
+                      list.len()
+                    ),
+                    Err(e) => log::error!("SELFTEST: tmux_list as {alt_user} failed -> {e}"),
+                  }
+                }
               }
               match crate::commands::adb_devices(handle.clone()).await {
                 Ok(list) => log::info!("SELFTEST: adb_devices ok -> {} devices", list.len()),
@@ -83,6 +115,19 @@ pub fn run() {
               match crate::commands::serial_list() {
                 Ok(list) => log::info!("SELFTEST: serial_list ok -> {} ports", list.len()),
                 Err(e) => log::error!("SELFTEST: serial_list failed -> {e}"),
+              }
+              let probe_dir = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+              match crate::commands::git_status(probe_dir.clone()).await {
+                Ok(s) => log::info!(
+                  "SELFTEST: git_status ok -> ok={} branch={} files={} dir={}",
+                  s.ok,
+                  s.branch,
+                  s.files.len(),
+                  probe_dir
+                ),
+                Err(e) => log::error!("SELFTEST: git_status failed -> {e}"),
               }
             }
             None => log::warn!("SELFTEST: no ssh profile found"),
@@ -119,6 +164,7 @@ pub fn run() {
       commands::open_serial,
       commands::fastboot_version,
       commands::fastboot_devices,
+      commands::git_status,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）
