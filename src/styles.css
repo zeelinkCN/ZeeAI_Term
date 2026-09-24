@@ -861,6 +861,228 @@ body {
   color: var(--muted);
 }
 
+/* ---------- 分屏 ---------- */
+
+.pane-grid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  gap: 1px;
+  background: var(--border);
+}
+
+.pane-grid.v2 {
+  grid-template-columns: 1fr 1fr;
+}
+
+.pane-grid.h2 {
+  grid-template-rows: 1fr 1fr;
+}
+
+.pane-grid.v3 {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.pane-grid.grid4 {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+.pane-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+  border: 2px solid transparent;
+}
+
+.pane-cell.focused {
+  border-color: var(--accent);
+}
+
+.pane-cell-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--titlebar);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.pane-cell.focused .pane-cell-head {
+  color: var(--fg);
+}
+
+.pane-cell-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.pane-empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 12px;
+}
+
+/* ---------- 命令面板（Ctrl+Shift+P） ---------- */
+
+.palette-backdrop {
+  align-items: flex-start;
+  padding-top: 80px;
+}
+
+.palette {
+  width: 560px;
+  max-width: 92vw;
+  background: var(--sidebar);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.palette-input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--titlebar);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.palette-list {
+  max-height: 44vh;
+  overflow: auto;
+  padding: 4px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.palette-item:hover,
+.palette-item.first {
+  background: var(--accent-soft);
+}
+
+/* ---------- 右侧 AI Agent 面板 ---------- */
+
+.ai-panel {
+  width: 268px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar);
+  border-left: 1px solid var(--border);
+  overflow: auto;
+}
+
+.ai-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--titlebar);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.ai-section {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.ai-tool {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-tool-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.ai-tool-meta {
+  margin: 3px 0 5px 14px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.ai-tool-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: 14px;
+}
+
+.ai-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.act-badge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--red);
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.dot.idle {
+  background: var(--muted);
+}
+
 .form-check {
   display: flex;
   align-items: center;

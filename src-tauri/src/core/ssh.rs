@@ -80,6 +80,7 @@ pub fn ssh_args(
     key_path: Option<&str>,
     remote_cmd: Option<&str>,
     batch_mode: bool,
+    jump: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-tt".into(),
@@ -95,6 +96,11 @@ pub fn ssh_args(
     if batch_mode {
         args.push("-o".into());
         args.push("BatchMode=yes".into());
+    }
+    // 跳板机：直接交给 ssh 的 -J，端口转发/认证都由它自己搞定
+    if let Some(j) = jump.map(str::trim).filter(|j| !j.is_empty()) {
+        args.push("-J".into());
+        args.push(j.to_string());
     }
     if let Some(k) = key_path {
         if !k.trim().is_empty() {
@@ -172,6 +178,7 @@ pub fn ssh_exec_args(
     user: &str,
     key_path: Option<&str>,
     remote_command: &str,
+    jump: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-o".into(),
@@ -186,6 +193,10 @@ pub fn ssh_exec_args(
             args.push("-i".into());
             args.push(k.to_string());
         }
+    }
+    if let Some(j) = jump.map(str::trim).filter(|j| !j.is_empty()) {
+        args.push("-J".into());
+        args.push(j.to_string());
     }
     args.push(format!("{user}@{host}"));
     args.push(remote_command.to_string());

@@ -17,6 +17,9 @@ pub struct SshConfig {
     pub allow_password: bool,
     #[serde(default)]
     pub key_path: Option<String>,
+    /// 跳板机，写法与 `ssh -J` 一致：`user@host` 或 `user@host:port`；留空表示直连
+    #[serde(default)]
+    pub jump: Option<String>,
     #[serde(default = "default_true")]
     pub tmux_enabled: bool,
     #[serde(default = "default_tmux_template")]
@@ -261,6 +264,7 @@ fn seed() -> Vec<ConnectionProfile> {
             auth_kind: "key".into(),
             allow_password: false,
             key_path: None,
+            jump: None,
             tmux_enabled: true,
             tmux_template: "{host}-{user}".into(),
             start_dir: None,

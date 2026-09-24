@@ -12,6 +12,8 @@ import type {
   GitStatus,
   GitCommit,
   GitBranch,
+  AdbFile,
+  AiProbe,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -108,16 +110,47 @@ export async function openAdbShell(
   onEvent: (e: SessionEvent) => void,
   cols?: number,
   rows?: number,
+  mode?: "shell" | "logcat",
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
   return invoke<SessionInfo>("open_adb_shell", {
     id,
     serial,
+    mode: mode ?? "shell",
     cols: cols ?? null,
     rows: rows ?? null,
     onEvent: ch,
   });
+}
+
+/** 列设备上的目录 */
+export async function adbLs(serial: string, path?: string): Promise<AdbFile[]> {
+  return invoke<AdbFile[]>("adb_ls", { serial, path: path ?? null });
+}
+
+export async function adbPull(
+  serial: string,
+  remote: string,
+  localDir: string,
+): Promise<string> {
+  return invoke<string>("adb_pull", { serial, remote, localDir });
+}
+
+export async function adbPush(
+  serial: string,
+  localPaths: string[],
+  remoteDir: string,
+): Promise<string> {
+  return invoke<string>("adb_push", { serial, localPaths, remoteDir });
+}
+
+export async function adbRm(serial: string, path: string, isDir: boolean): Promise<void> {
+  return invoke("adb_rm", { serial, path, isDir });
+}
+
+export async function adbMkdir(serial: string, path: string): Promise<void> {
+  return invoke("adb_mkdir", { serial, path });
 }
 
 export async function serialList(): Promise<SerialPortInfo[]> {
@@ -242,6 +275,23 @@ export async function workspaceSave(data: string): Promise<void> {
 /** 读取上次的工作区快照 */
 export async function workspaceLoad(): Promise<string | null> {
   return invoke<string | null>("workspace_load");
+}
+
+/** 探测服务器上的 AI 命令行工具 */
+export async function aiProbe(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<AiProbe> {
+  return invoke<AiProbe>("ai_probe", { profileId, userOverride: userOverride ?? null });
+}
+
+/** 一键安装某个 AI 工具 */
+export async function aiInstall(
+  profileId: string,
+  tool: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("ai_install", { profileId, tool, userOverride: userOverride ?? null });
 }
 
 /** 列出服务器上的 tmux 会话 */

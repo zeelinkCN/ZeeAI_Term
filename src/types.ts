@@ -7,6 +7,8 @@ export interface SshConfig {
   authKind: "password" | "key" | "agent";
   allowPassword?: boolean;
   keyPath?: string;
+  /** 跳板机，写法同 `ssh -J`：user@host 或 user@host:port */
+  jump?: string | null;
   tmuxEnabled: boolean;
   tmuxTemplate: string;
   startDir?: string;
@@ -150,6 +152,27 @@ export interface AdbDevice {
   serial: string;
   state: string;
   model?: string | null;
+}
+
+export interface AdbFile {
+  name: string;
+  isDir: boolean;
+  size: number;
+}
+
+export interface AiTool {
+  name: string;
+  label: string;
+  installed: boolean;
+  version: string;
+  installCmd: string;
+  runCmd: string;
+}
+
+export interface AiProbe {
+  tools: AiTool[];
+  npm: string;
+  running: string[];
 }
 
 export interface SerialPortInfo {

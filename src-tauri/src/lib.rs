@@ -240,6 +240,86 @@ pub fn run() {
                   Ok(()) => log::info!("SELFTEST: fs_remove ok -> {remote_dir}"),
                   Err(e) => log::error!("SELFTEST: fs_remove failed -> {e}"),
                 }
+                // 断点续传验证：先手工写一半，再走一次完整上传，看会不会接着传完
+                {
+                  let big_local = std::env::temp_dir().join("zeeai-selftest-resume.bin");
+                  let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+                  let _ = std::fs::write(&big_local, &payload);
+                  // 注意：文件名必须和本地文件名一致，fs_upload 是按本地文件名拼远端路径的
+                  let remote_resume =
+                    format!("{remote_dir}/zeeai-selftest-resume.bin");
+                  let cfg_ok = crate::commands::fs_mkdir(
+                    pid.clone(),
+                    remote_dir.clone(),
+                    None,
+                  )
+                  .await
+                  .is_ok();
+                  if cfg_ok {
+                    let conn = crate::core::sftp::connect(
+                      &profile.ssh.as_ref().unwrap().host,
+                      profile.ssh.as_ref().unwrap().port,
+                      &profile.ssh.as_ref().unwrap().user,
+                      None,
+                      None,
+                      None,
+                    )
+                    .await;
+                    match conn {
+                      Ok(conn) => {
+                        use tokio::io::AsyncWriteExt;
+                        let half = payload.len() / 2;
+                        if let Ok(mut f) = conn.sftp.create(&remote_resume).await {
+                          let _ = f.write_all(&payload[..half]).await;
+                          let _ = f.flush().await;
+                        }
+                        drop(conn);
+                        // 再走一次正常上传（应当从 half 处续传）
+                        match crate::commands::fs_upload(
+                          pid.clone(),
+                          vec![big_local.to_string_lossy().to_string()],
+                          remote_dir.clone(),
+                          None,
+                          None,
+                          handle.clone(),
+                        )
+                        .await
+                        {
+                          Ok(msg) => {
+                            // 校验远端大小
+                            let conn2 = crate::core::sftp::connect(
+                              &profile.ssh.as_ref().unwrap().host,
+                              profile.ssh.as_ref().unwrap().port,
+                              &profile.ssh.as_ref().unwrap().user,
+                              None,
+                              None,
+                              None,
+                            )
+                            .await;
+                            if let Ok(c2) = conn2 {
+                              match c2.sftp.metadata(&remote_resume).await {
+                                Ok(md) => {
+                                  let size = md.size.unwrap_or(0);
+                                  log::info!(
+                                    "SELFTEST: resume upload ok ({msg}) -> 远端 {} 字节，期望 {}，匹配 = {}",
+                                    size,
+                                    payload.len(),
+                                    size == payload.len() as u64
+                                  );
+                                }
+                                Err(e) => log::error!("SELFTEST: resume stat failed -> {e}"),
+                              }
+                            }
+                          }
+                          Err(e) => log::error!("SELFTEST: resume upload failed -> {e}"),
+                        }
+                      }
+                      Err(e) => log::error!("SELFTEST: resume setup failed -> {e}"),
+                    }
+                  }
+                  let _ = std::fs::remove_file(&big_local);
+                  let _ = crate::commands::fs_remove(pid.clone(), remote_dir.clone(), None).await;
+                }
                 let _ = std::fs::remove_file(&local_up);
                 let _ = std::fs::remove_dir_all(&local_down_dir);
               }
@@ -297,6 +377,11 @@ pub fn run() {
       commands::open_serial,
       commands::fastboot_version,
       commands::fastboot_devices,
+      commands::adb_ls,
+      commands::adb_pull,
+      commands::adb_push,
+      commands::adb_rm,
+      commands::adb_mkdir,
       commands::git_status,
       commands::git_init,
       commands::git_add,
@@ -313,6 +398,8 @@ pub fn run() {
       commands::secret_delete,
       commands::workspace_save,
       commands::workspace_load,
+      commands::ai_probe,
+      commands::ai_install,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

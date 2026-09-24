@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   has_password = {}", secret::has_password(&key));
 
     println!("2) 用密码建 SFTP 连接 …");
-    let conn = sftp::connect(&host, 22, &user, None, Some(&password)).await?;
+    let conn = sftp::connect(&host, 22, &user, None, Some(&password), None).await?;
     let (dir, entries) = sftp::list(&conn, None).await?;
     println!("   OK: 家目录 {dir}，{} 项", entries.len());
     for e in entries.iter().take(6) {

@@ -9,6 +9,13 @@ import { SessionBus } from "./sessionBus";
 import {
   adbDevices,
   adbVersion,
+  adbLs,
+  adbPull,
+  adbPush,
+  adbRm,
+  adbMkdir,
+  aiProbe,
+  aiInstall,
   fastbootDevices,
   fastbootVersion,
   gitStatus,
@@ -56,6 +63,8 @@ import {
 import { b64ToBytes, bytesToB64, uid } from "./util";
 import type {
   AdbDevice,
+  AdbFile,
+  AiProbe,
   AppSettings,
   ConnectionProfile,
   GitBranch,
@@ -86,6 +95,7 @@ import {
   IconPowerShell,
   IconSerial,
   IconServer,
+  IconSpark,
   IconTerminal,
   IconWsl,
 } from "./components/Icons";
@@ -184,6 +194,21 @@ const DEFAULT_SETTINGS: AppSettings = {
 };
 
 const APP_VERSION = "0.1.0";
+
+/** 各种分屏布局对应几个窗格 */
+function paneCount(layout: "single" | "v2" | "h2" | "v3" | "grid4"): number {
+  switch (layout) {
+    case "v2":
+    case "h2":
+      return 2;
+    case "v3":
+      return 3;
+    case "grid4":
+      return 4;
+    default:
+      return 1;
+  }
+}
 
 const THEMES: { key: string; label: string; kind: "dark" | "light" }[] = [
   { key: "dark", label: "VS Code 深色", kind: "dark" },
@@ -355,6 +380,21 @@ export default function App() {
   const [reopenNewAfterSave, setReopenNewAfterSave] = useState(false);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
+  // 分屏：paneLayout 决定有几格，panes 存每格放哪个会话
+  const [paneLayout, setPaneLayout] = useState<"single" | "v2" | "h2" | "v3" | "grid4">(
+    "single",
+  );
+  const [panes, setPanes] = useState<(string | null)[]>([]);
+  const [focusedPane, setFocusedPane] = useState(0);
+  // 命令面板（Ctrl+Shift+P）
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  // 右侧 AI Agent 面板
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [aiState, setAiState] = useState<AiProbe | null>(null);
+  const [aiBusy, setAiBusy] = useState<string | null>(null);
+  const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
+  const aiWasRunning = useRef(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
 
@@ -365,6 +405,11 @@ export default function App() {
   const [fbList, setFbList] = useState<AdbDevice[]>([]);
   const [serialPorts, setSerialPorts] = useState<SerialPortInfo[]>([]);
   const [serialLoading, setSerialLoading] = useState(false);
+  // ADB 文件浏览器
+  const [adbSerial, setAdbSerial] = useState<string | null>(null);
+  const [adbPath, setAdbPath] = useState("/sdcard");
+  const [adbFiles, setAdbFiles] = useState<AdbFile[]>([]);
+  const [adbNewName, setAdbNewName] = useState("");
   const [serialDialog, setSerialDialog] = useState<{
     isNew: boolean;
     draft: ConnectionProfile;
@@ -453,6 +498,126 @@ export default function App() {
       }
     })();
   }, []);
+
+  // ---------- 右侧 AI 面板：探测 / 安装 / 启动 / 完成通知 ----------
+  async function refreshAi() {
+    const cur = sessionsRef.current.find((s) => s.id === activeId);
+    if (!cur?.profileId) {
+      setAiState(null);
+      return;
+    }
+    try {
+      const probe = await aiProbe(cur.profileId, cur.user ?? null);
+      setAiState(probe);
+      // 之前有 AI 在跑、现在没有了 → 认为这一轮跑完，给个通知
+      const running = probe.running.length > 0;
+      if (aiWasRunning.current && !running) {
+        pushAiNotice("AI 任务看起来已经跑完了（进程已退出）");
+      }
+      aiWasRunning.current = running;
+    } catch (e) {
+      setAiState(null);
+      console.warn("ai_probe 失败：" + String(e));
+    }
+  }
+
+  function pushAiNotice(text: string) {
+    const item = { id: uid(), text, time: Date.now() };
+    setAiNotices((prev) => [item, ...prev].slice(0, 20));
+    setToast(text);
+  }
+
+  // 面板打开时探测一次，之后每 8 秒刷一次（既看安装状态，也看有没有跑完）
+  useEffect(() => {
+    if (!aiPanelOpen) return;
+    void refreshAi();
+    const t = window.setInterval(() => void refreshAi(), 8000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiPanelOpen, activeId]);
+
+  async function aiInstallTool(tool: string) {
+    const cur = sessionsRef.current.find((s) => s.id === activeId);
+    if (!cur?.profileId) {
+      setToast("先打开一个 SSH 会话，AI 面板才知道要装到哪台服务器");
+      return;
+    }
+    setAiBusy(tool);
+    setToast(`正在服务器上安装 ${tool}，可能要一两分钟…`);
+    try {
+      const out = await aiInstall(cur.profileId, tool, cur.user ?? null);
+      pushAiNotice(`${tool} 安装完成`);
+      if (out) console.log("ai_install 输出：" + out);
+      await refreshAi();
+    } catch (e) {
+      pushAiNotice(`${tool} 安装失败：${String(e)}`);
+    } finally {
+      setAiBusy(null);
+    }
+  }
+
+  /** 在当前会话的终端里启动 AI（就是把命令敲进去，你能看到它跑） */
+  function aiStartTool(tool: string) {
+    const cur = sessionsRef.current.find((s) => s.id === activeId);
+    if (!cur) {
+      setToast("先打开一个会话");
+      return;
+    }
+    void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\n`)));
+    aiWasRunning.current = true;
+    pushAiNotice(`已在「${cur.title}」里启动 ${tool}，它跑完我会提醒你`);
+  }
+
+  // 命令面板：Ctrl+Shift+P 打开，输入过滤，回车执行
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === "P" || e.key === "p" || e.code === "KeyP")) {
+        e.preventDefault();
+        setPaletteQuery("");
+        setPaletteOpen((v) => !v);
+      } else if (e.key === "Escape") {
+        setPaletteOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  /** 命令面板里能搜到的所有命令：菜单里的每一项 + 几个常用操作 */
+  function allCommands(): { label: string; group: string; run: () => void }[] {
+    const out: { label: string; group: string; run: () => void }[] = [];
+    for (const menu of buildMenus()) {
+      for (const item of menu.items) {
+        if (!item.sep && item.label && item.action) {
+          out.push({ label: item.label, group: menu.label, run: item.action });
+        }
+      }
+    }
+    out.push(
+      { label: "打开设置", group: "首选项", run: () => setShowSettings(true) },
+      { label: "服务器管理", group: "首选项", run: () => setShowServers(true) },
+      {
+        label: "文件面板：同步到终端目录",
+        group: "远程文件",
+        run: () => {
+          if (fileProfileId) void syncFsToTerminal(fileProfileId, activeTmuxName, activeSession?.cwd);
+        },
+      },
+      {
+        label: "文件面板：上传文件到当前目录",
+        group: "远程文件",
+        run: () => {
+          if (fileProfileId) void uploadToRemote(fileProfileId);
+        },
+      },
+      { label: "Git：打开本地仓库", group: "Git", run: () => void openGitWorkspace() },
+      { label: "Git：新建仓库（git init）", group: "Git", run: () => setGitInitDialog({ path: "" }) },
+      { label: "关闭全部本地终端", group: "终端", run: () => void closeSessions(localTerminals, "本地终端") },
+      { label: "关闭全部会话", group: "终端", run: () => void closeSessions(sessions, "会话") },
+      { label: "关于 ZeeAI Terminal", group: "帮助", run: () => setShowAbout(true) },
+    );
+    return out;
+  }
 
   // ---------- 工作区恢复：退出前存快照，下次打开时把会话重新拉起来 ----------
   const restoredRef = useRef(false);
@@ -752,6 +917,19 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 8000));
         setModule("powershell");
         await new Promise((r) => setTimeout(r, 10000));
+        // 分屏演示：左右两分屏（左边 SSH，右边本地 PowerShell）
+        setPaneLayout("v2");
+        await new Promise((r) => setTimeout(r, 10000));
+        setPaneLayout("single");
+        await new Promise((r) => setTimeout(r, 4000));
+        // AI Agent 面板
+        setAiPanelOpen(true);
+        await new Promise((r) => setTimeout(r, 14000));
+        // 命令面板（Ctrl+Shift+P）
+        setPaletteQuery("");
+        setPaletteOpen(true);
+        await new Promise((r) => setTimeout(r, 12000));
+        setPaletteOpen(false);
         setModule("remote");
         setSideTab("sessions");
         // 演示文件传输进度条：把一个十几 MB 的文件传上去，进度能看清楚
@@ -1732,21 +1910,88 @@ export default function App() {
     return id;
   }
 
-  async function openAdbSession(serial: string) {
+  async function openAdbSession(serial: string, mode: "shell" | "logcat" = "shell") {
     const id = uid();
     addSession({
       id,
-      title: `ADB · ${serial}`,
+      title: mode === "logcat" ? `logcat · ${serial}` : `ADB · ${serial}`,
       kind: "adb",
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
     });
     try {
-      await openAdbShell(id, serial, (e) => handleEvent(id, e));
+      await openAdbShell(id, serial, (e) => handleEvent(id, e), undefined, undefined, mode);
     } catch (e) {
-      setToast("打开 ADB shell 失败：" + String(e));
+      setToast(`打开 ${mode === "logcat" ? "logcat" : "ADB shell"} 失败：` + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
+    }
+  }
+
+  // ---------- ADB 文件管理 ----------
+
+  function joinRemote(dir: string, name: string) {
+    return `${dir.replace(/\/+$/, "")}/${name}`;
+  }
+
+  async function refreshAdbFiles(serial: string, path: string) {
+    setAdbLoading(true);
+    try {
+      setAdbFiles(await adbLs(serial, path));
+      setAdbPath(path);
+    } catch (e) {
+      setToast("读取设备目录失败：" + String(e));
+      setAdbFiles([]);
+    } finally {
+      setAdbLoading(false);
+    }
+  }
+
+  async function adbUpload(serial: string) {
+    const picked = await openLocalDialog({
+      multiple: true,
+      title: "选择要推送到设备的文件",
+    });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    try {
+      setToast(await adbPush(serial, paths, adbPath));
+      await refreshAdbFiles(serial, adbPath);
+    } catch (e) {
+      setToast("推送失败：" + String(e));
+    }
+  }
+
+  async function adbDownload(serial: string, name: string) {
+    const dir = await openLocalDialog({ directory: true, title: `选择保存「${name}」的目录` });
+    if (!dir || Array.isArray(dir)) return;
+    try {
+      setToast(await adbPull(serial, joinRemote(adbPath, name), dir));
+    } catch (e) {
+      setToast("下载失败：" + String(e));
+    }
+  }
+
+  async function adbMkdirNow(serial: string, name: string) {
+    const target = joinRemote(adbPath, name.trim());
+    if (!name.trim()) return;
+    try {
+      await adbMkdir(serial, target);
+      setAdbNewName("");
+      await refreshAdbFiles(serial, adbPath);
+      setToast(`已在设备上新建 ${target}`);
+    } catch (e) {
+      setToast("新建文件夹失败：" + String(e));
+    }
+  }
+
+  async function adbDelete(serial: string, name: string, isDir: boolean) {
+    try {
+      await adbRm(serial, joinRemote(adbPath, name), isDir);
+      await refreshAdbFiles(serial, adbPath);
+      setToast(`已删除 ${name}`);
+    } catch (e) {
+      setToast("删除失败：" + String(e));
     }
   }
 
@@ -1860,6 +2105,33 @@ export default function App() {
             label: showSidebar ? "隐藏侧栏" : "显示侧栏",
             action: () => setShowSidebar((v) => !v),
           },
+          { sep: true },
+          {
+            sep: false,
+            label: `${paneLayout === "single" ? "● " : ""}单窗格（不分割）`,
+            action: () => setPaneLayout("single"),
+          },
+          {
+            sep: false,
+            label: `${paneLayout === "v2" ? "● " : ""}左右两分屏`,
+            action: () => setPaneLayout("v2"),
+          },
+          {
+            sep: false,
+            label: `${paneLayout === "h2" ? "● " : ""}上下两分屏`,
+            action: () => setPaneLayout("h2"),
+          },
+          {
+            sep: false,
+            label: `${paneLayout === "v3" ? "● " : ""}三分屏（竖排三列）`,
+            action: () => setPaneLayout("v3"),
+          },
+          {
+            sep: false,
+            label: `${paneLayout === "grid4" ? "● " : ""}四分屏（2×2）`,
+            action: () => setPaneLayout("grid4"),
+          },
+          { sep: true },
           {
             sep: false,
             label: settings.theme === "dark" ? "切换到浅色主题" : "切换到深色主题",
@@ -2201,6 +2473,66 @@ export default function App() {
     [sessions],
   );
 
+  // ---------- 分屏 ----------
+  const paneSlots = useMemo(() => {
+    const n = paneCount(paneLayout);
+    const out: (string | null)[] = [];
+    for (let i = 0; i < n; i++) out.push(panes[i] ?? null);
+    return out;
+  }, [panes, paneLayout]);
+
+  // 命令面板的过滤结果。必须在 localTerminals 等所有 const 之后才算，
+  // 因为 buildMenus() 会读它们（提前读会 TDZ 报错、整页黑屏）。
+  const paletteItems = useMemo(() => {
+    const q = paletteQuery.trim().toLowerCase();
+    const all = allCommands();
+    if (!q) return all;
+    return all.filter(
+      (c) => c.label.toLowerCase().includes(q) || c.group.toLowerCase().includes(q),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paletteQuery, sessions, profiles, paneLayout, settings, showSidebar, activeId]);
+
+  // 布局变化：保留还能用的格子，把当前会话放进去
+  useEffect(() => {
+    if (paneLayout === "single") return;
+    setPanes((prev) => {
+      const n = paneCount(paneLayout);
+      const next: (string | null)[] = [];
+      const used = new Set<string>();
+      for (let i = 0; i < n; i++) {
+        const sid = prev[i] ?? null;
+        if (sid && sessions.some((s) => s.id === sid) && !used.has(sid)) {
+          next.push(sid);
+          used.add(sid);
+        } else {
+          next.push(null);
+        }
+      }
+      if (activeId && !used.has(activeId)) {
+        const empty = next.findIndex((x) => x === null);
+        next[empty >= 0 ? empty : 0] = activeId;
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneLayout, sessions.length]);
+
+  // 当前会话被切换时，让它出现在某个窗格里
+  useEffect(() => {
+    if (paneLayout === "single" || !activeId) return;
+    setPanes((prev) => {
+      const n = paneCount(paneLayout);
+      const next = [...prev];
+      while (next.length < n) next.push(null);
+      if (next.includes(activeId)) return next;
+      const empty = next.findIndex((x) => x === null);
+      next[empty >= 0 ? empty : Math.min(focusedPane, n - 1)] = activeId;
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, paneLayout, focusedPane]);
+
   // 把 git status 的结果拆成「已暂存」「未暂存/未跟踪」两组（VS Code 那种分法）
   const stagedFiles = useMemo(() => {
     if (!gitState?.ok) return [];
@@ -2300,6 +2632,15 @@ export default function App() {
           ))}
           <div className="act-sep" />
           <div className="act-foot">
+            <button
+              type="button"
+              className={"act" + (aiPanelOpen ? " active" : "")}
+              title="AI Agent（探测/安装/启动 AI 命令行工具）"
+              onClick={() => setAiPanelOpen((v) => !v)}
+            >
+              <IconSpark size={22} />
+              {aiNotices.length > 0 && <span className="act-badge">{aiNotices.length}</span>}
+            </button>
             <button
               type="button"
               className="act"
@@ -3171,6 +3512,29 @@ export default function App() {
                   >
                     <IconAndroid size={15} />
                     <span className="grow">{d.model || d.serial}</span>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="打开设备文件管理（浏览 / 推送 / 拉取）"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setAdbSerial(d.serial);
+                        void refreshAdbFiles(d.serial, "/sdcard");
+                      }}
+                    >
+                      文件
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="打开 logcat（实时日志）"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void openAdbSession(d.serial, "logcat");
+                      }}
+                    >
+                      logcat
+                    </button>
                     <span className={d.state === "device" ? "dot ok" : "dot off"} />
                   </div>
                 ))}
@@ -3274,14 +3638,75 @@ export default function App() {
           )}
 
           <div className="pane">
-            {sessions.length === 0 ? (
+            {paneLayout !== "single" && (
+              <div className={"pane-grid " + paneLayout}>
+                {paneSlots.map((sid, i) => {
+                  const ps = sid ? sessions.find((s) => s.id === sid) : null;
+                  return (
+                    <div
+                      key={i}
+                      className={"pane-cell" + (i === focusedPane ? " focused" : "")}
+                      onClick={() => {
+                        setFocusedPane(i);
+                        if (sid) setActiveId(sid);
+                      }}
+                    >
+                      <div className="pane-cell-head">
+                        <span className="grow ellipsis">
+                          {ps ? `${MODULE_LABEL[ps.kind]} · ${ps.title}` : `窗格 ${i + 1}（空）`}
+                        </span>
+                        {sid && (
+                          <button
+                            type="button"
+                            className="mini-x"
+                            style={{ opacity: 1 }}
+                            title="把这个窗格空出来（不会关闭会话）"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPanes((prev) => {
+                                const next = [...prev];
+                                next[i] = null;
+                                return next;
+                              });
+                            }}
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                      <div className="pane-cell-body">
+                        {ps ? (
+                          <TerminalView
+                            key={ps.id}
+                            sessionId={ps.id}
+                            bus={bus}
+                            active={i === focusedPane}
+                            fontSize={settings.fontSize}
+                            light={themeKind(settings.theme) === "light"}
+                            onCwd={(path) => handleTerminalCwd(ps.id, path)}
+                          />
+                        ) : (
+                          <div className="pane-empty">
+                            点左侧「会话」里的任意一个会话，它就会出现在这个窗格。
+                            <br />
+                            分屏只是多开几个视口，会话本身还是一个。
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {paneLayout === "single" && sessions.length === 0 ? (
               <div className="empty">
                 <div className="empty-title">ZeeAI Terminal</div>
                 <div className="empty-sub">
                   左侧「远程」里选一台服务器，或用 PowerShell / CMD / WSL 打开本地终端。
                 </div>
               </div>
-            ) : (
+            ) : paneLayout === "single" ? (
               sessions.map((s) => (
                 <div
                   key={s.id}
@@ -3301,14 +3726,143 @@ export default function App() {
                   />
                 </div>
               ))
-            )}
-            {activeFile && (
+            ) : null}
+            {paneLayout === "single" && activeFile && (
               <div className="file-wrap">
                 <FileView key={activeFile.path} file={activeFile} />
               </div>
             )}
           </div>
         </main>
+
+        {aiPanelOpen && (
+          <aside className="ai-panel">
+            <div className="ai-head">
+              <span className="grow ellipsis" title={activeSession?.title}>
+                AI Agent{activeSession ? ` · ${activeSession.title}` : ""}
+              </span>
+              <button
+                type="button"
+                className="mini-x"
+                style={{ opacity: 1 }}
+                title="刷新"
+                onClick={() => void refreshAi()}
+              >
+                ⟳
+              </button>
+              <button
+                type="button"
+                className="mini-x"
+                style={{ opacity: 1 }}
+                title="收起面板"
+                onClick={() => setAiPanelOpen(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            {aiNotices.length > 0 && (
+              <div className="ai-notices">
+                <div className="ai-section">
+                  消息通知（{aiNotices.length}）
+                  <button
+                    type="button"
+                    className="mini-x"
+                    style={{ marginLeft: "auto", opacity: 1 }}
+                    title="清空"
+                    onClick={() => setAiNotices([])}
+                  >
+                    ✕
+                  </button>
+                </div>
+                {aiNotices.slice(0, 4).map((n) => (
+                  <div className="ai-notice" key={n.id}>
+                    <span className="dot ok" />
+                    <span className="grow ellipsis" title={n.text}>
+                      {n.text}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!activeSession?.profileId && (
+              <div className="hint" style={{ padding: "10px 12px" }}>
+                AI 面板是跟着**当前会话所在的服务器**走的。
+                <br />
+                先打开一个 SSH 会话，再回来这里探测 / 安装 / 启动。
+              </div>
+            )}
+
+            {activeSession?.profileId && (
+              <>
+                <div className="hint" style={{ padding: "8px 12px 4px" }}>
+                  npm：{aiState?.npm ? aiState.npm : "未检测到（装 Node.js 才能装 Codex/Claude/Gemini）"}
+                  {aiState?.running.length ? `　运行中：${aiState.running.join(", ")}` : ""}
+                </div>
+                <div className="ai-section">AI 命令行工具</div>
+                {(aiState?.tools ?? []).map((t) => {
+                  const running = aiState?.running.includes(t.name) ?? false;
+                  return (
+                    <div className="ai-tool" key={t.name}>
+                      <div className="ai-tool-line">
+                        <span className={"dot " + (running ? "ok" : t.installed ? "idle" : "off")} />
+                        <span className="grow ellipsis">{t.label}</span>
+                        <span className="dim">
+                          {running ? "运行中" : t.installed ? "已安装" : "未安装"}
+                        </span>
+                      </div>
+                      <div className="ai-tool-meta ellipsis" title={t.version || t.installCmd}>
+                        {t.version || t.installCmd}
+                      </div>
+                      <div className="ai-tool-actions">
+                        {t.installed ? (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            disabled={!activeSession}
+                            title="在这个会话的终端里直接启动"
+                            onClick={() => aiStartTool(t.runCmd)}
+                          >
+                            一键启动
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            disabled={aiBusy !== null}
+                            title={t.installCmd}
+                            onClick={() => void aiInstallTool(t.name)}
+                          >
+                            {aiBusy === t.name ? "安装中…" : "一键安装"}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          title="在终端里输入这条安装命令，自己看着跑"
+                          disabled={!activeSession}
+                          onClick={() => aiStartTool(t.installCmd)}
+                        >
+                          在终端跑
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+                {!aiState && (
+                  <div className="hint" style={{ padding: "8px 12px" }}>
+                    正在探测这台服务器…
+                  </div>
+                )}
+                <div className="hint" style={{ padding: "10px 12px" }}>
+                  装好之后点「一键启动」，我会往当前终端里敲命令；
+                  它跑完（进程退出）我会在这里给你一条消息通知。
+                </div>
+              </>
+            )}
+          </aside>
+        )}
       </div>
 
       <div className="statusbar">
@@ -3447,6 +4001,122 @@ export default function App() {
             >
               删除
             </button>
+          </div>
+        </div>
+      )}
+
+      {adbSerial && (
+        <div className="modal-backdrop" onClick={() => setAdbSerial(null)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">设备文件 · {adbSerial}</div>
+            <div className="modal-body">
+              <div className="side-actions">
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="回到 /sdcard"
+                  onClick={() => void refreshAdbFiles(adbSerial, "/sdcard")}
+                >
+                  /sdcard
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="上一级"
+                  onClick={() => {
+                    const parent = adbPath.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+                    void refreshAdbFiles(adbSerial, parent.startsWith("/") ? parent : "/");
+                  }}
+                >
+                  上一级
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => void refreshAdbFiles(adbSerial, adbPath)}
+                >
+                  刷新
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="把本机文件推到当前目录"
+                  onClick={() => void adbUpload(adbSerial)}
+                >
+                  推送文件
+                </button>
+              </div>
+              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+                <input
+                  className="modal-input"
+                  style={{ flex: 1 }}
+                  value={adbPath}
+                  spellCheck={false}
+                  onChange={(e) => setAdbPath(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && adbSerial) void refreshAdbFiles(adbSerial, adbPath);
+                  }}
+                />
+              </div>
+              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+                <input
+                  className="modal-input"
+                  style={{ flex: 1 }}
+                  placeholder="新建文件夹的名字"
+                  value={adbNewName}
+                  onChange={(e) => setAdbNewName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && adbSerial) void adbMkdirNow(adbSerial, adbNewName);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="mini-btn"
+                  style={{ marginLeft: 6 }}
+                  disabled={!adbNewName.trim()}
+                  onClick={() => adbSerial && void adbMkdirNow(adbSerial, adbNewName)}
+                >
+                  新建文件夹
+                </button>
+              </div>
+              {adbLoading && <div className="hint">正在读取设备目录…</div>}
+              {!adbLoading && adbFiles.length === 0 && (
+                <div className="hint">这个目录是空的（或者没有读取权限，试试 /sdcard）。</div>
+              )}
+              {adbFiles.map((f) => (
+                <div
+                  key={f.name}
+                  className="tree-item"
+                  title={f.isDir ? "进入目录" : "下载到本机"}
+                  onClick={() =>
+                    adbSerial &&
+                    (f.isDir
+                      ? void refreshAdbFiles(adbSerial, joinRemote(adbPath, f.name))
+                      : void adbDownload(adbSerial, f.name))
+                  }
+                >
+                  {f.isDir ? <IconFolder size={14} /> : <IconFile size={14} />}
+                  <span className="grow ellipsis">{f.name}</span>
+                  <span className="dim">{f.isDir ? "" : humanSize(f.size)}</span>
+                  <button
+                    type="button"
+                    className="mini-x"
+                    title="删除"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (adbSerial) void adbDelete(adbSerial, f.name, f.isDir);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setAdbSerial(null)}>
+                关闭
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -4225,6 +4895,14 @@ export default function App() {
                 />
               </label>
               <label className="modal-field">
+                跳板机（可选，写法同 ssh -J：user@jump-host 或 user@jump-host:22）
+                <input
+                  value={editDialog.draft.ssh?.jump ?? ""}
+                  placeholder="root@10.0.0.1 —— 留空就是直连"
+                  onChange={(e) => patchDraft({}, { jump: e.target.value })}
+                />
+              </label>
+              <label className="modal-field">
                 tmux 会话名模板
                 <input
                   value={editDialog.draft.ssh?.tmuxTemplate ?? "{host}-{user}"}
@@ -4470,6 +5148,51 @@ export default function App() {
               <button type="button" className="btn primary" onClick={() => setShowSettings(false)}>
                 完成
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {paletteOpen && (
+        <div className="modal-backdrop palette-backdrop" onClick={() => setPaletteOpen(false)}>
+          <div className="palette" onClick={(e) => e.stopPropagation()}>
+            <input
+              autoFocus
+              className="palette-input"
+              placeholder="输入命令名，回车执行（Esc 关闭）"
+              value={paletteQuery}
+              onChange={(e) => setPaletteQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setPaletteOpen(false);
+                if (e.key === "Enter") {
+                  const first = paletteItems[0];
+                  if (first) {
+                    setPaletteOpen(false);
+                    first.run();
+                  }
+                }
+              }}
+            />
+            <div className="palette-list">
+              {paletteItems.length === 0 && (
+                <div className="hint" style={{ padding: "8px 12px" }}>
+                  没有匹配的命令。
+                </div>
+              )}
+              {paletteItems.slice(0, 40).map((c, i) => (
+                <button
+                  key={c.group + c.label}
+                  type="button"
+                  className={"palette-item" + (i === 0 ? " first" : "")}
+                  onClick={() => {
+                    setPaletteOpen(false);
+                    c.run();
+                  }}
+                >
+                  <span className="grow ellipsis">{c.label}</span>
+                  <span className="dim">{c.group}</span>
+                </button>
+              ))}
             </div>
           </div>
         </div>

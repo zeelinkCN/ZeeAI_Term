@@ -5,7 +5,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, git, pty, remote_fs, serial, sftp, ssh, tmux, SessionEvent, SessionRegistry,
+    adb, ai, git, pty, remote_fs, serial, sftp, ssh, tmux, SessionEvent, SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -179,6 +179,7 @@ pub fn open_ssh(
         cfg.key_path.as_deref(),
         remote_cmd.as_deref(),
         !cfg.allow_password,
+        cfg.jump.as_deref(),
     );
     let program = ssh::ssh_exe();
     let title = format!("{} · {}", profile.name, cfg.host);
@@ -329,6 +330,143 @@ pub async fn fastboot_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevic
     let devices = adb::parse_fastboot_devices(&out);
     log::info!("ipc: fastboot_devices -> {} devices", devices.len());
     Ok(devices)
+}
+
+// ---------- ADB 文件管理 ----------
+
+/// 列设备上的目录（默认 /sdcard）
+#[tauri::command]
+pub async fn adb_ls(
+    app: tauri::AppHandle,
+    serial: String,
+    path: Option<String>,
+) -> Result<Vec<adb::AdbFile>, String> {
+    let dir = path
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/sdcard".to_string());
+    log::info!("ipc: adb_ls {serial}:{dir}");
+    let exe = adb_exe(&app);
+    let args = vec![
+        "-s".to_string(),
+        serial,
+        "shell".to_string(),
+        format!("ls -la '{dir}'"),
+    ];
+    let out = run_capture(&exe, &args).await?;
+    Ok(adb::parse_ls(&out))
+}
+
+/// 从设备拉一个文件/目录到本地
+#[tauri::command]
+pub async fn adb_pull(
+    app: tauri::AppHandle,
+    serial: String,
+    remote: String,
+    local_dir: String,
+) -> Result<String, String> {
+    log::info!("ipc: adb_pull {serial}:{remote} -> {local_dir}");
+    if !std::path::Path::new(&local_dir).is_dir() {
+        return Err(format!("本地目录不存在: {local_dir}"));
+    }
+    let exe = adb_exe(&app);
+    let args = vec![
+        "-s".to_string(),
+        serial,
+        "pull".to_string(),
+        remote.clone(),
+        local_dir.clone(),
+    ];
+    let (ok, text) = run_capture_checked(&exe, &args).await?;
+    if ok {
+        Ok(format!("已下载到 {local_dir}"))
+    } else {
+        Err(text.trim().to_string())
+    }
+}
+
+/// 把本地文件推到设备上
+#[tauri::command]
+pub async fn adb_push(
+    app: tauri::AppHandle,
+    serial: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+) -> Result<String, String> {
+    log::info!("ipc: adb_push -> {} items to {remote_dir}", local_paths.len());
+    if local_paths.is_empty() {
+        return Err("没有选择文件".into());
+    }
+    let exe = adb_exe(&app);
+    let mut done = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for lp in &local_paths {
+        let args = vec![
+            "-s".to_string(),
+            serial.clone(),
+            "push".to_string(),
+            lp.clone(),
+            remote_dir.clone(),
+        ];
+        let (ok, text) = run_capture_checked(&exe, &args).await?;
+        if ok {
+            done += 1;
+        } else {
+            failed.push(format!("{lp}: {}", text.trim()));
+        }
+    }
+    if failed.is_empty() {
+        Ok(format!("已推送 {done} 项到 {remote_dir}"))
+    } else if done == 0 {
+        Err(format!("推送失败：{}", failed.join("；")))
+    } else {
+        Ok(format!("已推送 {done} 项，{} 项失败", failed.len()))
+    }
+}
+
+#[tauri::command]
+pub async fn adb_rm(
+    app: tauri::AppHandle,
+    serial: String,
+    path: String,
+    is_dir: Option<bool>,
+) -> Result<(), String> {
+    log::info!("ipc: adb_rm {serial}:{path}");
+    let exe = adb_exe(&app);
+    let cmd = if is_dir.unwrap_or(false) {
+        format!("rm -rf '{path}'")
+    } else {
+        format!("rm -f '{path}'")
+    };
+    let args = vec!["-s".to_string(), serial, "shell".to_string(), cmd];
+    let (ok, text) = run_capture_checked(&exe, &args).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(text.trim().to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn adb_mkdir(
+    app: tauri::AppHandle,
+    serial: String,
+    path: String,
+) -> Result<(), String> {
+    log::info!("ipc: adb_mkdir {serial}:{path}");
+    let exe = adb_exe(&app);
+    let args = vec![
+        "-s".to_string(),
+        serial,
+        "shell".to_string(),
+        format!("mkdir -p '{path}'"),
+    ];
+    let (ok, text) = run_capture_checked(&exe, &args).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(text.trim().to_string())
+    }
 }
 
 // ---------- Git ----------
@@ -715,6 +853,7 @@ pub async fn adb_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevice>, S
 pub fn open_adb_shell(
     id: String,
     serial: String,
+    mode: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
@@ -722,10 +861,13 @@ pub fn open_adb_shell(
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
     let exe = adb_exe(&app);
-    log::info!("ipc: open_adb_shell serial={serial} exe={exe:?}");
-    let args = adb::shell_args(&serial);
+    let mode = mode.unwrap_or_else(|| "shell".to_string());
+    log::info!("ipc: open_adb_shell serial={serial} mode={mode} exe={exe:?}");
+    let (args, title) = match mode.as_str() {
+        "logcat" => (adb::logcat_args(&serial), format!("logcat · {serial}")),
+        _ => (adb::shell_args(&serial), format!("ADB · {serial}")),
+    };
     let program = exe.to_string_lossy().to_string();
-    let title = format!("ADB · {serial}");
     let handle = pty::spawn(
         "adb",
         &title,
@@ -1117,6 +1259,7 @@ async fn sftp_for(profile_id: &str, user_override: Option<String>) -> Result<sft
         &cfg.user,
         cfg.key_path.as_deref(),
         pw.as_deref(),
+        cfg.jump.as_deref(),
     )
     .await
 }
@@ -1144,6 +1287,7 @@ async fn run_remote_capture(
             &cfg.user,
             cfg.key_path.as_deref(),
             Some(&pw),
+            cfg.jump.as_deref(),
         )
         .await?;
         return sftp::exec(&conn, command).await;
@@ -1154,11 +1298,73 @@ async fn run_remote_capture(
         &cfg.user,
         cfg.key_path.as_deref(),
         command,
+        cfg.jump.as_deref(),
     );
     run_ssh_capture(&args).await
 }
 
 // ---------- 凭据（Windows 凭据管理器） ----------
+
+// ---------- 服务器上的 AI 命令行工具 ----------
+
+/// 探测这台服务器上装了哪些 AI CLI、npm 有没有、有没有正在跑的
+#[tauri::command]
+pub async fn ai_probe(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<ai::AiProbe, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &ai::probe_script()).await?;
+    let probe = ai::parse_probe(&out);
+    log::info!(
+        "ipc: ai_probe -> {} 个工具，npm={:?}，运行中={:?}",
+        probe.tools.len(),
+        probe.npm,
+        probe.running
+    );
+    Ok(probe)
+}
+
+/// 一键安装某个 AI 工具（在服务器上跑 npm/pip）
+#[tauri::command]
+pub async fn ai_install(
+    profile_id: String,
+    tool: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let cmd = ai::TOOLS
+        .iter()
+        .find(|t| **t == tool)
+        .map(|t| match *t {
+            "codex" => "npm install -g @openai/codex",
+            "claude" => "npm install -g @anthropic-ai/claude-code",
+            "aider" => "python3 -m pip install -U aider-chat",
+            "gemini" => "npm install -g @google/gemini-cli",
+            _ => "",
+        })
+        .ok_or_else(|| format!("不认识这个工具: {tool}"))?;
+    if cmd.is_empty() {
+        return Err("这个工具没有配置安装命令".into());
+    }
+    log::info!("ipc: ai_install {tool} -> {cmd}");
+    // 先看有没有 npm / python，没有就直接给出可读的提示
+    let check = run_remote_capture(
+        &profile_id,
+        &cfg,
+        "command -v npm >/dev/null 2>&1 && echo HAS_NPM || echo NO_NPM; \
+         command -v python3 >/dev/null 2>&1 && echo HAS_PY || echo NO_PY",
+    )
+    .await?;
+    if cmd.starts_with("npm") && !check.contains("HAS_NPM") {
+        return Err("这台服务器上没有 npm —— 先装 Node.js（例如 dnf install -y nodejs 或 apt-get install -y nodejs）".into());
+    }
+    if cmd.contains("pip") && !check.contains("HAS_PY") {
+        return Err("这台服务器上没有 python3 —— 先装 Python 再装 aider".into());
+    }
+    let out = run_remote_capture(&profile_id, &cfg, &format!("{cmd} 2>&1 | tail -20")).await?;
+    Ok(out.trim().to_string())
+}
 
 #[tauri::command]
 pub fn secret_set(profile_id: String, password: String) -> Result<(), String> {

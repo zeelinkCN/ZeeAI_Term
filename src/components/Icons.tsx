@@ -280,6 +280,17 @@ export const IconClose = ({ size = 16, className }: IconProps) =>
 export const IconActivity = ({ size = 16, className }: IconProps) =>
   base(<polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />, size, className);
 
+/** AI：四角星（"智能"的通用符号，比机器人头好画也更好认） */
+export const IconSpark = ({ size = 16, className }: IconProps) =>
+  base(
+    <>
+      <path d="M12 3.2l2.1 5.1 5.1 2.1-5.1 2.1-2.1 5.1-2.1-5.1L4.8 10.4l5.1-2.1z" />
+      <path d="M18.6 16.4l.8 1.9 1.9.8-1.9.8-.8 1.9-.8-1.9-1.9-.8 1.9-.8z" />
+    </>,
+    size,
+    className,
+  );
+
 export const IconFile = ({ size = 16, className }: IconProps) =>
   base(
     <>

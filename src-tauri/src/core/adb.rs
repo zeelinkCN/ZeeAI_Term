@@ -44,6 +44,69 @@ pub fn shell_args(serial: &str) -> Vec<String> {
     vec!["-s".into(), serial.to_string(), "shell".into()]
 }
 
+pub fn logcat_args(serial: &str) -> Vec<String> {
+    vec![
+        "-s".into(),
+        serial.to_string(),
+        "logcat".into(),
+        "-v".into(),
+        "time".into(),
+    ]
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdbFile {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// 解析 `adb shell ls -la <dir>` 的输出。
+/// 典型行：`-rw-rw---- 1 root sdcard_rw 1234 2024-01-02 12:34 foo.txt`
+/// 目录行首字符是 `d`；名字里可能有空格，所以取第 8 列之后的全部内容。
+pub fn parse_ls(output: &str) -> Vec<AdbFile> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("total ") || t.contains("No such file") {
+            continue;
+        }
+        let fields: Vec<&str> = t.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let perm = fields[0];
+        let is_link = perm.starts_with('l');
+        let is_dir = perm.starts_with('d');
+        let size = fields[4].parse::<u64>().unwrap_or(0);
+        // 从第 8 个字段开始是文件名（可能有空格）
+        let name_start = line.find(fields[7]).unwrap_or(0);
+        let mut name = line[name_start..].trim().to_string();
+        if is_link {
+            // `name -> target` 只留名字
+            if let Some((n, _)) = name.split_once(" -> ") {
+                name = n.to_string();
+            }
+        }
+        if name == "." || name == ".." {
+            continue;
+        }
+        out.push(AdbFile {
+            name,
+            is_dir,
+            size,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    out
+}
+
 /// `fastboot devices` 输出是 `序列号\tfastboot` 一行一个。
 pub fn parse_fastboot_devices(output: &str) -> Vec<AdbDevice> {
     let mut out = Vec::new();

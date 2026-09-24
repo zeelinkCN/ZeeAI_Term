@@ -65,21 +65,84 @@ fn key_candidates(key_path: Option<&str>) -> Vec<PathBuf> {
 }
 
 /// 建立一条 SFTP 连接：先试密码（如果给了），再试各个密钥文件。
+/// `jump` 是跳板机（`user@host[:port]`），和 ssh 的 -J 写法一致。
 pub async fn connect(
     host: &str,
     port: u16,
     user: &str,
     key_path: Option<&str>,
     password: Option<&str>,
+    jump: Option<&str>,
 ) -> Result<SftpConn, String> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(60)),
         ..Default::default()
     });
-    let mut session = client::connect(config, (host, port), Client)
-        .await
-        .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?;
 
+    let mut session = match jump.map(str::trim).filter(|j| !j.is_empty()) {
+        Some(j) => {
+            let (j_user, j_host, j_port) = parse_jump(j, user)?;
+            log::info!("sftp: 经跳板机 {j_user}@{j_host}:{j_port} 连接 {host}:{port}");
+            let mut jump_session = client::connect(config.clone(), (j_host.as_str(), j_port), Client)
+                .await
+                .map_err(|e| format!("连接跳板机 {j_host}:{j_port} 失败: {e}"))?;
+            authenticate(&mut jump_session, &j_user, key_path, password).await?;
+            let ch = jump_session
+                .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
+                .await
+                .map_err(|e| format!("跳板机转发到 {host}:{port} 失败: {e}"))?;
+            client::connect_stream(config.clone(), ch.into_stream(), Client)
+                .await
+                .map_err(|e| format!("经跳板机连接 {host}:{port} 失败: {e}"))?
+        }
+        None => client::connect(config.clone(), (host, port), Client)
+            .await
+            .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?,
+    };
+
+    authenticate(&mut session, user, key_path, password).await?;
+
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("打开通道失败: {e}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("服务器不支持 SFTP 子系统: {e}"))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| format!("初始化 SFTP 失败: {e}"))?;
+
+    Ok(SftpConn { session, sftp })
+}
+
+/// 解析 `user@host[:port]`；没写 user 就用目标机用户名
+fn parse_jump(spec: &str, default_user: &str) -> Result<(String, String, u16), String> {
+    let (user, hostport) = match spec.split_once('@') {
+        Some((u, h)) => (u.to_string(), h.to_string()),
+        None => (default_user.to_string(), spec.to_string()),
+    };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| format!("跳板机端口不对: {p}"))?,
+        ),
+        None => (hostport, 22u16),
+    };
+    if host.is_empty() {
+        return Err("跳板机地址为空".into());
+    }
+    Ok((user, host, port))
+}
+
+/// 给一条已建立的 SSH 会话做认证：先密码，再依次试密钥文件
+async fn authenticate(
+    session: &mut Handle<Client>,
+    user: &str,
+    key_path: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), String> {
     let mut authed = false;
 
     if let Some(pwd) = password.filter(|p| !p.is_empty()) {
@@ -115,22 +178,9 @@ pub async fn connect(
     }
 
     if !authed {
-        return Err("认证失败：没有可用的密钥，也没有提供密码".into());
+        return Err(format!("{user} 认证失败：没有可用的密钥，也没有提供密码"));
     }
-
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("打开通道失败: {e}"))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| format!("服务器不支持 SFTP 子系统: {e}"))?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| format!("初始化 SFTP 失败: {e}"))?;
-
-    Ok(SftpConn { session, sftp })
+    Ok(())
 }
 
 /// 列目录；path 为空时用登录后的家目录
@@ -219,14 +269,22 @@ async fn write_remote_stream(
             .map_err(|e| format!("定位本地文件失败: {e}"))?;
     }
 
+    // 续传：不用 APPEND 标志（实测这台服务器的 sshd 不认，只写了半截），
+    // 改成打开文件后显式 seek 到断点再写。
     let mut f = if offset > 0 {
-        conn.sftp
+        use tokio::io::AsyncSeekExt;
+        let mut f = conn
+            .sftp
             .open_with_flags(
                 remote,
-                russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::APPEND,
+                russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::CREATE,
             )
             .await
-            .map_err(|e| format!("打开远端文件（续传）失败: {e}"))?
+            .map_err(|e| format!("打开远端文件（续传）失败: {e}"))?;
+        f.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("定位远端文件失败: {e}"))?;
+        f
     } else {
         conn.sftp
             .create(remote)
