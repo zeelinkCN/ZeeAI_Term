@@ -32,6 +32,7 @@ export async function openLocal(
   distro?: string,
   cols?: number,
   rows?: number,
+  cwd?: string,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -39,6 +40,7 @@ export async function openLocal(
     id,
     shell,
     distro: distro ?? null,
+    cwd: cwd ?? null,
     cols: cols ?? null,
     rows: rows ?? null,
     onEvent: ch,
@@ -125,10 +127,38 @@ export async function openSerial(
   path: string,
   baud: number,
   onEvent: (e: SessionEvent) => void,
+  extra?: {
+    dataBits?: number;
+    stopBits?: number;
+    parity?: string;
+    flowControl?: string;
+  },
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
-  return invoke<SessionInfo>("open_serial", { id, path, baud, onEvent: ch });
+  return invoke<SessionInfo>("open_serial", {
+    id,
+    path,
+    baud,
+    dataBits: extra?.dataBits ?? null,
+    stopBits: extra?.stopBits ?? null,
+    parity: extra?.parity ?? null,
+    flowControl: extra?.flowControl ?? null,
+    onEvent: ch,
+  });
+}
+
+/** 问服务器上这个 tmux 会话当前在哪个目录 */
+export async function remotePwd(
+  profileId: string,
+  tmuxSession?: string | null,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("remote_pwd", {
+    profileId,
+    tmuxSession: tmuxSession ?? null,
+    userOverride: userOverride ?? null,
+  });
 }
 
 export async function fastbootVersion(): Promise<string> {

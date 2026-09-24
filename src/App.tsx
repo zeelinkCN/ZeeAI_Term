@@ -28,6 +28,7 @@ import {
   openAdbShell,
   openSerial,
   openSsh,
+  remotePwd,
   saveProfile,
   sessionClose,
   serialList,
@@ -45,6 +46,7 @@ import type {
   GitStatus,
   HistoryEntry,
   RemoteEntry,
+  SerialConfig,
   SerialPortInfo,
   SessionEvent,
   SessionState,
@@ -61,6 +63,7 @@ import {
   IconFolder,
   IconGear,
   IconGit,
+  IconLogoTile,
   IconPlus,
   IconPowerShell,
   IconSerial,
@@ -138,17 +141,26 @@ const DEFAULT_SETTINGS: AppSettings = {
   closeAction: "exit",
   updateUrl: "",
   autoReconnect: true,
+  fsFollowTerminal: true,
 };
 
 const APP_VERSION = "0.1.0";
 
 const THEMES: { key: string; label: string; kind: "dark" | "light" }[] = [
   { key: "dark", label: "VS Code 深色", kind: "dark" },
-  { key: "light", label: "VS Code 浅色", kind: "light" },
-  { key: "github", label: "GitHub 浅色", kind: "light" },
+  { key: "one", label: "One Dark Pro", kind: "dark" },
+  { key: "tokyo", label: "Tokyo Night", kind: "dark" },
+  { key: "nord", label: "Nord 蓝灰", kind: "dark" },
+  { key: "dracula", label: "Dracula", kind: "dark" },
+  { key: "monokai", label: "Monokai", kind: "dark" },
   { key: "wechat", label: "微信绿", kind: "dark" },
   { key: "teams", label: "Teams 紫", kind: "dark" },
-  { key: "dracula", label: "Dracula", kind: "dark" },
+  { key: "teal", label: "青瓷（暗）", kind: "dark" },
+  { key: "light", label: "VS Code 浅色", kind: "light" },
+  { key: "github", label: "GitHub 浅色", kind: "light" },
+  { key: "paper", label: "纸白（护眼）", kind: "light" },
+  { key: "sakura", label: "樱花粉", kind: "light" },
+  { key: "mint", label: "薄荷绿", kind: "light" },
 ];
 
 function themeKind(key: string): "dark" | "light" {
@@ -311,8 +323,16 @@ export default function App() {
   const [fbVer, setFbVer] = useState("");
   const [fbList, setFbList] = useState<AdbDevice[]>([]);
   const [serialPorts, setSerialPorts] = useState<SerialPortInfo[]>([]);
-  const [serialBaud, setSerialBaud] = useState(115200);
   const [serialLoading, setSerialLoading] = useState(false);
+  const [serialDialog, setSerialDialog] = useState<{
+    isNew: boolean;
+    draft: ConnectionProfile;
+  } | null>(null);
+  const [serialMenu, setSerialMenu] = useState<{
+    profile: ConnectionProfile;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
@@ -338,6 +358,8 @@ export default function App() {
     message: string;
     onOk: () => void;
   } | null>(null);
+  const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [sessionRename, setSessionRename] = useState<{ id: string; value: string } | null>(null);
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
   fsPathRef.current = fsPath;
@@ -363,6 +385,17 @@ export default function App() {
       }
     })();
   }, []);
+
+  // 让 Windows 原生的标题栏（最上面那条）也跟着主题走。
+  // 不设置的话，即使应用里是深色，标题栏还是系统浅色的白条。
+  useEffect(() => {
+    const kind = themeKind(settings.theme);
+    void getCurrentWindow()
+      .setTheme(kind)
+      .catch(() => {
+        /* 某些系统上不支持就忽略，不影响主界面 */
+      });
+  }, [settings.theme]);
 
   useEffect(() => {
     void (async () => {
@@ -406,7 +439,11 @@ export default function App() {
         const id = await openSshSession(profile);
         await new Promise((r) => setTimeout(r, 15000));
         setSideTab("files");
-        await loadDir(profile.id, "/tmp/zeeai-demo");
+        // 演示「文件面板跟随终端目录」：先真的在终端里 cd，再点刷新
+        await sessionWrite(id, bytesToB64(new TextEncoder().encode("cd /tmp/zeeai-demo\n")));
+        await new Promise((r) => setTimeout(r, 3000));
+        const tmux = sessionsRef.current.find((s) => s.id === id)?.tmuxName;
+        await refreshFs(profile.id, tmux, undefined);
         await new Promise((r) => setTimeout(r, 8000));
         await openRemoteFile(profile.id, "README-demo.md", id);
         await new Promise((r) => setTimeout(r, 10000));
@@ -423,9 +460,55 @@ export default function App() {
           serialPortsRef.current.find((p) => /usb|ch3|cp21|ftdi|silicon/i.test(p.label)) ??
           serialPortsRef.current.find((p) => !/蓝牙|bluetooth/i.test(p.label));
         if (sp) {
-          await openSerialSession(sp.path);
+          const demoSerial: ConnectionProfile = {
+            id: uid(),
+            type: "serial",
+            name: `${sp.path} · 115200`,
+            group: "串口",
+            serial: {
+              path: sp.path,
+              baudRate: 115200,
+              dataBits: 8,
+              stopBits: 1,
+              parity: "none",
+              flowControl: "none",
+            },
+          };
+          try {
+            await saveProfile(demoSerial);
+            await refresh();
+          } catch {
+            /* 演示用，存不下也继续 */
+          }
+          await openSerialSession(demoSerial);
           await new Promise((r) => setTimeout(r, 14000));
         }
+        // Git 面板 + Git 工作空间（在仓库目录起本地终端）
+        setModule("git");
+        const repo = "D:\\AI\\ZeeAI_term";
+        setGitPath(repo);
+        setGitLoading(true);
+        try {
+          setGitState(await gitStatus(repo));
+        } catch {
+          /* 演示用，读不到就算了 */
+        }
+        setGitLoading(false);
+        const demoWs: ConnectionProfile = {
+          id: uid(),
+          type: "local",
+          name: "ZeeAI_term · git",
+          group: "Git 工作空间",
+          local: { shell: settings.defaultShell, cwd: repo },
+        };
+        try {
+          await saveProfile(demoWs);
+          await refresh();
+        } catch {
+          /* 演示用 */
+        }
+        await openLocalSession(settings.defaultShell, undefined, repo, "ZeeAI_term · git");
+        await new Promise((r) => setTimeout(r, 14000));
         setModule("remote");
         setSideTab("sessions");
         openNewSessionDialog(profile);
@@ -456,6 +539,7 @@ export default function App() {
   const fileProfile = profiles.find((p) => p.id === fileProfileId) ?? null;
   activeUserRef.current = activeSession?.user;
   serialPortsRef.current = serialPorts;
+  const activeTmuxName = activeSession?.tmuxName ?? undefined;
 
   useEffect(() => {
     if (!fileProfileId) {
@@ -463,9 +547,9 @@ export default function App() {
       setFsEntries([]);
       return;
     }
-    void loadDir(fileProfileId, undefined);
+    void refreshFs(fileProfileId, activeTmuxName, undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileProfileId]);
+  }, [fileProfileId, activeId, activeTmuxName, settings.fsFollowTerminal]);
 
   async function refresh() {
     try {
@@ -507,15 +591,21 @@ export default function App() {
     setActiveId(s.id);
   }
 
-  async function openLocalSession(shell: "powershell" | "cmd" | "wsl", distro?: string) {
+  async function openLocalSession(
+    shell: "powershell" | "cmd" | "wsl",
+    distro?: string,
+    cwd?: string,
+    titleOverride?: string,
+  ) {
     const id = uid();
-    const title =
+    const base =
       shell === "wsl" ? "WSL" + (distro ? " · " + distro : "") : shell === "cmd" ? "命令提示符" : "PowerShell";
+    const title = titleOverride?.trim() || base;
     addSession({ id, title, kind: shell, state: "connecting", openFiles: [], activeTab: "terminal" });
     try {
-      const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro);
+      const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
       setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, title: info.title || title } : s)),
+        prev.map((s) => (s.id === id ? { ...s, title: titleOverride?.trim() ? title : info.title || title } : s)),
       );
     } catch (e) {
       setToast("打开本地终端失败：" + String(e));
@@ -527,10 +617,13 @@ export default function App() {
     tmuxMode: "default" | "none" | "name" = "default",
     tmuxName?: string | null,
     userOverride?: string | null,
+    titleOverride?: string | null,
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
-    const title = explicitName ? `${profile.name} · ${explicitName}` : profile.name;
+    const title =
+      titleOverride?.trim() ||
+      (explicitName ? `${profile.name} · ${explicitName}` : profile.name);
     addSession({
       id,
       title,
@@ -559,7 +652,7 @@ export default function App() {
           s.id === id
             ? {
                 ...s,
-                title: explicitName ? title : info.title || title,
+                title: titleOverride?.trim() ? title : explicitName ? title : info.title || title,
                 tmuxName: info.tmuxSession ?? undefined,
                 user: info.user ?? s.user,
               }
@@ -576,6 +669,7 @@ export default function App() {
               profileName: profile.name,
               host: profile.ssh?.host ?? "",
               tmuxSession: info.tmuxSession ?? null,
+              title: titleOverride?.trim() || null,
               lastUsed: 0,
             }),
           );
@@ -783,6 +877,86 @@ export default function App() {
       .replace(/[.:/\\ ]/g, "-");
   }
 
+  // ---------- 串口连接（用户自己建的那几条，不再罗列系统里所有 COM 口） ----------
+
+  function openSerialDialog(profile?: ConnectionProfile) {
+    if (profile) {
+      setSerialDialog({ isNew: false, draft: JSON.parse(JSON.stringify(profile)) });
+      void refreshSerial();
+      return;
+    }
+    // 新建议一个默认值：优先挑 USB 串口（蓝牙虚拟串口一般用不上）
+    const first =
+      serialPorts.find((p) => /usb|ch3|cp21|ftdi|silicon|prolific/i.test(p.label)) ??
+      serialPorts[0];
+    setSerialDialog({
+      isNew: true,
+      draft: {
+        id: "",
+        type: "serial",
+        name: first ? `${first.path} · 115200` : "",
+        group: "串口",
+        serial: {
+          path: first?.path ?? "",
+          baudRate: 115200,
+          dataBits: 8,
+          stopBits: 1,
+          parity: "none",
+          flowControl: "none",
+        },
+      },
+    });
+    void refreshSerial();
+  }
+
+  function patchSerialDraft(
+    patch: Partial<ConnectionProfile>,
+    serialPatch?: Partial<SerialConfig>,
+  ) {
+    setSerialDialog((prev) => {
+      if (!prev) return prev;
+      const draft: ConnectionProfile = { ...prev.draft, ...patch };
+      if (serialPatch && draft.serial) {
+        draft.serial = { ...draft.serial, ...serialPatch };
+      }
+      return { ...prev, draft };
+    });
+  }
+
+  async function saveSerialDialog(openAfter: boolean) {
+    if (!serialDialog) return;
+    const p = serialDialog.draft;
+    const cfg = p.serial;
+    if (!cfg?.path.trim()) {
+      setToast("请选择或填写串口（例如 COM5）");
+      return;
+    }
+    const finalProfile: ConnectionProfile = {
+      ...p,
+      id: p.id || uid(),
+      name: p.name.trim() || `${cfg.path} · ${cfg.baudRate}`,
+      group: p.group.trim() || "串口",
+      serial: { ...cfg, path: cfg.path.trim().toUpperCase() },
+    };
+    try {
+      await saveProfile(finalProfile);
+      setSerialDialog(null);
+      await refresh();
+      if (openAfter) await openSerialSession(finalProfile);
+    } catch (e) {
+      setToast("保存失败：" + String(e));
+    }
+  }
+
+  async function removeSerialProfile(p: ConnectionProfile) {
+    try {
+      await deleteProfile(p.id);
+      await refresh();
+    } catch (e) {
+      setToast("删除失败：" + String(e));
+    }
+  }
+
   async function loadDialogTmux(profileId: string, user?: string) {
     setDialogBusy(true);
     try {
@@ -796,9 +970,9 @@ export default function App() {
   }
 
   function openNewSessionDialog(profile?: ConnectionProfile) {
-    const target = profile ?? profiles[0];
+    const target = profile ?? sshProfiles[0];
     if (!target) {
-      setToast("请先新建一个连接配置");
+      setToast("还没有服务器配置，先去「连接 → 服务器管理」里加一台");
       return;
     }
     const useTmux = target.ssh?.tmuxEnabled ?? settings.tmuxDefault;
@@ -853,10 +1027,11 @@ export default function App() {
       setToast("这条历史对应的连接配置已被删除");
       return;
     }
+    const custom = h.title?.trim() || undefined;
     if (h.tmuxSession) {
-      await openSshSession(profile, "name", h.tmuxSession);
+      await openSshSession(profile, "name", h.tmuxSession, null, custom);
     } else {
-      await openSshSession(profile, "none");
+      await openSshSession(profile, "none", null, null, custom);
     }
   }
 
@@ -913,6 +1088,65 @@ export default function App() {
     }
   }
 
+  /**
+   * 「打开本地 Git 仓库」：选一个本地目录 → 确认是 Git 仓库 →
+   * 存成一个工作空间（本地终端就起在这个目录），并顺手打开它的终端。
+   */
+  async function openGitWorkspace() {
+    const picked = await openLocalDialog({
+      directory: true,
+      title: "选择本地 Git 仓库目录",
+    });
+    if (!picked || Array.isArray(picked)) return;
+    const dir = picked;
+    setGitPath(dir);
+    setGitLoading(true);
+    let status: GitStatus | null = null;
+    try {
+      status = await gitStatus(dir);
+      setGitState(status);
+    } catch (e) {
+      setToast("读取 Git 状态失败：" + String(e));
+      setGitLoading(false);
+      return;
+    }
+    setGitLoading(false);
+    if (!status?.ok) {
+      setToast(status?.message || "这个目录不是 Git 仓库");
+      return;
+    }
+
+    const name = dir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || dir;
+    const shell = settings.defaultShell;
+    const existing = profiles.find((p) => p.type === "local" && p.local?.cwd === dir);
+    if (!existing) {
+      const profile: ConnectionProfile = {
+        id: uid(),
+        type: "local",
+        name: `${name} · git`,
+        group: "Git 工作空间",
+        local: { shell, cwd: dir },
+      };
+      try {
+        await saveProfile(profile);
+        await refresh();
+      } catch (e) {
+        setToast("保存工作空间失败：" + String(e));
+      }
+    }
+    await openLocalSession(shell, undefined, dir, `${name} · git`);
+    setToast(`已在 ${dir} 打开 Git 工作空间（终端 + git 命令行）`);
+  }
+
+  async function removeGitWorkspace(p: ConnectionProfile) {
+    try {
+      await deleteProfile(p.id);
+      await refresh();
+    } catch (e) {
+      setToast("删除失败：" + String(e));
+    }
+  }
+
   /** 远程会话意外断开时自动重连（会重新附加 tmux），最多 5 次指数退避。 */
   function scheduleReconnect(sessionId: string) {
     const s = sessionsRef.current.find((x) => x.id === sessionId);
@@ -956,20 +1190,31 @@ export default function App() {
     }
   }
 
-  async function openSerialSession(path: string) {
+  /** 用「串口连接」里存好的参数打开一个串口终端 */
+  async function openSerialSession(profile: ConnectionProfile) {
+    const cfg = profile.serial;
+    if (!cfg?.path) {
+      setToast("这个串口连接没有配置端口");
+      return;
+    }
     const id = uid();
     addSession({
       id,
-      title: `串口 · ${path}`,
+      title: profile.name,
       kind: "serial",
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
     });
     try {
-      const info = await openSerial(id, path, serialBaud, (e) => handleEvent(id, e));
+      const info = await openSerial(id, cfg.path, cfg.baudRate, (e) => handleEvent(id, e), {
+        dataBits: cfg.dataBits,
+        stopBits: cfg.stopBits,
+        parity: cfg.parity,
+        flowControl: cfg.flowControl,
+      });
       setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, title: info.title || s.title } : s)),
+        prev.map((s) => (s.id === id ? { ...s, title: profile.name || info.title || s.title } : s)),
       );
     } catch (e) {
       setToast("打开串口失败：" + String(e));
@@ -1154,6 +1399,26 @@ export default function App() {
     ];
   }
 
+  /**
+   * 刷新文件面板。
+   * 打开「跟随终端目录」时，会去问 tmux 这个会话的 pane 当前在哪个目录
+   * （就是你终端里 `pwd` 的那个），然后直接列那里——这样在终端里 cd 完，
+   * 点一下刷新文件列表就跟过去了，不用手输路径。
+   */
+  async function refreshFs(profileId: string, tmuxName?: string, fallback?: string) {
+    if (!settings.fsFollowTerminal || !tmuxName) {
+      await loadDir(profileId, fallback);
+      return;
+    }
+    try {
+      const pwd = await remotePwd(profileId, tmuxName, activeUserRef.current ?? null);
+      await loadDir(profileId, pwd);
+    } catch {
+      // 拿不到就保持原来的位置，别把用户扔到别处
+      await loadDir(profileId, fallback);
+    }
+  }
+
   async function loadDir(profileId: string, path?: string) {
     setFsLoading(true);
     try {
@@ -1264,6 +1529,42 @@ export default function App() {
     );
   }
 
+  /**
+   * 给会话改名：既改标签上的名字，也写进会话历史，
+   * 下次从「会话历史」点进来还是你起的名字。
+   */
+  async function renameSession(sessionId: string, rawName: string) {
+    const title = rawName.trim();
+    if (!title) {
+      setToast("会话名不能为空");
+      return;
+    }
+    const s = sessionsRef.current.find((x) => x.id === sessionId);
+    setSessions((prev) => prev.map((x) => (x.id === sessionId ? { ...x, title } : x)));
+    if (!s?.profileId) {
+      setSessionRename(null);
+      return;
+    }
+    const p = profiles.find((x) => x.id === s.profileId);
+    try {
+      setHistory(
+        await historySave({
+          id: "",
+          profileId: s.profileId,
+          profileName: p?.name ?? title,
+          host: p?.ssh?.host ?? "",
+          tmuxSession: s.tmuxName ?? null,
+          title,
+          lastUsed: 0,
+        }),
+      );
+      setToast(`会话已命名为「${title}」`);
+    } catch (e) {
+      setToast("改名字失败：" + String(e));
+    }
+    setSessionRename(null);
+  }
+
   /** 新建远端文件夹 / 重命名，共用一个输入弹窗 */
   async function confirmNameDialog() {
     if (!nameDialog) return;
@@ -1312,11 +1613,29 @@ export default function App() {
   const grouped = useMemo(() => {
     const map = new Map<string, ConnectionProfile[]>();
     for (const p of profiles) {
+      // 「已保存的服务器」只放 SSH 服务器；串口连接归串口面板自己管，
+      // 不要混进服务器列表里，否则会让人以为是同一类东西。
+      if (p.type !== "ssh") continue;
       const g = p.group || "默认";
       map.set(g, [...(map.get(g) ?? []), p]);
     }
     return Array.from(map.entries());
   }, [profiles]);
+
+  /** 只有 SSH 服务器（给「新建会话」「服务器管理」用） */
+  const sshProfiles = useMemo(() => profiles.filter((p) => p.type === "ssh"), [profiles]);
+
+  /** 用户自己建过的串口连接（不是系统里所有 COM 口） */
+  const serialProfiles = useMemo(
+    () => profiles.filter((p) => p.type === "serial" && !!p.serial?.path),
+    [profiles],
+  );
+
+  /** 本地 Git 工作空间（type=local 且带 cwd） */
+  const gitWorkspaces = useMemo(
+    () => profiles.filter((p) => p.type === "local" && !!p.local?.cwd),
+    [profiles],
+  );
 
   return (
     <div
@@ -1632,7 +1951,7 @@ export default function App() {
                               >
                                 <IconTerminal size={13} />
                                 <span className="grow ellipsis">
-                                  {h.tmuxSession ?? "普通 shell"}
+                                  {h.title?.trim() || h.tmuxSession || "普通 shell"}
                                 </span>
                                 <span className="dim">{relTime(h.lastUsed)}</span>
                                 <button
@@ -1678,7 +1997,8 @@ export default function App() {
                       <button
                         type="button"
                         className="mini-btn"
-                        onClick={() => void loadDir(fileProfile.id, fsPath)}
+                        title="跟随终端目录时，会跳到 tmux 会话当前的目录"
+                        onClick={() => void refreshFs(fileProfile.id, activeTmuxName, fsPath)}
                       >
                         刷新
                       </button>
@@ -1714,6 +2034,20 @@ export default function App() {
                         }
                       >
                         新建文件夹
+                      </button>
+                      <button
+                        type="button"
+                        className={"mini-btn" + (settings.fsFollowTerminal ? " active" : "")}
+                        title={
+                          settings.fsFollowTerminal
+                            ? "已开启：刷新会跳到终端（tmux）当前所在目录"
+                            : "已关闭：刷新只重读当前目录"
+                        }
+                        onClick={() =>
+                          void updateSettings({ fsFollowTerminal: !settings.fsFollowTerminal })
+                        }
+                      >
+                        {settings.fsFollowTerminal ? "✓ 跟随终端" : "跟随终端"}
                       </button>
                     </div>
                     <input
@@ -1796,6 +2130,79 @@ export default function App() {
             )}
             {module === "git" && (
               <>
+                <div className="side-actions">
+                  <button
+                    type="button"
+                    className="btn primary"
+                    title="选一个本地仓库目录，直接在这个目录开一个本地终端（PowerShell / CMD / WSL 按设置来）"
+                    onClick={() => void openGitWorkspace()}
+                  >
+                    <IconPlus size={14} /> 打开本地仓库
+                  </button>
+                </div>
+                <div className="tree-group">Git 工作空间</div>
+                <div className="hint" style={{ paddingTop: 0 }}>
+                  在某个仓库目录下起一个本地终端，可以直接敲 git 命令。
+                </div>
+                {gitWorkspaces.length === 0 && (
+                  <div className="hint">
+                    还没有工作空间。点「＋ 打开本地仓库」选一个目录即可。
+                  </div>
+                )}
+                {gitWorkspaces.map((p) => (
+                  <div
+                    key={p.id}
+                    className="tree-item"
+                    title={`${p.local?.cwd}（点击查看改动，右侧按钮开终端）`}
+                    onClick={() => {
+                      const dir = p.local?.cwd ?? "";
+                      setGitPath(dir);
+                      void (async () => {
+                        setGitLoading(true);
+                        try {
+                          setGitState(await gitStatus(dir));
+                        } catch (e) {
+                          setToast("读取 Git 状态失败：" + String(e));
+                        } finally {
+                          setGitLoading(false);
+                        }
+                      })();
+                    }}
+                  >
+                    <IconGit size={14} />
+                    <span className="grow ellipsis">{p.name}</span>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="在这个目录打开本地终端"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const dir = p.local?.cwd ?? "";
+                        void openLocalSession(
+                          p.local?.shell ?? settings.defaultShell,
+                          p.local?.distro,
+                          dir,
+                          p.name,
+                        );
+                      }}
+                    >
+                      终端
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-x"
+                      title="从工作空间里移除"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void removeGitWorkspace(p);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+
+                <div className="tree-group">快速查看某个仓库</div>
                 <label className="modal-field" style={{ paddingTop: 4 }}>
                   仓库路径
                   <input
@@ -1845,43 +2252,55 @@ export default function App() {
             {module === "serial" && (
               <>
                 <div className="side-actions">
-                  <button type="button" className="btn" onClick={() => void refreshSerial()}>
-                    <IconPlus size={14} /> 刷新串口
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => openSerialDialog()}
+                  >
+                    <IconPlus size={14} /> 新建串口连接
                   </button>
                 </div>
-                <label className="modal-field" style={{ paddingTop: 0 }}>
-                  波特率
-                  <select
-                    value={serialBaud}
-                    onChange={(e) => setSerialBaud(Number(e.target.value))}
-                  >
-                    {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {serialLoading && <div className="hint">正在枚举串口…</div>}
-                {!serialLoading && serialPorts.length === 0 && (
+                <div className="hint" style={{ paddingTop: 0 }}>
+                  这里只列你**自己建过**的串口连接。系统里那些蓝牙 / 虚拟串口不会出现在这里，
+                  免得点错——要用哪些口，你自己加。
+                </div>
+                {serialLoading && <div className="hint">正在检测串口…</div>}
+                {!serialLoading && serialProfiles.length === 0 && (
                   <div className="hint">
-                    没有检测到串口设备。
+                    还没有串口连接。
                     <br />
-                    插入 USB 转串口模块后点「刷新串口」。
+                    点上面「＋ 新建串口连接」，选好端口和波特率，保存后就会出现在这里。
                   </div>
                 )}
-                {serialPorts.map((p) => (
-                  <div
-                    key={p.path}
-                    className="tree-item"
-                    onClick={() => void openSerialSession(p.path)}
-                    title={`${p.path} — ${p.label}（点击以 ${serialBaud} 波特率打开）`}
-                  >
-                    <IconSerial size={15} />
-                    <span className="grow ellipsis">{p.path}</span>
-                    <span className="dim ellipsis">{p.label}</span>
-                  </div>
-                ))}
+                {serialProfiles.map((p) => {
+                  const cfg = p.serial;
+                  const alive = serialPorts.some((x) => x.path === cfg?.path);
+                  return (
+                    <div
+                      key={p.id}
+                      className="tree-item"
+                      onClick={() => void openSerialSession(p)}
+                      title={`${cfg?.path} · ${cfg?.baudRate} 波特率（点击打开）`}
+                    >
+                      <IconSerial size={15} />
+                      <span className="grow ellipsis">{p.name}</span>
+                      <span className="dim">{cfg?.baudRate}</span>
+                      {!alive && <span className="tag warn">未接入</span>}
+                      <button
+                        type="button"
+                        className="mini-x"
+                        title="编辑 / 复制 / 删除"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const r = (e.target as HTMLElement).getBoundingClientRect();
+                          setSerialMenu({ profile: p, x: r.left - 170, y: r.bottom + 4 });
+                        }}
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  );
+                })}
               </>
             )}
             {module === "adb" && (
@@ -1946,6 +2365,12 @@ export default function App() {
                 type="button"
                 className={"session-tab" + (s.id === activeId ? " active" : "")}
                 onClick={() => setActiveId(s.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setActiveId(s.id);
+                  setTabMenu({ id: s.id, x: e.clientX, y: e.clientY });
+                }}
+                title={`${s.title}（右键可以重命名）`}
               >
                 {moduleIcon(s.kind)}
                 <span>{s.title}</span>
@@ -2067,6 +2492,358 @@ export default function App() {
       )}
 
       {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
+
+      {serialMenu && (
+        <div
+          className="ctx-backdrop"
+          onClick={() => setSerialMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setSerialMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(Math.max(0, serialMenu.x), Math.max(0, window.innerWidth - 210)),
+              top: Math.min(Math.max(0, serialMenu.y), Math.max(0, window.innerHeight - 190)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="menu-head ellipsis">{serialMenu.profile.name}</div>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = serialMenu.profile;
+                setSerialMenu(null);
+                void openSerialSession(p);
+              }}
+            >
+              打开串口终端
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = serialMenu.profile;
+                setSerialMenu(null);
+                openSerialDialog(p);
+              }}
+            >
+              编辑（端口 / 波特率 / 校验…）
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = serialMenu.profile;
+                setSerialMenu(null);
+                void duplicateProfile(p);
+              }}
+            >
+              复制
+            </button>
+            <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = serialMenu.profile;
+                setSerialMenu(null);
+                setConfirmDialog({
+                  title: "删除串口连接",
+                  message: `确定删除「${p.name}」这条串口连接吗？`,
+                  onOk: () => void removeSerialProfile(p),
+                });
+              }}
+            >
+              删除
+            </button>
+          </div>
+        </div>
+      )}
+
+      {serialDialog && (
+        <div className="modal-backdrop" onClick={() => setSerialDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              {serialDialog.isNew ? "新建串口连接" : "编辑串口连接"}
+            </div>
+            <div className="modal-body">
+              <label className="modal-field">
+                名称
+                <input
+                  value={serialDialog.draft.name}
+                  placeholder="比如：ESP32 调试口"
+                  onChange={(e) => patchSerialDraft({ name: e.target.value })}
+                />
+              </label>
+
+              <label className="modal-field">
+                端口
+                <select
+                  value={
+                    serialPorts.some((p) => p.path === serialDialog.draft.serial?.path)
+                      ? serialDialog.draft.serial?.path
+                      : "__custom__"
+                  }
+                  onChange={(e) => {
+                    if (e.target.value !== "__custom__") {
+                      patchSerialDraft({}, { path: e.target.value });
+                    }
+                  }}
+                >
+                  {serialPorts.map((p) => (
+                    <option key={p.path} value={p.path}>
+                      {p.path} — {p.label}
+                    </option>
+                  ))}
+                  <option value="__custom__">
+                    {serialPorts.length === 0 ? "（没检测到串口，手动输入）" : "手动输入…"}
+                  </option>
+                </select>
+              </label>
+              <label className="modal-field">
+                端口名（也可以直接手填）
+                <input
+                  value={serialDialog.draft.serial?.path ?? ""}
+                  placeholder="COM5"
+                  onChange={(e) => patchSerialDraft({}, { path: e.target.value })}
+                />
+              </label>
+              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={serialLoading}
+                  onClick={() => void refreshSerial()}
+                >
+                  {serialLoading ? "检测中…" : "重新检测串口"}
+                </button>
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  检测到 {serialPorts.length} 个口（含蓝牙/虚拟串口，按需选）
+                </span>
+              </div>
+
+              <div className="modal-row">
+                <label className="modal-field">
+                  波特率
+                  <select
+                    value={
+                      [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].includes(
+                        serialDialog.draft.serial?.baudRate ?? 115200,
+                      )
+                        ? String(serialDialog.draft.serial?.baudRate)
+                        : "__custom__"
+                    }
+                    onChange={(e) => {
+                      if (e.target.value !== "__custom__") {
+                        patchSerialDraft({}, { baudRate: Number(e.target.value) });
+                      }
+                    }}
+                  >
+                    {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                    <option value="__custom__">自定义…</option>
+                  </select>
+                </label>
+                <label className="modal-field">
+                  自定义波特率
+                  <input
+                    value={serialDialog.draft.serial?.baudRate ?? 115200}
+                    onChange={(e) =>
+                      patchSerialDraft({}, { baudRate: Number(e.target.value) || 115200 })
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="modal-row">
+                <label className="modal-field">
+                  数据位
+                  <select
+                    value={serialDialog.draft.serial?.dataBits ?? 8}
+                    onChange={(e) => patchSerialDraft({}, { dataBits: Number(e.target.value) })}
+                  >
+                    {[5, 6, 7, 8].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="modal-field">
+                  停止位
+                  <select
+                    value={serialDialog.draft.serial?.stopBits ?? 1}
+                    onChange={(e) => patchSerialDraft({}, { stopBits: Number(e.target.value) })}
+                  >
+                    <option value={1}>1</option>
+                    <option value={2}>2</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="modal-row">
+                <label className="modal-field">
+                  校验位
+                  <select
+                    value={serialDialog.draft.serial?.parity ?? "none"}
+                    onChange={(e) =>
+                      patchSerialDraft({}, {
+                        parity: e.target.value as SerialConfig["parity"],
+                      })
+                    }
+                  >
+                    <option value="none">无 (None)</option>
+                    <option value="odd">奇校验 (Odd)</option>
+                    <option value="even">偶校验 (Even)</option>
+                  </select>
+                </label>
+                <label className="modal-field">
+                  流控
+                  <select
+                    value={serialDialog.draft.serial?.flowControl ?? "none"}
+                    onChange={(e) =>
+                      patchSerialDraft({}, {
+                        flowControl: e.target.value as SerialConfig["flowControl"],
+                      })
+                    }
+                  >
+                    <option value="none">无</option>
+                    <option value="software">软件 (XON/XOFF)</option>
+                    <option value="hardware">硬件 (RTS/CTS)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="hint" style={{ padding: "0 14px" }}>
+                这些参数是**这条连接自己的**，不会影响别的串口。
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setSerialDialog(null)}>
+                取消
+              </button>
+              <button type="button" className="btn" onClick={() => void saveSerialDialog(false)}>
+                仅保存
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => void saveSerialDialog(true)}
+              >
+                保存并打开
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tabMenu && (
+        <div
+          className="ctx-backdrop"
+          onClick={() => setTabMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setTabMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(Math.max(0, tabMenu.x), Math.max(0, window.innerWidth - 210)),
+              top: Math.min(Math.max(0, tabMenu.y), Math.max(0, window.innerHeight - 170)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const m = tabMenu;
+                const s = sessions.find((x) => x.id === m.id);
+                setTabMenu(null);
+                setSessionRename({ id: m.id, value: s?.title ?? "" });
+              }}
+            >
+              重命名会话…
+            </button>
+            {(() => {
+              const s = sessions.find((x) => x.id === tabMenu.id);
+              if (!s?.profileId) return null;
+              return (
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    setTabMenu(null);
+                    if (s) void reconnectSession(s);
+                  }}
+                >
+                  重新连接
+                </button>
+              );
+            })()}
+            <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const m = tabMenu;
+                setTabMenu(null);
+                void closeSession(m.id);
+              }}
+            >
+              关闭会话
+            </button>
+          </div>
+        </div>
+      )}
+
+      {sessionRename && (
+        <div className="modal-backdrop" onClick={() => setSessionRename(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">重命名会话</div>
+            <div className="modal-body">
+              <label className="modal-field">
+                显示名字
+                <input
+                  autoFocus
+                  value={sessionRename.value}
+                  placeholder="比如：后端调试 / AI 写文档"
+                  onChange={(e) =>
+                    setSessionRename({ ...sessionRename, value: e.target.value })
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void renameSession(sessionRename.id, sessionRename.value);
+                    if (e.key === "Escape") setSessionRename(null);
+                  }}
+                />
+              </label>
+              <div className="hint" style={{ padding: "0 14px" }}>
+                改完会同时记进「会话历史」，下次从历史点进来还是这个名字。
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setSessionRename(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => void renameSession(sessionRename.id, sessionRename.value)}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {fsMenu && (
         <div
@@ -2308,14 +3085,14 @@ export default function App() {
                 <button type="button" className="btn primary" onClick={() => openEditDialog()}>
                   ＋ 新建服务器
                 </button>
-                <span className="hint">共 {profiles.length} 台</span>
+                <span className="hint">共 {sshProfiles.length} 台</span>
               </div>
-              {profiles.length === 0 && (
+              {sshProfiles.length === 0 && (
                 <div className="hint" style={{ padding: "0 14px" }}>
                   还没有服务器，点「＋ 新建服务器」添加第一台。
                 </div>
               )}
-              {profiles.map((p) => (
+              {sshProfiles.map((p) => (
                 <div className="srv-row" key={p.id}>
                   <span
                     className="color-dot"
@@ -2639,6 +3416,9 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">关于 ZeeAI Terminal</div>
             <div className="modal-body">
+              <div className="about-row">
+                <IconLogoTile size={56} />
+              </div>
               <div className="hint">
                 <b>ZeeAI Terminal</b> 0.1.0
                 <br />
@@ -2680,7 +3460,7 @@ export default function App() {
                       void loadDialogTmux(e.target.value, newDialog.user);
                   }}
                 >
-                  {profiles.map((p) => (
+                  {sshProfiles.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}（{p.ssh?.user}@{p.ssh?.host}）
                     </option>

@@ -3,6 +3,67 @@ interface IconProps {
   className?: string;
 }
 
+/**
+ * 产品图标：立体麻将「红中」。
+ * 和打包用的 icons/*.png 是同一套几何（48 单位的画布），
+ * 说明里说的「立体的麻将红中、字要正、简洁但一看就懂」就指这个。
+ */
+export const IconLogoTile = ({ size = 18, className }: IconProps) => (
+  <svg
+    className={"icon" + (className ? " " + className : "")}
+    width={size}
+    height={size}
+    viewBox="0 0 48 48"
+    aria-hidden="true"
+  >
+    <defs>
+      <linearGradient id="zeeai-tile-face" x1="0" y1="0" x2="0.7" y2="1">
+        <stop offset="0" stopColor="#fffdf7" />
+        <stop offset="1" stopColor="#e9e2d1" />
+      </linearGradient>
+    </defs>
+    {/* 厚度（右下偏移 = 立体） */}
+    <rect x="5.6" y="6.6" width="37" height="38" rx="6.6" fill="#a69d84" />
+    {/* 正面 */}
+    <rect
+      x="4"
+      y="4"
+      width="37"
+      height="38"
+      rx="6.6"
+      fill="url(#zeeai-tile-face)"
+      stroke="rgba(120,110,92,0.30)"
+      strokeWidth="1.1"
+    />
+    <rect
+      x="6.9"
+      y="6.9"
+      width="31.2"
+      height="32.2"
+      rx="4.6"
+      fill="none"
+      stroke="rgba(120,110,90,0.14)"
+      strokeWidth="1"
+    />
+    {/* 红中：先白后红，做出刻出来的立体感 */}
+    <text
+      x="22.6"
+      y="24.2"
+      textAnchor="middle"
+      dominantBaseline="central"
+      fontFamily="'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
+      fontSize="26.6"
+      fontWeight="700"
+      fill="#c81a20"
+      stroke="rgba(255,255,255,0.92)"
+      strokeWidth="1.6"
+      paintOrder="stroke"
+    >
+      中
+    </text>
+  </svg>
+);
+
 function base(paths: React.ReactNode, size: number, className?: string) {
   return (
     <svg
@@ -37,46 +98,119 @@ export const IconServer = ({ size = 16, className }: IconProps) =>
     className,
   );
 
-/** PowerShell：方框 + `>_` 提示符 */
-export const IconPowerShell = ({ size = 16, className }: IconProps) =>
-  base(
-    <>
-      <rect x="2.5" y="3.5" width="19" height="17" rx="2.5" />
-      <polyline points="6.5 9 10.5 12 6.5 15" />
-      <line x1="12.5" y1="15" x2="17" y2="15" />
-    </>,
-    size,
-    className,
-  );
+/**
+ * PowerShell：学它原生的样子——深蓝底 + 白色 `>_`。
+ * 这里用固定品牌色（不跟随主题），这样和 CMD 一眼就能区分开。
+ */
+export const IconPowerShell = ({ size = 16, className }: IconProps) => (
+  <svg
+    className={"icon" + (className ? " " + className : "")}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <defs>
+      <linearGradient id="zeeai-ps-grad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stopColor="#3d7dd8" />
+        <stop offset="1" stopColor="#1b3a75" />
+      </linearGradient>
+    </defs>
+    <rect x="1.5" y="2.5" width="21" height="19" rx="3" fill="url(#zeeai-ps-grad)" />
+    <path
+      d="M6.4 8.2 10.5 12l-4.1 3.8"
+      fill="none"
+      stroke="#ffffff"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M12.4 15.6h5"
+      fill="none"
+      stroke="#ffffff"
+      strokeWidth="2"
+      strokeLinecap="round"
+    />
+  </svg>
+);
 
-/** CMD：控制台窗口 + 提示符 */
-export const IconCmd = ({ size = 16, className }: IconProps) =>
-  base(
-    <>
-      <rect x="2.5" y="4" width="19" height="16" rx="2" />
-      <line x1="2.5" y1="8.5" x2="21.5" y2="8.5" />
-      <polyline points="6 12 8.5 14 6 16" />
-      <line x1="10" y1="16" x2="13.5" y2="16" />
-    </>,
-    size,
-    className,
-  );
+/**
+ * CMD：学它原生的样子——黑色命令提示符窗口 + 白色 `C:\` 提示符 + 光标块。
+ * 提示符全部用「描边 + 圆点」画（不依赖字体），保证任何缩放下都居中、不歪。
+ * 和 PowerShell 的「蓝底 >_」放在一起一眼就能区分。
+ */
+export const IconCmd = ({ size = 16, className }: IconProps) => (
+  <svg
+    className={"icon" + (className ? " " + className : "")}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <rect x="1.5" y="2.5" width="21" height="19" rx="2.8" fill="#0d0d0d" />
+    {/* 标题栏 */}
+    <path
+      d="M1.5 5.3a2.8 2.8 0 0 1 2.8-2.8h15.4a2.8 2.8 0 0 1 2.8 2.8v1.5H1.5z"
+      fill="#3a3a3a"
+    />
+    <rect
+      x="1.5"
+      y="2.5"
+      width="21"
+      height="19"
+      rx="2.8"
+      fill="none"
+      stroke="#8c8c8c"
+      strokeWidth="1"
+    />
+    <g stroke="#f2f2f2" strokeWidth="1.65" strokeLinecap="round" fill="none">
+      {/* C */}
+      <path d="M9.31 12.79A2.5 2.5 0 1 0 9.31 16.01" />
+      {/* \ */}
+      <path d="M13.6 12.6 15.4 16.4" />
+    </g>
+    {/* : */}
+    <circle cx="11.5" cy="13.1" r="0.68" fill="#f2f2f2" />
+    <circle cx="11.5" cy="15.7" r="0.68" fill="#f2f2f2" />
+    {/* 光标 */}
+    <rect x="16.6" y="14.9" width="3.4" height="1.6" rx="0.3" fill="#f2f2f2" />
+  </svg>
+);
 
-/** WSL：企鹅 */
-export const IconWsl = ({ size = 16, className }: IconProps) =>
-  base(
-    <>
-      <ellipse cx="12" cy="9" rx="5" ry="6" />
-      <path d="M7.5 13.5c-1.8 1-1.8 3.5 0 4.5" />
-      <path d="M16.5 13.5c1.8 1 1.8 3.5 0 4.5" />
-      <circle cx="10.2" cy="8" r="0.9" fill="currentColor" stroke="none" />
-      <circle cx="13.8" cy="8" r="0.9" fill="currentColor" stroke="none" />
-      <path d="M11.2 10.6 12 12.2l0.8-1.6z" />
-      <path d="M8.5 20.5h7" />
-    </>,
-    size,
-    className,
-  );
+/**
+ * WSL：原来的企鹅只有几根线条，看不清是什么；这里改成色块画的 Tux，
+ * 黑白对比 + 橙色嘴和脚，缩到 22px 也能认出来。
+ */
+export const IconWsl = ({ size = 16, className }: IconProps) => (
+  <svg
+    className={"icon" + (className ? " " + className : "")}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    {/* 身体 */}
+    <ellipse cx="12" cy="13.6" rx="6" ry="7.8" fill="#141414" />
+    {/* 肚子 */}
+    <ellipse cx="12" cy="14.9" rx="3.9" ry="5.7" fill="#f4f4f4" />
+    {/* 头 */}
+    <ellipse cx="12" cy="7.3" rx="5" ry="4.5" fill="#141414" />
+    {/* 眼睛 */}
+    <circle cx="10.1" cy="7" r="1.6" fill="#ffffff" />
+    <circle cx="13.9" cy="7" r="1.6" fill="#ffffff" />
+    <circle cx="10.3" cy="7.2" r="0.8" fill="#141414" />
+    <circle cx="13.7" cy="7.2" r="0.8" fill="#141414" />
+    {/* 嘴 */}
+    <path d="M10.9 9h2.2l-1.1 2.2z" fill="#f5a623" />
+    {/* 翅膀 */}
+    <path d="M5.7 11.4c-.8 2.3-.6 4.8.7 6.6-1.9-1.5-2.6-4.3-1.5-6.9z" fill="#141414" />
+    <path d="M18.3 11.4c.8 2.3.6 4.8-.7 6.6 1.9-1.5 2.6-4.3 1.5-6.9z" fill="#141414" />
+    {/* 脚 */}
+    <path d="M8.3 20.7h3.2l-.5 1.2H7.8z" fill="#f5a623" />
+    <path d="M12.5 20.7h3.2l.5 1.2h-3.2z" fill="#f5a623" />
+  </svg>
+);
 
 /** 串口：插头 */
 export const IconSerial = ({ size = 16, className }: IconProps) =>
@@ -122,12 +256,15 @@ export const IconGit = ({ size = 16, className }: IconProps) =>
     className,
   );
 
-/** 设置：齿轮 */
+/**
+ * 设置：真正的一圈轮齿（原来是「圆 + 八根放射线」，看着像太阳/亮度图标）。
+ * 用和 VS Code 同一种「齿轮 + 内圈」的形状。
+ */
 export const IconGear = ({ size = 16, className }: IconProps) =>
   base(
     <>
-      <circle cx="12" cy="12" r="3.2" />
-      <path d="M12 2.5v2.6M12 18.9v2.6M4.6 4.6l1.9 1.9M17.5 17.5l1.9 1.9M2.5 12h2.6M18.9 12h2.6M4.6 19.4l1.9-1.9M17.5 6.5l1.9-1.9" />
+      <path d="M19.14 12.94a7.6 7.6 0 0 0 .06-.94 7.6 7.6 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.2 7.2 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.05.31-.08.62-.08.94s.03.63.08.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.12.22.38.31.6.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.09.48 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.62z" />
+      <circle cx="12" cy="12" r="3.1" />
     </>,
     size,
     className,

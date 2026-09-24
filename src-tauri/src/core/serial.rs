@@ -16,6 +16,57 @@ pub struct SerialPortInfo {
     pub label: String,
 }
 
+/// 串口参数。每个串口连接存自己的一套，不再全局共用一个波特率。
+#[derive(Clone, Debug)]
+pub struct SerialSettings {
+    pub baud: u32,
+    pub data_bits: u8,
+    /// 1 或 2
+    pub stop_bits: u8,
+    /// "none" / "odd" / "even"
+    pub parity: String,
+    /// "none" / "software" / "hardware"
+    pub flow_control: String,
+}
+
+impl Default for SerialSettings {
+    fn default() -> Self {
+        Self {
+            baud: 115200,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: "none".into(),
+            flow_control: "none".into(),
+        }
+    }
+}
+
+fn builder(path: &str, s: &SerialSettings) -> serialport::SerialPortBuilder {
+    serialport::new(path, s.baud)
+        .data_bits(match s.data_bits {
+            5 => serialport::DataBits::Five,
+            6 => serialport::DataBits::Six,
+            7 => serialport::DataBits::Seven,
+            _ => serialport::DataBits::Eight,
+        })
+        .stop_bits(if s.stop_bits == 2 {
+            serialport::StopBits::Two
+        } else {
+            serialport::StopBits::One
+        })
+        .parity(match s.parity.as_str() {
+            "odd" => serialport::Parity::Odd,
+            "even" => serialport::Parity::Even,
+            _ => serialport::Parity::None,
+        })
+        .flow_control(match s.flow_control.as_str() {
+            "software" => serialport::FlowControl::Software,
+            "hardware" => serialport::FlowControl::Hardware,
+            _ => serialport::FlowControl::None,
+        })
+        .timeout(Duration::from_millis(50))
+}
+
 pub fn list() -> Result<Vec<SerialPortInfo>, String> {
     let ports = serialport::available_ports().map_err(|e| format!("枚举串口失败: {e}"))?;
     Ok(ports
@@ -50,8 +101,13 @@ pub fn list() -> Result<Vec<SerialPortInfo>, String> {
 /// 无人值守自检用：打开串口读一会儿，返回 (收到字节数, 去掉 ANSI 转义的预览)。
 /// 用来验证「接上真实设备时能不能收到数据」，不需要开界面。
 pub fn probe(path: &str, baud: u32, millis: u64) -> Result<(usize, String), String> {
-    let mut port = serialport::new(path, baud)
-        .timeout(Duration::from_millis(50))
+    let mut port = builder(
+        path,
+        &SerialSettings {
+            baud,
+            ..Default::default()
+        },
+    )
         .open()
         .map_err(|e| format!("打开串口 {path} 失败: {e}"))?;
     let start = std::time::Instant::now();
@@ -83,12 +139,11 @@ pub fn probe(path: &str, baud: u32, millis: u64) -> Result<(usize, String), Stri
 /// 打开串口并把它桥接成一个终端会话（原始字节流 ↔ xterm）。
 pub fn open(
     path: &str,
-    baud: u32,
+    settings: &SerialSettings,
     title: &str,
     channel: Channel<SessionEvent>,
 ) -> Result<SessionHandle, String> {
-    let port = serialport::new(path, baud)
-        .timeout(Duration::from_millis(50))
+    let port = builder(path, settings)
         .open()
         .map_err(|e| format!("打开串口 {path} 失败: {e}"))?;
     let mut reader = port

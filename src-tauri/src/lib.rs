@@ -62,7 +62,26 @@ pub fn run() {
             Some(profile) => {
               log::info!("SELFTEST: using profile {}", profile.name);
               match crate::commands::tmux_list(profile.id.clone(), None).await {
-                Ok(list) => log::info!("SELFTEST: tmux_list ok -> {} sessions", list.len()),
+                Ok(list) => {
+                  log::info!("SELFTEST: tmux_list ok -> {} sessions", list.len());
+                  // 「文件面板跟随终端目录」依赖这个：问 tmux 会话当前在哪个目录
+                  if let Some(first) = list.first() {
+                    match crate::commands::remote_pwd(
+                      profile.id.clone(),
+                      Some(first.name.clone()),
+                      None,
+                    )
+                    .await
+                    {
+                      Ok(pwd) => log::info!(
+                        "SELFTEST: remote_pwd ok -> tmux {} 在 {}",
+                        first.name,
+                        pwd
+                      ),
+                      Err(e) => log::error!("SELFTEST: remote_pwd failed -> {e}"),
+                    }
+                  }
+                }
                 Err(e) => log::error!("SELFTEST: tmux_list failed -> {e}"),
               }
               match crate::commands::fs_list(profile.id.clone(), None, None).await {
@@ -254,6 +273,7 @@ pub fn run() {
       commands::session_close,
       commands::tmux_list,
       commands::tmux_kill,
+      commands::remote_pwd,
       commands::fs_list,
       commands::fs_read,
       commands::fs_upload,

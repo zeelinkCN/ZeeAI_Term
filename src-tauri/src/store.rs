@@ -30,6 +30,33 @@ pub struct SshConfig {
 pub struct SerialConfig {
     pub path: String,
     pub baud_rate: u32,
+    #[serde(default = "default_data_bits")]
+    pub data_bits: u8,
+    /// 1 或 2
+    #[serde(default = "default_stop_bits")]
+    pub stop_bits: u8,
+    /// "none" / "odd" / "even"
+    #[serde(default = "default_parity")]
+    pub parity: String,
+    /// "none" / "software" / "hardware"
+    #[serde(default = "default_flow_control")]
+    pub flow_control: String,
+}
+
+fn default_data_bits() -> u8 {
+    8
+}
+
+fn default_stop_bits() -> u8 {
+    1
+}
+
+fn default_parity() -> String {
+    "none".into()
+}
+
+fn default_flow_control() -> String {
+    "none".into()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -38,6 +65,9 @@ pub struct LocalConfig {
     pub shell: String,
     #[serde(default)]
     pub distro: Option<String>,
+    /// 本地终端/工作空间的起始目录（Git 工作空间就靠它）
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -104,6 +134,8 @@ pub struct Settings {
     pub update_url: String,
     /// SSH 会话意外断开时是否自动重连（并重新附加 tmux）
     pub auto_reconnect: bool,
+    /// 文件面板是否跟随终端当前目录（点刷新时自动跳到 tmux 的 pane 目录）
+    pub fs_follow_terminal: bool,
 }
 
 impl Default for Settings {
@@ -117,6 +149,7 @@ impl Default for Settings {
             close_action: "exit".into(),
             update_url: String::new(),
             auto_reconnect: true,
+            fs_follow_terminal: true,
         }
     }
 }
@@ -145,6 +178,9 @@ pub struct HistoryEntry {
     pub host: String,
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// 用户给这个会话起的名字（为空则界面按 tmux 会话名/普通 shell 显示）
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub last_used: u64,
 }

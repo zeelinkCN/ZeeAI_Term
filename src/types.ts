@@ -19,8 +19,20 @@ export interface ConnectionProfile {
   group: string;
   color?: string;
   ssh?: SshConfig;
-  serial?: { path: string; baudRate: number };
-  local?: { shell: "powershell" | "cmd" | "wsl"; distro?: string };
+  serial?: SerialConfig;
+  local?: { shell: "powershell" | "cmd" | "wsl"; distro?: string; cwd?: string };
+}
+
+/** 串口连接参数：每个串口自己一套，不再是全局共用一个波特率 */
+export interface SerialConfig {
+  path: string;
+  baudRate: number;
+  /** 5 / 6 / 7 / 8 */
+  dataBits?: number;
+  /** 1 / 2 */
+  stopBits?: number;
+  parity?: "none" | "odd" | "even";
+  flowControl?: "none" | "software" | "hardware";
 }
 
 export type SessionState =
@@ -76,6 +88,8 @@ export interface HistoryEntry {
   profileName: string;
   host: string;
   tmuxSession?: string | null;
+  /** 用户给这个会话起的名字 */
+  title?: string | null;
   lastUsed: number;
 }
 
@@ -88,6 +102,8 @@ export interface AppSettings {
   closeAction: "exit" | "tray";
   updateUrl: string;
   autoReconnect: boolean;
+  /** 文件面板是否跟随终端当前目录 */
+  fsFollowTerminal: boolean;
 }
 
 export interface GitFile {

@@ -16,9 +16,14 @@ body,
 body {
   background: #1e1e1e;
   color: #cccccc;
-  font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  /* 英文/数字走 Segoe UI，中文落到「微软雅黑 UI」——它比老的 YaHei 更适合界面小字号，
+     在 125%/133% 缩放的高分屏上明显更清楚。 */
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system,
+    sans-serif;
   font-size: 13px;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 .icon {
@@ -61,6 +66,19 @@ body {
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  flex: none;
+  padding-right: 2px;
+}
+
+.about-row {
+  display: flex;
+  justify-content: center;
+  padding: 2px 0 12px;
 }
 
 .menus span {
@@ -181,6 +199,133 @@ body {
   --accent: #7b83eb;
   --accent-soft: rgba(98, 100, 167, 0.24);
   --status: #4b53bc;
+}
+
+/* One Dark Pro */
+.app.theme-one {
+  --bg: #282c34;
+  --sidebar: #21252b;
+  --titlebar: #21252b;
+  --tab: #2c313a;
+  --border: #3b4048;
+  --fg: #abb2bf;
+  --muted: #7f848e;
+  --accent: #61afef;
+  --accent-soft: rgba(97, 175, 239, 0.18);
+  --green: #98c379;
+  --amber: #e5c07b;
+  --red: #e06c75;
+  --status: #3b7ea1;
+}
+
+/* Tokyo Night */
+.app.theme-tokyo {
+  --bg: #1a1b26;
+  --sidebar: #16161e;
+  --titlebar: #16161e;
+  --tab: #1f2335;
+  --border: #2f3549;
+  --fg: #c0caf5;
+  --muted: #787c99;
+  --accent: #7aa2f7;
+  --accent-soft: rgba(122, 162, 247, 0.18);
+  --green: #9ece6a;
+  --amber: #e0af68;
+  --red: #f7768e;
+  --status: #2b3b6b;
+}
+
+/* Nord */
+.app.theme-nord {
+  --bg: #2e3440;
+  --sidebar: #292e39;
+  --titlebar: #2b303b;
+  --tab: #333a46;
+  --border: #434c5e;
+  --fg: #d8dee9;
+  --muted: #94a1b8;
+  --accent: #88c0d0;
+  --accent-soft: rgba(136, 192, 208, 0.18);
+  --green: #a3be8c;
+  --amber: #ebcb8b;
+  --red: #bf616a;
+  --status: #5e81ac;
+}
+
+/* Monokai（略偏暗，眼睛舒服一点） */
+.app.theme-monokai {
+  --bg: #22221f;
+  --sidebar: #1d1d1b;
+  --titlebar: #27271f;
+  --tab: #26261f;
+  --border: #3d3d33;
+  --fg: #f2f0e6;
+  --muted: #9d9a86;
+  --accent: #ffd866;
+  --accent-soft: rgba(255, 216, 102, 0.16);
+  --green: #a9dc76;
+  --amber: #fc9867;
+  --red: #ff6188;
+  --status: #7a5c1e;
+}
+
+/* 青瓷：低饱和的墨绿/青，久看不累 */
+.app.theme-teal {
+  --bg: #12211f;
+  --sidebar: #0e1c1a;
+  --titlebar: #142825;
+  --tab: #16302c;
+  --border: #21443f;
+  --fg: #d3e5e0;
+  --muted: #7fa39c;
+  --accent: #4fd1c5;
+  --accent-soft: rgba(79, 209, 197, 0.16);
+  --green: #7ee0a8;
+  --amber: #e6c07b;
+  --red: #ef6f6f;
+  --status: #1f6f66;
+}
+
+/* 纸白：偏暖的浅色，比纯白护眼 */
+.app.theme-paper {
+  --bg: #f7f3ea;
+  --sidebar: #efe9dd;
+  --titlebar: #e8e1d3;
+  --tab: #f1ece1;
+  --border: #d5cbb8;
+  --fg: #35302a;
+  --muted: #7a7166;
+  --accent: #b35c1e;
+  --accent-soft: rgba(179, 92, 30, 0.12);
+  --status: #9a6a3a;
+}
+
+/* 樱花粉 */
+.app.theme-sakura {
+  --bg: #fdf4f7;
+  --sidebar: #f8e7ee;
+  --titlebar: #f3dbe6;
+  --tab: #faeaf0;
+  --border: #e7c9d6;
+  --fg: #3b2b33;
+  --muted: #8a6c78;
+  --accent: #d6477f;
+  --accent-soft: rgba(214, 71, 127, 0.12);
+  --status: #b83a6c;
+}
+
+/* 薄荷绿（浅色） */
+.app.theme-mint {
+  --bg: #f4fbf8;
+  --sidebar: #e6f5ef;
+  --titlebar: #d9eee6;
+  --tab: #eaf7f2;
+  --border: #c3e0d5;
+  --fg: #1f3530;
+  --muted: #66867c;
+  --accent: #0f9d76;
+  --accent-soft: rgba(15, 157, 118, 0.12);
+  --status: #0d7f60;
 }
 
 .app.theme-dracula {
@@ -442,6 +587,41 @@ body {
   color: var(--muted);
 }
 
+/*
+ * 会话历史挂在服务器下面，是「子级」。这里明确缩进 + 一条竖向引导线，
+ * 让人一眼看出它是从属关系，而不是和服务器并列。
+ */
+.tree-item.child {
+  margin-left: 20px;
+  padding-left: 8px;
+  position: relative;
+  font-size: 12px;
+}
+
+.tree-item.child::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.tree-item.child:last-child::before {
+  bottom: 50%;
+}
+
+.tree-item.child::after {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: var(--border);
+}
+
 .form-check {
   display: flex;
   align-items: center;
@@ -620,6 +800,11 @@ body {
 
 .mini-btn.danger:hover {
   background: rgba(255, 90, 90, 0.16);
+}
+
+.tree-item .tag.warn {
+  background: rgba(226, 192, 141, 0.18);
+  color: var(--amber);
 }
 
 .modal-body {

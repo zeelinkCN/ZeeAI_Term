@@ -53,12 +53,18 @@ pub fn open_local(
     id: String,
     shell: String,
     distro: Option<String>,
+    cwd: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
-    log::info!("ipc: open_local shell={} distro={:?}", shell, distro);
+    log::info!(
+        "ipc: open_local shell={} distro={:?} cwd={:?}",
+        shell,
+        distro,
+        cwd
+    );
     let (program, args, title) = match shell.as_str() {
         "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
         "wsl" => {
@@ -81,7 +87,7 @@ pub fn open_local(
         &title,
         &program,
         &args,
-        None,
+        cwd.as_deref().filter(|d| !d.trim().is_empty()),
         cols.unwrap_or(110),
         rows.unwrap_or(30),
         on_event,
@@ -271,12 +277,23 @@ pub fn open_serial(
     id: String,
     path: String,
     baud: u32,
+    data_bits: Option<u8>,
+    stop_bits: Option<u8>,
+    parity: Option<String>,
+    flow_control: Option<String>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
-    log::info!("ipc: open_serial path={path} baud={baud}");
+    let settings = serial::SerialSettings {
+        baud,
+        data_bits: data_bits.unwrap_or(8),
+        stop_bits: stop_bits.unwrap_or(1),
+        parity: parity.unwrap_or_else(|| "none".into()),
+        flow_control: flow_control.unwrap_or_else(|| "none".into()),
+    };
+    log::info!("ipc: open_serial path={path} {:?}", settings);
     let title = format!("串口 · {path} · {baud}");
-    let handle = serial::open(&path, baud, &title, on_event)?;
+    let handle = serial::open(&path, &settings, &title, on_event)?;
     registry
         .sessions
         .lock()
@@ -518,6 +535,49 @@ pub fn open_adb_shell(
         user: None,
         host: None,
     })
+}
+
+/// 问一下这个会话当前在哪个目录。
+/// tmux 会话能准确拿到（`#{pane_current_path}` 是 tmux 自己维护的），
+/// 普通 shell 拿不到，只能退回家目录——那种情况前端会保持原路径。
+#[tauri::command]
+pub async fn remote_pwd(
+    profile_id: String,
+    tmux_session: Option<String>,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let cmd = match tmux_session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(name) => format!(
+            "tmux display-message -p -t {} '#{{pane_current_path}}' 2>/dev/null",
+            remote_fs::sq(name)
+        ),
+        None => "pwd".to_string(),
+    };
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        &cmd,
+    );
+    let out = run_ssh_capture(&args).await?;
+    let path = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.starts_with('/'))
+        .next_back()
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return Err("拿不到远端当前目录".into());
+    }
+    log::info!("ipc: remote_pwd -> {path}");
+    Ok(path)
 }
 
 /// 列出服务器上的 tmux 会话（通过一次性 ssh 命令）。
