@@ -1,5 +1,5 @@
 mod commands;
-mod core;
+pub mod core;
 mod store;
 
 use core::SessionRegistry;
@@ -308,6 +308,11 @@ pub fn run() {
       commands::git_checkout,
       commands::git_diff,
       commands::git_show,
+      commands::secret_set,
+      commands::secret_has,
+      commands::secret_delete,
+      commands::workspace_save,
+      commands::workspace_load,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

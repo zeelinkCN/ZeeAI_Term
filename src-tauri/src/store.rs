@@ -119,6 +119,21 @@ fn settings_file() -> PathBuf {
     store_dir().join("settings.json")
 }
 
+/// 上次退出时的工作区快照（JSON 字符串，前端自己定义结构）
+fn workspace_file() -> PathBuf {
+    store_dir().join("workspace.json")
+}
+
+pub fn save_workspace(data: &str) -> Result<(), String> {
+    let dir = store_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    fs::write(workspace_file(), data).map_err(|e| format!("写入工作区失败: {e}"))
+}
+
+pub fn load_workspace() -> Option<String> {
+    fs::read_to_string(workspace_file()).ok()
+}
+
 /// 应用设置。所有字段都有默认值，方便版本升级时兼容旧文件。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -136,6 +151,8 @@ pub struct Settings {
     pub auto_reconnect: bool,
     /// 文件面板是否跟随终端当前目录（点刷新时自动跳到 tmux 的 pane 目录）
     pub fs_follow_terminal: bool,
+    /// 退出时保存工作区、启动时恢复上次打开的会话
+    pub restore_workspace: bool,
 }
 
 impl Default for Settings {
@@ -150,6 +167,7 @@ impl Default for Settings {
             update_url: String::new(),
             auto_reconnect: true,
             fs_follow_terminal: true,
+            restore_workspace: true,
         }
     }
 }

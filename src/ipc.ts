@@ -221,6 +221,29 @@ export async function gitShow(path: string, rev: string): Promise<string> {
   return invoke<string>("git_show", { path, rev });
 }
 
+/** 把密码存进 Windows 凭据管理器（传空字符串等于删除） */
+export async function secretSet(profileId: string, password: string): Promise<void> {
+  return invoke("secret_set", { profileId, password });
+}
+
+export async function secretHas(profileId: string): Promise<boolean> {
+  return invoke<boolean>("secret_has", { profileId });
+}
+
+export async function secretDelete(profileId: string): Promise<void> {
+  return invoke("secret_delete", { profileId });
+}
+
+/** 保存工作区快照（前端序列化成 JSON） */
+export async function workspaceSave(data: string): Promise<void> {
+  return invoke("workspace_save", { data });
+}
+
+/** 读取上次的工作区快照 */
+export async function workspaceLoad(): Promise<string | null> {
+  return invoke<string | null>("workspace_load");
+}
+
 /** 列出服务器上的 tmux 会话 */
 export async function tmuxList(
   profileId: string,

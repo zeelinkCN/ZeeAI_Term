@@ -3,6 +3,7 @@ pub mod git;
 pub mod job;
 pub mod pty;
 pub mod remote_fs;
+pub mod secret;
 pub mod serial;
 pub mod session;
 pub mod sftp;

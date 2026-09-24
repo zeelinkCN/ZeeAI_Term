@@ -104,6 +104,8 @@ export interface AppSettings {
   autoReconnect: boolean;
   /** 文件面板是否跟随终端当前目录 */
   fsFollowTerminal: boolean;
+  /** 退出时保存工作区、启动时恢复上次的会话 */
+  restoreWorkspace: boolean;
 }
 
 export interface GitFile {

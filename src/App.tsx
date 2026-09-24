@@ -39,6 +39,11 @@ import {
   openSerial,
   openSsh,
   remotePwd,
+  secretSet,
+  secretHas,
+  secretDelete,
+  workspaceSave,
+  workspaceLoad,
   saveProfile,
   sessionClose,
   serialList,
@@ -112,6 +117,24 @@ interface OpenSession {
   activeTab: string; // "terminal" 或文件名
 }
 
+/** 工作区快照里存的一个会话（只存"怎么把它开回来"，不存文件内容） */
+interface SavedSession {
+  kind: ModuleKey;
+  title: string;
+  profileId?: string;
+  user?: string;
+  tmuxName?: string;
+  tmuxMode?: "default" | "none" | "name";
+  cwd?: string;
+}
+
+interface SavedWorkspace {
+  version: number;
+  savedAt: number;
+  activeIndex: number;
+  sessions: SavedSession[];
+}
+
 interface MenuItem {
   sep: boolean;
   label?: string;
@@ -157,6 +180,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   updateUrl: "",
   autoReconnect: true,
   fsFollowTerminal: true,
+  restoreWorkspace: true,
 };
 
 const APP_VERSION = "0.1.0";
@@ -322,6 +346,7 @@ export default function App() {
   const [dialogBusy, setDialogBusy] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settingsReady, setSettingsReady] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showServers, setShowServers] = useState(false);
@@ -382,6 +407,8 @@ export default function App() {
   fsPathRef.current = fsPath;
   const sessionsRef = useRef<OpenSession[]>(sessions);
   sessionsRef.current = sessions;
+  const profilesRef = useRef<ConnectionProfile[]>(profiles);
+  profilesRef.current = profiles;
   const serialPortsRef = useRef<SerialPortInfo[]>([]);
   // 远程文件浏览器属于「当前会话」，所以读目录/读文件也要用当前会话实际登录的用户
   const activeUserRef = useRef<string | undefined>(undefined);
@@ -399,6 +426,9 @@ export default function App() {
   const [showBranches, setShowBranches] = useState(false);
   const [newBranch, setNewBranch] = useState("");
   const [diffDialog, setDiffDialog] = useState<{ title: string; text: string } | null>(null);
+  // 密码（存在 Windows 凭据管理器里，不写进配置文件）
+  const [editPassword, setEditPassword] = useState("");
+  const [editHasPassword, setEditHasPassword] = useState(false);
   // 文件传输进度（右下角那个小面板）
   const [transfers, setTransfers] = useState<
     {
@@ -418,9 +448,116 @@ export default function App() {
         setSettings({ ...DEFAULT_SETTINGS, ...(await settingsGet()) });
       } catch {
         /* 设置读取失败就用默认值 */
+      } finally {
+        setSettingsReady(true);
       }
     })();
   }, []);
+
+  // ---------- 工作区恢复：退出前存快照，下次打开时把会话重新拉起来 ----------
+  const restoredRef = useRef(false);
+  // 恢复流程结束前不许写快照，否则启动 1 秒内就把"待恢复的快照"覆盖成空的
+  const [restoreDone, setRestoreDone] = useState(false);
+  const [workspaceHint, setWorkspaceHint] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!settingsReady || restoredRef.current) return;
+    restoredRef.current = true;
+    if (!settings.restoreWorkspace) {
+      setRestoreDone(true);
+      return;
+    }
+    void (async () => {
+      let raw: string | null = null;
+      try {
+        raw = await workspaceLoad();
+      } catch {
+        setRestoreDone(true);
+        return;
+      }
+      if (!raw) {
+        setRestoreDone(true);
+        return;
+      }
+      let data: SavedWorkspace;
+      try {
+        data = JSON.parse(raw) as SavedWorkspace;
+      } catch {
+        setRestoreDone(true);
+        return;
+      }
+      const list = profilesRef.current;
+      const saved = data.sessions ?? [];
+      if (saved.length === 0) {
+        setRestoreDone(true);
+        return;
+      }
+      setWorkspaceHint(`正在恢复上次的 ${saved.length} 个会话…`);
+      const ids: string[] = [];
+      for (const s of saved) {
+        try {
+          if (s.kind === "remote" && s.profileId) {
+            const p = list.find((x) => x.id === s.profileId);
+            if (!p) continue;
+            const id = await openSshSession(
+              p,
+              s.tmuxMode ?? "default",
+              s.tmuxName ?? null,
+              s.user ?? null,
+              s.title ?? null,
+            );
+            ids.push(id);
+          } else if (s.kind === "powershell" || s.kind === "cmd" || s.kind === "wsl") {
+            const id = await openLocalSession(s.kind, undefined, s.cwd, s.title);
+            ids.push(id);
+          } else if (s.kind === "serial") {
+            const p = list.find((x) => x.type === "serial" && x.name === s.title);
+            if (!p) continue;
+            const id = await openSerialSession(p);
+            ids.push(id);
+          }
+        } catch {
+          /* 单个会话恢复失败不影响其它 */
+        }
+      }
+      if (ids.length > 0) {
+        const idx = Math.min(Math.max(data.activeIndex ?? 0, 0), ids.length - 1);
+        setActiveId(ids[idx]);
+      }
+      setWorkspaceHint(null);
+      setRestoreDone(true);
+      if (ids.length > 0) setToast(`已恢复上次的 ${ids.length} 个会话`);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsReady]);
+
+  // 会话有变化就把快照写下去（防抖，不写文件内容）
+  useEffect(() => {
+    if (!settingsReady || !settings.restoreWorkspace || !restoreDone) return;
+    const snapshot: SavedWorkspace = {
+      version: 1,
+      savedAt: Date.now(),
+      activeIndex: Math.max(
+        0,
+        sessions.findIndex((s) => s.id === activeId),
+      ),
+      sessions: sessions.map((s) => ({
+        kind: s.kind,
+        title: s.title,
+        profileId: s.profileId,
+        user: s.user,
+        tmuxName: s.tmuxName,
+        tmuxMode: s.tmuxMode,
+        cwd: s.cwd,
+      })),
+    };
+    const t = window.setTimeout(() => {
+      void workspaceSave(JSON.stringify(snapshot)).catch(() => {
+        /* 存不下就算了，不影响使用 */
+      });
+    }, 700);
+    return () => window.clearTimeout(t);
+  }, [sessions, activeId, settingsReady, settings.restoreWorkspace, restoreDone]);
 
   // 文件传输进度：后端用 emit 推过来，这里维护右下角那个进度面板
   useEffect(() => {
@@ -726,14 +863,22 @@ export default function App() {
     distro?: string,
     cwd?: string,
     titleOverride?: string,
-  ) {
+  ): Promise<string> {
     const id = uid();
     const base =
       shell === "wsl" ? "WSL" + (distro ? " · " + distro : "") : shell === "cmd" ? "命令提示符" : "PowerShell";
     // 同一个模块开多个时编号，方便在侧栏/标签里区分（PowerShell、PowerShell 2、…）
     const sameKind = sessionsRef.current.filter((s) => s.kind === shell).length + 1;
     const title = titleOverride?.trim() || (sameKind > 1 ? `${base} ${sameKind}` : base);
-    addSession({ id, title, kind: shell, state: "connecting", openFiles: [], activeTab: "terminal" });
+    addSession({
+      id,
+      title,
+      kind: shell,
+      cwd,
+      state: "connecting",
+      openFiles: [],
+      activeTab: "terminal",
+    });
     try {
       const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
       setSessions((prev) =>
@@ -742,6 +887,7 @@ export default function App() {
     } catch (e) {
       setToast("打开本地终端失败：" + String(e));
     }
+    return id;
   }
 
   async function openSshSession(
@@ -937,8 +1083,14 @@ export default function App() {
   function openEditDialog(profile?: ConnectionProfile) {
     if (profile) {
       setEditDialog({ draft: JSON.parse(JSON.stringify(profile)), isNew: false });
+      setEditPassword("");
+      void secretHas(profile.id)
+        .then(setEditHasPassword)
+        .catch(() => setEditHasPassword(false));
       return;
     }
+    setEditPassword("");
+    setEditHasPassword(false);
     setEditDialog({
       isNew: true,
       draft: {
@@ -1552,7 +1704,7 @@ export default function App() {
     const cfg = profile.serial;
     if (!cfg?.path) {
       setToast("这个串口连接没有配置端口");
-      return;
+      return "";
     }
     const id = uid();
     addSession({
@@ -1577,6 +1729,7 @@ export default function App() {
       setToast("打开串口失败：" + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
+    return id;
   }
 
   async function openAdbSession(serial: string) {
@@ -4096,6 +4249,74 @@ export default function App() {
                   允许在终端里输入密码（默认关闭：只用密钥/agent，连不上直接报错而不是卡住）
                 </span>
               </label>
+              {/* 密码存 Windows 凭据管理器：这样「只能用密码」的服务器也能读远程文件 / 列 tmux */}
+              <label className="modal-field">
+                密码（存在 Windows 凭据管理器，不会写进配置文件）
+                <input
+                  type="password"
+                  value={editPassword}
+                  placeholder={
+                    editHasPassword
+                      ? "已保存密码 · 输入新密码可覆盖"
+                      : "留空则不用密码登录"
+                  }
+                  onChange={(e) => setEditPassword(e.target.value)}
+                />
+              </label>
+              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={!editPassword || !editDialog.draft.id}
+                  title={
+                    editDialog.draft.id
+                      ? "存进 Windows 凭据管理器（控制面板 → 凭据管理器里可以看到并删除）"
+                      : "先保存这台服务器，再设置密码"
+                  }
+                  onClick={() => {
+                    const id = editDialog.draft.id;
+                    if (!id) {
+                      setToast("先保存这台服务器，再来设置密码");
+                      return;
+                    }
+                    void (async () => {
+                      try {
+                        await secretSet(id, editPassword);
+                        setEditHasPassword(true);
+                        setEditPassword("");
+                        setToast("密码已存进 Windows 凭据管理器");
+                      } catch (e) {
+                        setToast("保存密码失败：" + String(e));
+                      }
+                    })();
+                  }}
+                >
+                  保存密码
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  style={{ marginLeft: 6 }}
+                  disabled={!editHasPassword || !editDialog.draft.id}
+                  onClick={() => {
+                    const id = editDialog.draft.id;
+                    void (async () => {
+                      try {
+                        await secretDelete(id);
+                        setEditHasPassword(false);
+                        setToast("已删除保存的密码");
+                      } catch (e) {
+                        setToast("删除密码失败：" + String(e));
+                      }
+                    })();
+                  }}
+                >
+                  清除密码
+                </button>
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  {editHasPassword ? "✓ 已保存密码" : "未保存密码"}
+                </span>
+              </div>
               <label className="modal-field">
                 标签颜色（可选，显示在服务器名前）
                 <input
@@ -4189,6 +4410,18 @@ export default function App() {
                   onChange={(e) => void updateSettings({ autoReconnect: e.target.checked })}
                 />
                 <span>SSH 断开后自动重连（会重新附加 tmux，最多重试 5 次）</span>
+              </label>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.restoreWorkspace}
+                  onChange={(e) => void updateSettings({ restoreWorkspace: e.target.checked })}
+                />
+                <span>
+                  退出时保存工作区，下次打开自动恢复上次的会话（SSH / 本地终端 / 串口；
+                  只存"怎么开回来"，不存文件内容）
+                </span>
               </label>
 
               <label className="modal-field">

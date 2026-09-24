@@ -773,14 +773,7 @@ pub async fn remote_pwd(
         ),
         None => "pwd".to_string(),
     };
-    let args = ssh::ssh_exec_args(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        &cmd,
-    );
-    let out = run_ssh_capture(&args).await?;
+    let out = run_remote_capture(&profile_id, &cfg, &cmd).await?;
     let path = out
         .lines()
         .map(str::trim)
@@ -803,14 +796,7 @@ pub async fn tmux_list(
 ) -> Result<Vec<tmux::TmuxSession>, String> {
     log::info!("ipc: tmux_list profile_id={profile_id} user={user_override:?}");
     let cfg = ssh_config_for(&profile_id, user_override)?;
-    let args = ssh::ssh_exec_args(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        &tmux::list_remote_command(),
-    );
-    let out = run_ssh_capture(&args).await?;
+    let out = run_remote_capture(&profile_id, &cfg, &tmux::list_remote_command()).await?;
     let sessions = tmux::parse_list(&out);
     log::info!("ipc: tmux_list -> {} sessions", sessions.len());
     Ok(sessions)
@@ -825,14 +811,7 @@ pub async fn tmux_kill(
 ) -> Result<(), String> {
     log::info!("ipc: tmux_kill profile_id={profile_id} name={name}");
     let cfg = ssh_config_for(&profile_id, user_override)?;
-    let args = ssh::ssh_exec_args(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        &tmux::kill_remote_command(&name),
-    );
-    let _ = run_ssh_capture(&args).await?;
+    let _ = run_remote_capture(&profile_id, &cfg, &tmux::kill_remote_command(&name)).await?;
     Ok(())
 }
 
@@ -846,14 +825,7 @@ pub async fn fs_list(
 ) -> Result<remote_fs::RemoteListing, String> {
     log::info!("ipc: fs_list profile_id={profile_id} path={path:?}");
     let cfg = ssh_config_for(&profile_id, user_override)?;
-    let conn = sftp::connect(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        None,
-    )
-    .await?;
+    let conn = sftp_for(&profile_id, None).await?;
     let (dir, entries) = sftp::list(&conn, path.as_deref()).await?;
     let listing = remote_fs::RemoteListing {
         path: dir,
@@ -883,15 +855,7 @@ pub async fn fs_read(
     user_override: Option<String>,
 ) -> Result<String, String> {
     log::info!("ipc: fs_read profile_id={profile_id} path={path}");
-    let cfg = ssh_config_for(&profile_id, user_override)?;
-    let conn = sftp::connect(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        None,
-    )
-    .await?;
+    let conn = sftp_for(&profile_id, user_override).await?;
     let limit = max_bytes.unwrap_or(512 * 1024);
     let data = sftp::read_file(&conn, &path, limit).await?;
     Ok(base64::engine::general_purpose::STANDARD.encode(data))
@@ -913,17 +877,9 @@ pub async fn fs_upload(
     if local_paths.is_empty() {
         return Err("没有选择要上传的文件".into());
     }
-    let cfg = ssh_config_for(&profile_id, user_override)?;
     let dir = remote_dir.trim_end_matches('/').to_string();
     let dir = if dir.is_empty() { "/".to_string() } else { dir };
-    let conn = sftp::connect(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        None,
-    )
-    .await?;
+    let conn = sftp_for(&profile_id, user_override).await?;
 
     let mut done = 0usize;
     let mut bytes = 0u64;
@@ -1022,18 +978,10 @@ pub async fn fs_download(
     if remote_paths.is_empty() {
         return Err("没有选择要下载的文件".into());
     }
-    let cfg = ssh_config_for(&profile_id, user_override)?;
     if !std::path::Path::new(&local_dir).is_dir() {
         return Err(format!("本地目录不存在: {local_dir}"));
     }
-    let conn = sftp::connect(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        None,
-    )
-    .await?;
+    let conn = sftp_for(&profile_id, user_override).await?;
 
     let mut done = 0usize;
     let mut bytes = 0u64;
@@ -1162,14 +1110,71 @@ fn human_size(n: u64) -> String {
 /// 打开一条 SFTP 连接（几个文件操作命令共用）
 async fn sftp_for(profile_id: &str, user_override: Option<String>) -> Result<sftp::SftpConn, String> {
     let cfg = ssh_config_for(profile_id, user_override)?;
+    let pw = password_for(profile_id, &cfg);
     sftp::connect(
         &cfg.host,
         cfg.port,
         &cfg.user,
         cfg.key_path.as_deref(),
-        None,
+        pw.as_deref(),
     )
     .await
+}
+
+/// 这个配置要不要用凭据管理器里的密码（只有显式开了「允许输入密码」才取）
+fn password_for(profile_id: &str, cfg: &store::SshConfig) -> Option<String> {
+    if cfg.allow_password {
+        crate::core::secret::get_password(profile_id)
+    } else {
+        None
+    }
+}
+
+/// 跑一条一次性远端命令：有密码就用 russh exec（系统 ssh 喂不了密码），
+/// 否则还是走系统 ssh（更快，也复用用户的 known_hosts / config）。
+async fn run_remote_capture(
+    profile_id: &str,
+    cfg: &store::SshConfig,
+    command: &str,
+) -> Result<String, String> {
+    if let Some(pw) = password_for(profile_id, cfg) {
+        let conn = sftp::connect(
+            &cfg.host,
+            cfg.port,
+            &cfg.user,
+            cfg.key_path.as_deref(),
+            Some(&pw),
+        )
+        .await?;
+        return sftp::exec(&conn, command).await;
+    }
+    let args = ssh::ssh_exec_args(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        command,
+    );
+    run_ssh_capture(&args).await
+}
+
+// ---------- 凭据（Windows 凭据管理器） ----------
+
+#[tauri::command]
+pub fn secret_set(profile_id: String, password: String) -> Result<(), String> {
+    log::info!("ipc: secret_set profile={profile_id}");
+    crate::core::secret::set_password(&profile_id, &password)
+}
+
+#[tauri::command]
+pub fn secret_has(profile_id: String) -> bool {
+    crate::core::secret::has_password(&profile_id)
+}
+
+#[tauri::command]
+pub fn secret_delete(profile_id: String) -> Result<(), String> {
+    log::info!("ipc: secret_delete profile={profile_id}");
+    crate::core::secret::delete_password(&profile_id)
 }
 
 #[tauri::command]
@@ -1207,6 +1212,22 @@ pub async fn fs_rename(
 }
 
 // ---------- 会话历史 ----------
+
+/// 保存工作区快照（退出/变更时由前端调用）
+#[tauri::command]
+pub fn workspace_save(data: String) -> Result<(), String> {
+    store::save_workspace(&data)
+}
+
+/// 读取上次的工作区快照（没有就返回 null）
+#[tauri::command]
+pub fn workspace_load() -> Option<String> {
+    let data = store::load_workspace();
+    if data.is_some() {
+        log::info!("ipc: workspace_load -> 有快照");
+    }
+    data
+}
 
 #[tauri::command]
 pub fn history_list() -> Vec<HistoryEntry> {

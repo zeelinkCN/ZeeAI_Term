@@ -534,3 +534,30 @@ pub async fn rename(conn: &SftpConn, from: &str, to: &str) -> Result<(), String>
 pub async fn exists(conn: &SftpConn, path: &str) -> bool {
     conn.sftp.metadata(path).await.is_ok()
 }
+
+/// 借这条连接背后的 SSH 会话跑一条一次性命令，拿 stdout。
+/// 用途：只能用密码登录的服务器上，系统 `ssh.exe` 没法从命令行喂密码，
+/// 但我们已经通过密码建好了这条连接，就在这里直接 exec。
+pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
+    use russh::ChannelMsg;
+
+    let mut ch = conn
+        .session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("打开通道失败: {e}"))?;
+    ch.exec(true, command)
+        .await
+        .map_err(|e| format!("执行远端命令失败: {e}"))?;
+
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match ch.wait().await {
+            Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => out.extend_from_slice(&data),
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
