@@ -68,6 +68,9 @@ pub fn run() {
       commands::tmux_kill,
       commands::fs_list,
       commands::fs_read,
+      commands::history_list,
+      commands::history_save,
+      commands::history_remove,
     ])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")

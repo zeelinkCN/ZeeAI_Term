@@ -5,7 +5,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{pty, remote_fs, ssh, tmux, SessionEvent, SessionRegistry};
-use crate::store::{self, ConnectionProfile};
+use crate::store::{self, ConnectionProfile, HistoryEntry};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +14,8 @@ pub struct SessionInfo {
     pub profile_id: String,
     pub title: String,
     pub kind: String,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
 }
 
 #[tauri::command]
@@ -46,6 +48,8 @@ pub fn open_local(
     id: String,
     shell: String,
     distro: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
@@ -67,7 +71,16 @@ pub fn open_local(
         ),
     };
 
-    let handle = pty::spawn("local", &title, &program, &args, None, 110, 30, on_event)?;
+    let handle = pty::spawn(
+        "local",
+        &title,
+        &program,
+        &args,
+        None,
+        cols.unwrap_or(110),
+        rows.unwrap_or(30),
+        on_event,
+    )?;
     registry
         .sessions
         .lock()
@@ -79,6 +92,7 @@ pub fn open_local(
         profile_id: String::new(),
         title,
         kind: "local".into(),
+        tmux_session: None,
     })
 }
 
@@ -86,14 +100,18 @@ pub fn open_local(
 pub fn open_ssh(
     id: String,
     profile_id: String,
-    tmux_session: Option<String>,
+    tmux_mode: Option<String>,
+    tmux_name: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
 ) -> Result<SessionInfo, String> {
     log::info!(
-        "ipc: open_ssh profile_id={} tmux_session={:?}",
+        "ipc: open_ssh profile_id={} mode={:?} name={:?}",
         profile_id,
-        tmux_session
+        tmux_mode,
+        tmux_name
     );
     let profiles = store::load()?;
     let profile = profiles
@@ -105,14 +123,30 @@ pub fn open_ssh(
         .clone()
         .ok_or_else(|| "该配置不是 SSH 类型".to_string())?;
 
-    let remote_cmd = if cfg.tmux_enabled || tmux_session.is_some() {
-        let name = match tmux_session.as_ref().filter(|s| !s.trim().is_empty()) {
-            Some(explicit) => explicit.clone(),
-            None => ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user),
-        };
-        Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
-    } else {
-        None
+    // "none" = 明确不用 tmux（直接给普通 shell）；"name" = 指定会话名；
+    // 其他 = 按配置里的默认策略（开了就用模板名，没开就普通 shell）。
+    let mode = tmux_mode.unwrap_or_else(|| "default".into());
+    let mut resolved_tmux: Option<String> = None;
+    let remote_cmd = match mode.as_str() {
+        "none" => None,
+        "name" => {
+            let name = tmux_name.unwrap_or_default();
+            if name.trim().is_empty() {
+                None
+            } else {
+                resolved_tmux = Some(name.clone());
+                Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
+            }
+        }
+        _ => {
+            if cfg.tmux_enabled {
+                let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &cfg.user);
+                resolved_tmux = Some(name.clone());
+                Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
+            } else {
+                None
+            }
+        }
     };
 
     let args = ssh::ssh_args(
@@ -125,7 +159,16 @@ pub fn open_ssh(
     let program = ssh::ssh_exe();
     let title = format!("{} · {}", profile.name, cfg.host);
 
-    let handle = pty::spawn("ssh", &title, &program, &args, None, 110, 30, on_event)?;
+    let handle = pty::spawn(
+        "ssh",
+        &title,
+        &program,
+        &args,
+        None,
+        cols.unwrap_or(110),
+        rows.unwrap_or(30),
+        on_event,
+    )?;
     registry
         .sessions
         .lock()
@@ -137,6 +180,7 @@ pub fn open_ssh(
         profile_id,
         title,
         kind: "ssh".into(),
+        tmux_session: resolved_tmux,
     })
 }
 
@@ -297,4 +341,34 @@ pub async fn fs_read(
     );
     let out = run_ssh_capture(&args).await?;
     Ok(out.trim().to_string())
+}
+
+// ---------- 会话历史 ----------
+
+#[tauri::command]
+pub fn history_list() -> Vec<HistoryEntry> {
+    store::load_history()
+}
+
+#[tauri::command]
+pub fn history_save(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
+    if entry.id.trim().is_empty() {
+        entry.id = format!(
+            "h-{}-{}",
+            entry.profile_id,
+            entry.tmux_session.clone().unwrap_or_else(|| "default".into())
+        );
+    }
+    log::info!(
+        "ipc: history_save profile={} tmux={:?}",
+        entry.profile_name,
+        entry.tmux_session
+    );
+    store::upsert_history(entry)
+}
+
+#[tauri::command]
+pub fn history_remove(id: String) -> Result<Vec<HistoryEntry>, String> {
+    log::info!("ipc: history_remove id={id}");
+    store::remove_history(&id)
 }

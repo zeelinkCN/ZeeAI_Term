@@ -5,6 +5,7 @@ import type {
   SessionInfo,
   TmuxSession,
   RemoteListing,
+  HistoryEntry,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -25,6 +26,8 @@ export async function openLocal(
   shell: string,
   onEvent: (e: SessionEvent) => void,
   distro?: string,
+  cols?: number,
+  rows?: number,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -32,6 +35,8 @@ export async function openLocal(
     id,
     shell,
     distro: distro ?? null,
+    cols: cols ?? null,
+    rows: rows ?? null,
     onEvent: ch,
   });
 }
@@ -41,16 +46,34 @@ export async function openSsh(
   id: string,
   profileId: string,
   onEvent: (e: SessionEvent) => void,
-  tmuxSession?: string,
+  tmuxMode: "default" | "none" | "name" = "default",
+  tmuxName?: string | null,
+  cols?: number,
+  rows?: number,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
   return invoke<SessionInfo>("open_ssh", {
     id,
     profileId,
-    tmuxSession: tmuxSession ?? null,
+    tmuxMode,
+    tmuxName: tmuxName ?? null,
+    cols: cols ?? null,
+    rows: rows ?? null,
     onEvent: ch,
   });
+}
+
+export async function historyList(): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("history_list");
+}
+
+export async function historySave(entry: HistoryEntry): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("history_save", { entry });
+}
+
+export async function historyRemove(id: string): Promise<HistoryEntry[]> {
+  return invoke<HistoryEntry[]>("history_remove", { id });
 }
 
 /** 列出服务器上的 tmux 会话 */

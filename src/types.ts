@@ -34,6 +34,7 @@ export interface SessionInfo {
   profileId: string;
   title: string;
   kind: ConnType;
+  tmuxSession?: string | null;
 }
 
 export type SessionEvent =
@@ -63,4 +64,13 @@ export interface RemoteEntry {
 export interface RemoteListing {
   path: string;
   entries: RemoteEntry[];
+}
+
+export interface HistoryEntry {
+  id: string;
+  profileId: string;
+  profileName: string;
+  host: string;
+  tmuxSession?: string | null;
+  lastUsed: number;
 }

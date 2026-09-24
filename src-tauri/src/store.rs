@@ -77,6 +77,67 @@ fn store_file() -> PathBuf {
     store_dir().join("profiles.json")
 }
 
+fn history_file() -> PathBuf {
+    store_dir().join("history.json")
+}
+
+/// 一条会话历史：记录「用哪个配置、附加了哪个 tmux 会话、什么时候用过」。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub host: String,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
+    #[serde(default)]
+    pub last_used: u64,
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn load_history() -> Vec<HistoryEntry> {
+    let path = history_file();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<HistoryEntry>>(&text).unwrap_or_default()
+}
+
+pub fn save_history(entries: &[HistoryEntry]) -> Result<(), String> {
+    let dir = store_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let text = serde_json::to_string_pretty(entries).map_err(|e| format!("序列化失败: {e}"))?;
+    fs::write(history_file(), text).map_err(|e| format!("写入历史失败: {e}"))
+}
+
+/// 同一个「配置 + tmux 会话」只保留一条，按最近使用排序。
+pub fn upsert_history(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
+    let mut all = load_history();
+    all.retain(|e| !(e.profile_id == entry.profile_id && e.tmux_session == entry.tmux_session));
+    entry.last_used = now_secs();
+    all.insert(0, entry);
+    all.truncate(50);
+    save_history(&all)?;
+    Ok(all)
+}
+
+pub fn remove_history(id: &str) -> Result<Vec<HistoryEntry>, String> {
+    let mut all = load_history();
+    all.retain(|e| e.id != id);
+    save_history(&all)?;
+    Ok(all)
+}
+
 /// 首次运行时写入一条测试服务器，方便直接试用（可在界面里删除/修改）。
 fn seed() -> Vec<ConnectionProfile> {
     vec![ConnectionProfile {

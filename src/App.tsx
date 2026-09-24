@@ -8,6 +8,9 @@ import {
   deleteProfile,
   fsList,
   fsRead,
+  historyList,
+  historyRemove,
+  historySave,
   listProfiles,
   openLocal,
   openSsh,
@@ -19,6 +22,7 @@ import {
 import { b64ToBytes, uid } from "./util";
 import type {
   ConnectionProfile,
+  HistoryEntry,
   RemoteEntry,
   SessionEvent,
   SessionState,
@@ -57,6 +61,7 @@ interface OpenSession {
   kind: ModuleKey;
   profileId?: string;
   tmuxName?: string;
+  tmuxMode?: "default" | "none" | "name";
   state: SessionState;
   openFiles: OpenFile[];
   activeTab: string; // "terminal" 或文件名
@@ -199,6 +204,17 @@ export default function App() {
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
   const [tmuxLoading, setTmuxLoading] = useState(false);
 
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [newDialog, setNewDialog] = useState<{
+    profileId: string;
+    useTmux: boolean;
+    tmuxKind: "new" | "attach";
+    tmuxName: string;
+    attachTarget: string;
+  } | null>(null);
+  const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
+  const [dialogBusy, setDialogBusy] = useState(false);
+
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
@@ -209,6 +225,16 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setHistory(await historyList());
+      } catch {
+        /* 历史读取失败不影响主流程 */
+      }
+    })();
   }, []);
 
   // 自动化演示（ZEEAI_AUTODEMO=1）：连接 → 切到文件 → 打开 md/html 预览，
@@ -317,27 +343,57 @@ export default function App() {
 
   async function openSshSession(
     profile: ConnectionProfile,
-    tmuxSessionName?: string,
+    tmuxMode: "default" | "none" | "name" = "default",
+    tmuxName?: string | null,
   ): Promise<string> {
     const id = uid();
-    const title = tmuxSessionName ? `${profile.name} · ${tmuxSessionName}` : profile.name;
+    const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
+    const title = explicitName ? `${profile.name} · ${explicitName}` : profile.name;
     addSession({
       id,
       title,
       kind: "remote",
       profileId: profile.id,
-      tmuxName: tmuxSessionName,
+      tmuxName: explicitName ?? undefined,
+      tmuxMode,
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
     });
     try {
-      const info = await openSsh(id, profile.id, (e) => handleEvent(id, e), tmuxSessionName);
+      const info = await openSsh(
+        id,
+        profile.id,
+        (e) => handleEvent(id, e),
+        tmuxMode,
+        tmuxName ?? null,
+      );
       setSessions((prev) =>
         prev.map((s) =>
-          s.id === id ? { ...s, title: tmuxSessionName ? title : info.title || title } : s,
+          s.id === id
+            ? {
+                ...s,
+                title: explicitName ? title : info.title || title,
+                tmuxName: info.tmuxSession ?? undefined,
+              }
+            : s,
         ),
       );
+      // 记录到会话历史（用户可在侧栏里删掉不想留的）
+      try {
+        setHistory(
+          await historySave({
+            id: "",
+            profileId: profile.id,
+            profileName: profile.name,
+            host: profile.ssh?.host ?? "",
+            tmuxSession: info.tmuxSession ?? null,
+            lastUsed: 0,
+          }),
+        );
+      } catch {
+        /* 历史写入失败不影响会话使用 */
+      }
     } catch (e) {
       setToast("SSH 连接失败：" + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
@@ -368,7 +424,13 @@ export default function App() {
       prev.map((x) => (x.id === s.id ? { ...x, state: "reconnecting" } : x)),
     );
     try {
-      await openSsh(s.id, s.profileId, (e) => handleEvent(s.id, e), s.tmuxName);
+      await openSsh(
+        s.id,
+        s.profileId,
+        (e) => handleEvent(s.id, e),
+        s.tmuxMode ?? "default",
+        s.tmuxName ?? null,
+      );
     } catch (e) {
       setToast("重连失败：" + String(e));
       setSessions((prev) => prev.map((x) => (x.id === s.id ? { ...x, state: "error" } : x)));
@@ -433,6 +495,99 @@ export default function App() {
     } catch (e) {
       setToast("结束 tmux 会话失败：" + String(e));
     }
+  }
+
+  function defaultTmuxName(profile: ConnectionProfile): string {
+    const host = profile.ssh?.host ?? "";
+    const user = profile.ssh?.user ?? "";
+    const tpl = profile.ssh?.tmuxTemplate || "{host}-{user}";
+    return tpl
+      .replace("{host}", host)
+      .replace("{user}", user)
+      .replace(/[.:/\\ ]/g, "-");
+  }
+
+  async function loadDialogTmux(profileId: string) {
+    setDialogBusy(true);
+    try {
+      setDialogTmux(await tmuxList(profileId));
+    } catch (e) {
+      setToast("读取 tmux 会话失败：" + String(e));
+      setDialogTmux([]);
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  function openNewSessionDialog(profile?: ConnectionProfile) {
+    const target = profile ?? profiles[0];
+    if (!target) {
+      setToast("请先新建一个连接配置");
+      return;
+    }
+    const useTmux = target.ssh?.tmuxEnabled ?? false;
+    setNewDialog({
+      profileId: target.id,
+      useTmux,
+      tmuxKind: "new",
+      tmuxName: defaultTmuxName(target),
+      attachTarget: "",
+    });
+    if (useTmux) void loadDialogTmux(target.id);
+  }
+
+  async function confirmNewSession() {
+    if (!newDialog) return;
+    const profile = profiles.find((p) => p.id === newDialog.profileId);
+    if (!profile) return;
+    if (newDialog.useTmux && newDialog.tmuxKind === "attach" && !newDialog.attachTarget) {
+      setToast("请选择一个要附加的 tmux 会话");
+      return;
+    }
+    setDialogBusy(true);
+    try {
+      if (!newDialog.useTmux) {
+        await openSshSession(profile, "none");
+      } else if (newDialog.tmuxKind === "new") {
+        const name = newDialog.tmuxName.trim() || defaultTmuxName(profile);
+        await openSshSession(profile, "name", name);
+      } else {
+        await openSshSession(profile, "name", newDialog.attachTarget);
+      }
+      setNewDialog(null);
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  async function connectFromHistory(h: HistoryEntry) {
+    const profile = profiles.find((p) => p.id === h.profileId);
+    if (!profile) {
+      setToast("这条历史对应的连接配置已被删除");
+      return;
+    }
+    if (h.tmuxSession) {
+      await openSshSession(profile, "name", h.tmuxSession);
+    } else {
+      await openSshSession(profile, "none");
+    }
+  }
+
+  async function removeHistoryEntry(id: string) {
+    try {
+      setHistory(await historyRemove(id));
+    } catch (e) {
+      setToast("删除历史失败：" + String(e));
+    }
+  }
+
+  function relTime(secs: number): string {
+    if (!secs) return "";
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+    if (diff < 60) return "刚刚";
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+    return `${Math.floor(diff / 86400)} 天前`;
   }
 
   async function loadDir(profileId: string, path?: string) {
@@ -576,6 +731,13 @@ export default function App() {
             {module === "remote" && sideTab === "sessions" && (
               <>
                 <div className="side-actions">
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => openNewSessionDialog()}
+                  >
+                    <IconPlus size={14} /> 新建会话
+                  </button>
                   <button type="button" className="btn" onClick={() => setShowForm((v) => !v)}>
                     <IconPlus size={14} /> 新建连接
                   </button>
@@ -678,7 +840,7 @@ export default function App() {
                         <button
                           type="button"
                           className="mini-btn"
-                          onClick={() => void openSshSession(tmuxTarget, s.name)}
+                          onClick={() => void openSshSession(tmuxTarget, "name", s.name)}
                         >
                           连接
                         </button>
@@ -694,15 +856,19 @@ export default function App() {
                   </div>
                 )}
 
+                <div className="tree-group">已保存的服务器</div>
+                {grouped.length === 0 && (
+                  <div className="hint">还没有服务器。点上面的「新建连接」添加一台。</div>
+                )}
                 {grouped.map(([group, list]) => (
                   <div key={group}>
-                    <div className="tree-group">{group}</div>
+                    <div className="tree-subgroup">{group}</div>
                     {list.map((p) => (
                       <div
                         key={p.id}
                         className="tree-item"
-                        onClick={() => void openSshSession(p)}
-                        title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port}`}
+                        onClick={() => openNewSessionDialog(p)}
+                        title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port} — 点击新建会话`}
                       >
                         <IconServer size={15} />
                         <span className="grow">{p.name}</span>
@@ -710,7 +876,7 @@ export default function App() {
                         <button
                           type="button"
                           className="mini-x"
-                          title="tmux 会话"
+                          title="管理服务器上的 tmux 会话"
                           onClick={(e) => {
                             e.stopPropagation();
                             setTmuxTarget(p);
@@ -722,7 +888,7 @@ export default function App() {
                         <button
                           type="button"
                           className="mini-x"
-                          title="删除"
+                          title="删除连接"
                           onClick={(e) => {
                             e.stopPropagation();
                             void removeProfile(p);
@@ -732,6 +898,37 @@ export default function App() {
                         </button>
                       </div>
                     ))}
+                  </div>
+                ))}
+
+                <div className="tree-group">会话历史</div>
+                {history.length === 0 && (
+                  <div className="hint">还没有会话历史。连接过之后会出现在这里。</div>
+                )}
+                {history.map((h) => (
+                  <div
+                    key={h.id}
+                    className="tree-item"
+                    onClick={() => void connectFromHistory(h)}
+                    title={h.host}
+                  >
+                    <IconTerminal size={15} />
+                    <span className="grow">
+                      {h.profileName}
+                      {h.tmuxSession ? ` · ${h.tmuxSession}` : ""}
+                    </span>
+                    <span className="dim">{relTime(h.lastUsed)}</span>
+                    <button
+                      type="button"
+                      className="mini-x"
+                      title="从历史中移除"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void removeHistoryEntry(h.id);
+                      }}
+                    >
+                      ×
+                    </button>
                   </div>
                 ))}
               </>
@@ -947,6 +1144,126 @@ export default function App() {
       {toast && (
         <div className="toast" onClick={() => setToast(null)}>
           {toast}
+        </div>
+      )}
+
+      {newDialog && (
+        <div className="modal-backdrop" onClick={() => setNewDialog(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">新建会话</div>
+            <div className="modal-body">
+              <label className="modal-field">
+                服务器
+                <select
+                  value={newDialog.profileId}
+                  onChange={(e) => {
+                    const picked = profiles.find((x) => x.id === e.target.value);
+                    setNewDialog({
+                      ...newDialog,
+                      profileId: e.target.value,
+                      tmuxName: picked ? defaultTmuxName(picked) : newDialog.tmuxName,
+                      attachTarget: "",
+                    });
+                    if (newDialog.useTmux) void loadDialogTmux(e.target.value);
+                  }}
+                >
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}（{p.ssh?.user}@{p.ssh?.host}）
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={newDialog.useTmux}
+                  onChange={(e) => {
+                    setNewDialog({ ...newDialog, useTmux: e.target.checked });
+                    if (e.target.checked) void loadDialogTmux(newDialog.profileId);
+                  }}
+                />
+                <span>使用 tmux（断网后可回到同一个会话）</span>
+              </label>
+
+              {newDialog.useTmux && (
+                <div className="tmux-choice">
+                  <label className="form-check">
+                    <input
+                      type="radio"
+                      checked={newDialog.tmuxKind === "new"}
+                      onChange={() => setNewDialog({ ...newDialog, tmuxKind: "new" })}
+                    />
+                    <span>新建 tmux 会话</span>
+                  </label>
+                  {newDialog.tmuxKind === "new" && (
+                    <input
+                      className="modal-input"
+                      value={newDialog.tmuxName}
+                      onChange={(e) =>
+                        setNewDialog({ ...newDialog, tmuxName: e.target.value })
+                      }
+                      placeholder="会话名，例如 {host}-{user}"
+                    />
+                  )}
+
+                  <label className="form-check">
+                    <input
+                      type="radio"
+                      checked={newDialog.tmuxKind === "attach"}
+                      onChange={() => {
+                        setNewDialog({ ...newDialog, tmuxKind: "attach" });
+                        void loadDialogTmux(newDialog.profileId);
+                      }}
+                    />
+                    <span>附加到已有 tmux 会话</span>
+                  </label>
+                  {newDialog.tmuxKind === "attach" && (
+                    <div className="attach-list">
+                      {dialogBusy && <div className="hint">正在读取…</div>}
+                      {!dialogBusy && dialogTmux.length === 0 && (
+                        <div className="hint">这台服务器上还没有 tmux 会话。</div>
+                      )}
+                      {dialogTmux.map((t) => (
+                        <label
+                          key={t.name}
+                          className={
+                            "attach-item" + (newDialog.attachTarget === t.name ? " active" : "")
+                          }
+                        >
+                          <input
+                            type="radio"
+                            checked={newDialog.attachTarget === t.name}
+                            onChange={() =>
+                              setNewDialog({ ...newDialog, attachTarget: t.name })
+                            }
+                          />
+                          <IconTerminal size={14} />
+                          <span className="grow">{t.name}</span>
+                          <span className="dim">{t.windows} 窗口</span>
+                          {t.attached && <span className="tag">已连接</span>}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setNewDialog(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn primary"
+                disabled={dialogBusy}
+                onClick={() => void confirmNewSession()}
+              >
+                连接
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
