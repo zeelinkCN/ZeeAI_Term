@@ -1,3 +1,4 @@
+pub mod job;
 pub mod pty;
 pub mod remote_fs;
 pub mod session;

@@ -7,6 +7,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tauri::ipc::Channel;
 
 use super::session::{SessionEvent, SessionHandle};
+use super::job;
 
 /// 用系统 PTY 起一个进程（本地终端，或把 ssh.exe 跑在 PTY 里充当远程终端）。
 pub fn spawn(
@@ -45,6 +46,11 @@ pub fn spawn(
         .spawn_command(cmd)
         .map_err(|e| format!("spawn failed: {e}"))?;
     drop(pair.slave);
+
+    // 让子进程跟随应用生命周期，避免留下孤儿 ssh 客户端挂在远端 tmux 上
+    if let Some(pid) = child.process_id() {
+        job::assign(pid);
+    }
 
     let mut reader = pair
         .master

@@ -4637,6 +4637,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

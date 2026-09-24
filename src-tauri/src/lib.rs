@@ -3,6 +3,7 @@ mod core;
 mod store;
 
 use core::SessionRegistry;
+use tauri::Manager;
 use tauri::Emitter;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -68,6 +69,22 @@ pub fn run() {
       commands::fs_list,
       commands::fs_read,
     ])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|app_handle, event| {
+      // 退出前把所有会话进程收干净（Job Object 也会兜底，但显式做更清晰）
+      if let tauri::RunEvent::Exit = event {
+        let registry = app_handle.state::<SessionRegistry>();
+        // 先把句柄取出来再 kill，避免在持有 map 锁的同时去碰子进程
+        let handles: Vec<_> = match registry.sessions.lock() {
+          Ok(mut sessions) => sessions.drain().map(|(_, handle)| handle).collect(),
+          Err(_) => Vec::new(),
+        };
+        for handle in handles {
+          if let Ok(mut child) = handle.child.lock() {
+            let _ = child.kill();
+          }
+        }
+      }
+    });
 }
