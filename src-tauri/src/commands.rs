@@ -1325,47 +1325,9 @@ pub async fn ai_probe(
     Ok(probe)
 }
 
-/// 一键安装某个 AI 工具（在服务器上跑 npm/pip）
-#[tauri::command]
-pub async fn ai_install(
-    profile_id: String,
-    tool: String,
-    user_override: Option<String>,
-) -> Result<String, String> {
-    let cfg = ssh_config_for(&profile_id, user_override)?;
-    let cmd = ai::TOOLS
-        .iter()
-        .find(|t| **t == tool)
-        .map(|t| match *t {
-            "codex" => "npm install -g @openai/codex",
-            "claude" => "npm install -g @anthropic-ai/claude-code",
-            "aider" => "python3 -m pip install -U aider-chat",
-            "gemini" => "npm install -g @google/gemini-cli",
-            _ => "",
-        })
-        .ok_or_else(|| format!("不认识这个工具: {tool}"))?;
-    if cmd.is_empty() {
-        return Err("这个工具没有配置安装命令".into());
-    }
-    log::info!("ipc: ai_install {tool} -> {cmd}");
-    // 先看有没有 npm / python，没有就直接给出可读的提示
-    let check = run_remote_capture(
-        &profile_id,
-        &cfg,
-        "command -v npm >/dev/null 2>&1 && echo HAS_NPM || echo NO_NPM; \
-         command -v python3 >/dev/null 2>&1 && echo HAS_PY || echo NO_PY",
-    )
-    .await?;
-    if cmd.starts_with("npm") && !check.contains("HAS_NPM") {
-        return Err("这台服务器上没有 npm —— 先装 Node.js（例如 dnf install -y nodejs 或 apt-get install -y nodejs）".into());
-    }
-    if cmd.contains("pip") && !check.contains("HAS_PY") {
-        return Err("这台服务器上没有 python3 —— 先装 Python 再装 aider".into());
-    }
-    let out = run_remote_capture(&profile_id, &cfg, &format!("{cmd} 2>&1 | tail -20")).await?;
-    Ok(out.trim().to_string())
-}
-
+// 说明：曾经有过「一键安装」（后端直接帮你在服务器上跑 npm/pip）。
+// 实测体验不好：安装要几分钟、中间没有输出，看着像卡死；而且替用户在服务器上装东西本身偏重。
+// 现在改成「把安装命令敲进当前终端」，进度和报错你自己看得见。
 #[tauri::command]
 pub fn secret_set(profile_id: String, password: String) -> Result<(), String> {
     log::info!("ipc: secret_set profile={profile_id}");

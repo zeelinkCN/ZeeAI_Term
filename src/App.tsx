@@ -15,7 +15,6 @@ import {
   adbRm,
   adbMkdir,
   aiProbe,
-  aiInstall,
   fastbootDevices,
   fastbootVersion,
   gitStatus,
@@ -392,7 +391,6 @@ export default function App() {
   // 右侧 AI Agent 面板
   const [aiPanelOpen, setAiPanelOpen] = useState(false);
   const [aiState, setAiState] = useState<AiProbe | null>(null);
-  const [aiBusy, setAiBusy] = useState<string | null>(null);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   const aiWasRunning = useRef(false);
   const [updateMsg, setUpdateMsg] = useState("");
@@ -536,26 +534,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiPanelOpen, activeId]);
 
-  async function aiInstallTool(tool: string) {
-    const cur = sessionsRef.current.find((s) => s.id === activeId);
-    if (!cur?.profileId) {
-      setToast("先打开一个 SSH 会话，AI 面板才知道要装到哪台服务器");
-      return;
-    }
-    setAiBusy(tool);
-    setToast(`正在服务器上安装 ${tool}，可能要一两分钟…`);
-    try {
-      const out = await aiInstall(cur.profileId, tool, cur.user ?? null);
-      pushAiNotice(`${tool} 安装完成`);
-      if (out) console.log("ai_install 输出：" + out);
-      await refreshAi();
-    } catch (e) {
-      pushAiNotice(`${tool} 安装失败：${String(e)}`);
-    } finally {
-      setAiBusy(null);
-    }
-  }
-
   /** 在当前会话的终端里启动 AI（就是把命令敲进去，你能看到它跑） */
   function aiStartTool(tool: string) {
     const cur = sessionsRef.current.find((s) => s.id === activeId);
@@ -652,14 +630,21 @@ export default function App() {
         return;
       }
       const list = profilesRef.current;
-      const saved = data.sessions ?? [];
+      // 上限：快照里如果攒了很多（比如演示反复跑），一次全开会把服务器的
+      // sshd 打满（MaxStartups）而且标签栏会炸，所以只恢复最近的 8 个。
+      const MAX_RESTORE = 8;
+      const allSaved = data.sessions ?? [];
+      const saved = allSaved.slice(-MAX_RESTORE);
       if (saved.length === 0) {
         setRestoreDone(true);
         return;
       }
       setWorkspaceHint(`正在恢复上次的 ${saved.length} 个会话…`);
       const ids: string[] = [];
-      for (const s of saved) {
+      for (let i = 0; i < saved.length; i++) {
+        const s = saved[i];
+        // 一条一条来，中间留一点间隔，避免瞬间并发一堆 SSH 连接
+        if (i > 0) await new Promise((r) => setTimeout(r, 250));
         try {
           if (s.kind === "remote" && s.profileId) {
             const p = list.find((x) => x.id === s.profileId);
@@ -691,7 +676,13 @@ export default function App() {
       }
       setWorkspaceHint(null);
       setRestoreDone(true);
-      if (ids.length > 0) setToast(`已恢复上次的 ${ids.length} 个会话`);
+      if (ids.length > 0) {
+        setToast(
+          allSaved.length > MAX_RESTORE
+            ? `已恢复最近 ${ids.length} 个会话（快照里还有 ${allSaved.length - MAX_RESTORE} 个更早的没开）`
+            : `已恢复上次的 ${ids.length} 个会话`,
+        );
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settingsReady]);
@@ -3827,24 +3818,16 @@ export default function App() {
                             一键启动
                           </button>
                         ) : (
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            disabled={aiBusy !== null}
-                            title={t.installCmd}
-                            onClick={() => void aiInstallTool(t.name)}
-                          >
-                            {aiBusy === t.name ? "安装中…" : "一键安装"}
-                          </button>
+                          <span className="ai-install-hint">未安装 —— 用下面的命令装</span>
                         )}
                         <button
                           type="button"
                           className="mini-btn"
-                          title="在终端里输入这条安装命令，自己看着跑"
+                          title="把这条命令敲进当前终端，进度你自己看"
                           disabled={!activeSession}
-                          onClick={() => aiStartTool(t.installCmd)}
+                          onClick={() => aiStartTool(t.installed ? t.runCmd : t.installCmd)}
                         >
-                          在终端跑
+                          {t.installed ? "在终端启动" : "在终端安装"}
                         </button>
                       </div>
                     </div>
@@ -3856,8 +3839,9 @@ export default function App() {
                   </div>
                 )}
                 <div className="hint" style={{ padding: "10px 12px" }}>
-                  装好之后点「一键启动」，我会往当前终端里敲命令；
-                  它跑完（进程退出）我会在这里给你一条消息通知。
+                  这些按钮只是**把命令敲进当前终端**，装/跑的过程你自己看得见。
+                  <br />
+                  AI 跑完（进程退出）我会在这里给你一条消息通知。
                 </div>
               </>
             )}

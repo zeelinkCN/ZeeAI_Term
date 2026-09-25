@@ -285,14 +285,6 @@ export async function aiProbe(
   return invoke<AiProbe>("ai_probe", { profileId, userOverride: userOverride ?? null });
 }
 
-/** 一键安装某个 AI 工具 */
-export async function aiInstall(
-  profileId: string,
-  tool: string,
-  userOverride?: string | null,
-): Promise<string> {
-  return invoke<string>("ai_install", { profileId, tool, userOverride: userOverride ?? null });
-}
 
 /** 列出服务器上的 tmux 会话 */
 export async function tmuxList(

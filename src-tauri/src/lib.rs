@@ -399,7 +399,6 @@ pub fn run() {
       commands::workspace_save,
       commands::workspace_load,
       commands::ai_probe,
-      commands::ai_install,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）
