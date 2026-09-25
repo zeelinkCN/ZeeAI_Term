@@ -7,6 +7,7 @@ pub mod remote_fs;
 pub mod secret;
 pub mod serial;
 pub mod session;
+pub mod session_log;
 pub mod sftp;
 pub mod ssh;
 pub mod tmux;

@@ -12,6 +12,8 @@ interface Props {
   active: boolean;
   fontSize?: number;
   light?: boolean;
+  /** 往上能翻多少行历史（回滚缓冲） */
+  scrollback?: number;
   /** shell 通过 OSC 7 上报当前工作目录时回调（非 tmux 会话也能跟踪 cwd） */
   onCwd?: (path: string) => void;
 }
@@ -84,6 +86,7 @@ export default function TerminalView({
   active,
   fontSize = 13,
   light = false,
+  scrollback = 10000,
   onCwd,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -102,7 +105,7 @@ export default function TerminalView({
       fontSize,
       lineHeight: 1.2,
       cursorBlink: true,
-      scrollback: 10000,
+      scrollback,
       allowProposedApi: true,
       theme: light ? LIGHT_THEME : THEME,
     });
@@ -195,6 +198,7 @@ export default function TerminalView({
     if (!term) return;
     term.options.fontSize = fontSize;
     term.options.theme = light ? LIGHT_THEME : THEME;
+    term.options.scrollback = scrollback;
     try {
       fitRef.current?.fit();
     } catch {
@@ -203,7 +207,7 @@ export default function TerminalView({
     if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
       void sessionResize(sessionId, term.cols, term.rows);
     }
-  }, [fontSize, light, sessionId]);
+  }, [fontSize, light, scrollback, sessionId]);
 
   return <div className="terminal-host" ref={hostRef} />;
 }

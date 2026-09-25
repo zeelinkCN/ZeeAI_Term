@@ -137,6 +137,11 @@ pub fn load_workspace() -> Option<String> {
     fs::read_to_string(workspace_file()).ok()
 }
 
+/// 会话日志目录：%APPDATA%\ZeeAI-Terminal\logs\sessions
+pub fn log_dir() -> PathBuf {
+    store_dir().join("logs").join("sessions")
+}
+
 /// 应用设置。所有字段都有默认值，方便版本升级时兼容旧文件。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -156,6 +161,10 @@ pub struct Settings {
     pub fs_follow_terminal: bool,
     /// 退出时保存工作区、启动时恢复上次打开的会话
     pub restore_workspace: bool,
+    /// 终端回滚缓冲多少行（往上能翻多少历史）
+    pub scrollback: u32,
+    /// 新建会话时自动开始记录终端日志
+    pub auto_log: bool,
 }
 
 impl Default for Settings {
@@ -171,6 +180,8 @@ impl Default for Settings {
             auto_reconnect: true,
             fs_follow_terminal: true,
             restore_workspace: true,
+            scrollback: 10000,
+            auto_log: false,
         }
     }
 }

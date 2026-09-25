@@ -2011,6 +2011,16 @@ body {
   content: "⚠";
 }
 
+/* 正在记录终端日志的标签：小红点 */
+.rec-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 4px rgba(241, 76, 76, 0.9);
+}
+
 @keyframes status-in {
   from {
     opacity: 0;

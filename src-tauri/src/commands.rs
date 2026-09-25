@@ -60,6 +60,7 @@ pub fn open_local(
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
 ) -> Result<SessionInfo, String> {
     log::info!(
         "ipc: open_local shell={} distro={:?} cwd={:?}",
@@ -85,6 +86,7 @@ pub fn open_local(
     };
 
     let handle = pty::spawn(
+        &id,
         "local",
         &title,
         &program,
@@ -93,6 +95,7 @@ pub fn open_local(
         cols.unwrap_or(110),
         rows.unwrap_or(30),
         on_event,
+        logs.inner().clone(),
     )?;
     registry
         .sessions
@@ -122,6 +125,7 @@ pub fn open_ssh(
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
 ) -> Result<SessionInfo, String> {
     log::info!(
         "ipc: open_ssh profile_id={} mode={:?} name={:?}",
@@ -185,6 +189,7 @@ pub fn open_ssh(
     let title = format!("{} · {}", profile.name, cfg.host);
 
     let handle = pty::spawn(
+        &id,
         "ssh",
         &title,
         &program,
@@ -193,6 +198,7 @@ pub fn open_ssh(
         cols.unwrap_or(110),
         rows.unwrap_or(30),
         on_event,
+        logs.inner().clone(),
     )?;
     registry
         .sessions
@@ -287,6 +293,7 @@ pub fn open_serial(
     flow_control: Option<String>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
 ) -> Result<SessionInfo, String> {
     let settings = serial::SerialSettings {
         baud,
@@ -297,7 +304,7 @@ pub fn open_serial(
     };
     log::info!("ipc: open_serial path={path} {:?}", settings);
     let title = format!("串口 · {path} · {baud}");
-    let handle = serial::open(&path, &settings, &title, on_event)?;
+    let handle = serial::open(&id, &path, &settings, &title, on_event, logs.inner().clone())?;
     registry
         .sessions
         .lock()
@@ -859,6 +866,7 @@ pub fn open_adb_shell(
     on_event: Channel<SessionEvent>,
     app: tauri::AppHandle,
     registry: State<'_, SessionRegistry>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
 ) -> Result<SessionInfo, String> {
     let exe = adb_exe(&app);
     let mode = mode.unwrap_or_else(|| "shell".to_string());
@@ -869,6 +877,7 @@ pub fn open_adb_shell(
     };
     let program = exe.to_string_lossy().to_string();
     let handle = pty::spawn(
+        &id,
         "adb",
         &title,
         &program,
@@ -877,6 +886,7 @@ pub fn open_adb_shell(
         cols.unwrap_or(110),
         rows.unwrap_or(30),
         on_event,
+        logs.inner().clone(),
     )?;
     registry
         .sessions
@@ -1380,6 +1390,63 @@ pub async fn fs_rename(
 }
 
 // ---------- 会话历史 ----------
+
+// ---------- 终端会话日志 ----------
+
+/// 开始记录某个会话的终端输出，返回日志文件路径
+#[tauri::command]
+pub fn session_log_start(
+    id: String,
+    file_name: Option<String>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
+) -> Result<String, String> {
+    logs.start(&id, file_name.as_deref())
+}
+
+/// 停止记录，返回刚刚写过的文件路径
+#[tauri::command]
+pub fn session_log_stop(
+    id: String,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
+) -> Option<String> {
+    logs.stop(&id)
+}
+
+/// 这个会话正在记日志吗？是的话返回文件路径
+#[tauri::command]
+pub fn session_log_status(
+    id: String,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
+) -> Option<String> {
+    logs.status(&id)
+}
+
+/// 会话日志目录（不存在会创建）
+#[tauri::command]
+pub fn session_log_dir() -> Result<String, String> {
+    let dir = crate::core::session_log::LogRegistry::dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 用资源管理器打开一个文件或目录
+#[tauri::command]
+pub fn open_in_explorer(path: String) -> Result<(), String> {
+    log::info!("ipc: open_in_explorer {path}");
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("只支持 Windows".into())
+    }
+}
 
 /// 保存工作区快照（退出/变更时由前端调用）
 #[tauri::command]

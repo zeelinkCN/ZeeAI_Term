@@ -11,6 +11,7 @@ use super::job;
 
 /// 用系统 PTY 起一个进程（本地终端，或把 ssh.exe 跑在 PTY 里充当远程终端）。
 pub fn spawn(
+    session_id: &str,
     kind: &str,
     title: &str,
     program: &str,
@@ -19,6 +20,7 @@ pub fn spawn(
     cols: u16,
     rows: u16,
     channel: Channel<SessionEvent>,
+    logs: std::sync::Arc<super::session_log::LogRegistry>,
 ) -> Result<SessionHandle, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -66,12 +68,15 @@ pub fn spawn(
     });
 
     let ch = channel.clone();
+    let sid = session_id.to_string();
     thread::spawn(move || {
         let mut buf = [0u8; 16384];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // 会话日志：顺手把这一片原始输出落盘（没开日志时是空操作）
+                    logs.write(&sid, &buf[..n]);
                     let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                     if ch.send(SessionEvent::Data { data }).is_err() {
                         break;

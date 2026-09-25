@@ -138,10 +138,12 @@ pub fn probe(path: &str, baud: u32, millis: u64) -> Result<(usize, String), Stri
 
 /// 打开串口并把它桥接成一个终端会话（原始字节流 ↔ xterm）。
 pub fn open(
+    session_id: &str,
     path: &str,
     settings: &SerialSettings,
     title: &str,
     channel: Channel<SessionEvent>,
+    logs: std::sync::Arc<super::session_log::LogRegistry>,
 ) -> Result<SessionHandle, String> {
     let port = builder(path, settings)
         .open()
@@ -155,12 +157,15 @@ pub fn open(
     });
 
     let ch = channel.clone();
+    let sid = session_id.to_string();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => continue,
                 Ok(n) => {
+                    // 串口日志（用户点名要的：设备打印的东西也存下来）
+                    logs.write(&sid, &buf[..n]);
                     let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                     if ch.send(SessionEvent::Data { data }).is_err() {
                         break;

@@ -108,6 +108,10 @@ export interface AppSettings {
   fsFollowTerminal: boolean;
   /** 退出时保存工作区、启动时恢复上次的会话 */
   restoreWorkspace: boolean;
+  /** 终端回滚缓冲行数（往上能翻多少行历史） */
+  scrollback: number;
+  /** 新建会话时自动开始记录终端日志 */
+  autoLog: boolean;
 }
 
 export interface GitFile {

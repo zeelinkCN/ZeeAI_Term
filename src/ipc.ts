@@ -412,3 +412,28 @@ export async function sessionResize(
 export async function sessionClose(id: string): Promise<void> {
   return invoke("session_close", { id });
 }
+
+/** 开始记录某个会话的终端日志，返回日志文件路径 */
+export async function sessionLogStart(id: string, fileName?: string): Promise<string> {
+  return invoke<string>("session_log_start", { id, fileName: fileName ?? null });
+}
+
+/** 停止记录，返回刚写过的文件路径 */
+export async function sessionLogStop(id: string): Promise<string | null> {
+  return invoke<string | null>("session_log_stop", { id });
+}
+
+/** 这个会话正在记日志吗？是的话返回文件路径 */
+export async function sessionLogStatus(id: string): Promise<string | null> {
+  return invoke<string | null>("session_log_status", { id });
+}
+
+/** 会话日志目录（不存在会创建） */
+export async function sessionLogDir(): Promise<string> {
+  return invoke<string>("session_log_dir");
+}
+
+/** 用资源管理器打开文件或目录 */
+export async function openInExplorer(path: string): Promise<void> {
+  return invoke("open_in_explorer", { path });
+}

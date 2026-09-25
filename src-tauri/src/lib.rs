@@ -346,6 +346,9 @@ pub fn run() {
       Ok(())
     })
     .manage(SessionRegistry::new())
+    .manage(std::sync::Arc::new(
+      crate::core::session_log::LogRegistry::new(),
+    ))
     .invoke_handler(tauri::generate_handler![
       commands::list_profiles,
       commands::save_profile,
@@ -398,6 +401,11 @@ pub fn run() {
       commands::secret_delete,
       commands::workspace_save,
       commands::workspace_load,
+      commands::session_log_start,
+      commands::session_log_stop,
+      commands::session_log_status,
+      commands::session_log_dir,
+      commands::open_in_explorer,
       commands::ai_probe,
     ])
     .on_window_event(|window, event| {

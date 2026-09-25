@@ -52,6 +52,11 @@ import {
   workspaceLoad,
   saveProfile,
   sessionClose,
+  sessionLogStart,
+  sessionLogStop,
+  sessionLogStatus,
+  sessionLogDir,
+  openInExplorer,
   serialList,
   sessionWrite,
   settingsGet,
@@ -121,6 +126,8 @@ interface OpenSession {
   tmuxMode?: "default" | "none" | "name";
   /** 终端当前工作目录（OSC 7 或 tmux 上报） */
   cwd?: string;
+  /** 正在记录终端日志时的文件路径（没记录就是 undefined） */
+  logPath?: string;
   state: SessionState;
   openFiles: OpenFile[];
   activeTab: string; // "terminal" 或文件名
@@ -190,6 +197,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoReconnect: true,
   fsFollowTerminal: true,
   restoreWorkspace: true,
+  scrollback: 10000,
+  autoLog: false,
 };
 
 const APP_VERSION = "0.1.0";
@@ -548,7 +557,9 @@ export default function App() {
       notify("先打开一个会话");
       return;
     }
-    void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\n`)));
+    // 注意：Windows 的 PowerShell / CMD 需要回车 \r 才会执行命令，
+    // 发 \n 只会得到续行提示符（Linux 下 \r 一样能提交）。统一用 \r。
+    void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\r`)));
     aiWasRunning.current = true;
     pushAiNotice(`已在「${cur.title}」里启动 ${tool}，它跑完我会提醒你`);
   }
@@ -931,6 +942,22 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 8000));
         setModule("powershell");
         await new Promise((r) => setTimeout(r, 10000));
+        // 终端日志端到端验证：开一个终端 -> 开始记录 -> 打点东西 -> 停止
+        {
+          const logSid = await openLocalSession("powershell", undefined, repo, "日志验证");
+          await new Promise((r) => setTimeout(r, 3000));
+          await startSessionLog({ id: logSid, title: "日志验证" });
+          await new Promise((r) => setTimeout(r, 1000));
+          await sessionWrite(
+            logSid,
+            bytesToB64(
+              new TextEncoder().encode("echo ZEEAI-LOG-CHECK-12345; echo 第二行中文\r"),
+            ),
+          );
+          await new Promise((r) => setTimeout(r, 3000));
+          await stopSessionLog({ id: logSid });
+          await new Promise((r) => setTimeout(r, 2000));
+        }
         // 验证「关掉当前标签后应自动切到相邻会话」：关掉第一个标签再截图
         const firstTab = sessionsRef.current[0];
         if (firstTab) {
@@ -1058,6 +1085,60 @@ export default function App() {
     setActiveId(s.id);
   }
 
+  // ---------- 终端日志（SecureCRT 那种会话记录） ----------
+
+  /** 日志文件名：会话名 + 本地时间（后端只负责落盘，命名由前端给，省一个日期库） */
+  function logFileName(title: string) {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    return `${title}-${stamp}`;
+  }
+
+  async function startSessionLog(s: { id: string; title: string }) {
+    try {
+      const path = await sessionLogStart(s.id, logFileName(s.title));
+      setSessions((prev) =>
+        prev.map((x) => (x.id === s.id ? { ...x, logPath: path } : x)),
+      );
+      notify(`已开始记录日志：${path}`);
+      return path;
+    } catch (e) {
+      notify("开始记录日志失败：" + String(e));
+      return null;
+    }
+  }
+
+  async function stopSessionLog(s: { id: string }) {
+    try {
+      const path = await sessionLogStop(s.id);
+      setSessions((prev) =>
+        prev.map((x) => (x.id === s.id ? { ...x, logPath: undefined } : x)),
+      );
+      notify(path ? `已停止记录日志：${path}` : "这个会话没有在记日志");
+    } catch (e) {
+      notify("停止记录日志失败：" + String(e));
+    }
+  }
+
+  /** 打开日志文件；没在记就打开日志目录 */
+  async function openSessionLog(s: { logPath?: string }) {
+    try {
+      if (s.logPath) {
+        await openInExplorer(s.logPath);
+      } else {
+        await openInExplorer(await sessionLogDir());
+      }
+    } catch (e) {
+      notify("打开日志失败：" + String(e));
+    }
+  }
+
+  /** 新会话按设置决定要不要自动开日志 */
+  function maybeAutoLog(s: { id: string; title: string }) {
+    if (settings.autoLog) void startSessionLog(s);
+  }
+
   /**
    * 统一的提示入口。
    * - 出错 / 需要你立刻处理 → 中央红色 toast（挡住视线的只有这种，值得）
@@ -1106,6 +1187,7 @@ export default function App() {
       openFiles: [],
       activeTab: "terminal",
     });
+    maybeAutoLog({ id, title });
     try {
       const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
       setSessions((prev) =>
@@ -1141,6 +1223,7 @@ export default function App() {
       openFiles: [],
       activeTab: "terminal",
     });
+    maybeAutoLog({ id, title });
     try {
       const info = await openSsh(
         id,
@@ -1957,6 +2040,7 @@ export default function App() {
       openFiles: [],
       activeTab: "terminal",
     });
+    maybeAutoLog({ id, title: profile.name });
     try {
       const info = await openSerial(id, cfg.path, cfg.baudRate, (e) => handleEvent(id, e), {
         dataBits: cfg.dataBits,
@@ -1983,6 +2067,10 @@ export default function App() {
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
+    });
+    maybeAutoLog({
+      id,
+      title: mode === "logcat" ? `logcat-${serial}` : `adb-${serial}`,
     });
     try {
       await openAdbShell(id, serial, (e) => handleEvent(id, e), undefined, undefined, mode);
@@ -3640,6 +3728,7 @@ export default function App() {
               >
                 {moduleIcon(s.kind)}
                 <span>{s.title}</span>
+                {s.logPath && <span className="rec-dot" title="正在记录终端日志" />}
                 <span className={"status-dot " + s.state} />
                 {(s.state === "closed" || s.state === "error") && s.profileId && (
                   <span
@@ -3746,6 +3835,7 @@ export default function App() {
                             bus={bus}
                             active={i === focusedPane}
                             fontSize={settings.fontSize}
+                            scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                           />
@@ -3785,6 +3875,7 @@ export default function App() {
                     bus={bus}
                     active={s.id === activeId && s.activeTab === "terminal"}
                     fontSize={settings.fontSize}
+                    scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                   />
@@ -4503,6 +4594,61 @@ export default function App() {
                 </button>
               );
             })()}
+            {(() => {
+              const s = sessions.find((x) => x.id === tabMenu.id);
+              if (!s) return null;
+              return s.logPath ? (
+                <>
+                  <button
+                    type="button"
+                    className="menu-item"
+                    onClick={() => {
+                      setTabMenu(null);
+                      void stopSessionLog(s);
+                    }}
+                  >
+                    停止记录终端日志
+                  </button>
+                  <button
+                    type="button"
+                    className="menu-item"
+                    onClick={() => {
+                      setTabMenu(null);
+                      void openSessionLog(s);
+                    }}
+                  >
+                    打开日志文件
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    setTabMenu(null);
+                    void startSessionLog(s);
+                  }}
+                >
+                  开始记录终端日志
+                </button>
+              );
+            })()}
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setTabMenu(null);
+                void (async () => {
+                  try {
+                    await openInExplorer(await sessionLogDir());
+                  } catch (e) {
+                    notify("打开日志目录失败：" + String(e));
+                  }
+                })();
+              }}
+            >
+              打开日志目录
+            </button>
             <div className="menu-sep" />
             <button
               type="button"
@@ -5091,6 +5237,47 @@ export default function App() {
                   value={settings.fontSize}
                   onChange={(e) => void updateSettings({ fontSize: Number(e.target.value) })}
                 />
+              </label>
+
+              <label className="modal-field">
+                终端回滚行数：{settings.scrollback.toLocaleString()} 行
+                <input
+                  type="range"
+                  min={1000}
+                  max={200000}
+                  step={1000}
+                  value={settings.scrollback}
+                  onChange={(e) => void updateSettings({ scrollback: Number(e.target.value) })}
+                />
+              </label>
+              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
+                {[2000, 10000, 50000, 200000].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    className="mini-btn"
+                    style={{ marginRight: 6 }}
+                    onClick={() => void updateSettings({ scrollback: n })}
+                  >
+                    {n >= 1000 ? `${n / 1000}k` : n}
+                  </button>
+                ))}
+                <span className="hint">
+                  往上能翻多少行历史。超出后最老的行会被丢掉（不会崩，只是看不到更早的）；
+                  要长期留存就开终端日志。
+                </span>
+              </div>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.autoLog}
+                  onChange={(e) => void updateSettings({ autoLog: e.target.checked })}
+                />
+                <span>
+                  新建会话时自动记录终端日志（写到 %APPDATA%\ZeeAI-Terminal\logs\sessions；
+                  标签上会出现红点，右键标签可以停止或打开日志）
+                </span>
               </label>
 
               <label className="modal-field">
