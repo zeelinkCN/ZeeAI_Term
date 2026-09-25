@@ -271,29 +271,12 @@ pub fn remove_history(id: &str) -> Result<Vec<HistoryEntry>, String> {
     Ok(all)
 }
 
-/// 首次运行时写入一条测试服务器，方便直接试用（可在界面里删除/修改）。
+/// 首次运行**不内置任何服务器**。
+///
+/// 这里曾经塞过一条开发用的测试服务器（带真实 IP），那是我的疏忽：发布出去之后
+/// 每个下载的人打开就能看到那台机器的地址。现在改成空的，用户自己加自己的机器。
 fn seed() -> Vec<ConnectionProfile> {
-    vec![ConnectionProfile {
-        id: "seed-test-server".into(),
-        kind: "ssh".into(),
-        name: "测试服务器".into(),
-        group: "默认".into(),
-        color: None,
-        ssh: Some(SshConfig {
-            host: "203.0.113.10".into(),
-            port: 22,
-            user: "root".into(),
-            auth_kind: "key".into(),
-            allow_password: false,
-            key_path: None,
-            jump: None,
-            tmux_enabled: true,
-            tmux_template: "{host}-{user}".into(),
-            start_dir: None,
-        }),
-        serial: None,
-        local: None,
-    }]
+    Vec::new()
 }
 
 pub fn load() -> Result<Vec<ConnectionProfile>, String> {

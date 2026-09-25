@@ -5,18 +5,16 @@
 //!   4. 删掉凭据，确认真的删掉了
 //!
 //! 用法：cargo run --release --example secret_probe -- <host> <user> <password>
+//! （三个参数都是必填，源码里不留任何真实主机/账号/密码）
 
 use zeeai_terminal_lib::core::{secret, sftp};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "203.0.113.10".into());
-    let user = std::env::args().nth(2).unwrap_or_else(|| "pwuser".into());
-    let password = std::env::args()
-        .nth(3)
-        .unwrap_or_else(|| "CHANGEME".into());
+    let mut args = std::env::args().skip(1);
+    let (Some(host), Some(user), Some(password)) = (args.next(), args.next(), args.next()) else {
+        return Err("用法: cargo run --release --example secret_probe -- <host> <user> <password>".into());
+    };
     let key = format!("probe-{user}");
 
     println!("1) 写凭据管理器 …");
@@ -32,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("3) 读一个文件 …");
-    match sftp::read_file(&conn, "/home/pwuser/demo/pw-test.txt", 4096).await {
+    match sftp::read_file(&conn, &format!("/home/{user}/demo/pw-test.txt"), 4096).await {
         Ok(data) => println!("   OK: {}", String::from_utf8_lossy(&data).trim()),
         Err(e) => println!("   读文件失败（可能路径不同）: {e}"),
     }
