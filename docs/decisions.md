@@ -79,7 +79,7 @@ resume upload ok（只传了 97.7 KB）-> 远端 200000 字节，期望 200000�
 
 - **命令面板**：`Ctrl+Shift+P` 打开，能搜菜单里的所有命令 + 常用操作（打开设置、服务器管理、
   同步终端目录、上传、打开仓库、关闭全部终端…），回车执行；
-- **MSI 安装包**：targets 加上 `msi`，已产出 `ZeeAI Terminal_0.1.0_x64_en-US.msi`（13.2 MB）。
+- **MSI 安装包**：targets 加上 `msi`，已产出 `ZeeAI_Term_0.1.0_x64_en-US.msi`（13.2 MB）。
   > WiX 工具链同样卡在 GitHub 直连超时，我用代理下好放进 `%LOCALAPPDATA%\tauri\WixTools314`。
 
 ### A. 视图分屏（同一页面看多个终端）
@@ -751,7 +751,7 @@ chown -R zeeai:zeeai /home/zeeai/.ssh && chmod 700 /home/zeeai/.ssh && chmod 600
 | M5 / 决策#5 | ~~Windows 凭据管理器存密码~~ | **第九轮已完成**：密码存凭据管理器，SFTP 与一次性命令都支持密码认证。 |
 | M5 | **known_hosts 管理界面** | 没做，现在统一用 `StrictHostKeyChecking=accept-new`（见 A5）。 |
 | M5 | ~~快捷键 / 命令面板~~ | **第十轮已完成**（`Ctrl+Shift+P`）。自定义快捷键还没做。 |
-| M5 | ~~MSI 安装包~~ | **第十轮已出**（`ZeeAI Terminal_0.1.0_x64_en-US.msi`）。 |
+| M5 | ~~MSI 安装包~~ | **第十轮已出**（`ZeeAI_Term_0.1.0_x64_en-US.msi`）。 |
 | 决策#6 | ~~工作区恢复~~ | **第九轮已完成**（会话级；打开的远程文件内容没有一起恢复）。 |
 | 未定小项 | 全局热键唤起窗口（`Ctrl+\``） | 没做（文档标了「不阻塞开工」）。 |
 
@@ -782,7 +782,7 @@ npm run tauri dev
 正式产物：
 
 - 免安装版：`D:\AI\ZeeAI_term\src-tauri\target\release\zeeai-terminal.exe`（8.9 MB，双击即用）
-- 安装包：`D:\AI\ZeeAI_term\src-tauri\target\release\bundle\nsis\ZeeAI Terminal_0.1.0_x64-setup.exe`
+- 安装包：`D:\AI\ZeeAI_term\src-tauri\target\release\bundle\nsis\ZeeAI_Term_0.1.0_x64-setup.exe`
 
 > 两者都依赖系统已有的 **WebView2 Runtime**（你机器上已装 153.x；Win10/11 通常自带）。
 

@@ -193,7 +193,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   tmuxDefault: true,
   theme: "dark",
   closeAction: "exit",
-  updateUrl: "",
+  updateUrl: "https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest",
   autoReconnect: true,
   fsFollowTerminal: true,
   restoreWorkspace: true,

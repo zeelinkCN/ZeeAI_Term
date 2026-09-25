@@ -35,3 +35,4 @@ Thumbs.db
 # 打包产物（便携版 zip 等）
 /portable/*.zip
 /portable/ZeeAI-Terminal/
+/portable/ZeeAI_Term/

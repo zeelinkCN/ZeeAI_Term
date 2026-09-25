@@ -176,7 +176,7 @@ impl Default for Settings {
             tmux_default: true,
             theme: "dark".into(),
             close_action: "exit".into(),
-            update_url: String::new(),
+            update_url: default_update_url(),
             auto_reconnect: true,
             fs_follow_terminal: true,
             restore_workspace: true,
@@ -190,7 +190,18 @@ pub fn load_settings() -> Settings {
     let Ok(text) = fs::read_to_string(settings_file()) else {
         return Settings::default();
     };
-    serde_json::from_str::<Settings>(&text).unwrap_or_default()
+    let mut s = serde_json::from_str::<Settings>(&text).unwrap_or_default();
+    // 老配置里 update_url 是空字符串，会盖掉默认值 —— 这里补回来，
+    // 让「检查更新」默认就指向本项目的 GitHub Releases。
+    if s.update_url.trim().is_empty() {
+        s.update_url = default_update_url();
+    }
+    s
+}
+
+/// 默认更新源：本仓库的 latest release（GitHub API，返回 JSON，含 tag_name）
+fn default_update_url() -> String {
+    "https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest".to_string()
 }
 
 pub fn save_settings(settings: &Settings) -> Result<(), String> {

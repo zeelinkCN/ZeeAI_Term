@@ -1,6 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "ZeeAI Terminal",
+  "productName": "ZeeAI_Term",
+  "mainBinaryName": "ZeeAI_Term",
   "version": "0.1.0",
   "identifier": "com.zeeai.terminal",
   "build": {
