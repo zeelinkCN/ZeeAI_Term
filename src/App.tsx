@@ -337,6 +337,12 @@ export default function App() {
   const [sessions, setSessions] = useState<OpenSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // 状态栏里的轻提示（完成类消息走这里，不弹中央挡视线）
+  const [statusMsg, setStatusMsg] = useState<{
+    text: string;
+    at: number;
+    kind: "info" | "warn";
+  } | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
 
@@ -522,7 +528,8 @@ export default function App() {
   function pushAiNotice(text: string) {
     const item = { id: uid(), text, time: Date.now() };
     setAiNotices((prev) => [item, ...prev].slice(0, 20));
-    setToast(text);
+    // 只进状态栏 + AI 面板的列表，不弹中央 toast（那玩意儿挡视线）
+    notify(text);
   }
 
   // 面板打开时探测一次，之后每 8 秒刷一次（既看安装状态，也看有没有跑完）
@@ -538,7 +545,7 @@ export default function App() {
   function aiStartTool(tool: string) {
     const cur = sessionsRef.current.find((s) => s.id === activeId);
     if (!cur) {
-      setToast("先打开一个会话");
+      notify("先打开一个会话");
       return;
     }
     void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\n`)));
@@ -596,6 +603,22 @@ export default function App() {
     );
     return out;
   }
+
+  /**
+   * 兜底：只要还有会话，主区域就不该是空的。
+   * 关闭标签、批量关会话、会话异常退出……任何路径让 activeId 失效时，
+   * 这里都会把它接到最后一个会话上（以前会留下一片黑）。
+   */
+  useEffect(() => {
+    if (sessions.length === 0) {
+      if (activeId !== null) setActiveId(null);
+      return;
+    }
+    if (!activeId || !sessions.some((s) => s.id === activeId)) {
+      setActiveId(sessions[sessions.length - 1].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, activeId]);
 
   // ---------- 工作区恢复：退出前存快照，下次打开时把会话重新拉起来 ----------
   const restoredRef = useRef(false);
@@ -677,7 +700,7 @@ export default function App() {
       setWorkspaceHint(null);
       setRestoreDone(true);
       if (ids.length > 0) {
-        setToast(
+        notify(
           allSaved.length > MAX_RESTORE
             ? `已恢复最近 ${ids.length} 个会话（快照里还有 ${allSaved.length - MAX_RESTORE} 个更早的没开）`
             : `已恢复上次的 ${ids.length} 个会话`,
@@ -908,6 +931,14 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 8000));
         setModule("powershell");
         await new Promise((r) => setTimeout(r, 10000));
+        // 验证「关掉当前标签后应自动切到相邻会话」：关掉第一个标签再截图
+        const firstTab = sessionsRef.current[0];
+        if (firstTab) {
+          setActiveId(firstTab.id);
+          await new Promise((r) => setTimeout(r, 2000));
+          await closeSession(firstTab.id);
+        }
+        await new Promise((r) => setTimeout(r, 8000));
         // 分屏演示：左右两分屏（左边 SSH，右边本地 PowerShell）
         setPaneLayout("v2");
         await new Promise((r) => setTimeout(r, 10000));
@@ -975,7 +1006,7 @@ export default function App() {
     try {
       setProfiles(await listProfiles());
     } catch (e) {
-      setToast("读取连接配置失败：" + String(e));
+      notify("读取连接配置失败：" + String(e));
     }
   }
 
@@ -996,7 +1027,7 @@ export default function App() {
         );
         break;
       case "error":
-        setToast(e.message);
+        notify(e.message);
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, state: "error" } : s)),
         );
@@ -1027,6 +1058,33 @@ export default function App() {
     setActiveId(s.id);
   }
 
+  /**
+   * 统一的提示入口。
+   * - 出错 / 需要你立刻处理 → 中央红色 toast（挡住视线的只有这种，值得）
+   * - 完成类（已上传、已删除、AI 跑完…）→ 底部状态栏，几秒后自己消失
+   */
+  const raiseToast = setToast;
+  function notify(text: string) {
+    if (/失败|错误|不能|请|无法|不支持|被拒绝|不正确|超时|不存在|为空/.test(text)) {
+      raiseToast(text);
+    } else {
+      // 「……还没好/已尝试 N 次」这类需要你留意但不致命的，用黄色 + 感叹号
+      const kind: "info" | "warn" = /还没|没有|已尝试|重试|注意|不可|未/.test(text)
+        ? "warn"
+        : "info";
+      setStatusMsg({ text, at: Date.now(), kind });
+    }
+  }
+
+  // 状态栏提示 8 秒后自动消失
+  useEffect(() => {
+    if (!statusMsg) return;
+    const t = window.setTimeout(() => {
+      setStatusMsg((cur) => (cur && cur.at === statusMsg.at ? null : cur));
+    }, 8000);
+    return () => window.clearTimeout(t);
+  }, [statusMsg]);
+
   async function openLocalSession(
     shell: "powershell" | "cmd" | "wsl",
     distro?: string,
@@ -1054,7 +1112,7 @@ export default function App() {
         prev.map((s) => (s.id === id ? { ...s, title: titleOverride?.trim() ? title : info.title || title } : s)),
       );
     } catch (e) {
-      setToast("打开本地终端失败：" + String(e));
+      notify("打开本地终端失败：" + String(e));
     }
     return id;
   }
@@ -1125,27 +1183,37 @@ export default function App() {
         }
       }
     } catch (e) {
-      setToast("SSH 连接失败：" + String(e));
+      notify("SSH 连接失败：" + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
     return id;
   }
 
   async function closeSession(id: string) {
+    // 先记下它在标签栏里的位置，关掉之后要顶上来一个
+    const list = sessionsRef.current;
+    const idx = list.findIndex((s) => s.id === id);
     try {
       await sessionClose(id);
     } catch {
       /* 已断开则忽略 */
     }
     bus.drop(id);
-    setSessions((prev) => prev.filter((s) => s.id !== id));
-    setActiveId((cur) => (cur === id ? null : cur));
+    const next = list.filter((s) => s.id !== id);
+    setSessions(next);
+    setActiveId((cur) => {
+      if (cur !== id) return cur;
+      if (next.length === 0) return null;
+      // 关掉的是当前标签：优先接右边那个，没有右边就接最后一个（最右边的）
+      const at = idx < 0 ? next.length - 1 : Math.min(idx, next.length - 1);
+      return next[at].id;
+    });
   }
 
   /** 一次关掉一批会话（「关闭全部本地终端」「关闭全部会话」用这个） */
   async function closeSessions(list: OpenSession[], what: string) {
     if (list.length === 0) {
-      setToast(`现在没有打开的${what}`);
+      notify(`现在没有打开的${what}`);
       return;
     }
     const reallyDo = async () => {
@@ -1158,9 +1226,14 @@ export default function App() {
         bus.drop(s.id);
       }
       const ids = new Set(list.map((s) => s.id));
-      setSessions((prev) => prev.filter((s) => !ids.has(s.id)));
-      setActiveId((cur) => (cur && ids.has(cur) ? null : cur));
-      setToast(`已关闭 ${list.length} 个${what}`);
+      const remaining = sessionsRef.current.filter((s) => !ids.has(s.id));
+      setSessions(remaining);
+      setActiveId((cur) => {
+        if (!cur || !ids.has(cur)) return cur;
+        // 当前会话被关掉了：落到剩下的最后一个，别把主区域留空
+        return remaining.length > 0 ? remaining[remaining.length - 1].id : null;
+      });
+      notify(`已关闭 ${list.length} 个${what}`);
     };
     if (list.length === 1) {
       await reallyDo();
@@ -1199,14 +1272,14 @@ export default function App() {
         s.user ?? null,
       );
     } catch (e) {
-      setToast("重连失败：" + String(e));
+      notify("重连失败：" + String(e));
       setSessions((prev) => prev.map((x) => (x.id === s.id ? { ...x, state: "error" } : x)));
     }
   }
 
   async function submitProfile() {
     if (!form.host.trim()) {
-      setToast("请填写主机地址");
+      notify("请填写主机地址");
       return;
     }
     const p: ConnectionProfile = {
@@ -1230,7 +1303,7 @@ export default function App() {
       setShowForm(false);
       await refresh();
     } catch (e) {
-      setToast("保存失败：" + String(e));
+      notify("保存失败：" + String(e));
     }
   }
 
@@ -1239,7 +1312,7 @@ export default function App() {
       await deleteProfile(p.id);
       await refresh();
     } catch (e) {
-      setToast("删除失败：" + String(e));
+      notify("删除失败：" + String(e));
     }
   }
 
@@ -1283,7 +1356,7 @@ export default function App() {
     if (!editDialog) return;
     const p = editDialog.draft;
     if (!p.ssh?.host.trim()) {
-      setToast("请填写主机地址");
+      notify("请填写主机地址");
       return;
     }
     const finalProfile: ConnectionProfile = {
@@ -1301,7 +1374,7 @@ export default function App() {
         openNewSessionDialog(finalProfile);
       }
     } catch (e) {
-      setToast("保存失败：" + String(e));
+      notify("保存失败：" + String(e));
     }
   }
 
@@ -1315,7 +1388,7 @@ export default function App() {
       await saveProfile(copy);
       await refresh();
     } catch (e) {
-      setToast("复制失败：" + String(e));
+      notify("复制失败：" + String(e));
     }
   }
 
@@ -1338,7 +1411,7 @@ export default function App() {
     try {
       setTmuxSessions(await tmuxList(profile.id, profile.ssh?.user ?? null));
     } catch (e) {
-      setToast("读取 tmux 会话失败：" + String(e));
+      notify("读取 tmux 会话失败：" + String(e));
       setTmuxSessions([]);
     } finally {
       setTmuxLoading(false);
@@ -1350,7 +1423,7 @@ export default function App() {
       await tmuxKill(profile.id, name, profile.ssh?.user ?? null);
       await refreshTmux(profile);
     } catch (e) {
-      setToast("结束 tmux 会话失败：" + String(e));
+      notify("结束 tmux 会话失败：" + String(e));
     }
   }
 
@@ -1415,7 +1488,7 @@ export default function App() {
     const p = serialDialog.draft;
     const cfg = p.serial;
     if (!cfg?.path.trim()) {
-      setToast("请选择或填写串口（例如 COM5）");
+      notify("请选择或填写串口（例如 COM5）");
       return;
     }
     const finalProfile: ConnectionProfile = {
@@ -1431,7 +1504,7 @@ export default function App() {
       await refresh();
       if (openAfter) await openSerialSession(finalProfile);
     } catch (e) {
-      setToast("保存失败：" + String(e));
+      notify("保存失败：" + String(e));
     }
   }
 
@@ -1440,7 +1513,7 @@ export default function App() {
       await deleteProfile(p.id);
       await refresh();
     } catch (e) {
-      setToast("删除失败：" + String(e));
+      notify("删除失败：" + String(e));
     }
   }
 
@@ -1449,7 +1522,7 @@ export default function App() {
     try {
       setDialogTmux(await tmuxList(profileId, user ?? null));
     } catch (e) {
-      setToast("读取 tmux 会话失败：" + String(e));
+      notify("读取 tmux 会话失败：" + String(e));
       setDialogTmux([]);
     } finally {
       setDialogBusy(false);
@@ -1459,7 +1532,7 @@ export default function App() {
   function openNewSessionDialog(profile?: ConnectionProfile) {
     const target = profile ?? sshProfiles[0];
     if (!target) {
-      setToast("还没有服务器配置，先去「连接 → 服务器管理」里加一台");
+      notify("还没有服务器配置，先去「连接 → 服务器管理」里加一台");
       return;
     }
     const useTmux = target.ssh?.tmuxEnabled ?? settings.tmuxDefault;
@@ -1480,7 +1553,7 @@ export default function App() {
     const profile = profiles.find((p) => p.id === newDialog.profileId);
     if (!profile) return;
     if (newDialog.useTmux && newDialog.tmuxKind === "attach" && !newDialog.attachTarget) {
-      setToast("请选择一个要附加的 tmux 会话");
+      notify("请选择一个要附加的 tmux 会话");
       return;
     }
     setDialogBusy(true);
@@ -1511,7 +1584,7 @@ export default function App() {
   async function connectFromHistory(h: HistoryEntry) {
     const profile = profiles.find((p) => p.id === h.profileId);
     if (!profile) {
-      setToast("这条历史对应的连接配置已被删除");
+      notify("这条历史对应的连接配置已被删除");
       return;
     }
     // 已经在标签里开着的 tmux 会话：直接切过去，不要再 attach 一次。
@@ -1523,7 +1596,7 @@ export default function App() {
       );
       if (opened) {
         setActiveId(opened.id);
-        setToast(`「${h.title?.trim() || h.tmuxSession}」已经开着了，已帮你切过去`);
+        notify(`「${h.title?.trim() || h.tmuxSession}」已经开着了，已帮你切过去`);
         return;
       }
     }
@@ -1539,7 +1612,7 @@ export default function App() {
     try {
       setHistory(await historyRemove(id));
     } catch (e) {
-      setToast("删除历史失败：" + String(e));
+      notify("删除历史失败：" + String(e));
     }
   }
 
@@ -1551,7 +1624,7 @@ export default function App() {
       setFbVer(await fastbootVersion());
       setFbList(await fastbootDevices());
     } catch (e) {
-      setToast("ADB 不可用：" + String(e));
+      notify("ADB 不可用：" + String(e));
       setAdbVer("");
       setAdbList([]);
     } finally {
@@ -1564,7 +1637,7 @@ export default function App() {
     try {
       setSerialPorts(await serialList());
     } catch (e) {
-      setToast("枚举串口失败：" + String(e));
+      notify("枚举串口失败：" + String(e));
       setSerialPorts([]);
     } finally {
       setSerialLoading(false);
@@ -1574,14 +1647,14 @@ export default function App() {
   async function refreshGit() {
     const path = gitPath.trim();
     if (!path) {
-      setToast("请先填写仓库路径");
+      notify("请先填写仓库路径");
       return;
     }
     setGitLoading(true);
     try {
       setGitState(await gitStatus(path));
     } catch (e) {
-      setToast("读取 Git 状态失败：" + String(e));
+      notify("读取 Git 状态失败：" + String(e));
       setGitState(null);
     } finally {
       setGitLoading(false);
@@ -1592,7 +1665,7 @@ export default function App() {
   async function refreshGitAll(pathArg?: string) {
     const path = (pathArg ?? gitPath).trim();
     if (!path) {
-      setToast("请先选一个仓库");
+      notify("请先选一个仓库");
       return;
     }
     setGitBusy(true);
@@ -1608,7 +1681,7 @@ export default function App() {
         setGitBranchList([]);
       }
     } catch (e) {
-      setToast("读取 Git 状态失败：" + String(e));
+      notify("读取 Git 状态失败：" + String(e));
     } finally {
       setGitBusy(false);
     }
@@ -1621,7 +1694,7 @@ export default function App() {
       await gitAdd(path, files);
       await refreshGitAll(path);
     } catch (e) {
-      setToast("暂存失败：" + String(e));
+      notify("暂存失败：" + String(e));
     }
   }
 
@@ -1632,7 +1705,7 @@ export default function App() {
       await gitUnstage(path, files);
       await refreshGitAll(path);
     } catch (e) {
-      setToast("取消暂存失败：" + String(e));
+      notify("取消暂存失败：" + String(e));
     }
   }
 
@@ -1650,9 +1723,9 @@ export default function App() {
     try {
       await gitDiscard(path, files);
       await refreshGitAll(path);
-      setToast("已丢弃改动");
+      notify("已丢弃改动");
     } catch (e) {
-      setToast("丢弃失败：" + String(e));
+      notify("丢弃失败：" + String(e));
     }
   }
 
@@ -1660,17 +1733,17 @@ export default function App() {
     const path = gitPath.trim();
     if (!path) return;
     if (!gitMessage.trim()) {
-      setToast("先写提交信息");
+      notify("先写提交信息");
       return;
     }
     setGitBusy(true);
     try {
       const out = await gitCommit(path, gitMessage);
       setGitMessage("");
-      setToast(out.split("\n")[0] || "已提交");
+      notify(out.split("\n")[0] || "已提交");
       await refreshGitAll(path);
     } catch (e) {
-      setToast("提交失败：" + String(e));
+      notify("提交失败：" + String(e));
     } finally {
       setGitBusy(false);
     }
@@ -1683,10 +1756,10 @@ export default function App() {
     try {
       const out = await gitCheckout(path, branch, create);
       setNewBranch("");
-      setToast(out.trim().split("\n").pop() || `已切到 ${branch}`);
+      notify(out.trim().split("\n").pop() || `已切到 ${branch}`);
       await refreshGitAll(path);
     } catch (e) {
-      setToast("切换分支失败：" + String(e));
+      notify("切换分支失败：" + String(e));
     } finally {
       setGitBusy(false);
     }
@@ -1702,7 +1775,7 @@ export default function App() {
         text: text || "(没有 diff，可能已提交或只有模式变化)",
       });
     } catch (e) {
-      setToast("读取 diff 失败：" + String(e));
+      notify("读取 diff 失败：" + String(e));
     }
   }
 
@@ -1713,7 +1786,7 @@ export default function App() {
       const text = await gitShow(path, hash);
       setDiffDialog({ title: `${hash.slice(0, 8)} ${subject}`, text });
     } catch (e) {
-      setToast("读取提交失败：" + String(e));
+      notify("读取提交失败：" + String(e));
     }
   }
 
@@ -1735,13 +1808,13 @@ export default function App() {
       status = await gitStatus(dir);
       setGitState(status);
     } catch (e) {
-      setToast("读取 Git 状态失败：" + String(e));
+      notify("读取 Git 状态失败：" + String(e));
       setGitLoading(false);
       return;
     }
     setGitLoading(false);
     if (!status?.ok) {
-      setToast(status?.message || "这个目录不是 Git 仓库");
+      notify(status?.message || "这个目录不是 Git 仓库");
       return;
     }
 
@@ -1760,11 +1833,11 @@ export default function App() {
         await saveProfile(profile);
         await refresh();
       } catch (e) {
-        setToast("保存工作空间失败：" + String(e));
+        notify("保存工作空间失败：" + String(e));
       }
     }
     await openLocalSession(shell, undefined, dir, `${name} · git`);
-    setToast(`已在 ${dir} 打开 Git 工作空间（终端 + git 命令行）`);
+    notify(`已在 ${dir} 打开 Git 工作空间（终端 + git 命令行）`);
   }
 
   async function removeGitWorkspace(p: ConnectionProfile) {
@@ -1772,7 +1845,7 @@ export default function App() {
       await deleteProfile(p.id);
       await refresh();
     } catch (e) {
-      setToast("删除失败：" + String(e));
+      notify("删除失败：" + String(e));
     }
   }
 
@@ -1780,13 +1853,13 @@ export default function App() {
   async function createGitRepo(rawPath: string) {
     const dir = rawPath.trim();
     if (!dir) {
-      setToast("请先填要创建仓库的目录，例如 D:\\code\\my-repo");
+      notify("请先填要创建仓库的目录，例如 D:\\code\\my-repo");
       return;
     }
     try {
       await gitInit(dir, true);
     } catch (e) {
-      setToast("git init 失败：" + String(e));
+      notify("git init 失败：" + String(e));
       return;
     }
     setGitInitDialog(null);
@@ -1809,17 +1882,17 @@ export default function App() {
         });
         await refresh();
       } catch (e) {
-        setToast("保存工作空间失败：" + String(e));
+        notify("保存工作空间失败：" + String(e));
       }
     }
     await openLocalSession(shell, undefined, dir, `${name} · git`);
-    setToast(`已在 ${dir} 建好仓库并打开终端（可以 git add . 然后 commit）`);
+    notify(`已在 ${dir} 建好仓库并打开终端（可以 git add . 然后 commit）`);
   }
 
   /** 在某个目录直接开一个新的本地终端（Git 面板用） */
   async function openGitTerminal(dir: string, title?: string) {
     if (!dir.trim()) {
-      setToast("先选一个仓库目录");
+      notify("先选一个仓库目录");
       return;
     }
     await openLocalSession(settings.defaultShell, undefined, dir, title);
@@ -1832,7 +1905,7 @@ export default function App() {
     if (!settings.autoReconnect) return;
     const tries = reconnectTries.current[sessionId] ?? 0;
     if (tries >= 5) {
-      setToast("自动重连已尝试 5 次，先停下。点标签上的 ↻ 可以手动重试。");
+      notify("自动重连已尝试 5 次，先停下。点标签上的 ↻ 可以手动重试。");
       return;
     }
     reconnectTries.current[sessionId] = tries + 1;
@@ -1872,7 +1945,7 @@ export default function App() {
   async function openSerialSession(profile: ConnectionProfile) {
     const cfg = profile.serial;
     if (!cfg?.path) {
-      setToast("这个串口连接没有配置端口");
+      notify("这个串口连接没有配置端口");
       return "";
     }
     const id = uid();
@@ -1895,7 +1968,7 @@ export default function App() {
         prev.map((s) => (s.id === id ? { ...s, title: profile.name || info.title || s.title } : s)),
       );
     } catch (e) {
-      setToast("打开串口失败：" + String(e));
+      notify("打开串口失败：" + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
     return id;
@@ -1914,7 +1987,7 @@ export default function App() {
     try {
       await openAdbShell(id, serial, (e) => handleEvent(id, e), undefined, undefined, mode);
     } catch (e) {
-      setToast(`打开 ${mode === "logcat" ? "logcat" : "ADB shell"} 失败：` + String(e));
+      notify(`打开 ${mode === "logcat" ? "logcat" : "ADB shell"} 失败：` + String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
   }
@@ -1931,7 +2004,7 @@ export default function App() {
       setAdbFiles(await adbLs(serial, path));
       setAdbPath(path);
     } catch (e) {
-      setToast("读取设备目录失败：" + String(e));
+      notify("读取设备目录失败：" + String(e));
       setAdbFiles([]);
     } finally {
       setAdbLoading(false);
@@ -1946,10 +2019,10 @@ export default function App() {
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
     try {
-      setToast(await adbPush(serial, paths, adbPath));
+      notify(await adbPush(serial, paths, adbPath));
       await refreshAdbFiles(serial, adbPath);
     } catch (e) {
-      setToast("推送失败：" + String(e));
+      notify("推送失败：" + String(e));
     }
   }
 
@@ -1957,9 +2030,9 @@ export default function App() {
     const dir = await openLocalDialog({ directory: true, title: `选择保存「${name}」的目录` });
     if (!dir || Array.isArray(dir)) return;
     try {
-      setToast(await adbPull(serial, joinRemote(adbPath, name), dir));
+      notify(await adbPull(serial, joinRemote(adbPath, name), dir));
     } catch (e) {
-      setToast("下载失败：" + String(e));
+      notify("下载失败：" + String(e));
     }
   }
 
@@ -1970,9 +2043,9 @@ export default function App() {
       await adbMkdir(serial, target);
       setAdbNewName("");
       await refreshAdbFiles(serial, adbPath);
-      setToast(`已在设备上新建 ${target}`);
+      notify(`已在设备上新建 ${target}`);
     } catch (e) {
-      setToast("新建文件夹失败：" + String(e));
+      notify("新建文件夹失败：" + String(e));
     }
   }
 
@@ -1980,9 +2053,9 @@ export default function App() {
     try {
       await adbRm(serial, joinRemote(adbPath, name), isDir);
       await refreshAdbFiles(serial, adbPath);
-      setToast(`已删除 ${name}`);
+      notify(`已删除 ${name}`);
     } catch (e) {
-      setToast("删除失败：" + String(e));
+      notify("删除失败：" + String(e));
     }
   }
 
@@ -2001,7 +2074,7 @@ export default function App() {
     try {
       await settingsSet(next);
     } catch (e) {
-      setToast("保存设置失败：" + String(e));
+      notify("保存设置失败：" + String(e));
     }
   }
 
@@ -2012,7 +2085,7 @@ export default function App() {
 
   function clearActiveTerminal() {
     if (!activeSession) {
-      setToast("当前没有会话");
+      notify("当前没有会话");
       return;
     }
     void sessionWrite(activeSession.id, bytesToB64(new TextEncoder().encode("\u000c")));
@@ -2231,11 +2304,11 @@ export default function App() {
   ) {
     const target = await resolveTerminalCwd(profileId, tmuxName, cwd);
     if (!target) {
-      setToast("这个会话还没上报工作目录：在终端里按一下回车，或先 cd 一次再点同步");
+      notify("这个会话还没上报工作目录：在终端里按一下回车，或先 cd 一次再点同步");
       return;
     }
     await loadDir(profileId, target);
-    setToast(`已同步到终端目录：${target}`);
+    notify(`已同步到终端目录：${target}`);
   }
 
   async function loadDir(profileId: string, path?: string) {
@@ -2246,7 +2319,7 @@ export default function App() {
       setFsInput(listing.path);
       setFsEntries(listing.entries);
     } catch (e) {
-      setToast("读取远端目录失败：" + String(e));
+      notify("读取远端目录失败：" + String(e));
       setFsEntries([]);
     } finally {
       setFsLoading(false);
@@ -2260,7 +2333,7 @@ export default function App() {
   ) {
     const sessionId = sessionIdOverride ?? activeId;
     if (!sessionId) {
-      setToast("请先打开一个 SSH 会话");
+      notify("请先打开一个 SSH 会话");
       return;
     }
     const path = joinPath(fsPathRef.current, name);
@@ -2268,7 +2341,7 @@ export default function App() {
     try {
       const b64 = await fsRead(profileId, path, 1024 * 1024, activeUserRef.current ?? null);
       if (!b64) {
-        setToast("文件为空或无法读取（可能是目录或二进制文件）");
+        notify("文件为空或无法读取（可能是目录或二进制文件）");
         return;
       }
       setSessions((prev) =>
@@ -2280,7 +2353,7 @@ export default function App() {
         }),
       );
     } catch (e) {
-      setToast("读取文件失败：" + String(e));
+      notify("读取文件失败：" + String(e));
     }
   }
 
@@ -2306,10 +2379,10 @@ export default function App() {
         activeUserRef.current ?? null,
         uid(),
       );
-      setToast(msg);
+      notify(msg);
       await loadDir(profileId, fsPathRef.current);
     } catch (e) {
-      setToast("上传失败：" + String(e));
+      notify("上传失败：" + String(e));
     } finally {
       setFsBusy(false);
     }
@@ -2331,9 +2404,9 @@ export default function App() {
         activeUserRef.current ?? null,
         uid(),
       );
-      setToast(msg);
+      notify(msg);
     } catch (e) {
-      setToast("下载失败：" + String(e));
+      notify("下载失败：" + String(e));
     } finally {
       setFsBusy(false);
     }
@@ -2357,7 +2430,7 @@ export default function App() {
   async function renameSession(sessionId: string, rawName: string) {
     const title = rawName.trim();
     if (!title) {
-      setToast("会话名不能为空");
+      notify("会话名不能为空");
       return;
     }
     const s = sessionsRef.current.find((x) => x.id === sessionId);
@@ -2379,9 +2452,9 @@ export default function App() {
           lastUsed: 0,
         }),
       );
-      setToast(`会话已命名为「${title}」`);
+      notify(`会话已命名为「${title}」`);
     } catch (e) {
-      setToast("改名字失败：" + String(e));
+      notify("改名字失败：" + String(e));
     }
     setSessionRename(null);
   }
@@ -2391,7 +2464,7 @@ export default function App() {
     if (!nameDialog) return;
     const value = nameDialog.value.trim();
     if (!value) {
-      setToast("名字不能为空");
+      notify("名字不能为空");
       return;
     }
     const dir = nameDialog.dir;
@@ -2399,7 +2472,7 @@ export default function App() {
     try {
       if (nameDialog.mode === "mkdir") {
         await fsMkdir(nameDialog.profileId, joinPath(dir, value), activeUserRef.current ?? null);
-        setToast(`已新建 ${value}`);
+        notify(`已新建 ${value}`);
       } else {
         await fsRename(
           nameDialog.profileId,
@@ -2407,12 +2480,12 @@ export default function App() {
           joinPath(dir, value),
           activeUserRef.current ?? null,
         );
-        setToast(`已重命名为 ${value}`);
+        notify(`已重命名为 ${value}`);
       }
       setNameDialog(null);
       await loadDir(nameDialog.profileId, dir);
     } catch (e) {
-      setToast("操作失败：" + String(e));
+      notify("操作失败：" + String(e));
     } finally {
       setFsBusy(false);
     }
@@ -2422,10 +2495,10 @@ export default function App() {
     setFsBusy(true);
     try {
       await fsRemove(profileId, joinPath(fsPath, name), activeUserRef.current ?? null);
-      setToast(`已删除 ${name}`);
+      notify(`已删除 ${name}`);
       await loadDir(profileId, fsPath);
     } catch (e) {
-      setToast("删除失败：" + String(e));
+      notify("删除失败：" + String(e));
     } finally {
       setFsBusy(false);
     }
@@ -3851,6 +3924,15 @@ export default function App() {
             : "就绪"}
         </span>
         <span className="spacer" />
+        {statusMsg && (
+          <span
+            className={"status-notice " + statusMsg.kind}
+            title={statusMsg.text}
+            onClick={() => setStatusMsg(null)}
+          >
+            {statusMsg.text}
+          </span>
+        )}
         {activeFile && <span className="stat">{activeFile.path}</span>}
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
@@ -4932,7 +5014,7 @@ export default function App() {
                   onClick={() => {
                     const id = editDialog.draft.id;
                     if (!id) {
-                      setToast("先保存这台服务器，再来设置密码");
+                      notify("先保存这台服务器，再来设置密码");
                       return;
                     }
                     void (async () => {
@@ -4940,9 +5022,9 @@ export default function App() {
                         await secretSet(id, editPassword);
                         setEditHasPassword(true);
                         setEditPassword("");
-                        setToast("密码已存进 Windows 凭据管理器");
+                        notify("密码已存进 Windows 凭据管理器");
                       } catch (e) {
-                        setToast("保存密码失败：" + String(e));
+                        notify("保存密码失败：" + String(e));
                       }
                     })();
                   }}
@@ -4960,9 +5042,9 @@ export default function App() {
                       try {
                         await secretDelete(id);
                         setEditHasPassword(false);
-                        setToast("已删除保存的密码");
+                        notify("已删除保存的密码");
                       } catch (e) {
-                        setToast("删除密码失败：" + String(e));
+                        notify("删除密码失败：" + String(e));
                       }
                     })();
                   }}

@@ -1978,6 +1978,50 @@ body {
   flex: 1;
 }
 
+/* 状态栏里的轻提示：完成类消息在这里显示，不弹中央挡视线 */
+.statusbar .status-notice {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 12px;
+  max-width: 60vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  animation: status-in 0.16s ease-out;
+}
+
+.statusbar .status-notice::before {
+  content: "✓";
+  margin-right: 6px;
+  font-weight: 700;
+}
+
+/* 需要留意但不致命的：黄色底 + 感叹号 */
+.statusbar .status-notice.warn {
+  background: rgba(226, 192, 141, 0.95);
+  color: #3a2a00;
+}
+
+.statusbar .status-notice.warn::before {
+  content: "⚠";
+}
+
+@keyframes status-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .toast {
   position: fixed;
   left: 50%;
