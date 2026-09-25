@@ -1052,8 +1052,19 @@ body {
 
 .ai-tool-actions {
   display: flex;
+  align-items: center;
   gap: 6px;
   margin-left: 14px;
+}
+
+.ai-install-hint {
+  font-size: 11px;
+  color: var(--amber);
+}
+
+.mini-btn.primary {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .ai-notice {

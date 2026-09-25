@@ -3807,23 +3807,17 @@ export default function App() {
                         {t.version || t.installCmd}
                       </div>
                       <div className="ai-tool-actions">
-                        {t.installed ? (
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            disabled={!activeSession}
-                            title="在这个会话的终端里直接启动"
-                            onClick={() => aiStartTool(t.runCmd)}
-                          >
-                            一键启动
-                          </button>
-                        ) : (
-                          <span className="ai-install-hint">未安装 —— 用下面的命令装</span>
+                        {!t.installed && (
+                          <span className="ai-install-hint">未安装 —— 先装</span>
                         )}
                         <button
                           type="button"
-                          className="mini-btn"
-                          title="把这条命令敲进当前终端，进度你自己看"
+                          className={"mini-btn" + (t.installed ? " primary" : "")}
+                          title={
+                            t.installed
+                              ? "把启动命令敲进当前终端并回车，AI 跑完会通知你"
+                              : "把安装命令敲进当前终端并回车，进度你自己看"
+                          }
                           disabled={!activeSession}
                           onClick={() => aiStartTool(t.installed ? t.runCmd : t.installCmd)}
                         >
