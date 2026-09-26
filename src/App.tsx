@@ -774,6 +774,8 @@ export default function App() {
   const [sessionRename, setSessionRename] = useState<{ id: string; value: string } | null>(null);
   /** 正在被拖动的标签（用来实现左右拖动排序） */
   const [dragTabId, setDragTabId] = useState<string | null>(null);
+  /** 拖动时鼠标的位置（画一个跟着鼠标的"虚影"，VSCode 那样看得见在拖） */
+  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
   /** 侧栏宽度（可拖动调整，存 localStorage，下次打开还是你调好的宽度） */
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const v = Number(localStorage.getItem("zeeai.sidebarWidth"));
@@ -2041,11 +2043,15 @@ export default function App() {
   useEffect(() => {
     if (!dragTabId) return;
     const onMove = (e: MouseEvent) => {
+      setDragPos({ x: e.clientX, y: e.clientY }); // 让"跟着鼠标的虚影"动起来
       const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
       const over = el?.closest("[data-tab-id]")?.getAttribute("data-tab-id") ?? "";
       if (over && over !== dragTabId) moveTab(dragTabId, over);
     };
-    const onUp = () => setDragTabId(null);
+    const onUp = () => {
+      setDragTabId(null);
+      setDragPos(null);
+    };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => {
@@ -2410,18 +2416,17 @@ export default function App() {
       const userOverride = wantedUser || null;
       // 会话名字：填了就用；普通 shell 留空则**自动编号**（同一台机器开多个也能分得清，
       // 而且历史记录按名字分开存，不会再互相覆盖）
-      const plainCount = history.filter(
-        (h) => h.profileId === profile.id && !h.tmuxSession,
-      ).length;
-      const autoTitle = `${profile.name} · 普通 shell ${plainCount + 1}`;
       const wantedTitle = (newDialog.title ?? "").trim();
+      // 注意：这里**不要自己算自动名字**。名字的唯一性由 openSshSession 里那段
+      // "撞名就顺延"的逻辑保证；对话框一旦自己算了个名字传过去，就会把那套逻辑跳过，
+      // 结果就是每次都生成同一个「普通 shell 2」（实测踩过）。
       if (!newDialog.useTmux) {
         await openSshSession(
           profile,
           "none",
           null,
           userOverride,
-          wantedTitle || autoTitle,
+          wantedTitle || null,
           newDialog.highlightSetId,
         );
       } else if (newDialog.tmuxKind === "new") {
@@ -5087,7 +5092,10 @@ export default function App() {
                 // 注意：HTML5 的 draggable 在 WebView2 里对 <button> 不生效，
                 // 所以这里自己用鼠标事件做拖动（见下面那个全局 mousemove 的 effect）
                 onMouseDown={(e) => {
-                  if (e.button === 0) setDragTabId(s.id);
+                  if (e.button === 0) {
+                    setDragTabId(s.id);
+                    setDragPos({ x: e.clientX, y: e.clientY });
+                  }
                 }}
                 onClick={() => setActiveId(s.id)}
                 onContextMenu={(e) => {
@@ -5128,6 +5136,16 @@ export default function App() {
               <span className="session-tab placeholder">没有打开的会话</span>
             )}
           </div>
+
+          {/* 拖动标签时跟着鼠标走的"虚影"（VSCode 那种手感：拖起来就看得见） */}
+          {dragTabId && dragPos && (
+            <div
+              className="tab-drag-ghost"
+              style={{ left: dragPos.x + 14, top: dragPos.y + 12 }}
+            >
+              {sessions.find((s) => s.id === dragTabId)?.title ?? "标签"}
+            </div>
+          )}
 
           {activeSession && activeSession.openFiles.length > 0 && (
             <div className="sub-tabs">
@@ -7326,7 +7344,7 @@ export default function App() {
                 会话名字（可留空）
                 <input
                   value={newDialog.title ?? ""}
-                  placeholder={`留空 = 自动命名（例如 ${`${profiles.find((p) => p.id === newDialog.profileId)?.name ?? "服务器"} · 普通 shell 1`}）`}
+                  placeholder="留空 = 自动命名（普通 shell 会自动编号，不会重名）"
                   onChange={(e) => setNewDialog({ ...newDialog, title: e.target.value })}
                 />
               </label>

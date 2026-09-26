@@ -1277,6 +1277,27 @@ body {
   opacity: 0.45;
 }
 
+/* 拖动时跟着鼠标的虚影：虚线边 + 半透明 + 微微倾斜，明确"这个标签正被我拖着" */
+.tab-drag-ghost {
+  position: fixed;
+  z-index: 999;
+  padding: 4px 10px;
+  max-width: 260px;
+  border: 1px dashed var(--accent);
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.9;
+  transform: rotate(-1.5deg);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
 /* 设置对话框：左边分类，右边内容（二级菜单） */
 .settings-split {
   display: flex;
