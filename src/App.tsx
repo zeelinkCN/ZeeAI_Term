@@ -2477,7 +2477,9 @@ export default function App() {
     const opened = sessions.find((s) =>
       h.tmuxSession
         ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
-        : s.profileId === h.profileId && !s.tmuxName,
+        : s.profileId === h.profileId &&
+          !s.tmuxName &&
+          (s.title ?? "").trim() === (h.title ?? "").trim(),
     );
     if (opened) {
       setActiveId(opened.id);
@@ -2488,7 +2490,8 @@ export default function App() {
     if (h.tmuxSession) {
       await openSshSession(profile, "name", h.tmuxSession, null, custom);
     } else {
-      await openSshSession(profile, "none", null, null, custom);
+      // 普通 shell：带上这条历史的名字重开 —— 名字一样，历史记录还是同一条（不会又长出新的编号）
+      await openSshSession(profile, "none", null, null, custom ?? null);
     }
   }
 
@@ -4199,11 +4202,14 @@ export default function App() {
                             items.map((h) => {
                               // tmux 会话能精确判断"是不是已经在标签里开着"
                               // 已打开的判定：tmux 按 tmux 会话名比；普通 shell 按"这台机器 + 没有 tmux 名"比
-                              // （以前只认 tmux，所以普通 shell 的灯永远不亮、点一下还会再开一个）
+                              // 普通 shell 还必须**比名字** —— 否则同一台机器上随便开一个普通 shell，
+                              // 它所有普通 shell 的历史行都会显示"已打开"（实测就是这个 bug）
                               const opened = sessions.find((s) =>
                                 h.tmuxSession
                                   ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
-                                  : s.profileId === h.profileId && !s.tmuxName,
+                                  : s.profileId === h.profileId &&
+                                    !s.tmuxName &&
+                                    (s.title ?? "").trim() === (h.title ?? "").trim(),
                               );
                               const rowLabel =
                                 h.title?.trim() ||
