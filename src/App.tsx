@@ -6634,11 +6634,6 @@ export default function App() {
                 />
                 <span>在右下角显示一条提示（点一下跳回那个会话）</span>
               </label>
-              <div className="hint" style={{ padding: "0 14px 10px" }}>
-                这两项都是额外加的分层；活动栏 AI 图标上的**红点**始终会有（最不打扰的那一档）。
-                判据来自 Codex 的会话日志：跑完一轮、等你批准、等你回话 —— 启动任务时不会再弹。
-              </div>
-
               <label className="form-check">
                 <input
                   type="checkbox"
