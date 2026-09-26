@@ -1979,7 +1979,10 @@ export default function App() {
               profileName: profile.name,
               host: profile.ssh?.host ?? "",
               tmuxSession: info.tmuxSession ?? null,
-              title: titleOverride?.trim() || null,
+              // 存"最终显示名"（自动编号的「普通 shell N」也要存下来）。
+              // 之前这里写的是 titleOverride（只存用户手填的名字），自动编号的名字被丢成 null，
+              // 于是所有普通 shell 的去重键都变成同一个空值 → 又互相覆盖 → 永远不增数。
+              title: title || null,
               lastUsed: 0,
             }),
           );
