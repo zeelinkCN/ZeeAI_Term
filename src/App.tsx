@@ -7110,16 +7110,18 @@ export default function App() {
                   value={newDialog.profileId}
                   onChange={(e) => {
                     const picked = profiles.find((x) => x.id === e.target.value);
+                    // 换服务器时，登录用户要跟着换成"这台服务器自己的用户"，
+                    // 不能沿用上一台的值（否则 tmux 名也会拿旧用户去拼 —— 实测就是这样错的）
+                    const nextUser = picked?.ssh?.user ?? "";
                     setNewDialog({
                       ...newDialog,
                       profileId: e.target.value,
-                      tmuxName: picked
-                        ? defaultTmuxName(picked, newDialog.user)
-                        : newDialog.tmuxName,
+                      user: nextUser,
+                      tmuxName: picked ? defaultTmuxName(picked, nextUser) : "",
                       attachTarget: "",
                     });
                     if (newDialog.useTmux)
-                      void loadDialogTmux(e.target.value, newDialog.user);
+                      void loadDialogTmux(e.target.value, nextUser);
                   }}
                 >
                   {sshProfiles.map((p) => (
@@ -7174,12 +7176,16 @@ export default function App() {
                   onChange={(e) => {
                     const nextUser = e.target.value;
                     const picked = profiles.find((x) => x.id === newDialog.profileId);
+                    // tmux 名里带用户名（模板 {host}-{user}），所以改用户时跟着更新；
+                    // 只有当它还是"自动生成的那个"或为空时才覆盖，尊重手动改过的名字
+                    const auto = picked ? defaultTmuxName(picked, newDialog.user) : "";
+                    const keepManual =
+                      newDialog.tmuxName.trim() !== "" && newDialog.tmuxName !== auto;
                     setNewDialog({
                       ...newDialog,
                       user: nextUser,
-                      tmuxName: picked
-                        ? defaultTmuxName(picked, nextUser)
-                        : newDialog.tmuxName,
+                      tmuxName:
+                        picked && !keepManual ? defaultTmuxName(picked, nextUser) : newDialog.tmuxName,
                     });
                   }}
                 />
