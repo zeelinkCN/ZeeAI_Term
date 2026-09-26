@@ -194,6 +194,14 @@ export interface AiSessionSnapshot {
   linesSeen: number;
 }
 
+/** AI 任务产物：这一轮跑完之后新增/修改的文件（远端相对会话目录的路径） */
+export interface AiArtifact {
+  path: string;
+  name: string;
+  size: number;
+  mtime: number;
+}
+
 export interface AppSettings {
   fontSize: number;
   defaultShell: "powershell" | "cmd" | "wsl";

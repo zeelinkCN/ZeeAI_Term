@@ -380,6 +380,148 @@ if [ -n \"$f\" ]; then printf 'ZFILE|%s\\n' \"$f\"; tail -c {TAIL_BYTES} \"$f\";
     )
 }
 
+/// 任务产物：某个文件是"这一轮跑完之后新出现/被改过"的
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiArtifact {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    /// 最后修改时间（Unix 秒）
+    pub mtime: i64,
+}
+
+/// 找 cwd 下 `since` 之后被改过的文件（远端脚本：一行 `mtime|size|相对路径`）。
+///
+/// 为什么要"时间窗 + 目录"这套：AI 跑完不会告诉你它写了哪些文件（除非上 shell 集成），
+/// 但把"这一轮的起止时间"和"会话的工作目录"一对上，答案基本就在那儿了。
+/// 限制深度 3、排除 .git，取最近 12 个，避免在大仓库里扫爆。
+pub fn remote_artifacts_script(cwd: &str, since: i64) -> String {
+    let sq = cwd.replace('\'', "'\\''");
+    format!(
+        "cd '{sq}' 2>/dev/null || exit 0; \
+since=$(date -d @{since} '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || exit 0; \
+find . -maxdepth 3 -type f -newermt \"$since\" -not -path './.git/*' -not -path './node_modules/*' \
+-not -path './.codex/*' -not -name '*.sqlite*' -not -name '*.db' \
+-printf '%T@|%s|%p\\n' 2>/dev/null | sort -rn | head -12"
+    )
+}
+
+/// 解析 `mtime|size|路径` 形式的产物清单（路径里的 `|` 不影响，只切前两段）
+pub fn parse_artifacts(out: &str) -> Vec<AiArtifact> {
+    let mut list = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let mut it = line.splitn(3, '|');
+        let (Some(ts), Some(size), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(mtime) = ts.trim().split('.').next().unwrap_or("").parse::<i64>() else {
+            continue;
+        };
+        let size = size.trim().parse::<u64>().unwrap_or(0);
+        let rel = path.trim().trim_start_matches("./");
+        if rel.is_empty() {
+            continue;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+        list.push(AiArtifact {
+            path: rel.to_string(),
+            name,
+            size,
+            mtime,
+        });
+    }
+    list
+}
+
+/// 本机版本：直接走文件系统（深度 3、排除 .git / node_modules、最多 12 个）
+pub fn local_artifacts(cwd: &str, since: i64) -> Vec<AiArtifact> {
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        since: i64,
+        depth: u32,
+        out: &mut Vec<AiArtifact>,
+    ) {
+        if depth > 3 || out.len() >= 12 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            // 明显的噪音目录（版本库、依赖、以及 Codex 自己的状态库）不进产物清单
+            if name == ".git" || name == "node_modules" || name == ".codex" || name == "__pycache__" {
+                continue;
+            }
+            if name.ends_with(".sqlite")
+                || name.ends_with(".sqlite-wal")
+                || name.ends_with(".sqlite-shm")
+                || name.ends_with(".db")
+            {
+                continue;
+            }
+            if p.is_dir() {
+                walk(base, &p, since, depth + 1, out);
+                continue;
+            }
+            let Ok(md) = e.metadata() else { continue };
+            let Ok(mt) = md.modified() else { continue };
+            let Ok(dur) = mt.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            if (dur.as_secs() as i64) < since {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(base)
+                .map(|r| r.to_string_lossy().to_string())
+                .unwrap_or_else(|_| p.to_string_lossy().to_string());
+            out.push(AiArtifact {
+                path: rel,
+                name,
+                size: md.len(),
+                mtime: dur.as_secs() as i64,
+            });
+            if out.len() >= 12 {
+                return;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(std::path::Path::new(cwd), std::path::Path::new(cwd), since, 0, &mut out);
+    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn parses_find_output() {
+        let out = "1758889100.123|4096|./report.md\n1758889000.000|128|docs/summary.md\n";
+        let a = parse_artifacts(out);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].name, "report.md");
+        assert_eq!(a[0].path, "report.md");
+        assert_eq!(a[0].size, 4096);
+        assert_eq!(a[0].mtime, 1758889100);
+        assert_eq!(a[1].name, "summary.md");
+        assert!(parse_artifacts("garbage\n\n").is_empty());
+    }
+
+    #[test]
+    fn script_quotes_cwd_and_since() {
+        let s = remote_artifacts_script("/home/lz/my proj", 1758889000);
+        assert!(s.contains("cd '/home/lz/my proj'"));
+        assert!(s.contains("date -d @1758889000"));
+    }
+}
+
 /// 脚本输出（可能带一行 `ZFILE|路径` 前缀）→ 快照；没有会话就返回 None
 pub fn parse_script_output(text: &str) -> Option<AiSessionSnapshot> {
     let mut body = String::new();

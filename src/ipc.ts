@@ -17,6 +17,7 @@ import type {
   AiProbe,
   AiTask,
   AiSessionSnapshot,
+  AiArtifact,
   HighlightRule,
 } from "./types";
 
@@ -368,6 +369,25 @@ export async function aiSessionSnapshot(
     userOverride: userOverride ?? null,
     shell: shell ?? null,
     distro: distro ?? null,
+  });
+}
+
+/** 任务产物：cwd 下在 since（Unix 秒）之后新增/修改的文件 */
+export async function aiTaskArtifacts(
+  profileId: string | null,
+  userOverride: string | null,
+  shell: string | null,
+  distro: string | null,
+  cwd: string,
+  since: number,
+): Promise<AiArtifact[]> {
+  return invoke<AiArtifact[]>("ai_task_artifacts", {
+    profileId,
+    userOverride,
+    shell,
+    distro,
+    cwd,
+    since,
   });
 }
 

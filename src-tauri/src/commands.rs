@@ -1581,6 +1581,52 @@ pub async fn ai_session_snapshot(
     }
 }
 
+/// 任务产物：`cwd` 下在 `since`（Unix 秒）之后被新增/修改的文件。
+///
+/// 这一步是为了回答"AI 刚给我生成了什么"—— 日志里只有它干了活，产物得去目录里找。
+/// 远端走 `find -newermt`，本机/WSL 走文件系统遍历，两边都限制深度和条数。
+#[tauri::command]
+pub async fn ai_task_artifacts(
+    profile_id: Option<String>,
+    user_override: Option<String>,
+    shell: Option<String>,
+    distro: Option<String>,
+    cwd: String,
+    since: i64,
+) -> Result<Vec<ai_sessions::AiArtifact>, String> {
+    let cwd = cwd.trim().to_string();
+    if cwd.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(pid) = profile_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        let cfg = ssh_config_for(pid, user_override)?;
+        let script = ai_sessions::remote_artifacts_script(&cwd, since);
+        let out = run_remote_capture(pid, &cfg, &script).await?;
+        let list = ai_sessions::parse_artifacts(&out);
+        log::info!("ipc: ai_task_artifacts(remote {cwd}) -> {} 个", list.len());
+        return Ok(list);
+    }
+    match shell.as_deref().unwrap_or("powershell") {
+        "cmd" => Ok(Vec::new()),
+        "wsl" => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(d) = distro.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                args.push("-d".into());
+                args.push(d.to_string());
+            }
+            args.push("--".into());
+            args.push("sh".into());
+            args.push("-c".into());
+            args.push(ai_sessions::remote_artifacts_script(&cwd, since));
+            match run_capture_checked(std::path::Path::new("wsl.exe"), &args).await {
+                Ok((true, out)) => Ok(ai_sessions::parse_artifacts(&out)),
+                _ => Ok(Vec::new()),
+            }
+        }
+        _ => Ok(ai_sessions::local_artifacts(&cwd, since)),
+    }
+}
+
 // 说明：曾经有过「一键安装」（后端直接帮你在服务器上跑 npm/pip）。
 // 实测体验不好：安装要几分钟、中间没有输出，看着像卡死；而且替用户在服务器上装东西本身偏重。
 // 现在改成「把安装命令敲进当前终端」，进度和报错你自己看得见。

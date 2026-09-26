@@ -1236,6 +1236,33 @@ body {
 }
 
 /* 右下角「AI 需要你处理」提示条（可选，默认关） */
+.ai-artifacts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* 产物文件名：点一下就能看（远端走应用内预览） */
+.ai-artifact {
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 11px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-artifact:hover {
+  border-color: var(--accent);
+}
+
 .ai-alert-dock {
   bottom: 76px;
 }

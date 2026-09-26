@@ -22,6 +22,7 @@ import {
   aiTasksLocal,
   aiTasksRemote,
   aiSessionSnapshot,
+  aiTaskArtifacts,
   isAdmin,
   openAdminShell,
   restartAsAdmin,
@@ -91,6 +92,7 @@ import type {
   AdbFile,
   AiProbe,
   AiSessionSnapshot,
+  AiArtifact,
   AiTask,
   AppSettings,
   ConnectionProfile,
@@ -607,6 +609,8 @@ export default function App() {
   /// 已经通知过的那一轮（避免同一条消息反复弹）
   const aiTurnKey = useRef("");
   const aiSeeded = useRef(false);
+  /// 这一轮跑完之后的产物（卡片下面那排文件名）
+  const [aiArtifacts, setAiArtifacts] = useState<AiArtifact[]>([]);
   /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
   const [toolListOpen, setToolListOpen] = useState(false);
   const [updateMsg, setUpdateMsg] = useState("");
@@ -862,7 +866,24 @@ export default function App() {
         return;
       }
       const lists = await Promise.all(jobs);
-      setBoardTasks(lists.flat());
+      // 同一台机器上同一种工具可能被探测成多条（node 壳 + 内部二进制，或 App 记录的那条），
+      // 按「环境+服务器+工具+目录」合并成一张：优先保留有 tmux 窗格的 / 来自 App 的
+      const flat = lists.flat();
+      const merged: AiTask[] = [];
+      const keyOf = (t: AiTask) => `${t.env}|${t.server}|${t.tool}|${t.cwd || ""}`;
+      for (const t of flat) {
+        const hit = merged.find((m) => keyOf(m) === keyOf(t));
+        if (!hit) {
+          merged.push({ ...t });
+          continue;
+        }
+        const better =
+          (!hit.pane && !!t.pane) ||
+          (hit.source !== "app" && t.source === "app") ||
+          (hit.source === t.source && hit.durationMs < t.durationMs);
+        if (better) Object.assign(hit, t);
+      }
+      setBoardTasks(merged);
     } finally {
       boardBusy.current = false;
     }
@@ -909,7 +930,69 @@ export default function App() {
     }
   }
 
-  function considerSnapshot(cur: OpenSession, snap: AiSessionSnapshot) {
+  /**
+   * 找这一轮的产物：用"会话工作目录 + 这一轮的起止时间"去目录里翻。
+   * AI 不会告诉你它写了哪些文件，但这两样一对上，答案基本就在那儿。
+   */
+  async function refreshArtifacts(cur: OpenSession, snap: AiSessionSnapshot): Promise<AiArtifact[]> {
+    const startedAt = snap.lastTurnCompletedAt - Math.ceil(snap.lastTurnDurationMs / 1000) - 5;
+    if (!snap.cwd || startedAt <= 0) {
+      setAiArtifacts([]);
+      return [];
+    }
+    try {
+      const list = await aiTaskArtifacts(
+        cur.profileId ?? null,
+        cur.user ?? null,
+        cur.kind === "remote" ? null : cur.kind,
+        null,
+        snap.cwd,
+        startedAt,
+      );
+      setAiArtifacts(list);
+      return list;
+    } catch {
+      setAiArtifacts([]);
+      return [];
+    }
+  }
+
+  /** 打开一个产物：远端会话走应用内的 MD / HTML 预览，本地或其它类型用资源管理器 */
+  async function openArtifact(session: OpenSession, cwd: string, a: AiArtifact) {
+    const base = cwd.replace(/[\\/]+$/, "");
+    const isAbs = a.path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(a.path);
+    const abs = isAbs ? a.path : `${base}/${a.path}`;
+    const kind = fileKind(a.name);
+    if (session.profileId) {
+      try {
+        const b64 = await fsRead(session.profileId, abs, 1024 * 1024, session.user ?? null);
+        if (b64) {
+          setSessions((prev) =>
+            prev.map((s) => {
+              if (s.id !== session.id) return s;
+              const exists = s.openFiles.some((f) => f.path === abs);
+              const openFiles = exists
+                ? s.openFiles
+                : [...s.openFiles, { name: a.name, path: abs, kind, b64 }];
+              return { ...s, openFiles, activeTab: a.name };
+            }),
+          );
+          return;
+        }
+      } catch (e) {
+        notify("读取产物失败：" + String(e));
+        return;
+      }
+    }
+    try {
+      await openInExplorer(abs);
+      notify("已用资源管理器打开：" + abs);
+    } catch (e) {
+      notify("打开产物失败：" + String(e));
+    }
+  }
+
+  async function considerSnapshot(cur: OpenSession, snap: AiSessionSnapshot) {
     const needsMe = snap.state === "needs-approval" || snap.state === "waiting-user";
     const hasMessage = snap.lastTurnCompletedAt > 0 && snap.lastMessage.trim().length > 0;
     const turnKey = `${snap.sessionId}:${snap.lastTurnCompletedAt}:${snap.lastMessage.length}`;
@@ -922,18 +1005,31 @@ export default function App() {
     const freshTurn = hasMessage && turnKey !== aiTurnKey.current;
     if (!needsMe && !freshTurn) return;
 
-    // 人就在看这个终端（窗口在前台 + 正打开它）→ 不当成"新消息"
+    // 人就在看这个终端（窗口在前台 + 正打开它）→ 一般不打扰；
+    // 但"这一轮产出了文件"是另一回事：那是要你去看的东西，照样提醒。
     const watching =
       document.hasFocus() && cur.id === activeId && cur.activeTab === "terminal" && aiPanelOpen;
     if (freshTurn) aiTurnKey.current = turnKey;
-    if (watching && !needsMe) return;
 
-    const text = needsMe
-      ? snap.state === "needs-approval"
+    if (freshTurn) {
+      // 有新消息时顺手把"这一轮产出的文件"翻出来，提示里带上数量（列表在卡片下面）
+      void refreshArtifacts(cur, snap).then((list) => {
+        if (list.length === 0 && watching) return; // 没产物 + 你正看着 → 不打扰
+        const extra = list.length > 0 ? `（产出 ${list.length} 个文件，卡片下面可点开）` : "";
+        raiseAiAttention(
+          cur,
+          `「${cur.title}」有新消息${extra}：${aiShorten(snap.lastMessage, 60)}`,
+        );
+      });
+      return;
+    }
+    if (watching && !needsMe) return;
+    raiseAiAttention(
+      cur,
+      snap.state === "needs-approval"
         ? `「${cur.title}」等你批准：${snap.lastAction}`
-        : `「${cur.title}」等你回话`
-      : `「${cur.title}」有新消息：${aiShorten(snap.lastMessage, 70)}`;
-    raiseAiAttention(cur, text);
+        : `「${cur.title}」等你回话`,
+    );
   }
 
   /** 提醒用户：红点（总会）+ 状态栏一行 + 按设置闪任务栏 / 右下角提示 */
@@ -975,6 +1071,18 @@ export default function App() {
   useEffect(() => {
     if (aiPanelOpen) setAiUnread(0);
   }, [aiPanelOpen, activeId]);
+
+  /**
+   * 盯当前会话的日志 —— **面板关着也要盯**。
+   * 之前这个轮询挂在"面板打开"的 effect 里，所以你收起面板跑任务时，
+   * "跑完了/有新消息/产出文件"根本没人提醒（这就是"为什么没提示我看那个 Markdown"的主因之一）。
+   */
+  useEffect(() => {
+    void refreshSnapshot();
+    const t = window.setInterval(() => void refreshSnapshot(), 10000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
 
   // 回到窗口时把任务栏闪烁停掉（闪的目的就是叫你回来）
   useEffect(() => {
@@ -4979,6 +5087,22 @@ export default function App() {
                       >
                         耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
                       </div>
+                      {/* 这一轮产出的文件：点一下直接看（远端走应用内预览，本地用资源管理器） */}
+                      {snap && aiArtifacts.length > 0 && activeSession ? (
+                        <div className="ai-artifacts">
+                          {aiArtifacts.map((a) => (
+                            <button
+                              key={a.path}
+                              type="button"
+                              className="ai-artifact"
+                              title={`${a.path} · ${humanSize(a.size)}`}
+                              onClick={() => void openArtifact(activeSession, snap.cwd, a)}
+                            >
+                              {a.name}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   );
                 })}
@@ -6919,11 +7043,7 @@ function LocalModule({
         </button>
       </div>
       <div className="tree-group">已打开的 {label}（{sessions.length}）</div>
-      {sessions.length === 0 && (
-        <div className="hint">
-          还没有打开。点上面「新建 {label}」开一个，开多少个都会列在这里。
-        </div>
-      )}
+      {sessions.length === 0 && <div className="hint">还没有打开</div>}
       {sessions.map((s) => (
         <div
           key={s.id}
