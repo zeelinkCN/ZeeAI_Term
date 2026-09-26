@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 pub mod core;
 mod store;
 
@@ -406,6 +406,8 @@ pub fn run() {
       commands::session_log_dir,
       commands::open_in_explorer,
       commands::open_external_url,
+      commands::update_install_kind,
+      commands::update_download_install,
       commands::ai_probe,
     ])
     .on_window_event(|window, event| {

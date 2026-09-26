@@ -442,3 +442,20 @@ export async function openInExplorer(path: string): Promise<void> {
 export async function openExternalUrl(url: string): Promise<void> {
   return invoke("open_external_url", { url });
 }
+
+/** 当前这份是怎么装上的：nsis / msi / portable（决定能不能一键覆盖升级） */
+export async function updateInstallKind(): Promise<string> {
+  return invoke<string>("update_install_kind");
+}
+
+/**
+ * 一键升级：下载新版安装包 → 校验 → 静默覆盖安装 → 自动重启应用。
+ * 下载进度通过 `zeeai://transfer` 事件推送（右下角进度面板）。
+ */
+export async function updateDownloadInstall(
+  url: string,
+  expectedSize: number,
+  version: string,
+): Promise<string> {
+  return invoke<string>("update_download_install", { url, expectedSize, version });
+}

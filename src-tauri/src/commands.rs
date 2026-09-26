@@ -1244,6 +1244,12 @@ pub enum TransferEvent {
     },
 }
 
+/// 把传输/下载进度推给前端（右下角进度面板监听 `zeeai://transfer`）。
+fn emit_transfer(app: &tauri::AppHandle, ev: TransferEvent) {
+    use tauri::Emitter;
+    let _ = app.emit("zeeai://transfer", ev);
+}
+
 fn human_size(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
@@ -1470,6 +1476,441 @@ pub fn open_external_url(url: String) -> Result<(), String> {
         let _ = trimmed;
         Err("只支持 Windows".into())
     }
+}
+
+// ---------- 一键升级：下载新版安装包 → 静默覆盖安装 → 自动重启 ----------
+
+/// 当前这份是怎么装上的：`nsis` / `msi` / `portable`。
+///
+/// - `nsis`：我们的 NSIS 安装包按当前用户装到 `%LOCALAPPDATA%\ZeeAI_Term\`，
+///   可以用 `/S`（静默）+ `/R`（装完自动重启）一键覆盖；
+/// - `msi`：WiX 的 MSI 是 perMachine，装在 `%ProgramFiles%\ZeeAI_Term\`，
+///   没有 `/S /R` 这种开关，只能走 `msiexec /i <msi> /qb /norestart`（会弹一次 UAC）；
+/// - `portable`：解压在任意目录，只能手动替换文件。
+#[tauri::command]
+pub fn update_install_kind() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "portable".into();
+    };
+    let exe_l = exe.to_string_lossy().to_lowercase();
+    let under = |base: String| -> bool {
+        let base = base.to_lowercase();
+        let base = base.trim_end_matches('\\');
+        !base.is_empty() && exe_l.starts_with(&format!("{base}\\zeeai_term\\"))
+    };
+    let kind = if under(std::env::var("LOCALAPPDATA").unwrap_or_default()) {
+        "nsis"
+    } else if under(std::env::var("ProgramFiles").unwrap_or_default())
+        || under(std::env::var("ProgramFiles(x86)").unwrap_or_default())
+    {
+        "msi"
+    } else {
+        "portable"
+    };
+    log::info!("ipc: update_install_kind -> {kind} ({exe_l})");
+    kind.to_string()
+}
+
+/// 下载新版安装包并做基本校验（大小 + 文件头），返回落盘路径。
+///
+/// 为什么要绕这么一圈：
+/// - **不用第三方 HTTP 库**：直接用 Windows 自带的 `curl.exe`（Win10 1803+ 内置，
+///   走系统 Schannel），不往程序里塞一整套 TLS 栈，exe 体积不变；
+/// - **分片下载 + 断点续传**：实测这条线路对"长时间保持的下载连接"很不友好
+///   （整包 9MB 经常传着传着就被掐断，卡在几个百分点），但 1MB 左右的分段请求
+///   每次都能正常返回。所以这里按 1MB 一段发 `Range` 请求，从已有文件大小接着下，
+///   中途断了、甚至关掉应用重来，都能从断点继续，不用从头再来；
+/// - **抽成独立函数**：`examples/update_spike.rs` 可以拿真实 Release 地址直接验证。
+///
+/// `on_progress(done, total)` 在每段下完后回调一次。
+pub fn fetch_update_package(
+    url: &str,
+    expected_size: u64,
+    ext: &str,
+    version: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Read;
+
+    let curl = find_curl().ok_or_else(|| {
+        "找不到系统自带的 curl.exe（Windows 10 1803 以上都自带），请改用手动下载".to_string()
+    })?;
+
+    let dir = std::env::temp_dir().join("ZeeAI-Term-update");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    let safe_version: String = version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    let dest = dir.join(format!("ZeeAI_Term_{safe_version}_setup.{ext}"));
+
+    // 已经传完的同版本文件直接用（比如上次下好了但没装成）
+    let existing = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    if expected_size > 0 && existing == expected_size && header_ok(&dest, ext) {
+        log::info!("update: 复用已下载好的更新包 {}", dest.display());
+        on_progress(existing, expected_size);
+        return Ok(dest);
+    }
+    // 文件比预期还大 = 服务器没接受 Range（或上次下串了），从头来
+    if expected_size > 0 && existing > expected_size {
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    const CHUNK: u64 = 1024 * 1024; // 1MB 一段
+    const CHUNK_TRIES: usize = 4;
+    // 有系统代理就先用代理试（国内直连 GitHub 的下载 CDN 经常慢到几乎不动），
+    // 后两次改成直连，避免"代理开着但其实没启动"时彻底下不来。
+    let proxy = system_proxy();
+
+    let mut done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    on_progress(done, expected_size.max(done));
+
+    if expected_size == 0 {
+        // 不知道总大小（Release 没给 size）→ 只能整包下，靠 curl 自己的重试
+        run_curl_to_file(&curl, url, None, &dest, true, proxy.as_deref())?;
+        done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        on_progress(done, done);
+    } else {
+        while done < expected_size {
+            let start = done;
+            let end = (start + CHUNK - 1).min(expected_size - 1);
+            let mut last_err = String::new();
+            let mut ok = false;
+            for attempt in 1..=CHUNK_TRIES {
+                let use_proxy = if attempt <= 2 { proxy.as_deref() } else { None };
+                match run_curl_to_file(&curl, url, Some((start, end)), &dest, true, use_proxy) {
+                    Ok(()) => {
+                        ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        log::warn!("update: 第 {attempt} 次取分片 {start}-{end} 失败：{last_err}");
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    }
+                }
+            }
+            if !ok {
+                return Err(format!(
+                    "下载中断（已收到 {done} 字节 / 共 {expected_size}）。网络恢复后再点一次「一键升级」会从断点继续：{last_err}"
+                ));
+            }
+            let now = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if now <= done {
+                return Err(format!("下载卡住（已收到 {done} 字节 / 共 {expected_size}），请稍后重试"));
+            }
+            done = now;
+            on_progress(done, expected_size.max(done));
+        }
+    }
+
+    // 校验 1：大小必须和 Release 里标注的一致（防半截文件 / 被塞东西）
+    if expected_size > 0 && done != expected_size {
+        return Err(format!(
+            "更新包大小不对（下载 {done} 字节，官方标注 {expected_size} 字节），请重试（会从断点继续）"
+        ));
+    }
+
+    // 校验 2：文件头要对（exe = PE 的 MZ；msi = OLE 复合文档 D0CF11E0）
+    if !header_ok(&dest, ext) {
+        let _ = std::fs::remove_file(&dest);
+        return Err("更新包不是有效的安装程序（文件头不对），已丢弃".into());
+    }
+
+    Ok(dest)
+}
+
+/// 读 Windows「Internet 选项」里的代理设置。
+///
+/// 为什么需要：很多用户是靠 Clash / v2ray 这类本地代理访问 GitHub 的，而 `curl.exe`
+/// **不会**自动读这些设置，不显式告诉它就会走直连 —— 直连 GitHub 的下载 CDN 在国内
+/// 经常慢到几乎下不动。这里用 `reg query` 读一下（不引任何新依赖），有代理就带上。
+fn system_proxy() -> Option<String> {
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let enable = reg_value(KEY, "ProxyEnable")?;
+    // 0x0 = 关，0x1 = 开
+    let flag = enable.trim().to_ascii_lowercase();
+    if !(flag.ends_with("0x1") || flag == "1") {
+        return None;
+    }
+    let server = reg_value(KEY, "ProxyServer")?;
+    let server = server.trim();
+    if server.is_empty() {
+        return None;
+    }
+    // 可能是 "127.0.0.1:7897"，也可能是 "http=127.0.0.1:7897;https=..." 这种分协议写法
+    let host_port = server
+        .split(';')
+        .find_map(|part| {
+            let p = part.trim();
+            if let Some(rest) = p.strip_prefix("https=") {
+                Some(rest.to_string())
+            } else if let Some(rest) = p.strip_prefix("http=") {
+                Some(rest.to_string())
+            } else if !p.contains('=') {
+                Some(p.to_string())
+            } else {
+                None
+            }
+        })?;
+    let url = if host_port.starts_with("http://") || host_port.starts_with("https://") {
+        host_port
+    } else {
+        format!("http://{host_port}")
+    };
+    log::info!("update: 检测到系统代理 {url}，下载时一并使用");
+    Some(url)
+}
+
+/// `reg query <key> /v <name>` 取最后一个字段（值）
+fn reg_value(key: &str, name: &str) -> Option<String> {
+    let out = std::process::Command::new("reg")
+        .args(["query", key, "/v", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains(name) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(last) = parts.last() {
+                return Some((*last).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 找系统的 curl.exe：先看 System32，再看 PATH。
+fn find_curl() -> Option<std::path::PathBuf> {
+    if let Ok(sys) = std::env::var("SystemRoot") {
+        let p = std::path::Path::new(&sys).join("System32").join("curl.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    Some(std::path::PathBuf::from("curl.exe"))
+}
+
+/// 文件头对不对（exe = PE 的 MZ；msi = OLE 复合文档 D0CF11E0）
+fn header_ok(path: &std::path::Path, ext: &str) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            if f.read_exact(&mut head).is_err() {
+                false
+            } else if ext == "msi" {
+                head == [0xD0, 0xCF, 0x11, 0xE0]
+            } else {
+                &head[..2] == b"MZ"
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// 调一次 curl：`range` 有值时取指定分段，并且**追加**到 dest 末尾。
+fn run_curl_to_file(
+    curl: &std::path::Path,
+    url: &str,
+    range: Option<(u64, u64)>,
+    dest: &std::path::Path,
+    append: bool,
+    proxy: Option<&str>,
+) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(dest)
+        .map_err(|e| format!("打开目标文件失败: {e}"))?;
+
+    let mut cmd = std::process::Command::new(curl);
+    cmd.arg("-L")
+        .arg("--fail")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--retry")
+        .arg("3")
+        .arg("--retry-delay")
+        .arg("1")
+        .arg("--retry-all-errors");
+    if let Some((start, end)) = range {
+        cmd.arg("-r").arg(format!("{start}-{end}"));
+    }
+    if let Some(p) = proxy {
+        cmd.arg("--proxy").arg(p);
+    }
+    cmd.arg("-o").arg("-"); // 写到 stdout，我们负责追加到文件
+    cmd.arg(url);
+    cmd.stdout(std::process::Stdio::from(file));
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let out = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            format!("curl 退出码 {:?}", out.status.code())
+        } else {
+            msg
+        })
+    }
+}
+
+
+/// 下载新版安装包，校验后静默覆盖安装并自动重启应用。
+///
+/// 几点设计说明：
+/// - **只允许 GitHub Release 的下载地址**：这条命令本质上会执行一个下载来的安装包，
+///   所以地址必须形如 `https://github.com/<owner>/<repo>/releases/download/...`，
+///   避免它变成"任意 URL 下载并执行"的后门；
+/// - **校验**：见 [`fetch_update_package`]（大小 + 文件头）；
+/// - **进度**：复用 `zeeai://transfer` 事件，右下角进度面板直接显示下载进度；
+/// - **安装**：先写一个隐藏的 cmd 辅助脚本，等本进程退出后再执行安装，最后把应用拉起来。
+///   NSIS / MSI 都盖不住正在运行的 exe，所以必须先退出再装。
+#[tauri::command]
+pub async fn update_download_install(
+    app: tauri::AppHandle,
+    url: String,
+    expected_size: u64,
+    version: String,
+) -> Result<String, String> {
+    let u = url.trim().to_string();
+    if !(u.starts_with("https://github.com/") && u.contains("/releases/download/")) {
+        return Err("更新地址不是 GitHub Release 的下载地址，已拒绝执行".into());
+    }
+    let kind = update_install_kind();
+    if kind == "portable" {
+        return Err("当前是便携版，无法自动覆盖升级：请下载压缩包解压替换（配置不会丢）".into());
+    }
+    log::info!(
+        "ipc: update_download_install -> {u} (kind={kind}, expect {expected_size} bytes, v{version})"
+    );
+
+    let ext = if kind == "msi" { "msi" } else { "exe" };
+    let task = "update".to_string();
+    let name = if version.trim().is_empty() {
+        format!("ZeeAI_Term 新版安装包 (.{ext})")
+    } else {
+        format!("ZeeAI_Term {version} 安装包 (.{ext})")
+    };
+
+    // 下载 + 校验（放到阻塞线程里跑，别卡住 async 运行时）
+    let task_for_blocking = task.clone();
+    let name_for_blocking = name.clone();
+    let app_for_blocking = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        fetch_update_package(&u, expected_size, ext, &version, |done, total| {
+            if done == 0 {
+                emit_transfer(
+                    &app_for_blocking,
+                    TransferEvent::Start {
+                        task: task_for_blocking.clone(),
+                        name: name_for_blocking.clone(),
+                        total,
+                    },
+                );
+            } else {
+                emit_transfer(
+                    &app_for_blocking,
+                    TransferEvent::Progress {
+                        task: task_for_blocking.clone(),
+                        name: name_for_blocking.clone(),
+                        done,
+                        total,
+                    },
+                );
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("下载任务异常: {e}"))?;
+
+    let dest = match result {
+        Ok(p) => p,
+        Err(e) => {
+            emit_transfer(
+                &app,
+                TransferEvent::FileFailed {
+                    task: task.clone(),
+                    name: name.clone(),
+                    message: e.clone(),
+                },
+            );
+            return Err(e);
+        }
+    };
+    let done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    let dir = dest.parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
+    emit_transfer(
+        &app,
+        TransferEvent::FileDone {
+            task: task.clone(),
+            name: name.clone(),
+            bytes: done,
+        },
+    );
+
+    // ---- 写辅助脚本：等本进程退出后再装，装完把应用拉起来 ----
+    let exe_path = std::env::current_exe().map_err(|e| format!("取当前程序路径失败: {e}"))?;
+    let helper = dir.join("apply_update.cmd");
+    let pid = std::process::id();
+    let body = if kind == "msi" {
+        // MSI：msiexec 静默升级（/qb 显示一个进度条；perMachine 会弹一次 UAC）
+        format!(
+            "msiexec /i \"{}\" /qb /norestart\r\nstart \"\" \"{}\"\r\n",
+            dest.display(),
+            exe_path.display()
+        )
+    } else {
+        // NSIS：/S 静默安装 + /R 装完自动重启应用
+        format!("\"{}\" /S /R\r\n", dest.display())
+    };
+    let script = format!(
+        "@echo off\r\n\
+rem 等 ZeeAI_Term 主程序退出（pid {pid}），再执行安装\r\n\
+:wait\r\n\
+tasklist /FI \"PID eq {pid}\" /NH | find \"{pid}\" >nul\r\n\
+if not errorlevel 1 (\r\n\
+  ping -n 2 127.0.0.1 >nul\r\n\
+  goto wait\r\n\
+)\r\n\
+{body}"
+    );
+    std::fs::write(&helper, script).map_err(|e| format!("写升级脚本失败: {e}"))?;
+
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", &helper.to_string_lossy()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：升级过程不闪黑框
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd.spawn().map_err(|e| format!("启动升级脚本失败: {e}"))?;
+    log::info!("update: 升级脚本已启动 pid={}", child.id());
+
+    // 给脚本一点时间就位，然后走正常退出路径（收干净会话进程）；重启由脚本/安装包负责
+    let app_for_exit = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        log::info!("update: 退出应用，交给升级脚本完成覆盖");
+        app_for_exit.exit(0);
+    });
+
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// 保存工作区快照（退出/变更时由前端调用）

@@ -59,6 +59,8 @@ import {
   sessionLogDir,
   openInExplorer,
   openExternalUrl,
+  updateDownloadInstall,
+  updateInstallKind,
   serialList,
   sessionWrite,
   settingsGet,
@@ -193,6 +195,13 @@ const EMPTY_PROFILE = {
   keyPath: "",
 };
 
+/** GitHub Release 里的一个附件（检查更新时用来挑安装包） */
+interface Asset {
+  name?: string;
+  size?: number;
+  browser_download_url?: string;
+}
+
 const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
   defaultShell: "powershell",
@@ -213,7 +222,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   logDir: "",
 };
 
-const APP_VERSION = "0.1.2";
+const APP_VERSION = "0.1.3";
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
@@ -449,8 +458,15 @@ export default function App() {
   const [updateOffer, setUpdateOffer] = useState<{
     version: string;
     installerUrl: string;
+    installerSize: number;
+    msiUrl: string;
+    msiSize: number;
+    zipUrl: string;
     pageUrl: string;
   } | null>(null);
+  /** 当前这份是怎么装上的：nsis / msi / portable */
+  const [installKind, setInstallKind] = useState<string>("");
+  const [updateApplying, setUpdateApplying] = useState(false);
 
   const [adbList, setAdbList] = useState<AdbDevice[]>([]);
   const [adbVer, setAdbVer] = useState("");
@@ -554,6 +570,10 @@ export default function App() {
         setSettingsReady(true);
       }
     })();
+    // 一次性问清楚"这份是怎么装上的"，决定后面给不给一键升级按钮
+    void updateInstallKind()
+      .then(setInstallKind)
+      .catch(() => setInstallKind("portable"));
   }, []);
 
   /**
@@ -2299,23 +2319,25 @@ export default function App() {
       }
       // 用户明确说过"这个版本我暂时不升"→ 不再闪小红点（手动检查时仍然显示）
       if (silent && latest === settingsRef.current.ignoredUpdateVersion) return;
-      // 从 release 的 assets 里挑一个最适合当前机器的安装包：
-      // 优先 NSIS setup.exe（双击即装），其次 MSI，最后退回 release 页面
-      const assets = Array.isArray(data.assets)
-        ? (data.assets as { name?: unknown; browser_download_url?: unknown }[])
-        : [];
-      const pick = (test: (n: string) => boolean) =>
-        assets.find((a) => {
-          const n = String(a.name ?? "").toLowerCase();
-          return test(n) && typeof a.browser_download_url === "string";
-        });
-      const asset =
-        pick((n) => n.endsWith(".exe") && n.includes("setup")) ??
-        pick((n) => n.endsWith(".msi")) ??
-        pick((n) => n.endsWith(".exe"));
-      const installerUrl = asset ? String(asset.browser_download_url) : "";
+      // 从 release 里挑出三种产物：NSIS 安装包 / MSI / 便携版 zip。
+      // 一键升级要用哪一个是按"当前这份是怎么装上的"决定的（见 update_install_kind）。
+      const assets = (Array.isArray(data.assets) ? data.assets : []) as Asset[];
+      const find = (test: (n: string) => boolean) =>
+        assets.find((a) => test(String(a.name ?? "").toLowerCase()));
+      const setup =
+        find((n) => n.endsWith(".exe") && n.includes("setup")) ?? find((n) => n.endsWith(".exe"));
+      const msi = find((n) => n.endsWith(".msi"));
+      const zip = find((n) => n.endsWith(".zip"));
       const pageUrl = String(data.html_url ?? url);
-      setUpdateOffer({ version: latest, installerUrl, pageUrl });
+      setUpdateOffer({
+        version: latest,
+        installerUrl: setup?.browser_download_url ?? "",
+        installerSize: setup?.size ?? 0,
+        msiUrl: msi?.browser_download_url ?? "",
+        msiSize: msi?.size ?? 0,
+        zipUrl: zip?.browser_download_url ?? "",
+        pageUrl,
+      });
       setUpdateMsg(`发现新版本 ${latest}（当前 ${APP_VERSION}）`);
       if (silent) notify(`发现新版本 ${latest}，在「设置 → 检查更新」里可以一键下载`);
     } catch (e) {
@@ -2369,10 +2391,45 @@ export default function App() {
   }
 
   /**
+   * 一键升级：下载新版安装包 → 校验 → 静默覆盖安装 → 自动重启。
+   *
+   * - 安装版（NSIS）：`安装包 /S /R`，全程无窗口，装完自己把应用拉起来；
+   * - MSI 版：`msiexec /i ... /qb /norestart`，会弹一次 UAC（因为 MSI 是 perMachine）；
+   * - 便携版：没有覆盖安装这一说，按钮会退化成"下载 zip 手动替换"。
+   */
+  async function runOneClickUpgrade() {
+    if (!updateOffer) return;
+    const isMsi = installKind === "msi";
+    const url = isMsi ? updateOffer.msiUrl : updateOffer.installerUrl;
+    const expected = isMsi ? updateOffer.msiSize : updateOffer.installerSize;
+    if (!url) {
+      notify(isMsi ? "这个版本没有提供 MSI 安装包" : "这个版本没有提供安装包，请打开发布页");
+      return;
+    }
+    setUpdateApplying(true);
+    notify(`正在下载 ${updateOffer.version} 安装包…下载进度见右下角`);
+    try {
+      await updateDownloadInstall(url, expected, updateOffer.version);
+      notify(
+        isMsi
+          ? `已开始升级到 ${updateOffer.version}（MSI 安装可能会弹一次 UAC，请点“是”）`
+          : `已开始安装 ${updateOffer.version}，应用会自动重启`,
+      );
+    } catch (e) {
+      notify("一键升级失败：" + String(e));
+      setUpdateApplying(false);
+    }
+  }
+
+  /**
    * 「检查更新」区块 —— 设置对话框和关于对话框共用同一套 UI，
    * 免得两个地方行为不一致（这也是上一版"看到新版本却没地方点"的根因）。
    */
   function renderUpdateSection() {
+    // 只有"安装版"才能一键覆盖升级：NSIS 走 setup.exe，MSI 走 msiexec；便携版只能手动替换
+    const canOneClick =
+      (installKind === "nsis" && !!updateOffer?.installerUrl) ||
+      (installKind === "msi" && !!updateOffer?.msiUrl);
     return (
       <>
         <label className="modal-field">
@@ -2399,36 +2456,82 @@ export default function App() {
         </div>
         {updateOffer && (
           <>
-            <div className="modal-inline-action" style={{ marginTop: 6 }}>
-              {updateOffer.installerUrl ? (
+            {canOneClick ? (
+              <div className="modal-inline-action" style={{ marginTop: 6 }}>
                 <button
                   type="button"
                   className="btn primary"
-                  onClick={() => void openUpdateLink(updateOffer.installerUrl, "下载链接")}
+                  disabled={updateApplying}
+                  onClick={() => void runOneClickUpgrade()}
+                  title={
+                    installKind === "msi"
+                      ? "下载 MSI 后静默升级并自动重启（会弹一次 UAC）"
+                      : "下载安装包后静默覆盖安装并自动重启"
+                  }
                 >
-                  {`立即升级到 ${updateOffer.version}`}
+                  {updateApplying
+                    ? "正在下载更新包…"
+                    : installKind === "msi"
+                      ? `一键升级到 ${updateOffer.version}（会弹 UAC）`
+                      : `一键升级到 ${updateOffer.version} 并重启`}
                 </button>
-              ) : (
-                <span className="hint">这个版本没有找到安装包，请打开发布页</span>
-              )}
-              <button
-                type="button"
-                className="mini-btn"
-                onClick={() => void openUpdateLink(updateOffer.pageUrl, "发布页")}
-              >
-                打开发布页
-              </button>
-              <button
-                type="button"
-                className="mini-btn"
-                onClick={() => ignoreUpdateVersion(updateOffer.version)}
-              >
-                忽略此版本
-              </button>
-            </div>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => void openUpdateLink(updateOffer.pageUrl, "发布页")}
+                >
+                  打开发布页
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => ignoreUpdateVersion(updateOffer.version)}
+                >
+                  忽略此版本
+                </button>
+              </div>
+            ) : (
+              <div className="modal-inline-action" style={{ marginTop: 6 }}>
+                {updateOffer.zipUrl && (
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => void openUpdateLink(updateOffer.zipUrl, "便携版下载")}
+                  >
+                    {`下载便携版 ${updateOffer.version}`}
+                  </button>
+                )}
+                {updateOffer.installerUrl && (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    onClick={() => void openUpdateLink(updateOffer.installerUrl, "安装包下载")}
+                  >
+                    下载安装包
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => void openUpdateLink(updateOffer.pageUrl, "发布页")}
+                >
+                  打开发布页
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => ignoreUpdateVersion(updateOffer.version)}
+                >
+                  忽略此版本
+                </button>
+              </div>
+            )}
             <div className="hint">
-              点「立即升级」会用浏览器下载安装包，下完双击安装即可覆盖旧版本；配置存在
-              %APPDATA%\ZeeAI-Terminal\，不会丢。
+              {canOneClick
+                ? installKind === "msi"
+                  ? "MSI 是给企业批量部署用的（装在 Program Files，需要管理员），所以升级时会弹一次 UAC 授权；升级过程会自动结束当前应用并在装完后重新打开。"
+                  : "会静默完成覆盖安装并自动重启应用；tmux 会话不受影响，重开后可以重新附加。"
+                : "当前是便携版：解压在哪个目录就替换哪个目录里的文件即可，配置不会丢。"}
             </div>
           </>
         )}
@@ -5706,7 +5809,7 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.2
+                <b>ZeeAI Terminal</b> 0.1.3
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />
