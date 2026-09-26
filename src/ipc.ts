@@ -15,6 +15,8 @@ import type {
   GitBranch,
   AdbFile,
   AiProbe,
+  AiTask,
+  HighlightRule,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -286,6 +288,51 @@ export async function aiProbe(
   return invoke<AiProbe>("ai_probe", { profileId, userOverride: userOverride ?? null });
 }
 
+/** 终端关键字高亮的预设规则包（「载入预设规则」按钮用） */
+export async function highlightPresets(): Promise<HighlightRule[]> {
+  return invoke<HighlightRule[]>("highlight_presets");
+}
+
+/**
+ * 记一笔「App 自己在某个会话里启动了某个 AI 工具」。
+ * 这是 AI 任务看板里最精确的一层信号（开始时间、跑完没跑完都由 App 自己判）。
+ */
+export async function aiTaskNoteStart(
+  env: string,
+  server: string,
+  tool: string,
+  command: string,
+): Promise<AiTask> {
+  return invoke<AiTask>("ai_task_note_start", { env, server, tool, command });
+}
+
+/** AI 任务看板：远端快照（tmux 窗格 + ps 扫描 + App 自己启动的那批） */
+export async function aiTasksRemote(
+  profileId: string,
+  server: string,
+  userOverride?: string | null,
+): Promise<AiTask[]> {
+  return invoke<AiTask[]>("ai_tasks_remote", {
+    profileId,
+    server,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** AI 任务看板：本机 / WSL 快照（cmd 走「仅状态」，不扫进程表） */
+export async function aiTasksLocal(
+  shell: string,
+  server: string,
+  distro?: string | null,
+): Promise<AiTask[]> {
+  return invoke<AiTask[]>("ai_tasks_local", { shell, server, distro: distro ?? null });
+}
+
+/** 清掉某个环境里「已结束」的卡片 */
+export async function aiTasksClearFinished(env: string, server: string): Promise<void> {
+  return invoke("ai_tasks_clear_finished", { env, server });
+}
+
 
 /** 列出服务器上的 tmux 会话 */
 export async function tmuxList(
@@ -483,6 +530,14 @@ export async function updateInstallKind(): Promise<string> {
 }
 
 /**
+ * 上一次「一键升级」的结果（安装器退出码 / 失败原因）。
+ * 升级脚本写的 `apply_update.log`，读一次就删掉。
+ */
+export async function updateTakeResult(): Promise<string | null> {
+  return invoke<string | null>("update_take_result");
+}
+
+/**
  * 一键升级：下载新版安装包 → 校验 → 静默覆盖安装 → 自动重启应用。
  * 下载进度通过 `zeeai://transfer` 事件推送（右下角进度面板）。
  */
@@ -490,6 +545,12 @@ export async function updateDownloadInstall(
   url: string,
   expectedSize: number,
   version: string,
+  expectedSha?: string | null,
 ): Promise<string> {
-  return invoke<string>("update_download_install", { url, expectedSize, version });
+  return invoke<string>("update_download_install", {
+    url,
+    expectedSize,
+    version,
+    expectedSha: expectedSha ?? null,
+  });
 }

@@ -1,11 +1,12 @@
-use base64::Engine as _;
+﻿use base64::Engine as _;
 use portable_pty::PtySize;
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, git, pty, remote_fs, serial, sftp, ssh, tmux, SessionEvent, SessionRegistry,
+    adb, ai, ai_tasks, git, highlight, pty, remote_fs, serial, sftp, ssh, tmux, AiTaskRegistry,
+    SessionEvent, SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -1370,9 +1371,138 @@ pub async fn ai_probe(
         "ipc: ai_probe -> {} 个工具，npm={:?}，运行中={:?}",
         probe.tools.len(),
         probe.npm,
-        probe.running
-    );
-    Ok(probe)
+       probe.running
+   );
+   Ok(probe)
+}
+
+/// 终端关键字高亮的预设规则包（前端「载入预设规则」按钮用）。
+/// 规则本体存在 settings.json 里，这里只给一份出厂预设。
+#[tauri::command]
+pub fn highlight_presets() -> Vec<highlight::HighlightRule> {
+    highlight::presets()
+}
+
+// ---------- AI 任务看板（v1） ----------
+
+/// 记一笔「App 自己在某个会话里启动了某个 AI 工具」。
+/// 这一层是最精确的信号源：开始时间、跑没跑完都由 App 自己判，不靠猜。
+#[tauri::command]
+pub fn ai_task_note_start(
+    tasks: State<'_, AiTaskRegistry>,
+    env: String,
+    server: String,
+    tool: String,
+    command: String,
+) -> ai_tasks::AiTask {
+    log::info!("ipc: ai_task_note_start env={env} server={server} tool={tool}");
+    tasks.note_start(&env, &server, &tool, &command, store::now_secs() as i64)
+}
+
+/// 远端任务快照：tmux 窗格（能精确到 pane）+ ps 扫描，再和 App 自己启动的合并。
+#[tauri::command]
+pub async fn ai_tasks_remote(
+    tasks: State<'_, AiTaskRegistry>,
+    profile_id: String,
+    server: String,
+    user_override: Option<String>,
+) -> Result<Vec<ai_tasks::AiTask>, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let detected = match run_remote_capture(&profile_id, &cfg, &ai_tasks::remote_script()).await {
+        Ok(out) => {
+            let (procs, panes) = ai_tasks::parse_remote(&out);
+            Some(ai_tasks::classify(&procs, &panes, "remote", &server))
+        }
+        Err(e) => {
+            // 探测失败不是致命错误：App 自己启动的那批照样显示，只是状态停在上一次
+            log::warn!("ai_tasks_remote 探测失败：{e}");
+            None
+        }
+    };
+    Ok(tasks.merge("remote", &server, detected, store::now_secs() as i64))
+}
+
+/// 本机任务快照。
+///
+/// - `powershell`：用系统自带的 `Get-CimInstance Win32_Process` 读 CommandLine。
+///   全进程表扫描偏重，所以前端只在真有本机会话时、15~30 秒才调一次；
+/// - `wsl`：**进 WSL 里面**扫（Windows 侧只能看到 wslhost/vmmem，看不见里面的进程）；
+/// - `cmd`：CMD 没有脚本钩子，本阶段只给「仅状态」，不为它扫进程表。
+#[tauri::command]
+pub async fn ai_tasks_local(
+    tasks: State<'_, AiTaskRegistry>,
+    shell: String,
+    server: String,
+    distro: Option<String>,
+) -> Result<Vec<ai_tasks::AiTask>, String> {
+    let env = if shell == "wsl" { "wsl" } else { "local" };
+    let detected = match shell.as_str() {
+        "cmd" => None,
+        "wsl" => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(d) = distro.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                args.push("-d".into());
+                args.push(d.to_string());
+            }
+            args.push("--".into());
+            args.push("sh".into());
+            args.push("-c".into());
+            args.push(ai_tasks::remote_script());
+            match run_capture_checked(std::path::Path::new("wsl.exe"), &args).await {
+                Ok((true, out)) => {
+                    let (procs, panes) = ai_tasks::parse_remote(&out);
+                    let mut list = ai_tasks::classify(&procs, &panes, env, &server);
+                    for t in list.iter_mut() {
+                        t.source = "ps".into();
+                    }
+                    Some(list)
+                }
+                Ok((false, out)) => {
+                    log::warn!("ai_tasks_local(wsl) 失败：{}", out.trim());
+                    None
+                }
+                Err(e) => {
+                    log::warn!("ai_tasks_local(wsl) 失败：{e}");
+                    None
+                }
+            }
+        }
+        _ => {
+            let args = vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                ai_tasks::windows_script(),
+            ];
+            match run_capture_checked(std::path::Path::new("powershell.exe"), &args).await {
+                Ok((true, out)) => {
+                    let procs = ai_tasks::parse_windows(&out);
+                    let mut list =
+                        ai_tasks::classify(&procs, &std::collections::HashMap::new(), env, &server);
+                    for t in list.iter_mut() {
+                        t.source = "winproc".into();
+                    }
+                    Some(list)
+                }
+                Ok((false, out)) => {
+                    log::warn!("ai_tasks_local(powershell) 失败：{}", out.trim());
+                    None
+                }
+                Err(e) => {
+                    log::warn!("ai_tasks_local(powershell) 失败：{e}");
+                    None
+                }
+            }
+        }
+    };
+    Ok(tasks.merge(env, &server, detected, store::now_secs() as i64))
+}
+
+/// 清掉某个环境里「已结束」的卡片（还在跑的不动）
+#[tauri::command]
+pub fn ai_tasks_clear_finished(tasks: State<'_, AiTaskRegistry>, env: String, server: String) {
+    log::info!("ipc: ai_tasks_clear_finished env={env} server={server}");
+    tasks.clear_finished(&env, &server);
 }
 
 // 说明：曾经有过「一键安装」（后端直接帮你在服务器上跑 npm/pip）。
@@ -1545,6 +1675,27 @@ pub fn update_install_kind() -> String {
     kind.to_string()
 }
 
+/// 上一次「一键升级」的结果（安装器退出码 / 失败原因）。
+///
+/// 升级脚本会把 `installer exit=…` 写进 `%TEMP%\ZeeAI-Term-update\apply_update.log`，
+/// 这里读一次就删掉，前端拿它在状态栏提示一行（不弹浮层）。
+/// 0.1.5 的教训：升级失败时用户什么都看不到，只能干等。
+#[tauri::command]
+pub fn update_take_result() -> Option<String> {
+    let path = std::env::temp_dir()
+        .join("ZeeAI-Term-update")
+        .join("apply_update.log");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let t = text.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        log::info!("ipc: update_take_result -> {t}");
+        Some(t)
+    }
+}
+
 /// 下载新版安装包并做基本校验（大小 + 文件头），返回落盘路径。
 ///
 /// 为什么要绕这么一圈：
@@ -1560,16 +1711,14 @@ pub fn update_install_kind() -> String {
 pub fn fetch_update_package(
     url: &str,
     expected_size: u64,
+    expected_sha: Option<&str>,
     ext: &str,
     version: &str,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<std::path::PathBuf, String> {
-    use std::io::Read;
-
     let curl = find_curl().ok_or_else(|| {
         "找不到系统自带的 curl.exe（Windows 10 1803 以上都自带），请改用手动下载".to_string()
     })?;
-
     let dir = std::env::temp_dir().join("ZeeAI-Term-update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
     let safe_version: String = version
@@ -1577,81 +1726,47 @@ pub fn fetch_update_package(
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect();
     let dest = dir.join(format!("ZeeAI_Term_{safe_version}_setup.{ext}"));
-
-    // 已经传完的同版本文件直接用（比如上次下好了但没装成）
-    let existing = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-    if expected_size > 0 && existing == expected_size && header_ok(&dest, ext) {
-        log::info!("update: 复用已下载好的更新包 {}", dest.display());
-        on_progress(existing, expected_size);
-        return Ok(dest);
-    }
-    // 文件比预期还大 = 服务器没接受 Range（或上次下串了），从头来
-    if expected_size > 0 && existing > expected_size {
-        let _ = std::fs::remove_file(&dest);
-    }
-
-    const CHUNK: u64 = 1024 * 1024; // 1MB 一段
-    const CHUNK_TRIES: usize = 4;
+    // 临时名：校验全过之前，这个文件永远不算"下好了"
+    let part = dir.join(format!("ZeeAI_Term_{safe_version}_setup.{ext}.part"));
     // 有系统代理就先用代理试（国内直连 GitHub 的下载 CDN 经常慢到几乎不动），
-    // 后两次改成直连，避免"代理开着但其实没启动"时彻底下不来。
+    // 第二次改成直连，避免"代理开着但其实没启动"时彻底下不来。
     let proxy = system_proxy();
 
-    let mut done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-    on_progress(done, expected_size.max(done));
-
-    if expected_size == 0 {
-        // 不知道总大小（Release 没给 size）→ 只能整包下，靠 curl 自己的重试
-        run_curl_to_file(&curl, url, None, &dest, true, proxy.as_deref())?;
-        done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-        on_progress(done, done);
-    } else {
-        while done < expected_size {
-            let start = done;
-            let end = (start + CHUNK - 1).min(expected_size - 1);
-            let mut last_err = String::new();
-            let mut ok = false;
-            for attempt in 1..=CHUNK_TRIES {
-                let use_proxy = if attempt <= 2 { proxy.as_deref() } else { None };
-                match run_curl_to_file(&curl, url, Some((start, end)), &dest, true, use_proxy) {
-                    Ok(()) => {
-                        ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = e;
-                        log::warn!("update: 第 {attempt} 次取分片 {start}-{end} 失败：{last_err}");
-                        std::thread::sleep(std::time::Duration::from_millis(800));
-                    }
+    let mut last_err = String::new();
+    for attempt in 1..=2u8 {
+        let _ = std::fs::remove_file(&part);
+        let use_proxy = if attempt == 1 { proxy.as_deref() } else { None };
+        log::info!(
+            "update: 第 {attempt} 次整包下载 {url}（proxy={use_proxy:?}，期望 {expected_size} 字节）"
+        );
+        let one = run_curl_download(&curl, url, &part, expected_size, use_proxy, &mut on_progress)
+            .and_then(|()| {
+                match package_problem(&part, ext, expected_size, expected_sha) {
+                    None => Ok(()),
+                    Some(why) => Err(why),
+                }
+            });
+        match one {
+            Ok(()) => {
+                // 校验全过 → 原子改名成正式包
+                let _ = std::fs::remove_file(&dest);
+                std::fs::rename(&part, &dest).map_err(|e| format!("重命名更新包失败: {e}"))?;
+                let done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                on_progress(done, done);
+                log::info!("update: 更新包已下好并校验通过 {}", dest.display());
+                return Ok(dest);
+            }
+            Err(e) => {
+                last_err = e;
+                log::warn!("update: 第 {attempt} 次下载/校验没过：{last_err}");
+                let _ = std::fs::remove_file(&part);
+                if attempt == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
                 }
             }
-            if !ok {
-                return Err(format!(
-                    "下载中断（已收到 {done} 字节 / 共 {expected_size}）。网络恢复后再点一次「一键升级」会从断点继续：{last_err}"
-                ));
-            }
-            let now = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-            if now <= done {
-                return Err(format!("下载卡住（已收到 {done} 字节 / 共 {expected_size}），请稍后重试"));
-            }
-            done = now;
-            on_progress(done, expected_size.max(done));
         }
     }
-
-    // 校验 1：大小必须和 Release 里标注的一致（防半截文件 / 被塞东西）
-    if expected_size > 0 && done != expected_size {
-        return Err(format!(
-            "更新包大小不对（下载 {done} 字节，官方标注 {expected_size} 字节），请重试（会从断点继续）"
-        ));
-    }
-
-    // 校验 2：文件头要对（exe = PE 的 MZ；msi = OLE 复合文档 D0CF11E0）
-    if !header_ok(&dest, ext) {
-        let _ = std::fs::remove_file(&dest);
-        return Err("更新包不是有效的安装程序（文件头不对），已丢弃".into());
-    }
-
-    Ok(dest)
+    Err(format!("更新包下载或校验失败（已自动重试一次）：{last_err}"))
 }
 
 /// 读 Windows「Internet 选项」里的代理设置。
@@ -1746,63 +1861,198 @@ fn header_ok(path: &std::path::Path, ext: &str) -> bool {
     }
 }
 
-/// 调一次 curl：`range` 有值时取指定分段，并且**追加**到 dest 末尾。
-fn run_curl_to_file(
+/// 调一次 curl：**整包一次下完**（不分片、不续传），支持代理。
+///
+/// 三条都是 0.1.5 事故留下的教训：
+/// - **带超时**：连不上 15 秒、或 60 秒内平均速率低于 2KB/s 就判失败去重试，
+///   顺序挂在这里等死（0.1.5 那个僵尸 curl 就是这么来的）；
+/// - **stderr 写文件不写管道**：管道没人读、写满之后双方互等 = 死锁；
+/// - **挂进 Job Object**：App 退出/被强杀时 curl 跟着被收掉，不留孤儿进程。
+///
+/// 进度靠轮询文件大小（整包下载也能有进度条）。
+fn run_curl_download(
     curl: &std::path::Path,
     url: &str,
-    range: Option<(u64, u64)>,
     dest: &std::path::Path,
-    append: bool,
+    expected_size: u64,
     proxy: Option<&str>,
+    on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<(), String> {
-    use std::fs::OpenOptions;
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(dest)
-        .map_err(|e| format!("打开目标文件失败: {e}"))?;
+    let mut err_path = dest.as_os_str().to_os_string();
+    err_path.push(".stderr");
+    let err_path = std::path::PathBuf::from(err_path);
+    let _ = std::fs::remove_file(dest);
+    let _ = std::fs::remove_file(&err_path);
 
     let mut cmd = std::process::Command::new(curl);
     cmd.arg("-L")
         .arg("--fail")
         .arg("--silent")
         .arg("--show-error")
+        .arg("--connect-timeout")
+        .arg("15")
+        .arg("--speed-limit")
+        .arg("2048")
+        .arg("--speed-time")
+        .arg("60")
+        .arg("--max-time")
+        .arg("3600")
         .arg("--retry")
-        .arg("3")
+        .arg("5")
         .arg("--retry-delay")
-        .arg("1")
+        .arg("2")
         .arg("--retry-all-errors");
-    if let Some((start, end)) = range {
-        cmd.arg("-r").arg(format!("{start}-{end}"));
-    }
     if let Some(p) = proxy {
         cmd.arg("--proxy").arg(p);
     }
-    cmd.arg("-o").arg("-"); // 写到 stdout，我们负责追加到文件
+    cmd.arg("--stderr").arg(&err_path);
+    cmd.arg("-o").arg(dest);
     cmd.arg(url);
-    cmd.stdout(std::process::Stdio::from(file));
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
 
-    let out = cmd.output().map_err(|e| format!("启动 curl 失败: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if msg.is_empty() {
-            format!("curl 退出码 {:?}", out.status.code())
-        } else {
-            msg
-        })
+    on_progress(0, expected_size);
+    let mut child = cmd.spawn().map_err(|e| format!("启动 curl 失败: {e}"))?;
+    crate::core::job::assign(child.id());
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                let done = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                on_progress(done, expected_size.max(done));
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Err(e) => return Err(format!("等待 curl 失败: {e}")),
+        }
+    };
+    let done = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    on_progress(done, expected_size.max(done));
+    if status.success() {
+        return Ok(());
     }
+    let msg = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let msg = msg.trim().to_string();
+    Err(if msg.is_empty() {
+        format!("curl 退出码 {:?}", status.code())
+    } else {
+        msg
+    })
 }
 
+/// 用系统自带的 certutil 算 sha256（不引第三方加密库；certutil 从 Win7 起就有）
+fn sha256_of(path: &std::path::Path) -> Result<String, String> {
+    let out = std::process::Command::new("certutil")
+        .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
+        .output()
+        .map_err(|e| format!("调用 certutil 失败: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let t = line.trim();
+        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(t.to_ascii_lowercase());
+        }
+    }
+    Err("certutil 没能算出 sha256，无法校验更新包".into())
+}
+
+/// 校验下好的包：没问题返回 None，有问题返回原因。
+///
+/// - 大小必须和 Release 标注一致（防半截）；
+/// - 文件头必须是 PE / OLE（防下成 HTML 错误页、别的产物）；
+/// - 官方给了 sha256（GitHub Release API 的 `digest`）就必须一模一样 ——
+///   0.1.5 那次"大小对、内容错位"就是靠这一条能当场抓住。
+fn package_problem(
+    path: &std::path::Path,
+    ext: &str,
+    expected_size: u64,
+    expected_sha: Option<&str>,
+) -> Option<String> {
+    let actual = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if expected_size > 0 && actual != expected_size {
+        return Some(format!(
+            "大小不符（下载 {actual} 字节，官方 {expected_size} 字节）"
+        ));
+    }
+    if !header_ok(path, ext) {
+        return Some("文件头不对（不是有效的安装程序）".to_string());
+    }
+    if let Some(want) = expected_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        let want = want
+            .strip_prefix("sha256:")
+            .unwrap_or(want)
+            .to_ascii_lowercase();
+        if want.len() != 64 || !want.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(format!("官方给的 sha256 格式不对：{want}"));
+        }
+        match sha256_of(path) {
+            Ok(got) if got == want => {}
+            Ok(got) => return Some(format!("sha256 对不上（下载 {got}，官方 {want}）")),
+            Err(e) => return Some(e),
+        }
+    }
+    None
+}
+
+/// 生成「等主程序退出 → 安装 → 拉起应用」的辅助脚本。
+///
+/// 这里是 0.1.5 那次"点了升级什么都没发生"的事故现场，两个坑都补上了：
+/// - 等主程序退出**必须有上限**（以前主程序不退，脚本就永远卡着，安装永远不会开始）；
+/// - **必须检查安装器的退出码**。那次下载到的安装包被残留 curl 并发写坏，安装器弹
+///   "NSIS Error" 后以退出码 2 结束，而脚本照样一声不响地退出 —— 用户看不到任何反馈。
+///   现在失败会记一行日志、把坏包丢掉（下次自动重下），并把旧版重新拉起来。
+fn apply_update_script(
+    kind: &str,
+    dest: &std::path::Path,
+    log: &std::path::Path,
+    exe_path: &std::path::Path,
+    pid: u32,
+) -> String {
+    // 安装那一步单独一行：无论成不成，退出码都拿得到（0 = 成功）
+    let install = if kind == "msi" {
+        // MSI：msiexec 静默升级（/qb 显示一个进度条；perMachine 会弹一次 UAC）
+        format!("msiexec /i \"{}\" /qb /norestart", dest.display())
+    } else {
+        // NSIS：/S 静默安装 + /R 装完自动重启应用
+        format!("\"{}\" /S /R", dest.display())
+    };
+    format!(
+        "@echo off\r\n\
+setlocal enabledelayedexpansion\r\n\
+rem 等 ZeeAI_Term 主程序退出（pid {pid}）；最多等 2 分钟，超时就强杀，别挂死\r\n\
+set tries=0\r\n\
+:wait\r\n\
+tasklist /FI \"PID eq {pid}\" /NH | find \"{pid}\" >nul\r\n\
+if errorlevel 1 goto install\r\n\
+set /a tries+=1\r\n\
+if !tries! GEQ 60 goto killit\r\n\
+ping -n 2 127.0.0.1 >nul\r\n\
+goto wait\r\n\
+:killit\r\n\
+taskkill /PID {pid} /F >nul 2>&1\r\n\
+ping -n 2 127.0.0.1 >nul\r\n\
+:install\r\n\
+{install}\r\n\
+set RC=%ERRORLEVEL%\r\n\
+echo %DATE% %TIME% installer exit=%RC% >> \"{log}\"\r\n\
+if \"%RC%\"==\"0\" goto done\r\n\
+if \"%RC%\"==\"3010\" goto done\r\n\
+del /f /q \"{dest}\" >nul 2>&1\r\n\
+echo %DATE% %TIME% 安装失败，已丢弃这次下载的更新包 >> \"{log}\"\r\n\
+start \"\" \"{exe}\"\r\n\
+:done\r\n",
+        pid = pid,
+        install = install,
+        log = log.display(),
+        dest = dest.display(),
+        exe = exe_path.display(),
+    )
+}
 
 /// 下载新版安装包，校验后静默覆盖安装并自动重启应用。
 ///
@@ -1810,7 +2060,7 @@ fn run_curl_to_file(
 /// - **只允许 GitHub Release 的下载地址**：这条命令本质上会执行一个下载来的安装包，
 ///   所以地址必须形如 `https://github.com/<owner>/<repo>/releases/download/...`，
 ///   避免它变成"任意 URL 下载并执行"的后门；
-/// - **校验**：见 [`fetch_update_package`]（大小 + 文件头）；
+/// - **校验**：见 [`fetch_update_package`]（大小 + 文件头 + 官方 sha256）；
 /// - **进度**：复用 `zeeai://transfer` 事件，右下角进度面板直接显示下载进度；
 /// - **安装**：先写一个隐藏的 cmd 辅助脚本，等本进程退出后再执行安装，最后把应用拉起来。
 ///   NSIS / MSI 都盖不住正在运行的 exe，所以必须先退出再装。
@@ -1819,6 +2069,7 @@ pub async fn update_download_install(
     app: tauri::AppHandle,
     url: String,
     expected_size: u64,
+    expected_sha: Option<String>,
     version: String,
 ) -> Result<String, String> {
     let u = url.trim().to_string();
@@ -1830,7 +2081,8 @@ pub async fn update_download_install(
         return Err("当前是便携版，无法自动覆盖升级：请下载压缩包解压替换（配置不会丢）".into());
     }
     log::info!(
-        "ipc: update_download_install -> {u} (kind={kind}, expect {expected_size} bytes, v{version})"
+        "ipc: update_download_install -> {u} (kind={kind}, expect {expected_size} bytes, sha={:?}, v{version})",
+        expected_sha
     );
 
     let ext = if kind == "msi" { "msi" } else { "exe" };
@@ -1846,28 +2098,35 @@ pub async fn update_download_install(
     let name_for_blocking = name.clone();
     let app_for_blocking = app.clone();
     let result = tokio::task::spawn_blocking(move || {
-        fetch_update_package(&u, expected_size, ext, &version, |done, total| {
-            if done == 0 {
-                emit_transfer(
-                    &app_for_blocking,
-                    TransferEvent::Start {
-                        task: task_for_blocking.clone(),
-                        name: name_for_blocking.clone(),
-                        total,
-                    },
-                );
-            } else {
-                emit_transfer(
-                    &app_for_blocking,
-                    TransferEvent::Progress {
-                        task: task_for_blocking.clone(),
-                        name: name_for_blocking.clone(),
-                        done,
-                        total,
-                    },
-                );
-            }
-        })
+        fetch_update_package(
+            &u,
+            expected_size,
+            expected_sha.as_deref(),
+            ext,
+            &version,
+            |done, total| {
+                if done == 0 {
+                    emit_transfer(
+                        &app_for_blocking,
+                        TransferEvent::Start {
+                            task: task_for_blocking.clone(),
+                            name: name_for_blocking.clone(),
+                            total,
+                        },
+                    );
+                } else {
+                    emit_transfer(
+                        &app_for_blocking,
+                        TransferEvent::Progress {
+                            task: task_for_blocking.clone(),
+                            name: name_for_blocking.clone(),
+                            done,
+                            total,
+                        },
+                    );
+                }
+            },
+        )
     })
     .await
     .map_err(|e| format!("下载任务异常: {e}"))?;
@@ -1900,29 +2159,11 @@ pub async fn update_download_install(
     // ---- 写辅助脚本：等本进程退出后再装，装完把应用拉起来 ----
     let exe_path = std::env::current_exe().map_err(|e| format!("取当前程序路径失败: {e}"))?;
     let helper = dir.join("apply_update.cmd");
+    let log = dir.join("apply_update.log");
+    // 上一次的失败记录先清掉，免得新的一次还没跑完就被读成"上次失败了"
+    let _ = std::fs::remove_file(&log);
     let pid = std::process::id();
-    let body = if kind == "msi" {
-        // MSI：msiexec 静默升级（/qb 显示一个进度条；perMachine 会弹一次 UAC）
-        format!(
-            "msiexec /i \"{}\" /qb /norestart\r\nstart \"\" \"{}\"\r\n",
-            dest.display(),
-            exe_path.display()
-        )
-    } else {
-        // NSIS：/S 静默安装 + /R 装完自动重启应用
-        format!("\"{}\" /S /R\r\n", dest.display())
-    };
-    let script = format!(
-        "@echo off\r\n\
-rem 等 ZeeAI_Term 主程序退出（pid {pid}），再执行安装\r\n\
-:wait\r\n\
-tasklist /FI \"PID eq {pid}\" /NH | find \"{pid}\" >nul\r\n\
-if not errorlevel 1 (\r\n\
-  ping -n 2 127.0.0.1 >nul\r\n\
-  goto wait\r\n\
-)\r\n\
-{body}"
-    );
+    let script = apply_update_script(&kind, &dest, &log, &exe_path, pid);
     std::fs::write(&helper, script).map_err(|e| format!("写升级脚本失败: {e}"))?;
 
     let mut cmd = std::process::Command::new("cmd");
@@ -1935,6 +2176,8 @@ if not errorlevel 1 (\r\n\
     }
     let child = cmd.spawn().map_err(|e| format!("启动升级脚本失败: {e}"))?;
     log::info!("update: 升级脚本已启动 pid={}", child.id());
+    // 顺手把升级脚本也挂进 Job Object：万一它自己卡住，App 退出时会一起被收掉
+    crate::core::job::assign(child.id());
 
     // 给脚本一点时间就位，然后走正常退出路径（收干净会话进程）；重启由脚本/安装包负责
     let app_for_exit = app.clone();
@@ -2002,4 +2245,77 @@ pub fn settings_get() -> Settings {
 pub fn settings_set(settings: Settings) -> Result<(), String> {
     log::info!("ipc: settings_set theme={} font={}", settings.theme, settings.font_size);
     store::save_settings(&settings)
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("zeeai-cmd-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn package_problem_catches_short_wrong_and_mismatched_files() {
+        let exe = tmp("pkg-check.exe");
+        // 半截文件：大小不符
+        std::fs::write(&exe, vec![b'M', b'Z', 0, 0]).unwrap();
+        let p = package_problem(&exe, "exe", 1000, None).unwrap();
+        assert!(p.contains("大小不符"), "{p}");
+
+        // 大小对、文件头不对（比如下成了一个 HTML 错误页）
+        std::fs::write(&exe, b"<html>404</html>").unwrap();
+        let p = package_problem(&exe, "exe", 16, None).unwrap();
+        assert!(p.contains("文件头不对"), "{p}");
+
+        // 大小对、头也对，但 sha256 和官方给的差一位 → 必须拦住（0.1.5 就是这么坏的）
+        let mut body = vec![b'M', b'Z'];
+        body.extend(std::iter::repeat(0u8).take(14));
+        std::fs::write(&exe, &body).unwrap();
+        let good = sha256_of(&exe).unwrap();
+        assert_eq!(package_problem(&exe, "exe", 16, Some(&good)), None);
+        let mut bad = good.clone();
+        bad.replace_range(0..1, if good.starts_with('a') { "b" } else { "a" });
+        let p = package_problem(&exe, "exe", 16, Some(&format!("sha256:{bad}"))).unwrap();
+        assert!(p.contains("sha256 对不上"), "{p}");
+        let _ = std::fs::remove_file(&exe);
+    }
+
+    #[test]
+    fn apply_update_script_has_bounded_wait_and_failure_feedback() {
+        let dest = std::path::PathBuf::from(
+            r"C:\Users\u\AppData\Local\Temp\ZeeAI-Term-update\ZeeAI_Term_0.1.6_setup.exe",
+        );
+        let log = std::path::PathBuf::from(
+            r"C:\Users\u\AppData\Local\Temp\ZeeAI-Term-update\apply_update.log",
+        );
+        let exe = std::path::PathBuf::from(r"C:\Users\u\AppData\Local\ZeeAI_Term\ZeeAI_Term.exe");
+        let s = apply_update_script("nsis", &dest, &log, &exe, 4321);
+
+        // 等主程序退出：看得到 pid，而且有次数上限（不会无限等）
+        assert!(s.contains("PID eq 4321"), "{s}");
+        assert!(s.contains("if !tries! GEQ 60 goto killit"), "{s}");
+        // 安装完必须看退出码，失败要记日志、丢包、把旧版拉起来
+        assert!(s.contains("set RC=%ERRORLEVEL%"), "{s}");
+        assert!(s.contains("installer exit=%RC%"), "{s}");
+        assert!(
+            s.contains(
+                "del /f /q \"C:\\Users\\u\\AppData\\Local\\Temp\\ZeeAI-Term-update\\ZeeAI_Term_0.1.6_setup.exe\""
+            ),
+            "{s}"
+        );
+        assert!(
+            s.contains("start \"\" \"C:\\Users\\u\\AppData\\Local\\ZeeAI_Term\\ZeeAI_Term.exe\""),
+            "{s}"
+        );
+        // NSIS 走 /S /R（静默装 + 装完重启）
+        assert!(s.contains("/S /R"), "{s}");
+
+        // MSI 走 msiexec，且 3010（要重启）也算成功
+        let m = apply_update_script("msi", &dest, &log, &exe, 7);
+        assert!(m.contains("msiexec /i"), "{m}");
+        assert!(m.contains("\"%RC%\"==\"3010\" goto done"), "{m}");
+    }
 }

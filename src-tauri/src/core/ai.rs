@@ -104,10 +104,12 @@ pub fn parse_probe(output: &str) -> AiProbe {
                 if p.is_empty() {
                     continue;
                 }
-                // 只保留工具名，方便前端比对
-                let base = p.split_whitespace().next().unwrap_or(p);
-                let file = base.rsplit(['/', '\\']).next().unwrap_or(base);
-                running.push(file.to_string());
+                // 只保留工具名，方便前端比对。
+                // 用和「AI 任务看板」同一套判定：`node /usr/local/bin/codex` 要认成
+                // codex，而不是把解释器 node 当成工具名。
+                if let Some(tool) = crate::core::ai_tasks::tool_of(&p) {
+                    running.push(tool);
+                }
             }
         }
     }

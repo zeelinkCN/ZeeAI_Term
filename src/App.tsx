@@ -6,6 +6,7 @@ import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
 import TermThemeDialog from "./features/TermThemeDialog";
+import HighlightDialog from "./features/HighlightDialog";
 import { SessionBus } from "./sessionBus";
 import {
   adbDevices,
@@ -16,6 +17,10 @@ import {
   adbRm,
   adbMkdir,
   aiProbe,
+  aiTaskNoteStart,
+  aiTasksClearFinished,
+  aiTasksLocal,
+  aiTasksRemote,
   fastbootDevices,
   fastbootVersion,
   gitStatus,
@@ -61,6 +66,7 @@ import {
   openExternalUrl,
   updateDownloadInstall,
   updateInstallKind,
+  updateTakeResult,
   serialList,
   sessionWrite,
   settingsGet,
@@ -80,6 +86,7 @@ import type {
   AdbDevice,
   AdbFile,
   AiProbe,
+  AiTask,
   AppSettings,
   ConnectionProfile,
   GitBranch,
@@ -189,6 +196,62 @@ const MODULE_LABEL: Record<ModuleKey, string> = {
   adb: "ADB",
 };
 
+/** 本地终端在 AI 看板里显示成哪个"服务器" */
+function shellLabelOf(kind: string): string {
+  if (kind === "wsl") return "WSL";
+  if (kind === "cmd") return "本机 CMD（仅状态）";
+  return "本机 PowerShell";
+}
+
+const AI_TOOL_LABEL: Record<string, string> = {
+  codex: "OpenAI Codex CLI",
+  claude: "Claude Code",
+  aider: "Aider",
+  gemini: "Gemini CLI",
+};
+
+function aiToolLabel(name: string): string {
+  return AI_TOOL_LABEL[name] ?? name;
+}
+
+/** 环境徽标：本地 / 远端 / WSL */
+function aiEnvLabel(env: string): string {
+  if (env === "remote") return "远端";
+  if (env === "wsl") return "WSL";
+  return "本地";
+}
+
+/** 这张卡片是怎么被发现的（越靠前越准） */
+function aiSourceLabel(src: string): string {
+  switch (src) {
+    case "app":
+      return "App 启动（最准）";
+    case "tmux":
+      return "tmux 窗格";
+    case "winproc":
+      return "Windows 进程表";
+    default:
+      return "ps 扫描";
+  }
+}
+
+/** 毫秒 →「1 分 23 秒」；拿不到就显示「—」 */
+function aiDurationText(ms: number): string {
+  if (!ms || ms < 0) return "—";
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs} 秒`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return secs % 60 ? `${mins} 分 ${secs % 60} 秒` : `${mins} 分`;
+  return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
+}
+
+/** Unix 秒 → 本地时间 HH:MM:SS */
+function clockText(sec: number): string {
+  const d = new Date(sec * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 const EMPTY_PROFILE = {
   name: "",
   host: "",
@@ -203,6 +266,8 @@ interface Asset {
   name?: string;
   size?: number;
   browser_download_url?: string;
+  /** GitHub 会给的 sha256（形如 "sha256:...."），用来校验下载到的包 */
+  digest?: string;
 }
 
 /**
@@ -259,6 +324,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   termScheme: "vscode-dark",
   termSchemeCustom: "",
   logDir: "",
+  highlightEnabled: true,
+  // 预设规则由后端给（core::highlight::presets），前端这里只留空；
+  // 设置读回来之后就有内容了，用户也可以自己改。
+  highlightRules: [],
 };
 
 const APP_VERSION = "0.1.5";
@@ -471,6 +540,8 @@ export default function App() {
   const [showAbout, setShowAbout] = useState(false);
   // 终端配色对话框（视图菜单 / 设置里都能打开）
   const [showTermTheme, setShowTermTheme] = useState(false);
+  // 关键字高亮对话框（视图菜单 / 设置里都能打开）
+  const [showHighlight, setShowHighlight] = useState(false);
   const [showServers, setShowServers] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   // 在「新建会话」弹窗里点「＋ 新建服务器」时，保存后要回到新建会话弹窗
@@ -491,6 +562,9 @@ export default function App() {
   const [aiState, setAiState] = useState<AiProbe | null>(null);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   const aiWasRunning = useRef(false);
+  // AI 任务看板（v1）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片
+  const [boardTasks, setBoardTasks] = useState<AiTask[]>([]);
+  const boardBusy = useRef(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
@@ -498,8 +572,11 @@ export default function App() {
     version: string;
     installerUrl: string;
     installerSize: number;
+    /** 官方 sha256（GitHub Release API 的 digest），下载后必须对得上 */
+    installerSha: string;
     msiUrl: string;
     msiSize: number;
+    msiSha: string;
     zipUrl: string;
     pageUrl: string;
   } | null>(null);
@@ -622,6 +699,18 @@ export default function App() {
     void updateInstallKind()
       .then(setInstallKind)
       .catch(() => setInstallKind("portable"));
+    // 上一次自动升级的结果：升级脚本会写一行日志（安装器退出码 + 失败原因），
+    // 这里读一次就清掉，只往底部状态栏提示 —— 免得再出现"点了升级，什么都没有"。
+    void updateTakeResult()
+      .then((r) => {
+        if (!r) return;
+        if (/ins.*exit=0/i.test(r) || r.includes("installer exit=0")) {
+          notify("上次自动升级已安装完成");
+        } else {
+          notify(`上次自动升级没装成功（${r}）—— 已丢弃那个安装包，可直接再点一次「一键升级」`);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   /**
@@ -676,17 +765,87 @@ export default function App() {
     notify(text);
   }
 
+  /** 会话 → 看板上的「环境 + 服务器」 */
+  function boardEnvOf(s: OpenSession): { env: string; server: string } {
+    if (s.kind === "remote") {
+      const name = profilesRef.current.find((p) => p.id === s.profileId)?.name ?? s.title;
+      return { env: "remote", server: name };
+    }
+    return { env: s.kind === "wsl" ? "wsl" : "local", server: shellLabelOf(s.kind) };
+  }
+
+  /**
+   * 刷新 AI 任务看板。
+   *
+   * 信号源按可靠度分层（越靠前越准）：App 自己启动的 > 远端 tmux 窗格 > 远端 ps 扫描 >
+   * 本机进程表。几条必须守住的取舍：
+   * - WSL 里的进程从 Windows 侧看不见（只有 wslhost/vmmem），所以交给后端**进 WSL 里查**；
+   * - CMD 没有脚本钩子 → 只给「仅状态」，不为它扫全进程表；
+   * - Windows 全进程表扫描偏重 → 只有真有本机会话时才调，而且 20 秒才一次；
+   * - 卡片上只给「运行中 / 已结束 + 耗时」，**不做进度条**（TUI 没有百分比可拿）。
+   */
+  async function refreshBoard() {
+    if (boardBusy.current) return;
+    boardBusy.current = true;
+    try {
+      const jobs: Promise<AiTask[]>[] = [];
+      const seenRemote = new Set<string>();
+      const seenLocal = new Set<string>();
+      for (const s of sessionsRef.current) {
+        if (s.kind === "remote" && s.profileId) {
+          const key = `${s.profileId}|${s.user ?? ""}`;
+          if (seenRemote.has(key)) continue;
+          seenRemote.add(key);
+          jobs.push(
+            aiTasksRemote(s.profileId, boardEnvOf(s).server, s.user ?? null).catch(() => []),
+          );
+        } else if (s.kind === "powershell" || s.kind === "wsl" || s.kind === "cmd") {
+          // 每种本地终端只扫一次（多开几个 PowerShell 没必要扫好几遍进程表）
+          if (seenLocal.has(s.kind)) continue;
+          seenLocal.add(s.kind);
+          jobs.push(aiTasksLocal(s.kind, shellLabelOf(s.kind), null).catch(() => []));
+        }
+      }
+      if (jobs.length === 0) {
+        setBoardTasks([]);
+        return;
+      }
+      const lists = await Promise.all(jobs);
+      setBoardTasks(lists.flat());
+    } finally {
+      boardBusy.current = false;
+    }
+  }
+
+  /** 清掉看板上「已结束」的卡片（还在跑的不动） */
+  async function clearFinishedTasks() {
+    const envs = new Map<string, { env: string; server: string }>();
+    for (const t of boardTasks) {
+      if (t.state === "done") envs.set(`${t.env}|${t.server}`, { env: t.env, server: t.server });
+    }
+    for (const { env, server } of envs.values()) {
+      await aiTasksClearFinished(env, server).catch(() => {});
+    }
+    await refreshBoard();
+  }
+
   // 面板打开时探测一次，之后每 8 秒刷一次（既看安装状态，也看有没有跑完）
   useEffect(() => {
     if (!aiPanelOpen) return;
     void refreshAi();
+    void refreshBoard();
     const t = window.setInterval(() => void refreshAi(), 8000);
-    return () => window.clearInterval(t);
+    // 看板重一些（远端要跑 ps、本机要扫进程表），20 秒一次就够
+    const t2 = window.setInterval(() => void refreshBoard(), 20000);
+    return () => {
+      window.clearInterval(t);
+      window.clearInterval(t2);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiPanelOpen, activeId]);
 
   /** 在当前会话的终端里启动 AI（就是把命令敲进去，你能看到它跑） */
-  function aiStartTool(tool: string) {
+  function aiStartTool(tool: string, isRun: boolean) {
     const cur = sessionsRef.current.find((s) => s.id === activeId);
     if (!cur) {
       notify("先打开一个会话");
@@ -696,6 +855,15 @@ export default function App() {
     // 发 \n 只会得到续行提示符（Linux 下 \r 一样能提交）。统一用 \r。
     void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\r`)));
     aiWasRunning.current = true;
+    if (isRun) {
+      // 记一笔"App 自己启动的"——看板里这一层最准（开始时间/跑完与否都由 App 判）
+      const { env, server } = boardEnvOf(cur);
+      void aiTaskNoteStart(env, server, tool.trim(), tool.trim())
+        .then(() => {
+          void refreshBoard();
+        })
+        .catch(() => {});
+    }
     pushAiNotice(`已在「${cur.title}」里启动 ${tool}，它跑完我会提醒你`);
   }
 
@@ -756,6 +924,7 @@ export default function App() {
     out.push(
       { label: "打开设置", group: "首选项", run: () => setShowSettings(true) },
       { label: "终端配色", group: "首选项", run: () => setShowTermTheme(true) },
+      { label: "终端关键字高亮", group: "首选项", run: () => setShowHighlight(true) },
       { label: "服务器管理", group: "首选项", run: () => setShowServers(true) },
       {
         label: "文件面板：同步到终端目录",
@@ -2420,8 +2589,10 @@ export default function App() {
         version: latest,
         installerUrl: setup?.browser_download_url ?? "",
         installerSize: setup?.size ?? 0,
+        installerSha: setup?.digest ?? "",
         msiUrl: msi?.browser_download_url ?? "",
         msiSize: msi?.size ?? 0,
+        msiSha: msi?.digest ?? "",
         zipUrl: zip?.browser_download_url ?? "",
         pageUrl,
       });
@@ -2575,6 +2746,7 @@ export default function App() {
     const isMsi = installKind === "msi";
     const url = isMsi ? updateOffer.msiUrl : updateOffer.installerUrl;
     const expected = isMsi ? updateOffer.msiSize : updateOffer.installerSize;
+    const sha = isMsi ? updateOffer.msiSha : updateOffer.installerSha;
     if (!url) {
       notify(isMsi ? "这个版本没有提供 MSI 安装包" : "这个版本没有提供安装包，请打开发布页");
       return;
@@ -2582,7 +2754,7 @@ export default function App() {
     setUpdateApplying(true);
     notify(`正在下载 ${updateOffer.version} 安装包…下载进度见右下角`);
     try {
-      await updateDownloadInstall(url, expected, updateOffer.version);
+      await updateDownloadInstall(url, expected, updateOffer.version, sha || null);
       notify(
         isMsi
           ? `已开始升级到 ${updateOffer.version}（MSI 安装可能会弹一次 UAC，请点“是”）`
@@ -2758,6 +2930,7 @@ export default function App() {
           { sep: false, label: "缩小字体（Ctrl + －）", action: () => bumpFont(-1) },
           { sep: false, label: "重置字体（Ctrl + 0）", action: () => applyFontSize(13) },
           { sep: false, label: "终端配色…", action: () => setShowTermTheme(true) },
+          { sep: false, label: "关键字高亮…", action: () => setShowHighlight(true) },
           { sep: true },
           {
             sep: false,
@@ -4477,6 +4650,8 @@ export default function App() {
                             scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
                             palette={termPalette}
+                            highlightEnabled={settings.highlightEnabled}
+                            highlightRules={settings.highlightRules}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
                             onZoom={bumpFont}
@@ -4520,6 +4695,8 @@ export default function App() {
                     scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
                     palette={termPalette}
+                    highlightEnabled={settings.highlightEnabled}
+                    highlightRules={settings.highlightRules}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                     onNotice={notify}
                     onZoom={bumpFont}
@@ -4560,6 +4737,66 @@ export default function App() {
                 ✕
               </button>
             </div>
+
+            {/* ---------- AI 任务看板：多环境汇总 ---------- */}
+            <div className="ai-section">
+              AI 任务看板
+              <button
+                type="button"
+                className="mini-x"
+                style={{ marginLeft: "auto", opacity: 1 }}
+                title="重新扫描（远端 tmux 窗格 + ps；本机进程表）"
+                onClick={() => void refreshBoard()}
+              >
+                ⟳
+              </button>
+            </div>
+            {boardTasks.length === 0 ? (
+              <div className="hint" style={{ padding: "2px 12px 10px" }}>
+                没扫到正在跑的 AI。点下面工具里的「在终端启动」之后再回来，这里会列出
+                环境 / 服务器 / 命令 / 运行中·已结束 / 耗时。
+                <br />
+                WSL 里的进程会进 WSL 里面查；CMD 没有脚本钩子，只显示状态。
+              </div>
+            ) : (
+              <div className="ai-board">
+                {boardTasks.map((t) => (
+                  <div className={"ai-task " + t.state} key={t.id}>
+                    <div className="ai-task-line">
+                      <span className={"dot " + (t.state === "running" ? "ok" : "off")} />
+                      <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
+                      <span className="ai-tag">{aiEnvLabel(t.env)}</span>
+                      <span className="dim">{t.state === "running" ? "运行中" : "已结束"}</span>
+                    </div>
+                    <div className="ai-task-meta ellipsis" title={t.server}>
+                      {t.server}
+                      {t.pane ? ` · ${t.pane}` : ""}
+                      {typeof t.startedAt === "number"
+                        ? ` · 起于 ${clockText(t.startedAt)}`
+                        : ""}
+                    </div>
+                    <div className="ai-task-cmd ellipsis" title={t.command}>
+                      {t.command || "（拿不到命令行）"}
+                    </div>
+                    <div className="ai-task-meta">
+                      耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
+                      {t.pid ? ` · pid ${t.pid}` : ""}
+                    </div>
+                  </div>
+                ))}
+                {boardTasks.some((t) => t.state === "done") && (
+                  <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => void clearFinishedTasks()}
+                    >
+                      清掉已结束的卡片
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {aiNotices.length > 0 && (
               <div className="ai-notices">
@@ -4628,7 +4865,9 @@ export default function App() {
                               : "把安装命令敲进当前终端并回车，进度你自己看"
                           }
                           disabled={!activeSession}
-                          onClick={() => aiStartTool(t.installed ? t.runCmd : t.installCmd)}
+                          onClick={() =>
+                            aiStartTool(t.installed ? t.runCmd : t.installCmd, t.installed)
+                          }
                         >
                           {t.installed ? "在终端启动" : "在终端安装"}
                         </button>
@@ -5990,6 +6229,26 @@ export default function App() {
               <label className="form-check">
                 <input
                   type="checkbox"
+                  checked={settings.highlightEnabled}
+                  onChange={(e) => void updateSettings({ highlightEnabled: e.target.checked })}
+                />
+                <span>
+                  终端关键字高亮（ERROR / WARN / OK / panic 等高亮显示；SSH、串口、本地终端共用）
+                </span>
+              </label>
+              <div className="modal-inline-action">
+                <button type="button" className="mini-btn" onClick={() => setShowHighlight(true)}>
+                  关键字高亮规则…
+                </button>
+                <span className="hint" style={{ padding: "0 0 0 8px" }}>
+                  当前 {settings.highlightRules.filter((r) => r.enabled).length} 条规则生效，
+                  共 {settings.highlightRules.length} 条
+                </span>
+              </div>
+
+              <label className="form-check">
+                <input
+                  type="checkbox"
                   checked={settings.tmuxDefault}
                   onChange={(e) => void updateSettings({ tmuxDefault: e.target.checked })}
                 />
@@ -6141,6 +6400,17 @@ export default function App() {
             })
           }
           onClose={() => setShowTermTheme(false)}
+          onNotice={notify}
+        />
+      )}
+
+      {showHighlight && (
+        <HighlightDialog
+          rules={settings.highlightRules}
+          enabled={settings.highlightEnabled}
+          onEnabledChange={(v) => void updateSettings({ highlightEnabled: v })}
+          onChange={(rules) => void updateSettings({ highlightRules: rules })}
+          onClose={() => setShowHighlight(false)}
           onNotice={notify}
         />
       )}

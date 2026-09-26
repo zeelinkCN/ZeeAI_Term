@@ -190,6 +190,10 @@ pub struct Settings {
     pub term_scheme_custom: String,
     /// 会话日志目录；空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions
     pub log_dir: String,
+    /// 终端关键字高亮总开关（SSH / 串口 / 本地终端共用同一份规则）
+    pub highlight_enabled: bool,
+    /// 终端关键字高亮规则（预设见 core::highlight::presets）
+    pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
 }
 
 impl Default for Settings {
@@ -212,6 +216,10 @@ impl Default for Settings {
             term_scheme: "vscode-dark".into(),
             term_scheme_custom: String::new(),
             log_dir: String::new(),
+            // 默认就带上预设规则包（ERROR / WARN / OK / panic 各一套）。
+            // 全都是"只给关键词上色"，不影响交互式回显；不想要的在设置里关掉。
+            highlight_enabled: true,
+            highlight_rules: crate::core::highlight::presets(),
         }
     }
 }

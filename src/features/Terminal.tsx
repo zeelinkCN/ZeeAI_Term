@@ -4,8 +4,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
 import { bytesToB64 } from "../util";
+import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
 import type { TermPalette } from "../termThemes";
+import type { HighlightRule } from "../types";
 
 interface Props {
   sessionId: string;
@@ -23,6 +25,10 @@ interface Props {
   onNotice?: (text: string) => void;
   /** Ctrl + 鼠标滚轮缩放字号：+1 变大，-1 变小 */
   onZoom?: (delta: number) => void;
+  /** 关键字高亮总开关（SSH / 串口 / 本地终端共用同一份规则） */
+  highlightEnabled?: boolean;
+  /** 关键字高亮规则 */
+  highlightRules?: HighlightRule[];
 }
 
 /** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
@@ -98,10 +104,13 @@ export default function TerminalView({
   onCwd,
   onNotice,
   onZoom,
+  highlightEnabled = false,
+  highlightRules,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const hlRef = useRef<Highlighter | null>(null);
   // 终端自己的右键菜单（复制/粘贴/清空/全选）—— 浏览器那套菜单已被全局屏蔽
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
@@ -109,6 +118,11 @@ export default function TerminalView({
   onCwdRef.current = onCwd;
   const onZoomRef = useRef<Props["onZoom"]>(onZoom);
   onZoomRef.current = onZoom;
+  // 高亮规则也在重建终端时读一次就行（后续变化走下面的热更新 effect）
+  const hlRulesRef = useRef<HighlightRule[]>(highlightRules ?? []);
+  hlRulesRef.current = highlightRules ?? [];
+  const hlOnRef = useRef(highlightEnabled);
+  hlOnRef.current = highlightEnabled;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -162,7 +176,16 @@ export default function TerminalView({
     // 首次布局可能晚于挂载，多补几次，确保最终尺寸正确
     const timers = [80, 300, 900, 1800].map((ms) => window.setTimeout(doFit, ms));
 
-    bus.attach(sessionId, (bytes) => term.write(bytes));
+    // 关键字高亮：在 term.write 之前插一层（把命中的关键词包上 ANSI 颜色）。
+    // 只影响界面 —— 日志是后端从 PTY 原始字节写的，落盘前早就剥掉了 ANSI。
+    const hl = new Highlighter((data) => term.write(data));
+    hl.setRules(hlOnRef.current ? hlRulesRef.current : []);
+    hlRef.current = hl;
+    bus.attach(sessionId, (bytes) => {
+      // 没开高亮就完全走原路（原样把字节交给 xterm，零开销）
+      if (hl.active) hl.push(bytes);
+      else term.write(bytes);
+    });
     const sub = term.onData((data) => {
       void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(data)));
     });
@@ -207,11 +230,20 @@ export default function TerminalView({
       sub.dispose();
       osc7.dispose();
       bus.detach(sessionId);
+      hl.dispose();
+      hlRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
     };
   }, [sessionId, bus]);
+
+  // 高亮规则/开关变了：热更新，不重建终端（v1 不会给历史输出重新上色，这是已知取舍）
+  useEffect(() => {
+    hlRef.current?.setRules(highlightEnabled ? (highlightRules ?? []) : []);
+    // 规则数组每次渲染都可能是新对象，所以拿它的 JSON 当依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightEnabled, JSON.stringify(highlightRules ?? [])]);
 
   useEffect(() => {
     if (active && termRef.current) {

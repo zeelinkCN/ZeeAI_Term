@@ -348,6 +348,8 @@ pub fn run() {
     .manage(std::sync::Arc::new(
       crate::core::session_log::LogRegistry::new(),
     ))
+    // 「AI 任务看板」里"App 自己启动的"那批任务的账本
+    .manage(crate::core::ai_tasks::AiTaskRegistry::new())
     .invoke_handler(tauri::generate_handler![
       commands::list_profiles,
       commands::save_profile,
@@ -409,8 +411,14 @@ pub fn run() {
       commands::open_in_explorer,
       commands::open_external_url,
       commands::update_install_kind,
+      commands::update_take_result,
       commands::update_download_install,
       commands::ai_probe,
+      commands::highlight_presets,
+      commands::ai_task_note_start,
+      commands::ai_tasks_remote,
+      commands::ai_tasks_local,
+      commands::ai_tasks_clear_finished,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

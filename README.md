@@ -87,6 +87,20 @@ Monokai / Dracula / One Dark / Gruvbox / Tango 浅色），点一下立即生效
 Codex / Claude Code / Aider / Gemini CLI 是否安装、是否正在运行，支持一键安装与一键启动；
 每 8 秒探测一次进程，进程退出即判断任务结束并弹消息通知。
 
+**AI 任务看板（v1）**：同一个面板上半部分是多环境汇总卡片 —— 环境（本地 / 远端 / WSL）+
+服务器 + 命令 + 运行中·已结束 + 耗时 + 来源。信号源按可靠度分层：App 自己启动的（最准，
+开始时间和结束判定都由 App 记）> 远端 tmux 窗格（`tmux list-panes` + 进程树，能精确到哪个
+窗格）> 远端 `ps` 扫描 > 本机 `Get-CimInstance Win32_Process`。WSL 的进程会**进 WSL 里面**查
+（Windows 侧只能看到 wslhost/vmmem）；CMD 没有脚本钩子，只显示状态；TUI 拿不到百分比，
+所以**不做进度条**。本机全进程表扫描偏重，只在真有本机会话时才扫，20 秒一次。
+
+**终端关键字高亮（v1）**：ERROR / FAIL / Exception、WARN、OK / SUCCESS、panic / assert /
+watchdog 默认就带一套预设，命中即变色（SSH、串口、本地终端共用同一份规则）。
+规则可自己改：关键词、区分大小写、前景色 / 背景色、只给关键词上色还是整行上色；
+面板里显示实时样张。「视图 → 关键字高亮…」或设置里都能打开。
+实现走的是**数据流注入**（在 `term.write` 之前插 ANSI），所以**只在界面生效，日志文件仍是
+纯文本**；改规则不会重新着色历史输出（v1 的已知取舍，v2 用 decoration 做）。
+
 **终端日志（像 SecureCRT 那样留档）**：右键任意会话标签 → 「开始记录终端日志」，
 输出会以纯文本落到 `%APPDATA%\ZeeAI-Terminal\logs\sessions\`（写入前已剥掉 ANSI 颜色转义，
 记事本直接可读）。标签上出现红点表示正在记录；设置里可以开「新建会话自动记录」。
@@ -119,6 +133,26 @@ SSH 断线自动重连（指数退避，可关）。
 配置仍放在 `%APPDATA%\ZeeAI-Terminal\`（所以改名不会丢你的服务器、历史和日志）。
 应用内「检查更新」默认指向
 `https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest`。
+
+### 一键升级的下载规矩（0.1.6 起）
+
+0.1.5 出过一次"点了升级、什么都没发生"的事故：分片下载把一个残留的 curl 留在后台，
+它和后一次下载**交叠写同一个文件**，文件大小最后刚好等于官方大小、内容却错位 →
+安装器报 "NSIS Error" 后静默退出（退出码 2）。所以现在这条链路定死了四条：
+
+1. **不要出错**：整包最多自动重下一次，失败也要写日志、丢包、把旧版拉起来；
+2. **不要死锁**：`--connect-timeout` + 低速超时（60 秒低于 2KB/s 判失败）、
+   stderr 写文件而不是管道、curl 挂 Job Object（App 一退一起收掉，不留孤儿）；
+3. **不要分片**：一次请求整包下载，不再用 1MB Range 拼分段；
+4. **不要下错**：大小 + 文件头 + **官方 sha256**（Release API 的 `assets[].digest`，
+   用系统自带 `certutil -hashfile` 算）三重校验，全过才把 `.part` 改名成正式包。
+
+验证下载链路（只下载到临时目录，不安装、不改机器）：
+
+```powershell
+cd src-tauri
+cargo run --release --example update_spike -- <安装包直链> <字节数> exe <版本> sha256:<官方哈希>
+```
 
 ### 运行
 

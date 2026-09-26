@@ -103,6 +103,60 @@ export interface HistoryEntry {
   lastUsed: number;
 }
 
+/**
+ * 终端关键字高亮的一条规则。
+ *
+ * 一条规则 = 一组关键词 + 一套颜色 + 作用范围（只给关键词上色 / 整行上色）。
+ * SSH / 串口 / 本地终端共用同一份规则表。
+ */
+export interface HighlightRule {
+  id: string;
+  /** 规则名（只是标签，方便你在列表里认出来） */
+  name: string;
+  keywords: string[];
+  /** true = 区分大小写 */
+  caseSensitive: boolean;
+  /** 前景色 #rrggbb；空串 = 不改前景 */
+  fg: string;
+  /** 背景色 #rrggbb；空串 = 不改背景 */
+  bg: string;
+  /** true = 命中后整行上色；false = 只给关键词本身 */
+  wholeLine: boolean;
+  /**
+   * true = 关键词两侧必须是词边界。
+   * 预设「OK」默认打开（不打开的话 look / TOKEN 里也会亮），界面上没暴露这个开关。
+   */
+  wholeWord?: boolean;
+  enabled: boolean;
+}
+
+/** AI 任务看板上的一张卡片 */
+export interface AiTask {
+  id: string;
+  /** 环境：local（本机）/ remote（服务器）/ wsl */
+  env: string;
+  /** 环境名：远端是服务器名，本地是「本机 PowerShell」这类 */
+  server: string;
+  /** 命中的工具：codex / claude / aider / gemini */
+  tool: string;
+  /** 命令行（长了会截断） */
+  command: string;
+  /** tmux 窗格标签（形如 main:0.1）；不是 tmux 会话就是空串 */
+  pane: string;
+  /** 信号来源：app（App 自己启动的）/ tmux / ps / winproc */
+  source: string;
+  /** running / done */
+  state: string;
+  /** 已运行（运行中）或总共运行（已结束）的毫秒数 */
+  durationMs: number;
+  /** 进程号；探测不到是 0 */
+  pid: number;
+  /** 开始时间（Unix 秒）；只有 App 自己启动的那批是精确的 */
+  startedAt?: number | null;
+  /** 退出码；v1 拿不到就是 null */
+  exitCode?: number | null;
+}
+
 export interface AppSettings {
   fontSize: number;
   defaultShell: "powershell" | "cmd" | "wsl";
@@ -130,6 +184,10 @@ export interface AppSettings {
   termSchemeCustom: string;
   /** 会话日志目录；空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions */
   logDir: string;
+  /** 终端关键字高亮总开关（SSH / 串口 / 本地终端共用） */
+  highlightEnabled: boolean;
+  /** 终端关键字高亮规则 */
+  highlightRules: HighlightRule[];
 }
 
 export interface GitFile {

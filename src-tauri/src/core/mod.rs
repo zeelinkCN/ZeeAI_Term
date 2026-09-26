@@ -1,6 +1,8 @@
 pub mod adb;
 pub mod ai;
+pub mod ai_tasks;
 pub mod git;
+pub mod highlight;
 pub mod job;
 pub mod pty;
 pub mod remote_fs;
@@ -12,4 +14,5 @@ pub mod sftp;
 pub mod ssh;
 pub mod tmux;
 
+pub use ai_tasks::AiTaskRegistry;
 pub use session::{SessionEvent, SessionRegistry};

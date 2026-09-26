@@ -1132,6 +1132,66 @@ body {
   color: var(--amber);
 }
 
+/* ---------- AI 任务看板（多环境汇总卡片） ---------- */
+
+.ai-board {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 8px 6px;
+}
+
+.ai-task {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 5px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* 运行中的卡片给一条亮边，一眼分得出来 */
+.ai-task.running {
+  border-left-color: var(--green);
+}
+
+.ai-task.done {
+  opacity: 0.72;
+}
+
+.ai-task-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.ai-task-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ai-task-cmd {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--fg);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+/* 环境徽标：本地 / 远端 / WSL */
+.ai-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 15px;
+}
+
 .mini-btn.primary {
   border-color: var(--accent);
   color: var(--accent);
@@ -1657,6 +1717,124 @@ body {
   padding: 10px 14px;
   border-top: 1px solid var(--border);
   background: var(--titlebar);
+}
+
+/* ---------- 终端关键字高亮规则对话框 ---------- */
+
+.hl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.hl-rule {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.hl-rule.off {
+  opacity: 0.55;
+}
+
+.hl-rule-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hl-name {
+  flex: 1;
+  min-width: 0;
+  background: var(--input, rgba(255, 255, 255, 0.06));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 12.5px;
+}
+
+/* 规则样张：直接把这套颜色套在第一个关键词上，改颜色立刻看得见 */
+.hl-sample {
+  flex: none;
+  min-width: 92px;
+  text-align: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg, #181818);
+  border: 1px solid var(--border);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.hl-field {
+  display: block;
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.hl-field input {
+  display: block;
+  width: 100%;
+  margin-top: 3px;
+  background: var(--input, rgba(255, 255, 255, 0.06));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.hl-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 14px;
+  margin-top: 4px;
+}
+
+.hl-opts .form-check {
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.hl-colors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin-top: 4px;
+}
+
+.hl-color {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.hl-color-label {
+  min-width: 28px;
+}
+
+.hl-color input[type="color"] {
+  width: 30px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.hl-color code {
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .tree-item {
