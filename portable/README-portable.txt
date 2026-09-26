@@ -1,4 +1,4 @@
-ZeeAI Terminal 0.1.6 - 便携版 / Portable
+ZeeAI Terminal 0.1.7 - 便携版 / Portable
 =========================================
 
 怎么用 / How to run
