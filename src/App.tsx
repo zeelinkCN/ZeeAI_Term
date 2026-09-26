@@ -212,6 +212,15 @@ interface Asset {
  * 动它会毁掉所有 tmux 用户的手感。这里是把**前缀 + 某个键**对应的 tmux 命令
  * 做成可点的按钮（`title` 里写着等价快捷键，顺便当教学）。
  */
+/**
+ * 服务器没填分组时用的分组名。
+ *
+ * 这个值只用来"归类"，界面上**不显示** —— 只有一台服务器都不填分组时，
+ * 列表里出现一行莫名其妙的「默认」反而让人看不懂。多个分组同时存在时，
+ * 它才以「未分组」的名义出现，用来区分其它自建分组。
+ */
+const DEFAULT_SERVER_GROUP = "默认";
+
 const TMUX_ACTIONS: { key: string; label: string; title: string }[] = [
   { key: "new-window", label: "新建窗口", title: "等价于 Ctrl+B c" },
   { key: "split-h", label: "左右分屏", title: "等价于 Ctrl+B %" },
@@ -3106,6 +3115,18 @@ export default function App() {
   /** 只有 SSH 服务器（给「新建会话」「服务器管理」用） */
   const sshProfiles = useMemo(() => profiles.filter((p) => p.type === "ssh"), [profiles]);
 
+  /** 会话历史分组标题：只有一个分组时不显示（避免一行没意义的「默认」） */
+  const showGroupHeaders = grouped.length > 1;
+
+  /** 所有服务器的会话历史是不是都展开着（决定「展开/折叠全部」按钮显示哪个动作） */
+  const allServersExpanded =
+    sshProfiles.length > 0 && sshProfiles.every((p) => !collapsedServers.includes(p.id));
+
+  /** 一键展开 / 折叠所有服务器的会话历史 */
+  function toggleAllServers() {
+    setCollapsedServers(allServersExpanded ? sshProfiles.map((p) => p.id) : []);
+  }
+
   /** 用户自己建过的串口连接（不是系统里所有 COM 口） */
   const serialProfiles = useMemo(
     () => profiles.filter((p) => p.type === "serial" && !!p.serial?.path),
@@ -3333,33 +3354,42 @@ export default function App() {
           <div className="side-body">
             {module === "remote" && sideTab === "sessions" && (
               <>
-                <div className="tree-group">
-                  已保存的服务器
+                <div className="side-head-row">
+                  <span className="side-head-title">服务器</span>
                   <button
                     type="button"
-                    className="mini-x"
-                    style={{ marginLeft: "auto", opacity: 1 }}
-                    title="新建服务器"
+                    className="side-btn"
+                    title="新建一台服务器（SSH）"
                     onClick={() => openEditDialog()}
                   >
-                    ＋
+                    <IconPlus size={12} /> 新建
                   </button>
                   <button
                     type="button"
-                    className="mini-x"
-                    style={{ opacity: 1 }}
-                    title="服务器管理（编辑 / 复制 / 删除）"
+                    className="side-btn"
+                    title="服务器管理：编辑 / 复制 / 删除"
                     onClick={() => setShowServers(true)}
                   >
-                    ⋯
+                    服务器管理
                   </button>
                 </div>
                 {grouped.length === 0 && (
-                  <div className="hint">还没有服务器。点「新建会话」时可以直接新建一台。</div>
+                  <div className="hint">
+                    还没有服务器。点上面的「新建」，或者新建会话时直接加一台。
+                  </div>
+                )}
+                {sshProfiles.length > 0 && (
+                  <button type="button" className="side-allbtn" onClick={() => toggleAllServers()}>
+                    {allServersExpanded ? "▾ 折叠全部会话" : "▸ 展开全部会话"}
+                  </button>
                 )}
                 {grouped.map(([group, list]) => (
                   <div key={group}>
-                    <div className="tree-subgroup">{group}</div>
+                    {showGroupHeaders && (
+                      <div className="tree-subgroup">
+                        {group === DEFAULT_SERVER_GROUP ? "未分组" : group}
+                      </div>
+                    )}
                     {list.map((p) => {
                       const items = history.filter((h) => h.profileId === p.id);
                       const expanded = !collapsedServers.includes(p.id);
@@ -5669,9 +5699,10 @@ export default function App() {
                 />
               </label>
               <label className="modal-field">
-                分组
+                分组（可留空；留空就归到「未分组」）
                 <input
                   value={editDialog.draft.group}
+                  placeholder="例如：生产环境 / 测试机"
                   onChange={(e) => patchDraft({ group: e.target.value })}
                 />
               </label>

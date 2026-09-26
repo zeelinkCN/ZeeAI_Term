@@ -581,6 +581,76 @@ body {
   color: var(--muted);
 }
 
+/* ---------- 侧栏「服务器」区标题行：标题 + 两个看得见的按钮 ---------- */
+.side-head-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 8px 5px;
+  flex: none;
+}
+
+.side-head-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-right: auto;
+}
+
+.side-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.side-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: var(--accent);
+}
+
+.app.light .side-btn {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.app.light .side-btn:hover {
+  background: rgba(0, 0, 0, 0.11);
+}
+
+/* 「展开/折叠全部会话」：一行轻量按钮 */
+.side-allbtn {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 1px 8px 4px;
+  padding: 3px 7px;
+  text-align: left;
+  font-size: 11px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.side-allbtn:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: var(--border);
+  color: var(--fg);
+}
+
+.app.light .side-allbtn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
 .tree-subgroup {
   padding: 4px 12px 2px;
   font-size: 11px;
