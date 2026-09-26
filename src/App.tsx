@@ -2367,18 +2367,19 @@ export default function App() {
       notify("这条历史对应的连接配置已被删除");
       return;
     }
-    // 已经在标签里开着的 tmux 会话：直接切过去，不要再 attach 一次。
-    // 理由：同一个 tmux 会话被两个客户端 attach 时，tmux 会把窗口尺寸
-    // 迁就最小的那个客户端，两边会互相挤（就是我们之前遇到的"显示不全"）。
-    if (h.tmuxSession) {
-      const opened = sessions.find(
-        (s) => s.profileId === h.profileId && s.tmuxName === h.tmuxSession,
-      );
-      if (opened) {
-        setActiveId(opened.id);
-        notify(`「${h.title?.trim() || h.tmuxSession}」已经开着了，已帮你切过去`);
-        return;
-      }
+    // 已经在标签里开着的：直接切过去，不要再开一个。
+    // - tmux：同一个会话被两个客户端 attach 会互相挤窗口尺寸（"显示不全"那次的根因）；
+    // - 普通 shell：一台机器开一排一模一样的"普通 shell"纯属重复，切过去就够了
+    //   （真要再开一个，用「新建会话」按钮或服务器右键）。
+    const opened = sessions.find((s) =>
+      h.tmuxSession
+        ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
+        : s.profileId === h.profileId && !s.tmuxName,
+    );
+    if (opened) {
+      setActiveId(opened.id);
+      notify(`「${h.title?.trim() || h.tmuxSession || "普通 shell"}」已经开着了，已帮你切过去`);
+      return;
     }
     const custom = h.title?.trim() || undefined;
     if (h.tmuxSession) {
@@ -4072,13 +4073,17 @@ export default function App() {
                           {expanded &&
                             items.map((h) => {
                               // tmux 会话能精确判断"是不是已经在标签里开着"
-                              const opened = h.tmuxSession
-                                ? sessions.find(
-                                    (s) =>
-                                      s.profileId === h.profileId &&
-                                      s.tmuxName === h.tmuxSession,
-                                  )
-                                : undefined;
+                              // 已打开的判定：tmux 按 tmux 会话名比；普通 shell 按"这台机器 + 没有 tmux 名"比
+                              // （以前只认 tmux，所以普通 shell 的灯永远不亮、点一下还会再开一个）
+                              const opened = sessions.find((s) =>
+                                h.tmuxSession
+                                  ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
+                                  : s.profileId === h.profileId && !s.tmuxName,
+                              );
+                              const rowLabel =
+                                h.title?.trim() ||
+                                h.tmuxSession ||
+                                `${h.profileName || "服务器"} · 普通 shell`;
                               return (
                                 <div
                                   key={h.id}
@@ -4096,7 +4101,7 @@ export default function App() {
                                   />
                                   <IconTerminal size={13} />
                                   <span className="grow ellipsis">
-                                    {h.title?.trim() || h.tmuxSession || "普通 shell"}
+                                    {rowLabel}
                                   </span>
                                   {opened && <span className="tag">已打开</span>}
                                   <span className="dim">{relTime(h.lastUsed)}</span>
@@ -5776,10 +5781,19 @@ export default function App() {
       )}
 
       {serialDialog && (
-        <div className="modal-backdrop" onClick={() => setSerialDialog(null)}>
+        <div className="modal-backdrop">
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               {serialDialog.isNew ? "新建串口连接" : "编辑串口连接"}
+              <button
+                type="button"
+                className="mini-x"
+                style={{ float: "right", opacity: 1 }}
+                title="关闭"
+                onClick={() => setSerialDialog(null)}
+              >
+                ✕
+              </button>
             </div>
             <div className="modal-body">
               <label className="modal-field">
@@ -6451,10 +6465,19 @@ export default function App() {
       )}
 
       {editDialog && (
-        <div className="modal-backdrop" onClick={() => setEditDialog(null)}>
+        <div className="modal-backdrop">
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               {editDialog.isNew ? "新建服务器" : "编辑服务器"}
+              <button
+                type="button"
+                className="mini-x"
+                style={{ float: "right", opacity: 1 }}
+                title="关闭"
+                onClick={() => setEditDialog(null)}
+              >
+                ✕
+              </button>
             </div>
             <div className="modal-body">
               <label className="modal-field">
@@ -7065,9 +7088,21 @@ export default function App() {
       )}
 
       {newDialog && (
-        <div className="modal-backdrop" onClick={() => setNewDialog(null)}>
+        <div className="modal-backdrop">
+          {/* 输入型对话框：点外面不关（填了一半被手滑点掉很难受），只认右上角 ✕ / 取消 */}
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">新建会话</div>
+            <div className="modal-head">
+              新建会话
+              <button
+                type="button"
+                className="mini-x"
+                style={{ float: "right", opacity: 1 }}
+                title="关闭"
+                onClick={() => setNewDialog(null)}
+              >
+                ✕
+              </button>
+            </div>
             <div className="modal-body">
               <label className="modal-field">
                 服务器
