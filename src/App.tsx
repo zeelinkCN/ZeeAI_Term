@@ -3741,9 +3741,7 @@ export default function App() {
                   </button>
                 </div>
                 {grouped.length === 0 && (
-                  <div className="hint">
-                    还没有服务器。点上面的「新建」，或者新建会话时直接加一台。
-                  </div>
+                  <div className="hint">还没有服务器</div>
                 )}
                 {sshProfiles.length > 0 && (
                   <button type="button" className="side-allbtn" onClick={() => toggleAllServers()}>
@@ -3929,11 +3927,7 @@ export default function App() {
                 )}
 
                 {grouped.length === 0 && !showForm && (
-                  <div className="hint">
-                    还没有连接。点「新建连接」添加一台服务器，
-                    <br />
-                    认证使用你本机已配置的 SSH 密钥。
-                  </div>
+                  <div className="hint">还没有连接</div>
                 )}
 
                 {tmuxTarget && (
@@ -3959,7 +3953,7 @@ export default function App() {
                     </div>
                     {tmuxLoading && <div className="hint">正在读取…</div>}
                     {!tmuxLoading && tmuxSessions.length === 0 && (
-                      <div className="hint">没有 tmux 会话（或服务器未安装 tmux）。</div>
+                      <div className="hint">没有 tmux 会话</div>
                     )}
                     {tmuxSessions.map((s) => (
                       <div key={s.name} className="tmux-row">
@@ -3992,11 +3986,7 @@ export default function App() {
             {module === "remote" && sideTab === "files" && (
               <>
                 {!fileProfile && (
-                  <div className="hint">
-                    先打开一个 SSH 会话。
-                    <br />
-                    「文件」窗格会跟随当前会话所在服务器的目录。
-                  </div>
+                  <div className="hint">先打开一个 SSH 会话</div>
                 )}
                 {fileProfile && (
                   <>
@@ -4139,7 +4129,7 @@ export default function App() {
                         </div>
                       ))}
                       {!fsLoading && fsEntries.length === 0 && (
-                        <div className="hint">目录为空，或没有读取权限。</div>
+                        <div className="hint">空目录</div>
                       )}
                     </div>
                   </>
@@ -4198,13 +4188,8 @@ export default function App() {
                   </button>
                 </div>
                 <div className="tree-group">Git 工作空间</div>
-                <div className="hint" style={{ paddingTop: 0 }}>
-                  在某个仓库目录下起一个本地终端，可以直接敲 git 命令。
-                </div>
                 {gitWorkspaces.length === 0 && (
-                  <div className="hint">
-                    还没有工作空间。点「＋ 打开本地仓库」选一个已有仓库，或用「新建仓库」git init 一个。
-                  </div>
+                  <div className="hint">还没有工作空间</div>
                 )}
                 {gitWorkspaces.map((p) => (
                   <div
@@ -4476,9 +4461,7 @@ export default function App() {
                   </>
                 )}
                 {!gitLoading && !gitState && (
-                  <div className="hint">
-                    填一个本地仓库路径（本机需安装 Git），回车或点「刷新状态」查看分支与改动。
-                  </div>
+                  <div className="hint">填一个本地仓库路径</div>
                 )}
               </>
             )}
@@ -4493,17 +4476,9 @@ export default function App() {
                     <IconPlus size={14} /> 新建串口连接
                   </button>
                 </div>
-                <div className="hint" style={{ paddingTop: 0 }}>
-                  这里只列你**自己建过**的串口连接。系统里那些蓝牙 / 虚拟串口不会出现在这里，
-                  免得点错——要用哪些口，你自己加。
-                </div>
                 {serialLoading && <div className="hint">正在检测串口…</div>}
                 {!serialLoading && serialProfiles.length === 0 && (
-                  <div className="hint">
-                    还没有串口连接。
-                    <br />
-                    点上面「＋ 新建串口连接」，选好端口和波特率，保存后就会出现在这里。
-                  </div>
+                  <div className="hint">还没有串口连接</div>
                 )}
                 {serialProfiles.map((p) => {
                   const cfg = p.serial;
@@ -4545,17 +4520,13 @@ export default function App() {
                 </div>
                 <div className="hint">
                   {adbVer
-                    ? `adb 已就绪：${adbVer}`
+                    ? "adb 已就绪"
                     : adbLoading
                       ? "正在检测 adb…"
-                      : "未检测到 adb（应内置在应用里）"}
+                      : "未检测到 adb"}
                 </div>
                 {!adbLoading && adbList.length === 0 && adbVer !== "" && (
-                  <div className="hint">
-                    没有已连接的 Android 设备。
-                    <br />
-                    用 USB 连接手机并打开「USB 调试」后再刷新。
-                  </div>
+                  <div className="hint">没有已连接的设备</div>
                 )}
                 {adbList.map((d) => (
                   <div
@@ -4594,12 +4565,10 @@ export default function App() {
                 ))}
                 <div className="tree-group">Fastboot（bootloader 模式）</div>
                 <div className="hint">
-                  {fbVer ? `fastboot 已就绪：${fbVer}` : "未检测到 fastboot"}
+                  {fbVer ? "fastboot 已就绪" : "未检测到 fastboot"}
                 </div>
                 {fbList.length === 0 && (
-                  <div className="hint">
-                    没有 fastboot 设备。手机进 bootloader（`adb reboot bootloader`）后点「刷新设备」。
-                  </div>
+                  <div className="hint">没有 fastboot 设备</div>
                 )}
                 {fbList.map((d) => (
                   <div key={d.serial} className="tree-item" title={`${d.serial} · ${d.state}`}>
@@ -4946,11 +4915,8 @@ export default function App() {
               </button>
             </div>
             {boardTasks.length === 0 ? (
-              <div className="hint" style={{ padding: "2px 12px 10px" }}>
-                没扫到正在跑的 AI。点下面工具里的「在终端启动」之后再回来，这里会列出
-                环境 / 服务器 / 命令 / 运行中·已结束 / 耗时。
-                <br />
-                WSL 里的进程会进 WSL 里面查；CMD 没有脚本钩子，只显示状态。
+              <div className="hint" style={{ padding: "2px 12px 8px" }}>
+                暂无运行中的 AI
               </div>
             ) : (
               <div className="ai-board">
@@ -4959,6 +4925,8 @@ export default function App() {
                   const snapIndex = boardTasks.findIndex((x) => x.state === "running");
                   const snap = i === snapIndex ? aiSnapshot : null;
                   const state = snap?.state ?? t.state;
+                  // 进程还活着但这一轮说完了 ≠ 任务结束 —— 分开说，别让看板自相矛盾
+                  const processAlive = t.state === "running";
                   const label =
                     state === "needs-approval"
                       ? "等你批准"
@@ -4966,7 +4934,9 @@ export default function App() {
                         ? "等你回话"
                         : state === "running"
                           ? "运行中"
-                          : "已结束";
+                          : processAlive
+                            ? "这一轮完成"
+                            : "已结束";
                   const project = dirBase(t.cwd || snap?.cwd || "");
                   const usage = snap?.usage;
                   const pct =
@@ -4989,8 +4959,11 @@ export default function App() {
                       </div>
                       {snap && usage ? (
                         <div className="ai-task-meta">
-                          token {tokenM(usage.total)} · 上下文 {pct}% · 上一轮{" "}
-                          {aiDurationText(snap.lastTurnDurationMs)}
+                          token {tokenM(usage.total)}
+                          {pct >= 1 ? ` · 上下文 ${pct}%` : ""}
+                          {snap.lastTurnDurationMs > 0
+                            ? ` · 上一轮 ${aiDurationText(snap.lastTurnDurationMs)}`
+                            : ""}
                         </div>
                       ) : null}
                       {snap?.lastAction ? (
@@ -5050,18 +5023,12 @@ export default function App() {
 
             {!activeSession?.profileId && (
               <div className="hint" style={{ padding: "10px 12px" }}>
-                AI 面板是跟着**当前会话所在的服务器**走的。
-                <br />
-                先打开一个 SSH 会话，再回来这里探测 / 安装 / 启动。
+                先打开一个 SSH 会话
               </div>
             )}
 
             {activeSession?.profileId && (
               <>
-                <div className="hint" style={{ padding: "8px 12px 4px" }}>
-                  npm：{aiState?.npm ? aiState.npm : "未检测到（装 Node.js 才能装 Codex/Claude/Gemini）"}
-                  {aiState?.running.length ? `　运行中：${aiState.running.join(", ")}` : ""}
-                </div>
                 {/* 已安装/未安装这类"工具清单"放上面太占地方，折叠起来（看板才是主角） */}
                 <button
                   type="button"
@@ -5117,11 +5084,6 @@ export default function App() {
                     正在探测这台服务器…
                   </div>
                 )}
-                <div className="hint" style={{ padding: "10px 12px" }}>
-                  这些按钮只是**把命令敲进当前终端**，装/跑的过程你自己看得见。
-                  <br />
-                  AI 跑完（进程退出）我会在这里给你一条消息通知。
-                </div>
               </>
             )}
           </aside>
@@ -5391,7 +5353,7 @@ export default function App() {
               </div>
               {adbLoading && <div className="hint">正在读取设备目录…</div>}
               {!adbLoading && adbFiles.length === 0 && (
-                <div className="hint">这个目录是空的（或者没有读取权限，试试 /sdcard）。</div>
+                <div className="hint">空目录</div>
               )}
               {adbFiles.map((f) => (
                 <div
@@ -5686,7 +5648,7 @@ export default function App() {
               </div>
 
               <div className="hint" style={{ padding: "0 14px" }}>
-                这些参数是**这条连接自己的**，不会影响别的串口。
+                这些参数只影响这条连接
               </div>
             </div>
             <div className="modal-actions">
