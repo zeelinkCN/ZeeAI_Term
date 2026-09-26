@@ -360,7 +360,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   highlightRules: [],
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
-  aiNotifyCorner: false,
+  aiNotifyBadge: true,
 };
 
 const APP_VERSION = "0.1.6";
@@ -949,11 +949,34 @@ export default function App() {
         snap.cwd,
         startedAt,
       );
-      setAiArtifacts(list);
+      // 只有"当前会话"的产物才铺到看板卡片上（后台会话只是用来提醒）
+      if (cur.id === activeId) setAiArtifacts(list);
       return list;
     } catch {
       setAiArtifacts([]);
       return [];
+    }
+  }
+
+  /**
+   * 顺带盯一下**其它开着的会话**（30 秒一次）。
+   * 这样你切到 ADB / CMD / 别的服务器上干活时，一样能收到"那个 AI 已经干完了"的提示。
+   */
+  async function refreshOtherSnapshots() {
+    for (const s of sessionsRef.current) {
+      if (s.id === activeId) continue;
+      if (s.kind === "cmd" || s.kind === "serial" || s.kind === "adb") continue;
+      try {
+        const snap = await aiSessionSnapshot(
+          s.profileId ?? null,
+          s.user ?? null,
+          s.kind === "remote" ? null : s.kind,
+          null,
+        );
+        if (snap) await considerSnapshot(s, snap);
+      } catch {
+        // 单个会话读不到（没跑过 Codex / 网络抖动）不影响其它
+      }
     }
   }
 
@@ -1080,7 +1103,11 @@ export default function App() {
   useEffect(() => {
     void refreshSnapshot();
     const t = window.setInterval(() => void refreshSnapshot(), 10000);
-    return () => window.clearInterval(t);
+    const t2 = window.setInterval(() => void refreshOtherSnapshots(), 30000);
+    return () => {
+      window.clearInterval(t);
+      window.clearInterval(t2);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
@@ -3789,8 +3816,10 @@ export default function App() {
               onClick={() => setAiPanelOpen((v) => !v)}
             >
               <IconSpark size={22} />
-              {/* 有"要你处理/新消息"没看过时点个红点（通知分级里的最基础一档） */}
-              {aiUnread > 0 && <span className="act-dot" />}
+              {/* 有"要你处理/新消息"没看过时显示数字（设置里可关） */}
+              {settings.aiNotifyBadge && aiUnread > 0 && (
+                <span className="act-badge">{aiUnread > 9 ? "9+" : aiUnread}</span>
+              )}
             </button>
             <button
               type="button"
@@ -5232,6 +5261,22 @@ export default function App() {
           </span>
         )}
         {activeFile && <span className="stat">{activeFile.path}</span>}
+        {/* AI 干完活了：状态栏上闪一条，点一下直接切过去（哪个模块下都看得到） */}
+        {aiAlerts.length > 0 && (
+          <button
+            type="button"
+            className="stat ai-status-chip"
+            title={aiAlerts.map((a) => a.text).join("\n")}
+            onClick={() => {
+              const a = aiAlerts[0];
+              setAiUnread(0);
+              if (a.sessionId) setActiveId(a.sessionId);
+              setAiAlerts((prev) => prev.slice(1));
+            }}
+          >
+            {aiAlerts.length > 1 ? `AI 完成 ${aiAlerts.length} 项 ⟶` : "AI 已完成，点这里切过去 ⟶"}
+          </button>
+        )}
         {isAdminMode && (
           <span
             className="stat admin"
@@ -5243,42 +5288,6 @@ export default function App() {
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
       </div>
-
-      {/* 右下角提示（可选，默认关）：AI 需要你处理时才出现，点一下跳到那个会话 */}
-      {settings.aiNotifyCorner && aiAlerts.length > 0 && (
-        <div className="transfer-dock ai-alert-dock">
-          <div className="transfer-head">
-            <span>AI 需要你处理（{aiAlerts.length}）</span>
-            <button
-              type="button"
-              className="mini-x"
-              style={{ opacity: 1 }}
-              title="清空"
-              onClick={() => setAiAlerts([])}
-            >
-              ✕
-            </button>
-          </div>
-          {aiAlerts.map((a) => (
-            <button
-              key={a.id}
-              type="button"
-              className="ai-alert"
-              title={a.text}
-              onClick={() => {
-                setAiPanelOpen(true);
-                setAiUnread(0);
-                if (a.sessionId) setActiveId(a.sessionId);
-                setAiAlerts((prev) => prev.filter((x) => x.id !== a.id));
-              }}
-            >
-              <span className="dot ok" />
-              <span className="grow ellipsis">{a.text}</span>
-              <span className="dim">{clockText(Math.floor(a.time / 1000))}</span>
-            </button>
-          ))}
-        </div>
-      )}
 
       {transfers.length > 0 && (
         <div className="transfer-dock">
@@ -6629,10 +6638,10 @@ export default function App() {
               <label className="form-check">
                 <input
                   type="checkbox"
-                  checked={settings.aiNotifyCorner}
-                  onChange={(e) => void updateSettings({ aiNotifyCorner: e.target.checked })}
+                  checked={settings.aiNotifyBadge}
+                  onChange={(e) => void updateSettings({ aiNotifyBadge: e.target.checked })}
                 />
-                <span>在右下角显示一条提示（点一下跳回那个会话）</span>
+                <span>在左侧活动栏的 AI 星号上显示红点/数字</span>
               </label>
               <label className="form-check">
                 <input

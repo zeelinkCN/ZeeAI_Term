@@ -235,8 +235,8 @@ export interface AppSettings {
   highlightRules: HighlightRule[];
   /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
   aiNotifyTaskbar: boolean;
-  /** AI 有需要你处理的事情时，在右下角显示一条提示 */
-  aiNotifyCorner: boolean;
+  /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */
+  aiNotifyBadge: boolean;
 }
 
 export interface GitFile {

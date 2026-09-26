@@ -196,8 +196,8 @@ pub struct Settings {
     pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
     /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
     pub ai_notify_taskbar: bool,
-    /// AI 有新消息/要你处理时，是否在右下角显示一条提示
-    pub ai_notify_corner: bool,
+    /// 是否在左侧活动栏的 AI 星号上显示红点/数字
+    pub ai_notify_badge: bool,
 }
 
 impl Default for Settings {
@@ -226,7 +226,7 @@ impl Default for Settings {
             highlight_rules: crate::core::highlight::presets(),
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
-            ai_notify_corner: false,
+            ai_notify_badge: true,
         }
     }
 }
