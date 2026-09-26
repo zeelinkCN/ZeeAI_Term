@@ -627,6 +627,9 @@ export default function App() {
   const [tmuxLoading, setTmuxLoading] = useState(false);
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  /** 供异步流程读最新历史（自动编号要数"这台机器已有几个普通 shell"） */
+  const historyRef = useRef<HistoryEntry[]>(history);
+  historyRef.current = history;
   const [newDialog, setNewDialog] = useState<{
     profileId: string;
     useTmux: boolean;
@@ -771,6 +774,15 @@ export default function App() {
   const [sessionRename, setSessionRename] = useState<{ id: string; value: string } | null>(null);
   /** 正在被拖动的标签（用来实现左右拖动排序） */
   const [dragTabId, setDragTabId] = useState<string | null>(null);
+  /** 侧栏宽度（可拖动调整，存 localStorage，下次打开还是你调好的宽度） */
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const v = Number(localStorage.getItem("zeeai.sidebarWidth"));
+    return v >= 180 && v <= 620 ? v : 240;
+  });
+  // 拖动结束后把宽度记下来（下次打开还是你调好的宽度）
+  useEffect(() => {
+    localStorage.setItem("zeeai.sidebarWidth", String(sidebarWidth));
+  }, [sidebarWidth]);
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
   fsPathRef.current = fsPath;
@@ -1901,9 +1913,17 @@ export default function App() {
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
+    // 普通 shell 自动编号：不管是走"新建会话"对话框，还是从服务器右键 / 图标直接开，
+    // 名字都不能重复 —— 否则历史记录按名字去重时会互相覆盖（表现为"开了好几个只看到一行"）
+    const plainTitle = () => {
+      const used = historyRef.current.filter(
+        (h) => h.profileId === profile.id && !h.tmuxSession,
+      ).length;
+      return `${profile.name} · 普通 shell ${used + 1}`;
+    };
     const title =
       titleOverride?.trim() ||
-      (explicitName ? `${profile.name} · ${explicitName}` : profile.name);
+      (explicitName ? `${profile.name} · ${explicitName}` : plainTitle());
     addSession({
       id,
       title,
@@ -2006,6 +2026,28 @@ export default function App() {
       return next;
     });
   }
+
+  /**
+   * 标签拖动排序（自己实现，不用 HTML5 拖拽 —— 那套在 WebView2 里对 button 不生效）：
+   * 按住标签往左右挪，鼠标经过别的标签时**实时让它俩换位**，松手就停。
+   * 效果上就是"拖着排"，而且所见即所得。
+   */
+  useEffect(() => {
+    if (!dragTabId) return;
+    const onMove = (e: MouseEvent) => {
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const over = el?.closest("[data-tab-id]")?.getAttribute("data-tab-id") ?? "";
+      if (over && over !== dragTabId) moveTab(dragTabId, over);
+    };
+    const onUp = () => setDragTabId(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragTabId]);
 
   async function closeSessions(list: OpenSession[], what: string) {
     if (list.length === 0) {
@@ -4002,7 +4044,29 @@ export default function App() {
           </div>
         </nav>
 
-      <aside className="sidebar" style={{ display: showSidebar ? undefined : "none" }}>
+      <aside
+        className="sidebar"
+        style={{ display: showSidebar ? undefined : "none", width: sidebarWidth }}
+      >
+        {/* 侧栏右边缘的拖动条：按住左右拖可以调宽度 */}
+        <div
+          className="sidebar-resizer"
+          title="左右拖动调整侧栏宽度"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startW = sidebarWidth;
+            const onMove = (ev: MouseEvent) =>
+              setSidebarWidth(Math.min(620, Math.max(180, startW + ev.clientX - startX)));
+            const onUp = () => {
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+        />
+        {/* 右边缘可以左右拖，调侧栏宽度（名字长的时候很有用） */}
           <div className="side-head">{MODULE_LABEL[module]}</div>
 
           {module === "remote" && (
@@ -4140,12 +4204,17 @@ export default function App() {
                                     className={"open-dot" + (opened ? " on" : "")}
                                     title={opened ? "已打开" : "未打开"}
                                   />
+                                  {/* 最前面标一下是不是 tmux 会话（用户要的"小 T 字图标"） */}
+                                  {h.tmuxSession && (
+                                    <span className="tmux-mark" title="tmux 会话（服务器上会一直活着）">
+                                      T
+                                    </span>
+                                  )}
                                   <IconTerminal size={13} />
-                                  <span className="grow ellipsis">
+                                  <span className="grow ellipsis" title={rowLabel}>
                                     {rowLabel}
                                   </span>
                                   {opened && <span className="tag">已打开</span>}
-                                  <span className="dim">{relTime(h.lastUsed)}</span>
                                   <button
                                     type="button"
                                     className="mini-x"
@@ -5009,26 +5078,12 @@ export default function App() {
                 }
                 // 左右拖动排序：把一个标签拖到另一个上面，就插到它前面/后面
                 draggable
-                onDragStart={(e) => {
-                  setDragTabId(s.id);
-                  e.dataTransfer.effectAllowed = "move";
-                  try {
-                    e.dataTransfer.setData("text/plain", s.id);
-                  } catch {
-                    /* 某些环境不允许设置数据，忽略即可 */
-                  }
+                data-tab-id={s.id}
+                // 注意：HTML5 的 draggable 在 WebView2 里对 <button> 不生效，
+                // 所以这里自己用鼠标事件做拖动（见下面那个全局 mousemove 的 effect）
+                onMouseDown={(e) => {
+                  if (e.button === 0) setDragTabId(s.id);
                 }}
-                onDragOver={(e) => {
-                  if (!dragTabId || dragTabId === s.id) return;
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = "move";
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  moveTab(dragTabId ?? e.dataTransfer.getData("text/plain"), s.id);
-                  setDragTabId(null);
-                }}
-                onDragEnd={() => setDragTabId(null)}
                 onClick={() => setActiveId(s.id)}
                 onContextMenu={(e) => {
                   e.preventDefault();

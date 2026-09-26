@@ -450,6 +450,8 @@ body {
   border-right: 1px solid var(--border);
   flex: none;
   min-height: 0;
+  /* 侧栏右边缘有个拖动条，需要相对定位 */
+  position: relative;
 }
 
 .side-head {
@@ -1237,6 +1239,35 @@ body {
 
 /* 状态栏上的「AI 已完成」提示：闪一下 + 强调色，点一下切到那个会话 */
 /* 标签拖动排序：拖起来时半透明 + 抓手光标 */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.sidebar-resizer:hover {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+/* tmux 小标记：最前面一个 T，一眼看出这个会话在服务器上是持久的 */
+.tmux-mark {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  line-height: 15px;
+  text-align: center;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
 .session-tab {
   cursor: grab;
 }
