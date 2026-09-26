@@ -12,6 +12,34 @@
 
 ## 第十轮更新 · 队列清空（③④⑤⑥）+ 分屏 + AI Agent 面板
 
+### 发版与推送通道：固定优先 SSH-443（2026-09-26，用户确认）
+
+**背景**：这台机器上 `github.com:443` 的 HTTPS git 通道极不稳定 —— 连续 15 次 `git push`
+全部 `Recv failure: Connection was reset` / `Could not connect`（而同一时间 `api.github.com`
+完全正常）。`ssh.github.com:443`（GitHub 官方的 SSH-over-443 入口）实测稳定、一次成功。
+
+**结论（用户拍板）**：以后推送**优先走 SSH-443**。仓库里的配置是：
+
+```
+origin  https://github.com/zeelinkCN/ZeeAI_Term.git          (fetch)   ← 拉代码保持原样
+origin  ssh://git@ssh.github.com:443/zeelinkCN/ZeeAI_Term.git (push)    ← 只有推送走这条
+```
+
+也就是 `git remote set-url --push origin ssh://git@ssh.github.com:443/zeelinkCN/ZeeAI_Term.git`，
+**fetch 地址不动**。认证用本机已有的 `~/.ssh/id_ed25519`（GitHub 上已登记）。
+
+**发版清单**（脚本：`scripts/publish-release.ps1`，需要 `$env:GH_TOKEN`）：
+
+1. 核对四个版本号一致：`src-tauri/tauri.conf.json`、`package.json`、
+   `src-tauri/Cargo.toml`、`src/App.tsx` 的 `APP_VERSION`；
+2. `npm run tauri build` 出 NSIS + MSI；便携版 zip 由打包脚本产出；
+3. `git push origin main` 和 `git push origin vX.Y.Z`（自动走 SSH-443）；
+4. `gh release create`（走 `api.github.com`，附件上传走 `uploads.github.com`，这条线可用）；
+5. 复核 `releases/latest` 指向刚发的版本。
+
+**注意**：`gh` 的 Release 相关操作走 API，不受 `github.com:443` 抽风影响，所以**不需要**为它做兜底；
+只有 `git push` 需要走 SSH-443。
+
 ### 第十一轮补 · 三条界面反馈（2026-09-26）
 
 1. **彻底去掉中央浮层**：以前"出错"会弹一个红色浮层（挡住终端）。
