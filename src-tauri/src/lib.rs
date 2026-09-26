@@ -136,31 +136,30 @@ pub fn run() {
                 Ok(list) => log::info!("SELFTEST: serial_list ok -> {} ports", list.len()),
                 Err(e) => log::error!("SELFTEST: serial_list failed -> {e}"),
               }
-              // 真机串口验证：ZEEAI_SELFTEST_SERIAL=COM5 指定端口（默认自动挑一个非蓝牙口），
-              // 打开读 4 秒，看能不能真收到设备发出来的数据。
+              // 真机串口验证：**只有显式设了 ZEEAI_SELFTEST_SERIAL 才探测**。
+              // 默认绝不去碰任何串口 —— 用户机器上的串口可能正被别的项目占用，
+              // 自检悄悄打开它会把别人的程序踢掉（我踩过这个坑）。
               {
                 let wanted = std::env::var("ZEEAI_SELFTEST_SERIAL").unwrap_or_default();
-                let ports = crate::core::serial::list().unwrap_or_default();
-                let pick = if !wanted.trim().is_empty() {
-                  ports.iter().find(|p| p.path.eq_ignore_ascii_case(wanted.trim()))
+                if wanted.trim().is_empty() {
+                  log::info!(
+                    "SELFTEST: serial_probe 跳过（未指定 ZEEAI_SELFTEST_SERIAL，默认不占用任何串口）"
+                  );
                 } else {
-                  ports
-                    .iter()
-                    .find(|p| !p.label.contains("蓝牙"))
-                    .or_else(|| ports.first())
-                };
-                match pick {
-                  Some(p) => match crate::core::serial::probe(&p.path, 115200, 4000) {
-                    Ok((n, preview)) => log::info!(
-                      "SELFTEST: serial_probe {} ({}) ok -> {} bytes | {}",
-                      p.path,
-                      p.label,
-                      n,
-                      preview
-                    ),
-                    Err(e) => log::error!("SELFTEST: serial_probe {} failed -> {e}", p.path),
-                  },
-                  None => log::warn!("SELFTEST: no serial port to probe"),
+                  let ports = crate::core::serial::list().unwrap_or_default();
+                  match ports.iter().find(|p| p.path.eq_ignore_ascii_case(wanted.trim())) {
+                    Some(p) => match crate::core::serial::probe(&p.path, 115200, 4000) {
+                      Ok((n, preview)) => log::info!(
+                        "SELFTEST: serial_probe {} ({}) ok -> {} bytes | {}",
+                        p.path,
+                        p.label,
+                        n,
+                        preview
+                      ),
+                      Err(e) => log::error!("SELFTEST: serial_probe {} failed -> {e}", p.path),
+                    },
+                    None => log::warn!("SELFTEST: serial port {} not found", wanted.trim()),
+                  }
                 }
               }
               // M3 文件传输链路：新建目录 → 上传 → 列目录 → 下载回来比对 → 改名 → 删除

@@ -888,38 +888,9 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 12000));
         setModule("serial");
         await new Promise((r) => setTimeout(r, 14000));
-        // 接上一块真实开发板（比如 ESP32）时，把串口日志也开一个终端，
-        // 截图里就能看到真实设备输出的启动日志。
-        const sp =
-          serialPortsRef.current.find((p) => /usb|ch3|cp21|ftdi|silicon/i.test(p.label)) ??
-          serialPortsRef.current.find((p) => !/蓝牙|bluetooth/i.test(p.label));
-        if (sp) {
-          const demoSerial: ConnectionProfile = {
-            id: uid(),
-            type: "serial",
-            name: `${sp.path} · 115200`,
-            group: "串口",
-            serial: {
-              path: sp.path,
-              baudRate: 115200,
-              dataBits: 8,
-              stopBits: 1,
-              parity: "none",
-              flowControl: "none",
-            },
-          };
-          try {
-            const cur = await listProfiles();
-            if (!cur.some((p) => p.type === "serial" && p.serial?.path === sp.path)) {
-              await saveProfile(demoSerial);
-              await refresh();
-            }
-          } catch {
-            /* 演示用，存不下也继续 */
-          }
-          await openSerialSession(demoSerial);
-          await new Promise((r) => setTimeout(r, 14000));
-        }
+        // 注意：演示**不再自动打开串口终端**。
+        // 用户机器上的串口（比如 COM5）可能正被别的项目占用，自动化脚本去打开它会把人家的程序踢掉。
+        // 串口面板本身的截图仍然保留（列表是只读枚举，不占用端口）。
         // Git 面板 + Git 工作空间（在仓库目录起本地终端）
         setModule("git");
         const repo = "D:\\AI\\ZeeAI_term";
