@@ -5,6 +5,7 @@ import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
+import TermThemeDialog from "./features/TermThemeDialog";
 import { SessionBus } from "./sessionBus";
 import {
   adbDevices,
@@ -66,6 +67,11 @@ import {
   tmuxList,
 } from "./ipc";
 import { b64ToBytes, bytesToB64, uid } from "./util";
+import {
+  CUSTOM_SCHEME_KEY,
+  TERM_SCHEMES,
+  resolveTermPalette,
+} from "./termThemes";
 import type {
   AdbDevice,
   AdbFile,
@@ -200,9 +206,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   restoreWorkspace: true,
   scrollback: 10000,
   autoLog: false,
+  lastUpdateCheck: 0,
+  ignoredUpdateVersion: "",
+  termScheme: "vscode-dark",
+  termSchemeCustom: "",
+  logDir: "",
 };
 
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
@@ -410,6 +421,8 @@ export default function App() {
   const [settingsReady, setSettingsReady] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  // 终端配色对话框（视图菜单 / 设置里都能打开）
+  const [showTermTheme, setShowTermTheme] = useState(false);
   const [showServers, setShowServers] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   // 在「新建会话」弹窗里点「＋ 新建服务器」时，保存后要回到新建会话弹窗
@@ -495,6 +508,9 @@ export default function App() {
   sessionsRef.current = sessions;
   const profilesRef = useRef<ConnectionProfile[]>(profiles);
   profilesRef.current = profiles;
+  // 自动检查更新用的是定时器回调，闭包里的 settings 会过期，所以这里存一份最新的
+  const settingsRef = useRef<AppSettings>(settings);
+  settingsRef.current = settings;
   const serialPortsRef = useRef<SerialPortInfo[]>([]);
   // 远程文件浏览器属于「当前会话」，所以读目录/读文件也要用当前会话实际登录的用户
   const activeUserRef = useRef<string | undefined>(undefined);
@@ -539,6 +555,29 @@ export default function App() {
       }
     })();
   }, []);
+
+  /**
+   * 后台自动检查更新。
+   *
+   * 时机：开机/启动应用时如果距上次检查超过 6 小时就查一次；之后每 30 分钟看一次表，
+   * 仍然要求间隔满 6 小时才真的发请求 —— 也就是「一天最多几次」，不会来回骚扰。
+   */
+  useEffect(() => {
+    if (!settingsReady) return;
+    const MIN_INTERVAL_SECS = 6 * 3600;
+    const due = () =>
+      Date.now() / 1000 - (settingsRef.current.lastUpdateCheck ?? 0) > MIN_INTERVAL_SECS;
+    if (due()) void checkForUpdates({ silent: true });
+    const timer = window.setInterval(
+      () => {
+        if (due()) void checkForUpdates({ silent: true });
+      },
+      30 * 60 * 1000,
+    );
+    return () => window.clearInterval(timer);
+    // 只在"设置读好了"这一刻挂上定时器，之后靠 settingsRef 取最新值
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsReady]);
 
   // ---------- 右侧 AI 面板：探测 / 安装 / 启动 / 完成通知 ----------
   async function refreshAi() {
@@ -634,6 +673,7 @@ export default function App() {
     }
     out.push(
       { label: "打开设置", group: "首选项", run: () => setShowSettings(true) },
+      { label: "终端配色", group: "首选项", run: () => setShowTermTheme(true) },
       { label: "服务器管理", group: "首选项", run: () => setShowServers(true) },
       {
         label: "文件面板：同步到终端目录",
@@ -654,6 +694,14 @@ export default function App() {
       { label: "关闭全部本地终端", group: "终端", run: () => void closeSessions(localTerminals, "本地终端") },
       { label: "关闭全部会话", group: "终端", run: () => void closeSessions(sessions, "会话") },
       { label: "关于 ZeeAI Terminal", group: "帮助", run: () => setShowAbout(true) },
+      {
+        label: "检查更新",
+        group: "帮助",
+        run: () => {
+          setShowAbout(true);
+          void checkForUpdates();
+        },
+      },
     );
     return out;
   }
@@ -2213,14 +2261,24 @@ export default function App() {
     void sessionWrite(activeSession.id, bytesToB64(new TextEncoder().encode("\u000c")));
   }
 
-  async function checkForUpdates() {
-    const url = settings.updateUrl.trim();
+  /**
+   * 检查更新。
+   *
+   * - 手动点按钮（设置 / 关于对话框）→ `silent` 不传，界面会写"正在检查 / 已是最新"；
+   * - 后台自动检查 → `silent: true`：成功不吭声（只在发现新版时亮小红点），
+   *   失败也不吭声（没网是常态，不该拿红色报错烦人）。
+   */
+  async function checkForUpdates(opts?: { silent?: boolean }) {
+    const silent = opts?.silent === true;
+    const url = settingsRef.current.updateUrl.trim();
     if (!url) {
-      setUpdateMsg("请先填写更新源地址（返回 JSON，含 tag_name 或 version 字段）。");
+      if (!silent) setUpdateMsg("请先填写更新源地址（返回 JSON，含 tag_name 或 version 字段）。");
       return;
     }
-    setUpdateBusy(true);
-    setUpdateMsg("正在检查…");
+    if (!silent) {
+      setUpdateBusy(true);
+      setUpdateMsg("正在检查…");
+    }
     setUpdateOffer(null);
     try {
       const res = await fetch(url, { headers: { Accept: "application/json" } });
@@ -2230,10 +2288,17 @@ export default function App() {
         .replace(/^v/i, "")
         .trim();
       if (!latest) throw new Error("返回内容里没有 tag_name / version 字段");
+      // 记录检查时间：自动检查靠它做节流（不要每次开窗都去问 GitHub）
+      const stamp = Math.floor(Date.now() / 1000);
+      if (Math.abs((settingsRef.current.lastUpdateCheck ?? 0) - stamp) > 60) {
+        void updateSettings({ lastUpdateCheck: stamp });
+      }
       if (compareVersion(latest, APP_VERSION) <= 0) {
-        setUpdateMsg(`已是最新版本（${APP_VERSION}）`);
+        if (!silent) setUpdateMsg(`已是最新版本（${APP_VERSION}）`);
         return;
       }
+      // 用户明确说过"这个版本我暂时不升"→ 不再闪小红点（手动检查时仍然显示）
+      if (silent && latest === settingsRef.current.ignoredUpdateVersion) return;
       // 从 release 的 assets 里挑一个最适合当前机器的安装包：
       // 优先 NSIS setup.exe（双击即装），其次 MSI，最后退回 release 页面
       const assets = Array.isArray(data.assets)
@@ -2252,11 +2317,123 @@ export default function App() {
       const pageUrl = String(data.html_url ?? url);
       setUpdateOffer({ version: latest, installerUrl, pageUrl });
       setUpdateMsg(`发现新版本 ${latest}（当前 ${APP_VERSION}）`);
+      if (silent) notify(`发现新版本 ${latest}，在「设置 → 检查更新」里可以一键下载`);
     } catch (e) {
-      setUpdateMsg("检查失败：" + String(e));
+      if (!silent) setUpdateMsg("检查失败：" + String(e));
     } finally {
-      setUpdateBusy(false);
+      if (!silent) setUpdateBusy(false);
     }
+  }
+
+  /** 打开更新相关的外链（走系统浏览器），失败只写底部状态栏 */
+  async function openUpdateLink(url: string, what: string) {
+    try {
+      await openExternalUrl(url);
+    } catch (e) {
+      notify(`打开${what}失败：` + String(e));
+    }
+  }
+
+  /** 设置里显示"当前终端配色"用 */
+  function currentTermSchemeName(): string {
+    if (settings.termScheme === CUSTOM_SCHEME_KEY) return "自定义";
+    return TERM_SCHEMES.find((s) => s.key === settings.termScheme)?.name ?? "VS Code 深色（默认）";
+  }
+
+  /** 选择会话日志目录（空 = 用默认位置） */
+  async function pickLogDir() {
+    const dir = await openLocalDialog({
+      directory: true,
+      title: "选择会话日志保存目录",
+    });
+    if (!dir || Array.isArray(dir)) return;
+    await updateSettings({ logDir: dir });
+    notify("日志目录已改为 " + dir);
+  }
+
+  /** 打开目录（查看已经写下去的日志） */
+  async function openLogDir() {
+    try {
+      const dir = await sessionLogDir();
+      await openInExplorer(dir);
+    } catch (e) {
+      notify("打开日志目录失败：" + String(e));
+    }
+  }
+
+  /** 用户选择「忽略此版本」：记住版本号，之后自动检查不再为它亮小红点 */
+  function ignoreUpdateVersion(version: string) {
+    void updateSettings({ ignoredUpdateVersion: version });
+    setUpdateOffer(null);
+    setUpdateMsg(`已忽略 ${version}，等下一个版本再提醒`);
+  }
+
+  /**
+   * 「检查更新」区块 —— 设置对话框和关于对话框共用同一套 UI，
+   * 免得两个地方行为不一致（这也是上一版"看到新版本却没地方点"的根因）。
+   */
+  function renderUpdateSection() {
+    return (
+      <>
+        <label className="modal-field">
+          更新源（返回 JSON 的地址，含 tag_name 或 version 字段）
+          <input
+            value={settings.updateUrl}
+            placeholder="https://api.github.com/repos/you/zeeai-terminal/releases/latest"
+            onChange={(e) => void updateSettings({ updateUrl: e.target.value })}
+          />
+        </label>
+        <div className="modal-inline-action">
+          <button
+            type="button"
+            className="mini-btn"
+            disabled={updateBusy}
+            onClick={() => void checkForUpdates()}
+          >
+            {updateBusy ? "检查中…" : "检查更新"}
+          </button>
+          <span className="hint" style={{ padding: "0 0 0 8px" }}>
+            当前版本 {APP_VERSION}
+          </span>
+          {updateMsg && <div className="hint">{updateMsg}</div>}
+        </div>
+        {updateOffer && (
+          <>
+            <div className="modal-inline-action" style={{ marginTop: 6 }}>
+              {updateOffer.installerUrl ? (
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => void openUpdateLink(updateOffer.installerUrl, "下载链接")}
+                >
+                  {`立即升级到 ${updateOffer.version}`}
+                </button>
+              ) : (
+                <span className="hint">这个版本没有找到安装包，请打开发布页</span>
+              )}
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => void openUpdateLink(updateOffer.pageUrl, "发布页")}
+              >
+                打开发布页
+              </button>
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => ignoreUpdateVersion(updateOffer.version)}
+              >
+                忽略此版本
+              </button>
+            </div>
+            <div className="hint">
+              点「立即升级」会用浏览器下载安装包，下完双击安装即可覆盖旧版本；配置存在
+              %APPDATA%\ZeeAI-Terminal\，不会丢。
+            </div>
+          </>
+        )}
+      </>
+    );
   }
 
   function buildMenus(): { key: string; label: string; items: MenuItem[] }[] {
@@ -2303,6 +2480,7 @@ export default function App() {
           { sep: false, label: "放大字体", action: () => bumpFont(1) },
           { sep: false, label: "缩小字体", action: () => bumpFont(-1) },
           { sep: false, label: "重置字体", action: () => void updateSettings({ fontSize: 13 }) },
+          { sep: false, label: "终端配色…", action: () => setShowTermTheme(true) },
           { sep: true },
           {
             sep: false,
@@ -2677,6 +2855,12 @@ export default function App() {
     [sessions],
   );
 
+  /** 当前生效的终端配色（视图 → 终端配色 里选的那套） */
+  const termPalette = useMemo(
+    () => resolveTermPalette(settings.termScheme, settings.termSchemeCustom),
+    [settings.termScheme, settings.termSchemeCustom],
+  );
+
   // ---------- 分屏 ----------
   const paneSlots = useMemo(() => {
     const n = paneCount(paneLayout);
@@ -2783,6 +2967,7 @@ export default function App() {
                 onClick={() => setOpenMenu(openMenu === menu.key ? null : menu.key)}
               >
                 {menu.label}
+                {menu.key === "help" && updateOffer && <span className="menu-dot" />}
               </span>
               {openMenu === menu.key && (
                 <div className="menu-drop">
@@ -2852,6 +3037,7 @@ export default function App() {
               onClick={() => setShowSettings(true)}
             >
               <IconGear size={22} />
+              {updateOffer && <span className="act-dot" />}
             </button>
           </div>
         </nav>
@@ -3889,6 +4075,7 @@ export default function App() {
                             fontSize={settings.fontSize}
                             scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
+                            palette={termPalette}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
                           />
@@ -3930,6 +4117,7 @@ export default function App() {
                     fontSize={settings.fontSize}
                     scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
+                    palette={termPalette}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                     onNotice={notify}
                   />
@@ -5323,10 +5511,38 @@ export default function App() {
                   onChange={(e) => void updateSettings({ autoLog: e.target.checked })}
                 />
                 <span>
-                  新建会话时自动记录终端日志（写到 %APPDATA%\ZeeAI-Terminal\logs\sessions；
-                  标签上会出现红点，右键标签可以停止或打开日志）
+                  新建会话时自动记录终端日志（标签上会出现红点，右键标签可以停止或打开日志）
                 </span>
               </label>
+
+              <label className="modal-field">
+                会话日志目录（留空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions）
+                <input
+                  value={settings.logDir}
+                  placeholder="例如 D:\zeeai-logs"
+                  onChange={(e) => void updateSettings({ logDir: e.target.value })}
+                />
+              </label>
+              <div className="modal-inline-action">
+                <button type="button" className="mini-btn" onClick={() => void pickLogDir()}>
+                  选择目录…
+                </button>
+                <button type="button" className="mini-btn" onClick={() => void openLogDir()}>
+                  打开目录
+                </button>
+                {settings.logDir.trim() !== "" && (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    onClick={() => {
+                      void updateSettings({ logDir: "" });
+                      notify("日志目录已恢复为默认位置");
+                    }}
+                  >
+                    恢复默认
+                  </button>
+                )}
+              </div>
 
               <label className="modal-field">
                 默认终端
@@ -5357,6 +5573,15 @@ export default function App() {
                   ))}
                 </select>
               </label>
+
+              <div className="modal-inline-action">
+                <button type="button" className="mini-btn" onClick={() => setShowTermTheme(true)}>
+                  终端配色…
+                </button>
+                <span className="hint" style={{ padding: "0 0 0 8px" }}>
+                  当前：{currentTermSchemeName()}
+                </span>
+              </div>
 
               <label className="form-check">
                 <input
@@ -5412,62 +5637,7 @@ export default function App() {
                 </select>
               </label>
 
-              <label className="modal-field">
-                更新源（返回 JSON 的地址，含 tag_name 或 version 字段）
-                <input
-                  value={settings.updateUrl}
-                  placeholder="https://api.github.com/repos/you/zeeai-terminal/releases/latest"
-                  onChange={(e) => void updateSettings({ updateUrl: e.target.value })}
-                />
-              </label>
-              <div className="modal-inline-action">
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={updateBusy}
-                  onClick={() => void checkForUpdates()}
-                >
-                  {updateBusy ? "检查中…" : "检查更新"}
-                </button>
-                <span className="hint" style={{ padding: "0 0 0 8px" }}>
-                  当前版本 {APP_VERSION}
-                </span>
-                {updateMsg && <div className="hint">{updateMsg}</div>}
-              </div>
-              {updateOffer && (
-                <div className="modal-inline-action" style={{ marginTop: 6 }}>
-                  {updateOffer.installerUrl && (
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      onClick={() => {
-                        void openExternalUrl(updateOffer.installerUrl).catch((e) =>
-                          notify("打开下载链接失败：" + String(e)),
-                        );
-                      }}
-                    >
-                      {`下载 ${updateOffer.version} 安装包`}
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="mini-btn"
-                    onClick={() => {
-                      void openExternalUrl(updateOffer.pageUrl).catch((e) =>
-                        notify("打开发布页失败：" + String(e)),
-                      );
-                    }}
-                  >
-                    打开发布页
-                  </button>
-                </div>
-              )}
-              {updateOffer && (
-                <div className="hint">
-                  安装包会在浏览器里下载，下完双击安装即可覆盖升级；配置存在
-                  %APPDATA%\ZeeAI-Terminal\，不会丢。
-                </div>
-              )}
+              {renderUpdateSection()}
 
               <div className="hint">
                 设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
@@ -5536,13 +5706,15 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.1
+                <b>ZeeAI Terminal</b> 0.1.2
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />
                 <br />
                 技术栈：Tauri 2 + Rust + React + xterm.js
               </div>
+              <div className="about-sep" />
+              {renderUpdateSection()}
             </div>
             <div className="modal-actions">
               <button type="button" className="btn" onClick={() => setShowAbout(false)}>
@@ -5551,6 +5723,22 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {showTermTheme && (
+        <TermThemeDialog
+          palette={termPalette}
+          schemeKey={settings.termScheme}
+          customJson={settings.termSchemeCustom}
+          onPick={(key, custom) =>
+            void updateSettings({
+              termScheme: key,
+              ...(custom !== undefined ? { termSchemeCustom: custom } : {}),
+            })
+          }
+          onClose={() => setShowTermTheme(false)}
+          onNotice={notify}
+        />
       )}
 
       {newDialog && (

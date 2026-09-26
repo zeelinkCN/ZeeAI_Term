@@ -148,6 +148,12 @@ pub fn load_workspace() -> Option<String> {
 
 /// 会话日志目录：%APPDATA%\ZeeAI-Terminal\logs\sessions
 pub fn log_dir() -> PathBuf {
+    // 设置里指定了自定义目录就用它（比如放到 D:\zeeai-logs 或网络盘），
+    // 空字符串 = 用默认位置。
+    let custom = load_settings().log_dir.trim().to_string();
+    if !custom.is_empty() {
+        return PathBuf::from(custom);
+    }
     store_dir().join("logs").join("sessions")
 }
 
@@ -174,6 +180,16 @@ pub struct Settings {
     pub scrollback: u32,
     /// 新建会话时自动开始记录终端日志
     pub auto_log: bool,
+    /// 上次检查更新成功的时间（Unix 秒）；0 表示从没检查过
+    pub last_update_check: u64,
+    /// 用户点了「忽略这个版本」的版本号，避免同一个版本反复闪小红点
+    pub ignored_update_version: String,
+    /// 终端配色方案 key（见前端 src/termThemes.ts）；空 = 跟随旧行为
+    pub term_scheme: String,
+    /// 自定义配色的 JSON（仅 term_scheme = "custom" 时使用）
+    pub term_scheme_custom: String,
+    /// 会话日志目录；空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions
+    pub log_dir: String,
 }
 
 impl Default for Settings {
@@ -191,6 +207,11 @@ impl Default for Settings {
             restore_workspace: true,
             scrollback: 10000,
             auto_log: false,
+            last_update_check: 0,
+            ignored_update_version: String::new(),
+            term_scheme: "vscode-dark".into(),
+            term_scheme_custom: String::new(),
+            log_dir: String::new(),
         }
     }
 }

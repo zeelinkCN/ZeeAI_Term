@@ -112,6 +112,16 @@ export interface AppSettings {
   scrollback: number;
   /** 新建会话时自动开始记录终端日志 */
   autoLog: boolean;
+  /** 上次检查更新成功的时间（Unix 秒）；0 = 从未检查 */
+  lastUpdateCheck: number;
+  /** 用户选择「忽略此版本」的版本号 */
+  ignoredUpdateVersion: string;
+  /** 终端配色方案 key（见 termThemes.ts）；"custom" 表示用下面的自定义配色 */
+  termScheme: string;
+  /** 自定义配色的 JSON */
+  termSchemeCustom: string;
+  /** 会话日志目录；空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions */
+  logDir: string;
 }
 
 export interface GitFile {

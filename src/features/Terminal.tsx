@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
 import { bytesToB64 } from "../util";
 import type { SessionBus } from "../sessionBus";
+import type { TermPalette } from "../termThemes";
 
 interface Props {
   sessionId: string;
@@ -12,6 +13,8 @@ interface Props {
   active: boolean;
   fontSize?: number;
   light?: boolean;
+  /** 终端配色（来自设置里的方案）；不传就按 light 用内置默认 */
+  palette?: TermPalette;
   /** 往上能翻多少行历史（回滚缓冲） */
   scrollback?: number;
   /** shell 通过 OSC 7 上报当前工作目录时回调（非 tmux 会话也能跟踪 cwd） */
@@ -88,6 +91,7 @@ export default function TerminalView({
   active,
   fontSize = 13,
   light = false,
+  palette,
   scrollback = 10000,
   onCwd,
   onNotice,
@@ -112,7 +116,7 @@ export default function TerminalView({
       cursorBlink: true,
       scrollback,
       allowProposedApi: true,
-      theme: light ? LIGHT_THEME : THEME,
+      theme: palette ?? (light ? LIGHT_THEME : THEME),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -202,7 +206,7 @@ export default function TerminalView({
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = fontSize;
-    term.options.theme = light ? LIGHT_THEME : THEME;
+    term.options.theme = palette ?? (light ? LIGHT_THEME : THEME);
     term.options.scrollback = scrollback;
     try {
       fitRef.current?.fit();
@@ -212,7 +216,9 @@ export default function TerminalView({
     if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
       void sessionResize(sessionId, term.cols, term.rows);
     }
-  }, [fontSize, light, scrollback, sessionId]);
+    // palette 每次渲染都是新对象时不该重建终端，所以用它的 JSON 当依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fontSize, light, palette && JSON.stringify(palette), scrollback, sessionId]);
 
   /** 终端右键菜单的动作 */
   async function copySelection() {

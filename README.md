@@ -22,7 +22,7 @@ HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开�
 
 ### 便携版
 
-`portable/ZeeAI_Term-0.1.1-portable.zip`（解压即用，内含内置 platform-tools，
+`portable/ZeeAI_Term-0.1.2-portable.zip`（解压即用，内含内置 platform-tools，
 ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 
 ### 功能现状
@@ -59,6 +59,14 @@ ADB logcat + 设备文件管理（浏览/推送/拉取/删除）、断点续传�
 **分屏**：「视图」菜单可选单窗格 / 左右两分屏 / 上下两分屏 / 三分屏 / 四分屏，
 每个窗格显示一个会话，同一页面同时看多台机器。
 
+**终端配色**：「视图 → 终端配色…」内置 15 套风格（MobaXterm 经典黑底 16 色 / MobaXterm 浅色 /
+CMD 经典 / PowerShell 蓝 / Linux 控制台 / Ubuntu 紫 / VS Code 深浅 / Solarized 深浅 /
+Monokai / Dracula / One Dark / Gruvbox / Tango 浅色），点一下立即生效，不重建会话；
+另有「自定义」：20 个颜色自己调，也支持粘贴 Windows Terminal 的配色 JSON 导入。
+
+**会话日志目录可自定义**：设置里可指定任意目录（本机其它盘或网络盘），
+留空则用默认的 `%APPDATA%\ZeeAI-Terminal\logs\sessions\`。
+
 **AI Agent 面板**：活动栏底部 AI 按钮 → 右侧面板，探测服务器上的
 Codex / Claude Code / Aider / Gemini CLI 是否安装、是否正在运行，支持一键安装与一键启动；
 每 8 秒探测一次进程，进程退出即判断任务结束并弹消息通知。
@@ -87,9 +95,9 @@ SSH 断线自动重连（指数退避，可关）。
 ### 产出物
 
 - 免安装版：`src-tauri/target/release/ZeeAI_Term.exe`
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.1_x64-setup.exe`
-- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.1_x64_en-US.msi`
-- 便携版：`portable/ZeeAI_Term-0.1.1-portable.zip`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.2_x64-setup.exe`
+- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.2_x64_en-US.msi`
+- 便携版：`portable/ZeeAI_Term-0.1.2-portable.zip`
 
 应用名与可执行文件名统一为 **`ZeeAI_Term`**（`productName` / `mainBinaryName`），
 配置仍放在 `%APPDATA%\ZeeAI-Terminal\`（所以改名不会丢你的服务器、历史和日志）。
