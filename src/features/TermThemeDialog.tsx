@@ -179,9 +179,21 @@ export default function TermThemeDialog({
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop">
+      {/* 点外面不关（改配色要来回对照，误点一下窗口就没了） */}
       <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">终端配色</div>
+        <div className="modal-head">
+          终端配色与关键字高亮
+          <button
+            type="button"
+            className="mini-x"
+            style={{ float: "right", opacity: 1 }}
+            title="关闭"
+            onClick={onClose}
+          >
+            ✕
+          </button>
+        </div>
         <div className="modal-body">
           {/* 先选"给谁配"：全局一套，或者按终端分开配（配色 + 高亮规则集一起） */}
           {scopeOptions && scopeOptions.length > 0 && (

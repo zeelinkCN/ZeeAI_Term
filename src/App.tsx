@@ -5081,14 +5081,14 @@ export default function App() {
                             palette={termPaletteFor(
                               settings,
                               profiles.find((p) => p.id === ps.profileId),
-                              ps.kind,
+                              kindOfSession(ps.kind),
                             )}
                             highlightEnabled={settings.highlightEnabled}
                             highlightRules={highlightRulesFor(
                               settings,
                               ps.highlightSetId,
                               profiles.find((p) => p.id === ps.profileId),
-                              ps.kind,
+                              kindOfSession(ps.kind),
                             )}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
@@ -5135,13 +5135,14 @@ export default function App() {
                     palette={termPaletteFor(
                       settings,
                       profiles.find((p) => p.id === s.profileId),
-                      s.kind,
+                      kindOfSession(s.kind),
                     )}
                     highlightEnabled={settings.highlightEnabled}
                     highlightRules={highlightRulesFor(
                       settings,
                       s.highlightSetId,
                       profiles.find((p) => p.id === s.profileId),
+                      kindOfSession(s.kind),
                     )}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                     onNotice={notify}
@@ -6659,9 +6660,21 @@ export default function App() {
       )}
 
       {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+        <div className="modal-backdrop">
+          {/* 点外面**不关**：设置要反复对照着改，误点一下全没了很难受；只认右上角 ✕ / 完成 */}
           <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">设置</div>
+            <div className="modal-head">
+              设置
+              <button
+                type="button"
+                className="mini-x"
+                style={{ float: "right", opacity: 1 }}
+                title="关闭设置"
+                onClick={() => setShowSettings(false)}
+              >
+                ✕
+              </button>
+            </div>
             <div className="settings-split">
               {/* 左边：分类。点一下右边就只显示这一类（像微信设置那样） */}
               <div className="settings-nav">
