@@ -201,7 +201,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoLog: false,
 };
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.1";
 
 /** 各种分屏布局对应几个窗格 */
 function paneCount(layout: "single" | "v2" | "h2" | "v3" | "grid4"): number {
@@ -5458,7 +5458,7 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.0
+                <b>ZeeAI Terminal</b> 0.1.1
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />
