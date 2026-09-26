@@ -1448,6 +1448,30 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     }
 }
 
+/// 用系统默认浏览器打开一个 http/https 链接（用于「检查更新 → 下载新版」）
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("只允许打开 http/https 链接".into());
+    }
+    log::info!("ipc: open_external_url {trimmed}");
+    #[cfg(windows)]
+    {
+        // 用 cmd 的 start 走默认浏览器；空标题参数是为了防止带引号的 URL 被当成窗口标题
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = trimmed;
+        Err("只支持 Windows".into())
+    }
+}
+
 /// 保存工作区快照（退出/变更时由前端调用）
 #[tauri::command]
 pub fn workspace_save(data: String) -> Result<(), String> {

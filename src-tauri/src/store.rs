@@ -122,6 +122,15 @@ fn settings_file() -> PathBuf {
     store_dir().join("settings.json")
 }
 
+/// 读取文本文件并去掉 UTF-8 BOM。
+///
+/// 用户手动编辑过 JSON（旧版记事本、部分编辑器会写 BOM）之后，serde_json 会因为开头的
+/// BOM 直接解析失败 —— 表现就是「设置/服务器列表被悄悄重置成默认值」。统一在这里容错。
+fn read_text(path: &PathBuf) -> std::io::Result<String> {
+    let text = fs::read_to_string(path)?;
+    Ok(text.trim_start_matches('\u{feff}').to_string())
+}
+
 /// 上次退出时的工作区快照（JSON 字符串，前端自己定义结构）
 fn workspace_file() -> PathBuf {
     store_dir().join("workspace.json")
@@ -134,7 +143,7 @@ pub fn save_workspace(data: &str) -> Result<(), String> {
 }
 
 pub fn load_workspace() -> Option<String> {
-    fs::read_to_string(workspace_file()).ok()
+    read_text(&workspace_file()).ok()
 }
 
 /// 会话日志目录：%APPDATA%\ZeeAI-Terminal\logs\sessions
@@ -187,7 +196,7 @@ impl Default for Settings {
 }
 
 pub fn load_settings() -> Settings {
-    let Ok(text) = fs::read_to_string(settings_file()) else {
+    let Ok(text) = read_text(&settings_file()) else {
         return Settings::default();
     };
     let mut s = serde_json::from_str::<Settings>(&text).unwrap_or_default();
@@ -237,7 +246,7 @@ pub fn now_secs() -> u64 {
 
 pub fn load_history() -> Vec<HistoryEntry> {
     let path = history_file();
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Ok(text) = read_text(&path) else {
         return Vec::new();
     };
     if text.trim().is_empty() {
@@ -286,7 +295,7 @@ pub fn load() -> Result<Vec<ConnectionProfile>, String> {
         save(&seeded)?;
         return Ok(seeded);
     }
-    let text = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
+    let text = read_text(&path).map_err(|e| format!("读取配置失败: {e}"))?;
     if text.trim().is_empty() {
         return Ok(vec![]);
     }

@@ -437,3 +437,8 @@ export async function sessionLogDir(): Promise<string> {
 export async function openInExplorer(path: string): Promise<void> {
   return invoke("open_in_explorer", { path });
 }
+
+/** 用系统默认浏览器打开 http/https 链接 */
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke("open_external_url", { url });
+}

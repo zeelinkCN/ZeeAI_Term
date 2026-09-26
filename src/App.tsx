@@ -57,6 +57,7 @@ import {
   sessionLogStatus,
   sessionLogDir,
   openInExplorer,
+  openExternalUrl,
   serialList,
   sessionWrite,
   settingsGet,
@@ -202,6 +203,25 @@ const DEFAULT_SETTINGS: AppSettings = {
 };
 
 const APP_VERSION = "0.1.1";
+
+/** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
+function compareVersion(a: string, b: string): number {
+  const nums = (v: string) =>
+    v
+      .trim()
+      .replace(/^v/i, "")
+      .split(/[.+\-]/)
+      .map((x) => parseInt(x, 10))
+      .filter((n) => Number.isFinite(n));
+  const A = nums(a);
+  const B = nums(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = A[i] ?? 0;
+    const y = B[i] ?? 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
 
 /** 各种分屏布局对应几个窗格 */
 function paneCount(layout: "single" | "v2" | "h2" | "v3" | "grid4"): number {
@@ -412,6 +432,12 @@ export default function App() {
   const aiWasRunning = useRef(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
+  /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
+  const [updateOffer, setUpdateOffer] = useState<{
+    version: string;
+    installerUrl: string;
+    pageUrl: string;
+  } | null>(null);
 
   const [adbList, setAdbList] = useState<AdbDevice[]>([]);
   const [adbVer, setAdbVer] = useState("");
@@ -2195,6 +2221,7 @@ export default function App() {
     }
     setUpdateBusy(true);
     setUpdateMsg("正在检查…");
+    setUpdateOffer(null);
     try {
       const res = await fetch(url, { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2203,11 +2230,28 @@ export default function App() {
         .replace(/^v/i, "")
         .trim();
       if (!latest) throw new Error("返回内容里没有 tag_name / version 字段");
-      setUpdateMsg(
-        latest === APP_VERSION
-          ? `已是最新版本（${APP_VERSION}）`
-          : `发现新版本 ${latest}（当前 ${APP_VERSION}）`,
-      );
+      if (compareVersion(latest, APP_VERSION) <= 0) {
+        setUpdateMsg(`已是最新版本（${APP_VERSION}）`);
+        return;
+      }
+      // 从 release 的 assets 里挑一个最适合当前机器的安装包：
+      // 优先 NSIS setup.exe（双击即装），其次 MSI，最后退回 release 页面
+      const assets = Array.isArray(data.assets)
+        ? (data.assets as { name?: unknown; browser_download_url?: unknown }[])
+        : [];
+      const pick = (test: (n: string) => boolean) =>
+        assets.find((a) => {
+          const n = String(a.name ?? "").toLowerCase();
+          return test(n) && typeof a.browser_download_url === "string";
+        });
+      const asset =
+        pick((n) => n.endsWith(".exe") && n.includes("setup")) ??
+        pick((n) => n.endsWith(".msi")) ??
+        pick((n) => n.endsWith(".exe"));
+      const installerUrl = asset ? String(asset.browser_download_url) : "";
+      const pageUrl = String(data.html_url ?? url);
+      setUpdateOffer({ version: latest, installerUrl, pageUrl });
+      setUpdateMsg(`发现新版本 ${latest}（当前 ${APP_VERSION}）`);
     } catch (e) {
       setUpdateMsg("检查失败：" + String(e));
     } finally {
@@ -5390,6 +5434,40 @@ export default function App() {
                 </span>
                 {updateMsg && <div className="hint">{updateMsg}</div>}
               </div>
+              {updateOffer && (
+                <div className="modal-inline-action" style={{ marginTop: 6 }}>
+                  {updateOffer.installerUrl && (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => {
+                        void openExternalUrl(updateOffer.installerUrl).catch((e) =>
+                          notify("打开下载链接失败：" + String(e)),
+                        );
+                      }}
+                    >
+                      {`下载 ${updateOffer.version} 安装包`}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    onClick={() => {
+                      void openExternalUrl(updateOffer.pageUrl).catch((e) =>
+                        notify("打开发布页失败：" + String(e)),
+                      );
+                    }}
+                  >
+                    打开发布页
+                  </button>
+                </div>
+              )}
+              {updateOffer && (
+                <div className="hint">
+                  安装包会在浏览器里下载，下完双击安装即可覆盖升级；配置存在
+                  %APPDATA%\ZeeAI-Terminal\，不会丢。
+                </div>
+              )}
 
               <div className="hint">
                 设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
