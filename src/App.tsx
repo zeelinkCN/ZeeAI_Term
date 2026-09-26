@@ -626,6 +626,8 @@ export default function App() {
   const [showAbout, setShowAbout] = useState(false);
   // 终端配色对话框（视图菜单 / 设置里都能打开）
   const [showTermTheme, setShowTermTheme] = useState(false);
+  /** 「终端配色」对话框当前在给谁配：global / shell:powershell… / p:<profileId> */
+  const [lookScope, setLookScope] = useState("global");
   // 关键字高亮对话框（视图菜单 / 设置里都能打开）
   const [showHighlight, setShowHighlight] = useState(false);
   const [showServers, setShowServers] = useState(false);
@@ -3714,6 +3716,70 @@ export default function App() {
     () => resolveTermPalette(settings.termScheme, settings.termSchemeCustom),
     [settings.termScheme, settings.termSchemeCustom],
   );
+
+  // ---------- 「终端配色」对话框：先选作用范围，再给这个范围配色 + 绑高亮规则集 ----------
+  const lookScopes = useMemo(
+    () => [
+      { key: "global", label: "全局默认（所有终端）" },
+      { key: "shell:powershell", label: "本地 PowerShell" },
+      { key: "shell:cmd", label: "本地 CMD" },
+      { key: "shell:wsl", label: "本地 WSL" },
+      ...profiles.map((p) => ({
+        key: `p:${p.id}`,
+        label: `${p.type === "serial" ? "串口" : p.type === "local" ? "本地" : "服务器"} · ${p.name}`,
+      })),
+    ],
+    [profiles],
+  );
+  const lookProfile = lookScope.startsWith("p:")
+    ? profiles.find((p) => p.id === lookScope.slice(2))
+    : undefined;
+  const lookShell = lookScope.startsWith("shell:") ? lookScope.slice(6) : "";
+  /** 当前作用范围实际生效的配色（用作对话框里"当前"的显示） */
+  const lookPalette = termPaletteFor(settings, lookProfile, lookShell || undefined);
+  const lookScheme = termSchemeFor(settings, lookProfile, lookShell || undefined);
+
+  /** 给当前作用范围选配色方案（服务器/串口写进 profile，本地 shell 写进设置） */
+  async function setLookScheme(key: string, custom?: string) {
+    if (lookProfile) {
+      try {
+        await saveProfile({
+          ...lookProfile,
+          termScheme: key,
+          termSchemeCustom:
+            custom !== undefined ? custom : (lookProfile.termSchemeCustom ?? settings.termSchemeCustom),
+        });
+        await refresh();
+      } catch (e) {
+        notify("保存这台机器的配色失败：" + String(e));
+      }
+      return;
+    }
+    if (lookShell) {
+      void updateSettings({ termSchemeByShell: { ...settings.termSchemeByShell, [lookShell]: key } });
+      return;
+    }
+    void updateSettings({
+      termScheme: key,
+      ...(custom !== undefined ? { termSchemeCustom: custom } : {}),
+    });
+  }
+
+  /** 给当前作用范围绑高亮规则集 */
+  async function setLookSet(id: string) {
+    if (lookProfile) {
+      try {
+        await saveProfile({ ...lookProfile, highlightSetId: id || null });
+        await refresh();
+      } catch (e) {
+        notify("保存这台机器的高亮规则集失败：" + String(e));
+      }
+      return;
+    }
+    if (lookShell) {
+      void updateSettings({ highlightSetByShell: { ...settings.highlightSetByShell, [lookShell]: id } });
+    }
+  }
 
   // ---------- 分屏 ----------
   const paneSlots = useMemo(() => {
@@ -6895,15 +6961,16 @@ export default function App() {
 
       {showTermTheme && (
         <TermThemeDialog
-          palette={termPalette}
-          schemeKey={settings.termScheme}
-          customJson={settings.termSchemeCustom}
-          onPick={(key, custom) =>
-            void updateSettings({
-              termScheme: key,
-              ...(custom !== undefined ? { termSchemeCustom: custom } : {}),
-            })
-          }
+          palette={lookScope === "global" ? termPalette : lookPalette}
+          schemeKey={lookScheme.key}
+          customJson={lookScheme.custom ?? ""}
+          scopeOptions={lookScopes}
+          scopeKey={lookScope}
+          onScopeChange={setLookScope}
+          setOptions={settings.highlightRuleSets.map((s) => ({ id: s.id, name: s.name || "(未命名)" }))}
+          boundSetId={lookProfile?.highlightSetId ?? (lookShell ? settings.highlightSetByShell[lookShell] ?? "" : "")}
+          onBindSet={lookScope === "global" ? undefined : (id) => void setLookSet(id)}
+          onPick={(key, custom) => void setLookScheme(key, custom)}
           onClose={() => setShowTermTheme(false)}
           onNotice={notify}
         />

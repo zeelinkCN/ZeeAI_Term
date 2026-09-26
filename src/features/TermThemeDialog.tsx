@@ -20,6 +20,14 @@ interface Props {
   onClose: () => void;
   /** 出错信息（走底部状态栏） */
   onNotice: (text: string) => void;
+  /** 作用范围（全局默认 / 本地三类 shell / 每台服务器 / 每个串口） */
+  scopeOptions?: { key: string; label: string }[];
+  scopeKey?: string;
+  onScopeChange?: (key: string) => void;
+  /** 该范围绑定的高亮规则集（只在非全局范围显示这一行） */
+  setOptions?: { id: string; name: string }[];
+  boundSetId?: string;
+  onBindSet?: (id: string) => void;
 }
 
 /** 16 色预览条：一眼看出这套配色长什么样 */
@@ -122,6 +130,12 @@ export default function TermThemeDialog({
   onPick,
   onClose,
   onNotice,
+  scopeOptions,
+  scopeKey,
+  onScopeChange,
+  setOptions,
+  boundSetId,
+  onBindSet,
 }: Props) {
   // 自定义配色：从当前生效值起步（用户改到一半切走也不丢，因为每次都写进 settings）
   const [customDraft, setCustomDraft] = useState<TermPalette>(() =>
@@ -162,6 +176,36 @@ export default function TermThemeDialog({
       <div className="modal wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">终端配色</div>
         <div className="modal-body">
+          {/* 先选"给谁配"：全局一套，或者按终端分开配（配色 + 高亮规则集一起） */}
+          {scopeOptions && scopeOptions.length > 0 && (
+            <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+              <span className="hint" style={{ padding: "0 6px 0 0" }}>
+                作用范围
+              </span>
+              <select value={scopeKey} onChange={(e) => onScopeChange?.(e.target.value)}>
+                {scopeOptions.map((s) => (
+                  <option key={s.key} value={s.key}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+              {onBindSet && (
+                <>
+                  <span className="hint" style={{ padding: "0 6px 0 12px" }}>
+                    关键字高亮
+                  </span>
+                  <select value={boundSetId ?? ""} onChange={(e) => onBindSet(e.target.value)}>
+                    <option value="">跟随默认那套</option>
+                    {(setOptions ?? []).map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </div>
+          )}
           <Preview palette={isCustom ? customDraft : palette} />
 
           <div className="hint" style={{ marginTop: 8 }}>
