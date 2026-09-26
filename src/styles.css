@@ -1198,6 +1198,66 @@ body {
   line-height: 15px;
 }
 
+/* 状态标签：等你批准 / 等你回话 / 运行中 / 已结束 */
+.ai-state {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.ai-state.running {
+  color: var(--green);
+}
+
+.ai-state.idle {
+  color: var(--muted);
+}
+
+.ai-state.needs-approval,
+.ai-state.waiting-user {
+  color: var(--amber);
+}
+
+.ai-state.done {
+  color: var(--muted);
+}
+
+/* 点得动的分区标题（工具清单那段折起来） */
+.ai-section-toggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ai-section-toggle:hover {
+  color: var(--fg);
+}
+
+/* 右下角「AI 需要你处理」提示条（可选，默认关） */
+.ai-alert-dock {
+  bottom: 76px;
+}
+
+.ai-alert {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ai-alert:hover {
+  background: var(--accent-soft);
+}
+
 .mini-btn.primary {
   border-color: var(--accent);
   color: var(--accent);

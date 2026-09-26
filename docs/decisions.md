@@ -968,3 +968,47 @@ cargo run --release --example pty_probe -- 203.0.113.10 root
 
 > 未验证项（如实说明）：提权那条路需要人工点 UAC，自动化环境里没法验；已验证的是编译、
 > 令牌查询能正常返回、以及非管理员路径没有副作用。
+
+### ⑥ 0.1.7（未发版）：AI 面板数据质量 + 通知分级 + 读会话日志
+
+**用户报的两个问题（都成立）**：
+
+1. "我什么时候开了这么多 codex？" —— 看板上那 4 张卡全是**后台服务**：在用户的服务器上实测，
+   那两个用户（root / lz）各自有一对
+   `~/.codex/packages/app-server-daemon/.../bin/codex app-server --managed-daemon` +
+   `codex app-server daemon pid-update-loop`。它们 argv[0] 也叫 `codex`，被旧规则当成"任务"；
+   而且父子两条都留了下来（旧的父子去重要求"同一个 tmux 窗格"，走 ps 扫描时没有窗格信息）。
+2. "字符串太长看不清" —— 卡片第二行直接印完整命令行，后半段全被省略号吃掉。
+
+**改法**：
+
+- `is_background_service()`：参数里含 `app-server` / `--analytics-default-enabled` /
+  `code_mode_host` / `mcp` 的一律不算任务（实测那 4 张卡全部命中）；
+- 父子去重**不再要求同一个窗格**：同工具 + 互为父子 → 只留在跑的那个；
+- 远端脚本新增 `ZCWD|pid|目录`（顺带只对疑似 AI 的进程做 `readlink /proc/<pid>/cwd`），
+  卡片第二行改成 **`用户@主机 · 项目目录`**，完整命令行只放悬停提示；
+- 看板上方只留"正在跑的"，`AI 命令行工具`（安装/启动）整段折叠起来。
+
+**通知改成由会话日志驱动**（`core/ai_sessions.rs`）：
+
+- 启动任务**不再弹通知**（以前 `aiStartTool()` 里无条件弹一条，这就是"每启动一次就打扰一次"）；
+- 主判据是 Codex 的 rollout 日志：`task_complete`（带 `last_agent_message` / `duration_ms`）
+  才算"有新消息"，`*approval_request` / `request_user_input` 算"在等你"，都按轮去重；
+- **你正看着它就不打扰**（窗口在前台 + 正打开那个会话的终端）；
+- 通知分级：**活动栏 AI 图标红点**（始终有）→ 可选**闪 Windows 任务栏**（仅窗口不在前台时，
+  靠 `requestUserAttention`，不加依赖）→ 可选**右下角提示条**（可点，点了跳回该会话）；
+- 进程消失只写一行状态栏（不再当通知）。
+
+**token 用量**：从 `token_count` 读累计/本轮/上下文窗口，界面**以 M（兆）为单位**显示
+（用户明确要求不折算成钱），另给"上下文占用 %"。实测远端某会话累计 6,923,603 → 显示 `6.92M`。
+
+**真机验证（用户授权的测试机，只读命令）**：
+
+- `ps` 原始输出确认那 4 个进程都是 app-server 守护进程 → 新过滤规则能全灭；
+- 远端 `~/.codex/sessions/2026/09/26/rollout-2026-09-26T20-34-50-*.jsonl` 可读，
+  尾巴 400KB 里有 `task_complete` ×2、`token_count` ×3，字段名与本地一致（CLI 0.157.1）。
+
+**仍未验证**：`needs-approval` 这条状态没有真实样本 —— 用户的会话策略是
+`approval_policy = never`，日志里没有 approval 事件。解析器按二进制里查到的
+`exec_approval_request` / `apply_patch_approval_request` / `request_user_input` 事件名做了
+兜底（子串匹配 + 屏幕文案兜底留待下一步），等抓到真实样本再定稿。

@@ -194,6 +194,10 @@ pub struct Settings {
     pub highlight_enabled: bool,
     /// 终端关键字高亮规则（预设见 core::highlight::presets）
     pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
+    /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
+    pub ai_notify_taskbar: bool,
+    /// AI 有新消息/要你处理时，是否在右下角显示一条提示
+    pub ai_notify_corner: bool,
 }
 
 impl Default for Settings {
@@ -220,6 +224,9 @@ impl Default for Settings {
             // 全都是"只给关键词上色"，不影响交互式回显；不想要的在设置里关掉。
             highlight_enabled: true,
             highlight_rules: crate::core::highlight::presets(),
+            // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
+            ai_notify_taskbar: false,
+            ai_notify_corner: false,
         }
     }
 }

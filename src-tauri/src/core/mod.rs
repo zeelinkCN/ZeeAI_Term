@@ -1,5 +1,6 @@
 pub mod adb;
 pub mod ai;
+pub mod ai_sessions;
 pub mod ai_tasks;
 pub mod elevate;
 pub mod git;

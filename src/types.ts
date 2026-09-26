@@ -141,6 +141,8 @@ export interface AiTask {
   tool: string;
   /** 命令行（长了会截断） */
   command: string;
+  /** 进程的工作目录（卡片上显示"项目目录"用）；拿不到是空串 */
+  cwd: string;
   /** tmux 窗格标签（形如 main:0.1）；不是 tmux 会话就是空串 */
   pane: string;
   /** 信号来源：app（App 自己启动的）/ tmux / ps / winproc */
@@ -155,6 +157,41 @@ export interface AiTask {
   startedAt?: number | null;
   /** 退出码；v1 拿不到就是 null */
   exitCode?: number | null;
+}
+
+/** Codex 会话日志里读出来的用量（token 以"个"为单位，界面自己折成 M 显示） */
+export interface AiUsage {
+  input: number;
+  cachedInput: number;
+  output: number;
+  reasoning: number;
+  /** 整个会话累计 */
+  total: number;
+  /** 最近一次请求 */
+  lastTotal: number;
+  /** 模型上下文窗口（算占用百分比用） */
+  contextWindow: number;
+}
+
+/**
+ * 一个 Codex 会话的实时快照（从 `~/.codex/sessions` 的日志里读出来的）。
+ * 比"进程还在不在"准得多：有新消息、在跑还是在等你，都能看出来。
+ */
+export interface AiSessionSnapshot {
+  sessionId: string;
+  cwd: string;
+  /** AI 最近一轮结束时的最后一段话 */
+  lastMessage: string;
+  lastTurnDurationMs: number;
+  lastTurnCompletedAt: number;
+  usage?: AiUsage | null;
+  /** running / idle / needs-approval / waiting-user */
+  state: string;
+  /** 一行"现在在干什么" */
+  lastAction: string;
+  approvalPolicy: string;
+  updatedAt: number;
+  linesSeen: number;
 }
 
 export interface AppSettings {
@@ -188,6 +225,10 @@ export interface AppSettings {
   highlightEnabled: boolean;
   /** 终端关键字高亮规则 */
   highlightRules: HighlightRule[];
+  /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
+  aiNotifyTaskbar: boolean;
+  /** AI 有需要你处理的事情时，在右下角显示一条提示 */
+  aiNotifyCorner: boolean;
 }
 
 export interface GitFile {

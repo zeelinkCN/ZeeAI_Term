@@ -43,6 +43,8 @@ pub struct AiTask {
     pub tool: String,
     /// 命令行（过长会截断）
     pub command: String,
+    /// 进程的工作目录（卡片上显示"项目目录"就用它）—— 拿不到就是空串
+    pub cwd: String,
     /// tmux 窗格标签（形如 main:0.1）；不是 tmux 会话就是空串
     pub pane: String,
     /// app（App 自己启动的）/ tmux / ps / winproc
@@ -67,6 +69,14 @@ pub struct RawProc {
     pub args: String,
 }
 
+/// 一次扫描的结果：进程表 + tmux 窗格 + 进程工作目录
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub procs: Vec<RawProc>,
+    pub panes: HashMap<u32, String>,
+    pub cwds: HashMap<u32, String>,
+}
+
 // ---------- 远端采集 ----------
 
 /// 远端采集脚本：先列 tmux 窗格，再扫进程表。
@@ -84,6 +94,9 @@ pub fn remote_script() -> String {
 if command -v tmux >/dev/null 2>&1; then \
 tmux list-panes -a -F 'ZPANE|#{pane_pid}|#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null; \
 fi; \
+ps -eo pid=,args= 2>/dev/null | while read -r zpid zargs; do \
+case \"$zargs\" in *codex*|*claude*|*aider*|*gemini*) printf 'ZCWD|%s|%s\\n' \"$zpid\" \"$(readlink \"/proc/$zpid/cwd\" 2>/dev/null)\" ;; esac; \
+done; \
 if ps -eo pid=,ppid=,etimes=,args= >/dev/null 2>&1; then printf 'ZPS1\\n'; \
 ps -eo pid=,ppid=,etimes=,args= 2>/dev/null; \
 else printf 'ZPS0\\n'; ps -eo pid=,ppid=,args= 2>/dev/null; fi; \
@@ -91,10 +104,9 @@ printf 'ZZEND\\n'"
         .to_string()
 }
 
-/// 解析远端脚本的输出，返回（进程表, pane pid → 窗格标签）
-pub fn parse_remote(output: &str) -> (Vec<RawProc>, HashMap<u32, String>) {
-    let mut procs = Vec::new();
-    let mut panes = HashMap::new();
+/// 解析远端脚本的输出
+pub fn parse_remote(output: &str) -> Scan {
+    let mut scan = Scan::default();
     // 0 = 还没进进程区；1 = 有 etimes；2 = 没有 etimes（ps -o ...args= 的退化形式）
     let mut mode = 0u8;
     for line in output.lines() {
@@ -116,7 +128,18 @@ pub fn parse_remote(output: &str) -> (Vec<RawProc>, HashMap<u32, String>) {
             let pid = it.next().and_then(|v| v.trim().parse::<u32>().ok());
             let label = it.next().unwrap_or("").trim().to_string();
             if let (Some(pid), false) = (pid, label.is_empty()) {
-                panes.insert(pid, label);
+                scan.panes.insert(pid, label);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ZCWD|") {
+            let mut it = rest.splitn(2, '|');
+            let pid = it.next().and_then(|v| v.trim().parse::<u32>().ok());
+            let cwd = it.next().unwrap_or("").trim().to_string();
+            if let Some(pid) = pid {
+                if !cwd.is_empty() && cwd != "/" {
+                    scan.cwds.insert(pid, cwd);
+                }
             }
             continue;
         }
@@ -124,10 +147,10 @@ pub fn parse_remote(output: &str) -> (Vec<RawProc>, HashMap<u32, String>) {
             continue;
         }
         if let Some(p) = parse_ps_line(line, mode == 1) {
-            procs.push(p);
+            scan.procs.push(p);
         }
     }
-    (procs, panes)
+    scan
 }
 
 fn parse_ps_line(line: &str, with_etimes: bool) -> Option<RawProc> {
@@ -208,6 +231,16 @@ pub fn parse_windows(output: &str) -> Vec<RawProc> {
     out
 }
 
+/// 本机（Windows）：把 PowerShell 的输出包成 Scan。
+/// Win32_Process 不给工作目录，也没有 tmux 窗格，所以后两项为空 —— 卡片上那两个字段会显示成"—"。
+pub fn scan_windows(output: &str) -> Scan {
+    Scan {
+        procs: parse_windows(output),
+        panes: HashMap::new(),
+        cwds: HashMap::new(),
+    }
+}
+
 // ---------- 认工具 ----------
 
 fn base_name(s: &str) -> String {
@@ -257,6 +290,24 @@ pub fn tool_of(args: &str) -> Option<String> {
     None
 }
 
+/// 这是不是"后台服务"而不是"用户在跑的会话"。
+///
+/// 为什么要单独判：Codex 的 `app-server`（桌面端/IDE 集成用的常驻服务）argv[0] 也叫 `codex`，
+/// 光看文件名会把它算成一条"正在跑的 AI 任务"—— 实测用户截图上那 4 张卡片就是这么来的：
+/// 两个用户各有一两个 app-server 常驻进程，看着像"我什么时候开了这么多 codex"。
+pub fn is_background_service(args: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "app-server",
+        "app_server",
+        "--analytics-default-enabled",
+        "code_mode_host",
+        "mcp-server",
+        "mcp_server",
+    ];
+    let lower = args.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// 一条进程属于哪个 tmux 窗格（跟着 ppid 往上找 pane 的根进程）
 fn pane_of(pid: u32, panes: &HashMap<u32, String>, ppid_of: &HashMap<u32, u32>) -> String {
     let mut cur = pid;
@@ -270,6 +321,22 @@ fn pane_of(pid: u32, panes: &HashMap<u32, String>, ppid_of: &HashMap<u32, u32>) 
         }
     }
     String::new()
+}
+
+/// 进程的工作目录；自己和父进程都没有记录就返回 None
+/// （子进程常常跟父进程同一个目录，所以往上找一层是有意义的兜底）
+fn cwd_of(pid: u32, cwds: &HashMap<u32, String>, ppid_of: &HashMap<u32, u32>) -> Option<String> {
+    let mut cur = pid;
+    for _ in 0..8 {
+        if let Some(c) = cwds.get(&cur) {
+            return Some(c.clone());
+        }
+        match ppid_of.get(&cur) {
+            Some(next) if *next != 0 && *next != cur => cur = *next,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn is_ancestor(maybe_ancestor: u32, of: u32, ppid_of: &HashMap<u32, u32>) -> bool {
@@ -288,21 +355,29 @@ fn is_ancestor(maybe_ancestor: u32, of: u32, ppid_of: &HashMap<u32, u32>) -> boo
     false
 }
 
-/// 把进程表变成卡片：认工具 → 找 tmux 窗格 → 去掉同一工具的父子重复
-pub fn classify(procs: &[RawProc], panes: &HashMap<u32, String>, env: &str, server: &str) -> Vec<AiTask> {
+/// 把扫描结果变成卡片：认工具 → 排掉后台服务 → 找 tmux 窗格 → 去掉同一工具的父子重复
+pub fn classify(scan: &Scan, env: &str, server: &str) -> Vec<AiTask> {
+    let procs = &scan.procs;
+    let panes = &scan.panes;
     let ppid_of: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
     let mut out: Vec<AiTask> = Vec::new();
     for p in procs {
+        // app-server / mcp 这类常驻服务不算"任务"
+        if is_background_service(&p.args) {
+            continue;
+        }
         let Some(tool) = tool_of(&p.args) else {
             continue;
         };
         let pane = pane_of(p.pid, panes, &ppid_of);
+        let cwd = cwd_of(p.pid, &scan.cwds, &ppid_of).unwrap_or_default();
         out.push(AiTask {
             id: format!("{env}:{server}:{}:{tool}", p.pid),
             env: env.to_string(),
             server: server.to_string(),
             tool,
             command: tidy(&p.args, 300),
+            cwd,
             pane,
             source: String::new(), // 下面按 pane 是否找到来定
             state: "running".to_string(),
@@ -312,14 +387,15 @@ pub fn classify(procs: &[RawProc], panes: &HashMap<u32, String>, env: &str, serv
             exit_code: None,
         });
     }
-    // 同一个工具、同一个窗格里，如果一个是另一个的父进程（npx → codex 这种），
-    // 只留真正在跑的那个（里面的那个）。
+    // 同一个工具如果一个是另一个的父进程（npx → codex、sh → claude 这种），只留里面那个。
+    // 注意：这里**不再要求"同一个窗格"** —— 走 ps 扫描时根本没有窗格信息，
+    // 以前那条限制会让父子两条都留下来（= 一张任务显示成两张卡）。
     for i in 0..out.len() {
         for j in 0..out.len() {
             if i == j {
                 continue;
             }
-            if out[i].tool != out[j].tool || out[i].pane != out[j].pane {
+            if out[i].tool != out[j].tool {
                 continue;
             }
             if is_ancestor(out[i].pid, out[j].pid, &ppid_of) {
@@ -416,6 +492,7 @@ impl AiTaskRegistry {
             server: server.to_string(),
             tool: tool.to_string(),
             command: tidy(command, 300),
+            cwd: String::new(),
             pane: String::new(),
             source: "app".to_string(),
             state: "running".to_string(),
@@ -474,6 +551,7 @@ impl AiTaskRegistry {
                         server: t.server.clone(),
                         tool: t.tool.clone(),
                         command: t.command.clone(),
+                        cwd: String::new(),
                         pane: String::new(),
                         source: "app".to_string(),
                         state: if t.running { "running" } else { "done" }.to_string(),
@@ -545,10 +623,10 @@ ZPS1\n\
   1001  1000   120 node /usr/local/bin/codex\n\
   1002  1001    30 /usr/local/bin/codex\n\
 ZZEND\n";
-        let (procs, panes) = parse_remote(out);
-        assert_eq!(procs.len(), 3);
-        assert_eq!(panes.get(&1000).map(String::as_str), Some("main:0.1"));
-        let tasks = classify(&procs, &panes, "remote", "测试机");
+        let scan = parse_remote(out);
+        assert_eq!(scan.procs.len(), 3);
+        assert_eq!(scan.panes.get(&1000).map(String::as_str), Some("main:0.1"));
+        let tasks = classify(&scan, "remote", "测试机");
         assert_eq!(tasks.len(), 1, "父子重复应该只留一条");
         assert_eq!(tasks[0].tool, "codex");
         assert_eq!(tasks[0].pane, "main:0.1");
@@ -559,10 +637,10 @@ ZZEND\n";
     #[test]
     fn parses_remote_output_without_etimes() {
         let out = "ZZBEGIN\nZPS0\n  42  1  python3 -m aider\nZZEND\n";
-        let (procs, panes) = parse_remote(out);
-        assert_eq!(procs.len(), 1);
-        assert_eq!(procs[0].etimes, None);
-        let tasks = classify(&procs, &panes, "remote", "srv");
+        let scan = parse_remote(out);
+        assert_eq!(scan.procs.len(), 1);
+        assert_eq!(scan.procs[0].etimes, None);
+        let tasks = classify(&scan, "remote", "srv");
         assert_eq!(tasks[0].tool, "aider");
         assert_eq!(tasks[0].duration_ms, 0);
         assert_eq!(tasks[0].source, "ps");
@@ -594,6 +672,7 @@ ZPROC|200|4||python3 -m aider\n";
             server: "srv".into(),
             tool: "codex".into(),
             command: "node /usr/local/bin/codex".into(),
+            cwd: "/root/proj".into(),
             pane: "main:0.1".into(),
             source: "tmux".into(),
             state: "running".into(),
@@ -633,6 +712,7 @@ ZPROC|200|4||python3 -m aider\n";
             server: "本机 PowerShell".into(),
             tool: "claude".into(),
             command: "node claude".into(),
+            cwd: String::new(),
             pane: String::new(),
             source: "winproc".into(),
             state: "running".into(),
@@ -652,5 +732,53 @@ ZPROC|200|4||python3 -m aider\n";
         assert_eq!(tidy("a\nb\tc", 100), "a b c");
         let long = tidy(&"x".repeat(400), 300);
         assert_eq!(long.chars().count(), 301);
+    }
+
+    #[test]
+    fn ignores_background_services_like_app_server() {
+        // 用户截图里那 4 张"我没开这么多 codex"就是这种常驻服务
+        let procs = vec![
+            proc(
+                10,
+                1,
+                3600,
+                "/root/.codex/packages/app-server/bin/codex app-server --analytics-default-enabled",
+            ),
+            proc(11, 10, 3599, "node /root/.codex/packages/app-server/index.js"),
+            proc(12, 1, 3600, "codex -c features.code_mode_host=true app-server"),
+        ];
+        let scan = Scan {
+            procs,
+            ..Default::default()
+        };
+        assert!(classify(&scan, "remote", "lz@example").is_empty());
+    }
+
+    #[test]
+    fn collapses_parent_child_even_without_pane_info() {
+        // npx → codex：走 ps 扫描时没有 tmux 窗格，以前两条都会留下（一张任务显示成两张卡）
+        let procs = vec![
+            proc(100, 1, 60, "node /usr/local/bin/npx codex"),
+            proc(101, 100, 55, "node /usr/local/bin/codex --foo"),
+        ];
+        let scan = Scan {
+            procs,
+            ..Default::default()
+        };
+        let tasks = classify(&scan, "remote", "srv");
+        assert_eq!(tasks.len(), 1, "父子应该只剩一条");
+        assert_eq!(tasks[0].pid, 101, "留下的是真正在跑的那个");
+    }
+
+    #[test]
+    fn card_carries_cwd_for_short_display() {
+        let procs = vec![proc(500, 1, 30, "codex --help")];
+        let mut scan = Scan {
+            procs,
+            ..Default::default()
+        };
+        scan.cwds.insert(500, "/home/lz/work/proj".into());
+        let tasks = classify(&scan, "remote", "lz@1.2.3.4");
+        assert_eq!(tasks[0].cwd, "/home/lz/work/proj");
     }
 }

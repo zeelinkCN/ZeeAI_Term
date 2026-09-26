@@ -5,8 +5,8 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, ai_tasks, elevate, git, highlight, pty, remote_fs, serial, sftp, ssh, tmux,
-    AiTaskRegistry, SessionEvent, SessionRegistry,
+    adb, ai, ai_sessions, ai_tasks, elevate, git, highlight, pty, remote_fs, serial, sftp, ssh,
+    tmux, AiTaskRegistry, SessionEvent, SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -1442,8 +1442,8 @@ pub async fn ai_tasks_remote(
     let cfg = ssh_config_for(&profile_id, user_override)?;
     let detected = match run_remote_capture(&profile_id, &cfg, &ai_tasks::remote_script()).await {
         Ok(out) => {
-            let (procs, panes) = ai_tasks::parse_remote(&out);
-            Some(ai_tasks::classify(&procs, &panes, "remote", &server))
+            let scan = ai_tasks::parse_remote(&out);
+            Some(ai_tasks::classify(&scan, "remote", &server))
         }
         Err(e) => {
             // 探测失败不是致命错误：App 自己启动的那批照样显示，只是状态停在上一次
@@ -1482,8 +1482,8 @@ pub async fn ai_tasks_local(
             args.push(ai_tasks::remote_script());
             match run_capture_checked(std::path::Path::new("wsl.exe"), &args).await {
                 Ok((true, out)) => {
-                    let (procs, panes) = ai_tasks::parse_remote(&out);
-                    let mut list = ai_tasks::classify(&procs, &panes, env, &server);
+                    let scan = ai_tasks::parse_remote(&out);
+                    let mut list = ai_tasks::classify(&scan, env, &server);
                     for t in list.iter_mut() {
                         t.source = "ps".into();
                     }
@@ -1508,9 +1508,8 @@ pub async fn ai_tasks_local(
             ];
             match run_capture_checked(std::path::Path::new("powershell.exe"), &args).await {
                 Ok((true, out)) => {
-                    let procs = ai_tasks::parse_windows(&out);
-                    let mut list =
-                        ai_tasks::classify(&procs, &std::collections::HashMap::new(), env, &server);
+                    let scan = ai_tasks::scan_windows(&out);
+                    let mut list = ai_tasks::classify(&scan, env, &server);
                     for t in list.iter_mut() {
                         t.source = "winproc".into();
                     }
@@ -1535,6 +1534,51 @@ pub async fn ai_tasks_local(
 pub fn ai_tasks_clear_finished(tasks: State<'_, AiTaskRegistry>, env: String, server: String) {
     log::info!("ipc: ai_tasks_clear_finished env={env} server={server}");
     tasks.clear_finished(&env, &server);
+}
+
+/// 读 Codex 的会话日志，给出"有没有新消息 / 在跑还是在等我 / 耗时 / token 用量"。
+///
+/// 这一层比"进程还在不在"准得多：进程只能说明跑着，而日志里有 `task_complete`
+/// （带 AI 最后一段话和耗时）和 `token_count`（带本轮与累计用量、上下文窗口）。
+/// 远端走一条 ssh 命令读 `~/.codex/sessions` 里最新那个 rollout 的尾巴；
+/// 本机/WSL 直接读文件。CMD 没有这个概念，返回 None。
+#[tauri::command]
+pub async fn ai_session_snapshot(
+    profile_id: Option<String>,
+    user_override: Option<String>,
+    shell: Option<String>,
+    distro: Option<String>,
+) -> Result<Option<ai_sessions::AiSessionSnapshot>, String> {
+    if let Some(pid) = profile_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        let cfg = ssh_config_for(pid, user_override)?;
+        let out = run_remote_capture(pid, &cfg, &ai_sessions::remote_tail_script()).await?;
+        let snap = ai_sessions::parse_script_output(&out);
+        log::info!(
+            "ipc: ai_session_snapshot(remote) -> state={:?} tokens={:?}",
+            snap.as_ref().map(|s| s.state.as_str()),
+            snap.as_ref().and_then(|s| s.usage.as_ref()).map(|u| u.total)
+        );
+        return Ok(snap);
+    }
+    match shell.as_deref().unwrap_or("powershell") {
+        "cmd" => Ok(None),
+        "wsl" => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(d) = distro.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                args.push("-d".into());
+                args.push(d.to_string());
+            }
+            args.push("--".into());
+            args.push("sh".into());
+            args.push("-c".into());
+            args.push(ai_sessions::remote_tail_script());
+            match run_capture_checked(std::path::Path::new("wsl.exe"), &args).await {
+                Ok((true, out)) => Ok(ai_sessions::parse_script_output(&out)),
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(ai_sessions::local_snapshot()),
+    }
 }
 
 // 说明：曾经有过「一键安装」（后端直接帮你在服务器上跑 npm/pip）。

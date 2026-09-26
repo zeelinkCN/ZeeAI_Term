@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
@@ -21,6 +21,7 @@ import {
   aiTasksClearFinished,
   aiTasksLocal,
   aiTasksRemote,
+  aiSessionSnapshot,
   isAdmin,
   openAdminShell,
   restartAsAdmin,
@@ -89,6 +90,7 @@ import type {
   AdbDevice,
   AdbFile,
   AiProbe,
+  AiSessionSnapshot,
   AiTask,
   AppSettings,
   ConnectionProfile,
@@ -255,6 +257,29 @@ function clockText(sec: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/** 一行短文本（通知里用）：压成一行并截断 */
+function aiShorten(s: string, max: number): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= max ? one : one.slice(0, max) + "…";
+}
+
+/** token 数 → 以「兆（M）」为单位显示，例如 1_234_567 → "1.23M" */
+function tokenM(n: number): string {
+  if (!n || n < 0) return "0M";
+  const m = n / 1_000_000;
+  if (m >= 100) return `${Math.round(m)}M`;
+  if (m >= 1) return `${m.toFixed(2)}M`;
+  if (m >= 0.01) return `${m.toFixed(3)}M`;
+  return "0.01M 以下";
+}
+
+/** 路径 → 只留最后一段（卡片上显示"项目目录"用） */
+function dirBase(p: string): string {
+  const t = p.replace(/[\\/]+$/, "");
+  const parts = t.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
 const EMPTY_PROFILE = {
   name: "",
   host: "",
@@ -331,6 +356,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 预设规则由后端给（core::highlight::presets），前端这里只留空；
   // 设置读回来之后就有内容了，用户也可以自己改。
   highlightRules: [],
+  // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
+  aiNotifyTaskbar: false,
+  aiNotifyCorner: false,
 };
 
 const APP_VERSION = "0.1.6";
@@ -568,6 +596,19 @@ export default function App() {
   // AI 任务看板（v1）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片
   const [boardTasks, setBoardTasks] = useState<AiTask[]>([]);
   const boardBusy = useRef(false);
+  // 会话日志快照（有新消息/在等你/耗时/token 都从这儿来）
+  const [aiSnapshot, setAiSnapshot] = useState<AiSessionSnapshot | null>(null);
+  /// 需要你处理的事情还没被看过时，活动栏 AI 图标上的红点
+  const [aiUnread, setAiUnread] = useState(0);
+  /// 右下角那几条"AI 需要你"的提示（可点可清）
+  const [aiAlerts, setAiAlerts] = useState<
+    { id: string; text: string; sessionId: string; time: number }[]
+  >([]);
+  /// 已经通知过的那一轮（避免同一条消息反复弹）
+  const aiTurnKey = useRef("");
+  const aiSeeded = useRef(false);
+  /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
+  const [toolListOpen, setToolListOpen] = useState(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
@@ -755,10 +796,11 @@ export default function App() {
     try {
       const probe = await aiProbe(cur.profileId, cur.user ?? null);
       setAiState(probe);
-      // 之前有 AI 在跑、现在没有了 → 认为这一轮跑完，给个通知
+      // 进程消失只是"粗信号"：现在只写一行状态栏，不再当通知弹（真正的"跑完了"
+      // 由会话日志里的 task_complete 负责，见 refreshSnapshot）
       const running = probe.running.length > 0;
       if (aiWasRunning.current && !running) {
-        pushAiNotice("AI 任务看起来已经跑完了（进程已退出）");
+        notify(`「${cur.title}」的 AI 进程已经退出`);
       }
       aiWasRunning.current = running;
     } catch (e) {
@@ -838,20 +880,110 @@ export default function App() {
     await refreshBoard();
   }
 
+  /**
+   * 拉着看当前会话的 Codex 日志，决定"要不要提醒你"。
+   *
+   * 这是通知的主判据（比"进程还在不在"准得多）：
+   * - `needs-approval` / `waiting-user` → 在等你，必须提醒（红点 + 按设置闪任务栏/右下角）；
+   * - 新一轮 `task_complete`（带 AI 最后一段话）→ 有结果了，提醒一次，并按轮去重；
+   * - 其它（在跑、空闲）→ 不打扰。
+   * 另外：如果你正开着那个会话的终端、窗口也在前台，就当你已经看到了，不提醒。
+   */
+  async function refreshSnapshot() {
+    const cur = sessionsRef.current.find((s) => s.id === activeId);
+    if (!cur) {
+      setAiSnapshot(null);
+      return;
+    }
+    try {
+      const snap = await aiSessionSnapshot(
+        cur.profileId ?? null,
+        cur.user ?? null,
+        cur.kind === "remote" ? null : cur.kind,
+        null,
+      );
+      setAiSnapshot(snap);
+      if (snap) considerSnapshot(cur, snap);
+    } catch {
+      // 读不到日志很正常（比如这台机器还没跑过 Codex），静默即可
+    }
+  }
+
+  function considerSnapshot(cur: OpenSession, snap: AiSessionSnapshot) {
+    const needsMe = snap.state === "needs-approval" || snap.state === "waiting-user";
+    const hasMessage = snap.lastTurnCompletedAt > 0 && snap.lastMessage.trim().length > 0;
+    const turnKey = `${snap.sessionId}:${snap.lastTurnCompletedAt}:${snap.lastMessage.length}`;
+    // 第一次拿到这个会话的快照时只记下来，不提醒（否则一开应用就会把上一轮翻出来弹）
+    if (!aiSeeded.current) {
+      aiSeeded.current = true;
+      aiTurnKey.current = turnKey;
+      return;
+    }
+    const freshTurn = hasMessage && turnKey !== aiTurnKey.current;
+    if (!needsMe && !freshTurn) return;
+
+    // 人就在看这个终端（窗口在前台 + 正打开它）→ 不当成"新消息"
+    const watching =
+      document.hasFocus() && cur.id === activeId && cur.activeTab === "terminal" && aiPanelOpen;
+    if (freshTurn) aiTurnKey.current = turnKey;
+    if (watching && !needsMe) return;
+
+    const text = needsMe
+      ? snap.state === "needs-approval"
+        ? `「${cur.title}」等你批准：${snap.lastAction}`
+        : `「${cur.title}」等你回话`
+      : `「${cur.title}」有新消息：${aiShorten(snap.lastMessage, 70)}`;
+    raiseAiAttention(cur, text);
+  }
+
+  /** 提醒用户：红点（总会）+ 状态栏一行 + 按设置闪任务栏 / 右下角提示 */
+  function raiseAiAttention(cur: OpenSession, text: string) {
+    setAiUnread((n) => n + 1);
+    setAiAlerts((prev) =>
+      [{ id: uid(), text, sessionId: cur.id, time: Date.now() }, ...prev].slice(0, 5),
+    );
+    notify(text);
+    if (settingsRef.current.aiNotifyTaskbar && !document.hasFocus()) {
+      // 只在窗口不在前台时闪（前台闪没有意义）；回到窗口时下面那个 effect 会取消
+      void getCurrentWindow()
+        .requestUserAttention(UserAttentionType.Critical)
+        .catch(() => {});
+    }
+  }
+
   // 面板打开时探测一次，之后每 8 秒刷一次（既看安装状态，也看有没有跑完）
   useEffect(() => {
     if (!aiPanelOpen) return;
     void refreshAi();
     void refreshBoard();
+    // 会话日志是通知的主判据，跟着面板一起刷
+    void refreshSnapshot();
     const t = window.setInterval(() => void refreshAi(), 8000);
     // 看板重一些（远端要跑 ps、本机要扫进程表），20 秒一次就够
-    const t2 = window.setInterval(() => void refreshBoard(), 20000);
+    const t2 = window.setInterval(() => {
+      void refreshBoard();
+      void refreshSnapshot();
+    }, 20000);
     return () => {
       window.clearInterval(t);
       window.clearInterval(t2);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiPanelOpen, activeId]);
+
+  // 打开 AI 面板 = 你已经看到了 → 清掉红点
+  useEffect(() => {
+    if (aiPanelOpen) setAiUnread(0);
+  }, [aiPanelOpen, activeId]);
+
+  // 回到窗口时把任务栏闪烁停掉（闪的目的就是叫你回来）
+  useEffect(() => {
+    const onFocus = () => {
+      void getCurrentWindow().requestUserAttention(null).catch(() => {});
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
 
   /** 在当前会话的终端里启动 AI（就是把命令敲进去，你能看到它跑） */
   function aiStartTool(tool: string, isRun: boolean) {
@@ -873,7 +1005,8 @@ export default function App() {
         })
         .catch(() => {});
     }
-    pushAiNotice(`已在「${cur.title}」里启动 ${tool}，它跑完我会提醒你`);
+    // 启动只在状态栏留一行 —— 以前这里会弹一条通知，等于"每启动一次就打扰一次"
+    notify(`已在「${cur.title}」里启动 ${tool}（跑完/需要你时我才会提醒）`);
   }
 
   /**
@@ -3548,7 +3681,8 @@ export default function App() {
               onClick={() => setAiPanelOpen((v) => !v)}
             >
               <IconSpark size={22} />
-              {aiNotices.length > 0 && <span className="act-badge">{aiNotices.length}</span>}
+              {/* 有"要你处理/新消息"没看过时点个红点（通知分级里的最基础一档） */}
+              {aiUnread > 0 && <span className="act-dot" />}
             </button>
             <button
               type="button"
@@ -4820,30 +4954,61 @@ export default function App() {
               </div>
             ) : (
               <div className="ai-board">
-                {boardTasks.map((t) => (
-                  <div className={"ai-task " + t.state} key={t.id}>
-                    <div className="ai-task-line">
-                      <span className={"dot " + (t.state === "running" ? "ok" : "off")} />
-                      <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
-                      <span className="ai-tag">{aiEnvLabel(t.env)}</span>
-                      <span className="dim">{t.state === "running" ? "运行中" : "已结束"}</span>
+                {boardTasks.map((t, i) => {
+                  // 会话日志只有"当前会话"这一份，所以就把它挂在第一张运行中的卡片上
+                  const snapIndex = boardTasks.findIndex((x) => x.state === "running");
+                  const snap = i === snapIndex ? aiSnapshot : null;
+                  const state = snap?.state ?? t.state;
+                  const label =
+                    state === "needs-approval"
+                      ? "等你批准"
+                      : state === "waiting-user"
+                        ? "等你回话"
+                        : state === "running"
+                          ? "运行中"
+                          : "已结束";
+                  const project = dirBase(t.cwd || snap?.cwd || "");
+                  const usage = snap?.usage;
+                  const pct =
+                    usage && usage.contextWindow > 0
+                      ? Math.min(100, Math.round((usage.total / usage.contextWindow) * 100))
+                      : 0;
+                  return (
+                    <div className={"ai-task " + state} key={t.id}>
+                      <div className="ai-task-line">
+                        <span className={"dot " + (state === "running" ? "ok" : "idle")} />
+                        <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
+                        <span className="ai-tag">{aiEnvLabel(t.env)}</span>
+                        <span className={"ai-state " + state}>{label}</span>
+                      </div>
+                      {/* 第二行只给"在哪台机器、哪个项目"；完整命令行放悬停提示 */}
+                      <div className="ai-task-meta ellipsis">
+                        {t.server}
+                        {project ? ` · ${project}` : ""}
+                        {t.pane ? ` · ${t.pane}` : ""}
+                      </div>
+                      {snap && usage ? (
+                        <div className="ai-task-meta">
+                          token {tokenM(usage.total)} · 上下文 {pct}% · 上一轮{" "}
+                          {aiDurationText(snap.lastTurnDurationMs)}
+                        </div>
+                      ) : null}
+                      {snap?.lastAction ? (
+                        <div className="ai-task-cmd ellipsis" title={snap.lastAction}>
+                          {snap.lastAction}
+                        </div>
+                      ) : null}
+                      <div
+                        className="ai-task-meta ellipsis"
+                        title={`${t.command || "（拿不到命令行）"}\npid ${t.pid} · ${aiSourceLabel(
+                          t.source,
+                        )}`}
+                      >
+                        耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
+                      </div>
                     </div>
-                    <div className="ai-task-meta ellipsis" title={t.server}>
-                      {t.server}
-                      {t.pane ? ` · ${t.pane}` : ""}
-                      {typeof t.startedAt === "number"
-                        ? ` · 起于 ${clockText(t.startedAt)}`
-                        : ""}
-                    </div>
-                    <div className="ai-task-cmd ellipsis" title={t.command}>
-                      {t.command || "（拿不到命令行）"}
-                    </div>
-                    <div className="ai-task-meta">
-                      耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
-                      {t.pid ? ` · pid ${t.pid}` : ""}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {boardTasks.some((t) => t.state === "done") && (
                   <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
                     <button
@@ -4897,11 +5062,23 @@ export default function App() {
                   npm：{aiState?.npm ? aiState.npm : "未检测到（装 Node.js 才能装 Codex/Claude/Gemini）"}
                   {aiState?.running.length ? `　运行中：${aiState.running.join(", ")}` : ""}
                 </div>
-                <div className="ai-section">AI 命令行工具</div>
-                {(aiState?.tools ?? []).map((t) => {
-                  const running = aiState?.running.includes(t.name) ?? false;
-                  return (
-                    <div className="ai-tool" key={t.name}>
+                {/* 已安装/未安装这类"工具清单"放上面太占地方，折叠起来（看板才是主角） */}
+                <button
+                  type="button"
+                  className="ai-section ai-section-toggle"
+                  onClick={() => setToolListOpen((v) => !v)}
+                  title="展开/收起工具清单（安装与在终端启动）"
+                >
+                  <span className="grow">{toolListOpen ? "▾" : "▸"} AI 命令行工具</span>
+                  <span className="dim">
+                    {(aiState?.tools ?? []).filter((t) => t.installed).length} 个已安装
+                  </span>
+                </button>
+                {toolListOpen &&
+                  (aiState?.tools ?? []).map((t) => {
+                    const running = aiState?.running.includes(t.name) ?? false;
+                    return (
+                      <div className="ai-tool" key={t.name}>
                       <div className="ai-tool-line">
                         <span className={"dot " + (running ? "ok" : t.installed ? "idle" : "off")} />
                         <span className="grow ellipsis">{t.label}</span>
@@ -4932,9 +5109,9 @@ export default function App() {
                           {t.installed ? "在终端启动" : "在终端安装"}
                         </button>
                       </div>
-                    </div>
-                  );
-                })}
+                      </div>
+                    );
+                  })}
                 {!aiState && (
                   <div className="hint" style={{ padding: "8px 12px" }}>
                     正在探测这台服务器…
@@ -4980,6 +5157,42 @@ export default function App() {
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
       </div>
+
+      {/* 右下角提示（可选，默认关）：AI 需要你处理时才出现，点一下跳到那个会话 */}
+      {settings.aiNotifyCorner && aiAlerts.length > 0 && (
+        <div className="transfer-dock ai-alert-dock">
+          <div className="transfer-head">
+            <span>AI 需要你处理（{aiAlerts.length}）</span>
+            <button
+              type="button"
+              className="mini-x"
+              style={{ opacity: 1 }}
+              title="清空"
+              onClick={() => setAiAlerts([])}
+            >
+              ✕
+            </button>
+          </div>
+          {aiAlerts.map((a) => (
+            <button
+              key={a.id}
+              type="button"
+              className="ai-alert"
+              title={a.text}
+              onClick={() => {
+                setAiPanelOpen(true);
+                setAiUnread(0);
+                if (a.sessionId) setActiveId(a.sessionId);
+                setAiAlerts((prev) => prev.filter((x) => x.id !== a.id));
+              }}
+            >
+              <span className="dot ok" />
+              <span className="grow ellipsis">{a.text}</span>
+              <span className="dim">{clockText(Math.floor(a.time / 1000))}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {transfers.length > 0 && (
         <div className="transfer-dock">
@@ -6312,6 +6525,32 @@ export default function App() {
                   当前 {settings.highlightRules.filter((r) => r.enabled).length} 条规则生效，
                   共 {settings.highlightRules.length} 条
                 </span>
+              </div>
+
+              <div className="ai-section" style={{ paddingLeft: 14 }}>
+                AI 通知
+              </div>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyTaskbar}
+                  onChange={(e) => void updateSettings({ aiNotifyTaskbar: e.target.checked })}
+                />
+                <span>
+                  窗口不在前台时闪 Windows 任务栏（AI 跑完 / 需要你批准 / 等你回话时）
+                </span>
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyCorner}
+                  onChange={(e) => void updateSettings({ aiNotifyCorner: e.target.checked })}
+                />
+                <span>在右下角显示一条提示（点一下跳回那个会话）</span>
+              </label>
+              <div className="hint" style={{ padding: "0 14px 10px" }}>
+                这两项都是额外加的分层；活动栏 AI 图标上的**红点**始终会有（最不打扰的那一档）。
+                判据来自 Codex 的会话日志：跑完一轮、等你批准、等你回话 —— 启动任务时不会再弹。
               </div>
 
               <label className="form-check">

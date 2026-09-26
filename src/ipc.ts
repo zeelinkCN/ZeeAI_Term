@@ -16,6 +16,7 @@ import type {
   AdbFile,
   AiProbe,
   AiTask,
+  AiSessionSnapshot,
   HighlightRule,
 } from "./types";
 
@@ -350,6 +351,24 @@ export async function aiTasksLocal(
 /** 清掉某个环境里「已结束」的卡片 */
 export async function aiTasksClearFinished(env: string, server: string): Promise<void> {
   return invoke("ai_tasks_clear_finished", { env, server });
+}
+
+/**
+ * 读 Codex 会话日志，拿到"有没有新消息 / 在跑还是在等你 / 耗时 / token"。
+ * 远端读服务器上的 `~/.codex/sessions`（一条 ssh 命令取最新 rollout 的尾巴）。
+ */
+export async function aiSessionSnapshot(
+  profileId?: string | null,
+  userOverride?: string | null,
+  shell?: string | null,
+  distro?: string | null,
+): Promise<AiSessionSnapshot | null> {
+  return invoke<AiSessionSnapshot | null>("ai_session_snapshot", {
+    profileId: profileId ?? null,
+    userOverride: userOverride ?? null,
+    shell: shell ?? null,
+    distro: distro ?? null,
+  });
 }
 
 
