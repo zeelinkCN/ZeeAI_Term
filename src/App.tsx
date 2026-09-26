@@ -374,6 +374,15 @@ interface Asset {
  */
 const DEFAULT_SERVER_GROUP = "默认";
 
+/** 设置对话框左侧的分类（点一下就跳到右边对应内容） */
+const SETTINGS_TABS: { key: string; label: string }[] = [
+  { key: "look", label: "外观" },
+  { key: "term", label: "终端与会话" },
+  { key: "log", label: "会话日志" },
+  { key: "notify", label: "通知" },
+  { key: "update", label: "更新与关于" },
+];
+
 const TMUX_ACTIONS: { key: string; label: string; title: string }[] = [
   { key: "new-window", label: "新建窗口", title: "等价于 Ctrl+B c" },
   { key: "split-h", label: "左右分屏", title: "等价于 Ctrl+B %" },
@@ -634,6 +643,8 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsReady, setSettingsReady] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /** 设置对话框左边选中的分类（二级菜单） */
+  const [settingsTab, setSettingsTab] = useState("look");
   const [showAbout, setShowAbout] = useState(false);
   // 终端配色对话框（视图菜单 / 设置里都能打开）
   const [showTermTheme, setShowTermTheme] = useState(false);
@@ -1266,8 +1277,7 @@ export default function App() {
     }
     out.push(
       { label: "打开设置", group: "首选项", run: () => setShowSettings(true) },
-      { label: "终端配色", group: "首选项", run: () => setShowTermTheme(true) },
-      { label: "终端关键字高亮", group: "首选项", run: () => setShowHighlight(true) },
+      { label: "终端配色与关键字高亮", group: "首选项", run: () => setShowTermTheme(true) },
       { label: "服务器管理", group: "首选项", run: () => setShowServers(true) },
       {
         label: "文件面板：同步到终端目录",
@@ -3315,8 +3325,8 @@ export default function App() {
           { sep: false, label: "放大字体（Ctrl + ＋）", action: () => bumpFont(1) },
           { sep: false, label: "缩小字体（Ctrl + －）", action: () => bumpFont(-1) },
           { sep: false, label: "重置字体（Ctrl + 0）", action: () => applyFontSize(13) },
-          { sep: false, label: "终端配色…", action: () => setShowTermTheme(true) },
-          { sep: false, label: "关键字高亮…", action: () => setShowHighlight(true) },
+          // 配色和关键字高亮在同一个对话框里（"作用范围"里可以按终端类型分开设）
+          { sep: false, label: "终端配色与关键字高亮…", action: () => setShowTermTheme(true) },
           { sep: true },
           {
             sep: false,
@@ -5142,7 +5152,13 @@ export default function App() {
             ) : null}
             {paneLayout === "single" && activeFile && (
               <div className="file-wrap">
-                <FileView key={activeFile.path} file={activeFile} />
+                <FileView
+                  key={activeFile.path}
+                  file={activeFile}
+                  profileId={activeSession?.profileId}
+                  userOverride={activeSession?.user ?? null}
+                  onNotice={notify}
+                />
               </div>
             )}
           </div>
@@ -6644,10 +6660,25 @@ export default function App() {
 
       {showSettings && (
         <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">设置</div>
-            <div className="modal-body">
-              <div className="tree-group">外观</div>
+            <div className="settings-split">
+              {/* 左边：分类。点一下右边就只显示这一类（像微信设置那样） */}
+              <div className="settings-nav">
+                {SETTINGS_TABS.map((t) => (
+                  <button
+                    key={t.key}
+                    type="button"
+                    className={"settings-nav-item" + (settingsTab === t.key ? " active" : "")}
+                    onClick={() => setSettingsTab(t.key)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <div className="modal-body">
+              {settingsTab === "look" && (
+                <>
               <label className="modal-field">
                 终端字体大小：{settings.fontSize}px（也可直接 Ctrl + 滚轮 或 Ctrl + ＋ / －）
                 <input
@@ -6687,7 +6718,11 @@ export default function App() {
                   要长期留存就开终端日志。
                 </span>
               </div>
+                </>
+              )}
 
+              {settingsTab === "log" && (
+                <>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -6727,7 +6762,11 @@ export default function App() {
                   </button>
                 )}
               </div>
+                </>
+              )}
 
+              {settingsTab === "term" && (
+                <>
               <label className="modal-field">
                 默认终端
                 <select
@@ -6744,6 +6783,11 @@ export default function App() {
                 </select>
               </label>
 
+                </>
+              )}
+
+              {settingsTab === "look" && (
+                <>
               <label className="modal-field">
                 主题配色
                 <select
@@ -6766,9 +6810,11 @@ export default function App() {
                   当前配色：{currentTermSchemeName()}（可在里面按"终端类型"分别设置）
                 </span>
               </div>
-              <div className="tree-group">终端与会话</div>
+                </>
+              )}
 
-              <div className="tree-group">通知</div>
+              {settingsTab === "notify" && (
+                <>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -6787,6 +6833,11 @@ export default function App() {
                 />
                 <span>在左侧活动栏的 AI 星号上显示红点/数字</span>
               </label>
+                </>
+              )}
+
+              {settingsTab === "term" && (
+                <>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -6841,10 +6892,17 @@ export default function App() {
                 </select>
               </label>
 
-              {renderUpdateSection()}
+                </>
+              )}
 
-              <div className="hint">
-                设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
+              {settingsTab === "update" && (
+                <>
+                  {renderUpdateSection()}
+                  <div className="hint">
+                    设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
+                  </div>
+                </>
+              )}
               </div>
             </div>
             <div className="modal-actions">
@@ -6996,21 +7054,6 @@ export default function App() {
                   {sshProfiles.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}（{p.ssh?.user}@{p.ssh?.host}）
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {/* 这次开会话用哪套高亮规则（默认跟着服务器绑定走，也可以临时挑一套） */}
-              <label className="modal-field">
-                关键字高亮规则
-                <select
-                  value={newDialog.highlightSetId ?? ""}
-                  onChange={(e) => setNewDialog({ ...newDialog, highlightSetId: e.target.value || null })}
-                >
-                  <option value="">跟随服务器设置</option>
-                  {settings.highlightRuleSets.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name || "(未命名)"}
                     </option>
                   ))}
                 </select>
@@ -7256,9 +7299,37 @@ const MD_STYLES: { key: MdStyle; label: string }[] = [
   { key: "paper", label: "文档" },
 ];
 
-function FileView({ file }: { file: OpenFile }) {
+function FileView({
+  file,
+  profileId,
+  userOverride,
+  onNotice,
+}: {
+  file: OpenFile;
+  /** 这个文件在哪台服务器上（本地文件没有，就不显示下载按钮） */
+  profileId?: string;
+  userOverride?: string | null;
+  onNotice?: (text: string) => void;
+}) {
   const [preview, setPreview] = useState(true);
   const [mdStyle, setMdStyle] = useState<MdStyle>("github");
+  const [saving, setSaving] = useState(false);
+
+  /** 把远端文件下载到本机（选一个目录，文件名保持原样） */
+  async function download() {
+    if (!profileId) return;
+    const dir = await openLocalDialog({ directory: true, multiple: false, title: "下载到哪个目录" });
+    if (!dir || typeof dir !== "string") return;
+    setSaving(true);
+    try {
+      const saved = await fsDownload(profileId, [file.path], dir, userOverride ?? null);
+      onNotice?.(`已下载：${saved || file.name}`);
+    } catch (e) {
+      onNotice?.("下载失败：" + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const isMd = file.kind === "md";
   const isHtml = file.kind === "html";
@@ -7307,6 +7378,19 @@ function FileView({ file }: { file: OpenFile }) {
             onClick={() => setPreview((v) => !v)}
           >
             {preview ? "预览" : "源码"}
+          </button>
+        )}
+        {/* 远端文件：直接在这里下载，不用去文件面板里找 */}
+        {profileId && (
+          <button
+            type="button"
+            className="mini-btn primary"
+            style={{ marginLeft: 6 }}
+            disabled={saving}
+            title="把这个文件下载到本机（选目标目录，文件名不变）"
+            onClick={() => void download()}
+          >
+            {saving ? "下载中…" : "⬇ 下载"}
           </button>
         )}
         <span className="file-kind">{kindLabel(file.kind)}</span>
