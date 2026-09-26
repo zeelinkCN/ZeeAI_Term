@@ -21,6 +21,9 @@ import {
   aiTasksClearFinished,
   aiTasksLocal,
   aiTasksRemote,
+  isAdmin,
+  openAdminShell,
+  restartAsAdmin,
   fastbootDevices,
   fastbootVersion,
   gitStatus,
@@ -330,7 +333,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   highlightRules: [],
 };
 
-const APP_VERSION = "0.1.5";
+const APP_VERSION = "0.1.6";
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
@@ -582,6 +585,8 @@ export default function App() {
   } | null>(null);
   /** 当前这份是怎么装上的：nsis / msi / portable */
   const [installKind, setInstallKind] = useState<string>("");
+  /** 当前是不是以管理员身份在跑（状态栏显示一个标） */
+  const [isAdminMode, setIsAdminMode] = useState(false);
   const [updateApplying, setUpdateApplying] = useState(false);
   // tmux 快捷操作面板（只在当前会话是 tmux 会话时出现）
   const [tmuxDockOpen, setTmuxDockOpen] = useState(true);
@@ -699,6 +704,10 @@ export default function App() {
     void updateInstallKind()
       .then(setInstallKind)
       .catch(() => setInstallKind("portable"));
+    // 是不是管理员模式（决定状态栏要不要标一下、菜单里那句要不要变）
+    void isAdmin()
+      .then(setIsAdminMode)
+      .catch(() => setIsAdminMode(false));
     // 上一次自动升级的结果：升级脚本会写一行日志（安装器退出码 + 失败原因），
     // 这里读一次就清掉，只往底部状态栏提示 —— 免得再出现"点了升级，什么都没有"。
     void updateTakeResult()
@@ -2884,6 +2893,39 @@ export default function App() {
     );
   }
 
+  /**
+   * 以管理员身份重启整个应用。
+   *
+   * 为什么不是"只提权某一个标签页"：终端是我们用 ConPTY 建的，伪控制台和管道都挂在
+   * 我们这个普通权限进程上，Windows 不允许管理员子进程挂进来。所以走"整个应用提权"
+   * （Windows Terminal 的「以管理员身份运行」也是这个模型）：过一次 UAC，之后开的
+   * PowerShell / CMD / WSL **天然都是管理员**。
+   */
+  async function doRestartAsAdmin() {
+    if (isAdminMode) {
+      notify("当前已经是管理员模式了");
+      return;
+    }
+    try {
+      await restartAsAdmin();
+      notify("正在以管理员身份重启…请在 UAC 窗口里点「是」");
+    } catch (e) {
+      notify("以管理员身份重启失败：" + String(e));
+    }
+  }
+
+  /** 折中方案：以管理员身份单独开一个 PowerShell / CMD 窗口（独立窗口，不在标签里） */
+  async function doOpenAdminShell(shell: "powershell" | "cmd") {
+    try {
+      await openAdminShell(shell);
+      notify(
+        `已请求打开管理员 ${shell === "cmd" ? "CMD" : "PowerShell"}（UAC 点「是」后会在独立窗口打开）`,
+      );
+    } catch (e) {
+      notify("打开管理员终端失败：" + String(e));
+    }
+  }
+
   function buildMenus(): { key: string; label: string; items: MenuItem[] }[] {
     const openConnectionForm = () => {
       setModule("remote");
@@ -2996,6 +3038,24 @@ export default function App() {
           { sep: false, label: "新建 PowerShell", action: () => void openLocalSession("powershell") },
           { sep: false, label: "新建 CMD", action: () => void openLocalSession("cmd") },
           { sep: false, label: "新建 WSL", action: () => void openLocalSession("wsl") },
+          { sep: true },
+          {
+            sep: false,
+            label: isAdminMode
+              ? "已以管理员身份运行（本地终端都是管理员）"
+              : "以管理员身份重启…（UAC；之后本地终端都是管理员）",
+            action: () => void doRestartAsAdmin(),
+          },
+          {
+            sep: false,
+            label: "以管理员身份打开 PowerShell（独立窗口）",
+            action: () => void doOpenAdminShell("powershell"),
+          },
+          {
+            sep: false,
+            label: "以管理员身份打开 CMD（独立窗口）",
+            action: () => void doOpenAdminShell("cmd"),
+          },
           { sep: true },
           {
             sep: false,
@@ -4909,6 +4969,14 @@ export default function App() {
           </span>
         )}
         {activeFile && <span className="stat">{activeFile.path}</span>}
+        {isAdminMode && (
+          <span
+            className="stat admin"
+            title="当前以管理员身份运行：新开的 PowerShell / CMD / WSL 都是管理员"
+          >
+            🛡 管理员
+          </span>
+        )}
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
       </div>
@@ -6369,7 +6437,7 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.5
+                <b>ZeeAI Terminal</b> 0.1.6
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />

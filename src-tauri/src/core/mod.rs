@@ -1,6 +1,7 @@
 pub mod adb;
 pub mod ai;
 pub mod ai_tasks;
+pub mod elevate;
 pub mod git;
 pub mod highlight;
 pub mod job;

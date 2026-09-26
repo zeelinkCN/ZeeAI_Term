@@ -293,6 +293,25 @@ export async function highlightPresets(): Promise<HighlightRule[]> {
   return invoke<HighlightRule[]>("highlight_presets");
 }
 
+/** 当前应用是不是以管理员身份在跑 */
+export async function isAdmin(): Promise<boolean> {
+  return invoke<boolean>("is_admin");
+}
+
+/**
+ * 以管理员身份重启整个应用（弹一次 UAC）。
+ * 之后开的 PowerShell / CMD 天然都是管理员 —— ConPTY 挂在我们的进程上，
+ * 没法只给单个标签页提权。
+ */
+export async function restartAsAdmin(): Promise<void> {
+  return invoke("restart_as_admin");
+}
+
+/** 以管理员身份单独开一个 PowerShell / CMD 窗口（独立窗口，不在标签里） */
+export async function openAdminShell(shell: "powershell" | "cmd"): Promise<void> {
+  return invoke("open_admin_shell", { shell });
+}
+
 /**
  * 记一笔「App 自己在某个会话里启动了某个 AI 工具」。
  * 这是 AI 任务看板里最精确的一层信号（开始时间、跑完没跑完都由 App 自己判）。

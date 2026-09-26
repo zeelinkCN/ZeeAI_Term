@@ -5,8 +5,8 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, ai_tasks, git, highlight, pty, remote_fs, serial, sftp, ssh, tmux, AiTaskRegistry,
-    SessionEvent, SessionRegistry,
+    adb, ai, ai_tasks, elevate, git, highlight, pty, remote_fs, serial, sftp, ssh, tmux,
+    AiTaskRegistry, SessionEvent, SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -1381,6 +1381,38 @@ pub async fn ai_probe(
 #[tauri::command]
 pub fn highlight_presets() -> Vec<highlight::HighlightRule> {
     highlight::presets()
+}
+
+// ---------- 管理员模式（提权） ----------
+
+/// 当前应用是不是以管理员身份在跑（状态栏要显示一个"管理员"标）
+#[tauri::command]
+pub fn is_admin() -> bool {
+    elevate::is_elevated()
+}
+
+/// 以管理员身份重启整个应用：过一次 UAC，之后开的 PowerShell / CMD 天然都是管理员。
+///
+/// 为什么不给"单个标签页提权"：终端是我们用 ConPTY 建的，伪控制台挂在普通权限进程上，
+/// Windows 不允许管理员子进程挂进去（详见 core::elevate 的说明）。
+#[tauri::command]
+pub fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    log::info!("ipc: restart_as_admin");
+    elevate::relaunch_self_elevated()?;
+    // 新实例起来之后再退出（走正常退出路径，顺手把会话进程收干净）
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        log::info!("admin: 退出旧实例，交给管理员实例接管");
+        app.exit(0);
+    });
+    Ok(())
+}
+
+/// 以管理员身份单独开一个 PowerShell / CMD 窗口（不在我们的标签里，但立刻有管理员权限）
+#[tauri::command]
+pub fn open_admin_shell(shell: String) -> Result<(), String> {
+    log::info!("ipc: open_admin_shell shell={shell}");
+    elevate::open_elevated_shell(&shell)
 }
 
 // ---------- AI 任务看板（v1） ----------

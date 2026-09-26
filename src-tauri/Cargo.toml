@@ -1,6 +1,6 @@
 [package]
 name = "zeeai-terminal"
-version = "0.1.5"
+version = "0.1.6"
 description = "ZeeAI Terminal - Windows multi-protocol terminal workbench"
 authors = ["ZeeAI"]
 license = ""
@@ -37,5 +37,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }

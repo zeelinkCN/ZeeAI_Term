@@ -1127,6 +1127,12 @@ body {
   margin-left: 14px;
 }
 
+/* 管理员模式标（状态栏） */
+.stat.admin {
+  color: var(--amber);
+  font-weight: 600;
+}
+
 .ai-install-hint {
   font-size: 11px;
   color: var(--amber);

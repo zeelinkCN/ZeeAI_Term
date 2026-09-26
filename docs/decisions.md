@@ -948,3 +948,23 @@ cargo run --release --example pty_probe -- 203.0.113.10 root
 - 本机全进程表扫描偏重 → 只有真有本机会话时才调，而且 **20 秒**一次；
 - 已知限制：App 自己启动的任务会从"运行中"变"已结束"并保留一段时间（可手动清），
   纯探测到的进程消失后直接从看板移除；WSL 目前按默认发行版查（会话里暂时没存 distro）。
+
+### ⑤ 0.1.6 追加：管理员模式（PowerShell / CMD 提权）
+
+用户反馈"没有管理员模式，有些东西运行不了"。实现与取舍：
+
+- **只能整个应用提权，不能单标签页提权**：终端是本应用用 ConPTY 建的，伪控制台与两根管道
+  都挂在**普通权限的我们**身上；要把管理员子进程挂进去，得有管理员令牌去 `CreateProcessAsUser`，
+  而拿令牌本身就需要特权。业界通行做法就是整个终端提权（Windows Terminal 的
+  「以管理员身份运行」同模型）；
+- 所以给了两条路：**「以管理员身份重启」**（`ShellExecuteExW` 的 `runas` 动作，过一次 UAC，
+  之后 PowerShell / CMD / WSL 天然都是管理员）与**「以管理员身份打开 PowerShell / CMD
+  （独立窗口）」**（不重启应用，代价是那个窗口不在我们的标签里）；
+- 提权状态用令牌查询（`OpenProcessToken` + `GetTokenInformation(TokenElevation)`）判断，
+  是管理员时底部状态栏显示「🛡 管理员」；
+- 用户取消 UAC（`ERROR_CANCELLED = 1223`）会被识别成"已取消"，走状态栏提示，不报错弹窗；
+- 实现只用了系统 API + 已依赖的 `windows-sys`（新增 `Win32_UI_Shell` /
+  `Win32_UI_WindowsAndMessaging` / `Win32_System_Registry` 三个 feature），**零新增第三方库**。
+
+> 未验证项（如实说明）：提权那条路需要人工点 UAC，自动化环境里没法验；已验证的是编译、
+> 令牌查询能正常返回、以及非管理员路径没有副作用。
