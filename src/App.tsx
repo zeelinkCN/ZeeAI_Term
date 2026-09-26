@@ -1916,10 +1916,16 @@ export default function App() {
     // 普通 shell 自动编号：不管是走"新建会话"对话框，还是从服务器右键 / 图标直接开，
     // 名字都不能重复 —— 否则历史记录按名字去重时会互相覆盖（表现为"开了好几个只看到一行"）
     const plainTitle = () => {
-      const used = historyRef.current.filter(
-        (h) => h.profileId === profile.id && !h.tmuxSession,
-      ).length;
-      return `${profile.name} · 普通 shell ${used + 1}`;
+      // 硬保证不重名：从"已有记录数 + 1"开始，如果这个名字已被占用就继续往后顺延。
+      // （之前只按数量算，计数一旦过期就会反复生成同一个名字 → 又覆盖同一条记录，
+      //   于是"开了好几个却只有一条、永远显示 普通 shell 2"）
+      const rows = historyRef.current.filter((h) => h.profileId === profile.id);
+      const taken = new Set(
+        rows.map((h) => (h.title ?? "").trim()).filter((t) => t !== ""),
+      );
+      let n = rows.filter((h) => !h.tmuxSession).length + 1;
+      while (taken.has(`${profile.name} · 普通 shell ${n}`)) n++;
+      return `${profile.name} · 普通 shell ${n}`;
     };
     const title =
       titleOverride?.trim() ||
@@ -4131,7 +4137,7 @@ export default function App() {
                       return (
                         <div key={p.id}>
                           <div
-                            className="tree-item"
+                            className="tree-item srv-node"
                             onClick={() => toggleServer(p.id)}
                             onDoubleClick={() => openEditDialog(p)}
                             onContextMenu={(e) => {
@@ -5077,7 +5083,6 @@ export default function App() {
                   (s.id === dragTabId ? " dragging" : "")
                 }
                 // 左右拖动排序：把一个标签拖到另一个上面，就插到它前面/后面
-                draggable
                 data-tab-id={s.id}
                 // 注意：HTML5 的 draggable 在 WebView2 里对 <button> 不生效，
                 // 所以这里自己用鼠标事件做拖动（见下面那个全局 mousemove 的 effect）
