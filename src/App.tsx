@@ -1962,7 +1962,13 @@ export default function App() {
           s.id === id
             ? {
                 ...s,
-                title: titleOverride?.trim() ? title : explicitName ? title : info.title || title,
+                // 标签标题的三条规则（以前普通 shell 也被 info.title 覆盖，
+                // 于是标签显示成"lz · 47.99.241.168"，和历史里的"普通 shell 2"对不上）：
+                // 1) 用户手填的名字 → 用用户的；
+                // 2) 普通 shell（没 tmux）→ 用我们算好的自动编号名字；
+                // 3) tmux → 用后端回来的真实会话名（initial default 模式事先拿不到名字）。
+                title:
+                  titleOverride?.trim() || tmuxMode === "none" ? title : info.title || title,
                 tmuxName: info.tmuxSession ?? undefined,
                 user: info.user ?? s.user,
               }
