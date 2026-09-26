@@ -252,7 +252,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   logDir: "",
 };
 
-const APP_VERSION = "0.1.3";
+const APP_VERSION = "0.1.4";
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
@@ -6033,7 +6033,7 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.3
+                <b>ZeeAI Terminal</b> 0.1.4
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />

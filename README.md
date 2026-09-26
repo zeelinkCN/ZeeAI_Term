@@ -22,7 +22,7 @@ HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开�
 
 ### 便携版
 
-`portable/ZeeAI_Term-0.1.3-portable.zip`（解压即用，内含内置 platform-tools，
+`portable/ZeeAI_Term-0.1.4-portable.zip`（解压即用，内含内置 platform-tools，
 ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 
 ### 功能现状
@@ -67,6 +67,15 @@ Monokai / Dracula / One Dark / Gruvbox / Tango 浅色），点一下立即生效
 **会话日志目录可自定义**：设置里可指定任意目录（本机其它盘或网络盘），
 留空则用默认的 `%APPDATA%\ZeeAI-Terminal\logs\sessions\`。
 
+**侧栏折叠**：点左侧活动栏**当前那个图标**折叠侧栏，点别的图标切过去并展开（VS Code 习惯）；
+「视图」菜单里的「折叠/展开侧栏」作为备选入口。
+
+**tmux 快捷操作面板**：连上 tmux 会话后，侧栏底部出现一版面按钮 —— 新建窗口、上下/左右分屏、
+切换窗口与窗格、放大窗格、换布局、滚动查看、重命名窗口、关闭窗格/窗口、脱离会话。
+按钮等价于对应的 `Ctrl+B xxx`（悬停会提示），但实现方式是**另开一条 ssh 跑 tmux 命令**，
+所以 **`Ctrl+B` 前缀键保持原样没被改动**，当前窗格在跑 vim 时按钮也照样有效。
+面板里还会列出当前会话的所有窗口，点一下直接切过去（每 10 秒对表，收起来就不打扰服务器）。
+
 **AI Agent 面板**：活动栏底部 AI 按钮 → 右侧面板，探测服务器上的
 Codex / Claude Code / Aider / Gemini CLI 是否安装、是否正在运行，支持一键安装与一键启动；
 每 8 秒探测一次进程，进程退出即判断任务结束并弹消息通知。
@@ -95,9 +104,9 @@ SSH 断线自动重连（指数退避，可关）。
 ### 产出物
 
 - 免安装版：`src-tauri/target/release/ZeeAI_Term.exe`
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.3_x64-setup.exe`
-- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.3_x64_en-US.msi`
-- 便携版：`portable/ZeeAI_Term-0.1.3-portable.zip`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.4_x64-setup.exe`
+- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.4_x64_en-US.msi`
+- 便携版：`portable/ZeeAI_Term-0.1.4-portable.zip`
 
 应用名与可执行文件名统一为 **`ZeeAI_Term`**（`productName` / `mainBinaryName`），
 配置仍放在 `%APPDATA%\ZeeAI-Terminal\`（所以改名不会丢你的服务器、历史和日志）。
