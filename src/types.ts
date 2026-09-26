@@ -22,6 +22,10 @@ export interface ConnectionProfile {
   color?: string;
   /** 这台服务器 / 串口 / 本地终端用哪一套高亮规则集（空 = 用全局默认那套） */
   highlightSetId?: string | null;
+  /** 这台服务器 / 串口 / 本地终端用哪套终端配色（空 = 用全局那套） */
+  termScheme?: string | null;
+  /** 配合 termScheme = "custom" 的自定义配色 JSON */
+  termSchemeCustom?: string | null;
   ssh?: SshConfig;
   serial?: SerialConfig;
   local?: { shell: "powershell" | "cmd" | "wsl"; distro?: string; cwd?: string };
@@ -246,6 +250,10 @@ export interface AppSettings {
   highlightRules: HighlightRule[];
   /** 命名规则集：服务器 / 串口 / 本地终端可各绑一套 */
   highlightRuleSets: HighlightRuleSet[];
+  /** 本地终端按 shell 各绑的配色方案 key（powershell / cmd / wsl） */
+  termSchemeByShell: Record<string, string>;
+  /** 本地终端按 shell 各绑的高亮规则集 id */
+  highlightSetByShell: Record<string, string>;
   /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
   aiNotifyTaskbar: boolean;
   /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */

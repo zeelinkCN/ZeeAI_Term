@@ -86,6 +86,7 @@ import {
   CUSTOM_SCHEME_KEY,
   TERM_SCHEMES,
   resolveTermPalette,
+  type TermPalette,
 } from "./termThemes";
 import type {
   AdbDevice,
@@ -287,18 +288,45 @@ function dirBase(p: string): string {
 
 /**
  * 某个会话该用哪一套高亮规则：
- * 会话上临时选的 > 这台服务器/串口/本地终端绑定的 > 全局默认那套。
+ * 会话上临时选的 > 这台服务器/串口绑定的 > 本地这种 shell 绑定的 > 全局默认那套。
  */
 function highlightRulesFor(
   settings: AppSettings,
   sessionSetId: string | null | undefined,
   profile: ConnectionProfile | undefined,
+  shellKind?: string,
 ): HighlightRule[] {
-  const id = (sessionSetId || profile?.highlightSetId || "").trim();
+  const byShell = shellKind ? settings.highlightSetByShell?.[shellKind] : "";
+  const id = (sessionSetId || profile?.highlightSetId || byShell || "").trim();
   const set = id ? settings.highlightRuleSets.find((s) => s.id === id) : undefined;
   if (set) return set.rules;
   const fallback = settings.highlightRuleSets.find((s) => s.id === "default");
   return fallback?.rules ?? settings.highlightRules;
+}
+
+/**
+ * 某个会话该用哪套终端配色（16 色）：
+ * 这台服务器/串口绑定的 > 本地这种 shell 绑定的 > 全局那套。
+ */
+function termSchemeFor(
+  settings: AppSettings,
+  profile: ConnectionProfile | undefined,
+  shellKind?: string,
+): { key: string; custom?: string } {
+  const byShell = shellKind ? settings.termSchemeByShell?.[shellKind] : "";
+  const key = (profile?.termScheme || byShell || settings.termScheme || "").trim();
+  const custom = profile?.termSchemeCustom ?? settings.termSchemeCustom;
+  return { key: key || settings.termScheme, custom };
+}
+
+/** 直接算出某个会话该用的 16 色配色 */
+function termPaletteFor(
+  settings: AppSettings,
+  profile: ConnectionProfile | undefined,
+  shellKind?: string,
+): TermPalette {
+  const look = termSchemeFor(settings, profile, shellKind);
+  return resolveTermPalette(look.key, look.custom);
 }
 
 const EMPTY_PROFILE = {
@@ -379,6 +407,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   highlightRules: [],
   // 规则集由后端给（core::highlight::presets 兜底），前端启动后就有内容
   highlightRuleSets: [],
+  termSchemeByShell: {},
+  highlightSetByShell: {},
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
   aiNotifyBadge: true,
@@ -4982,12 +5012,17 @@ export default function App() {
                             fontSize={settings.fontSize}
                             scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
-                            palette={termPalette}
+                            palette={termPaletteFor(
+                              settings,
+                              profiles.find((p) => p.id === ps.profileId),
+                              ps.kind,
+                            )}
                             highlightEnabled={settings.highlightEnabled}
                             highlightRules={highlightRulesFor(
                               settings,
                               ps.highlightSetId,
                               profiles.find((p) => p.id === ps.profileId),
+                              ps.kind,
                             )}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
@@ -5031,7 +5066,11 @@ export default function App() {
                     fontSize={settings.fontSize}
                     scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
-                    palette={termPalette}
+                    palette={termPaletteFor(
+                      settings,
+                      profiles.find((p) => p.id === s.profileId),
+                      s.kind,
+                    )}
                     highlightEnabled={settings.highlightEnabled}
                     highlightRules={highlightRulesFor(
                       settings,
@@ -6372,6 +6411,20 @@ export default function App() {
                   {settings.highlightRuleSets.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name || "(未命名)"}（{s.rules.length} 条）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="modal-field">
+                终端配色方案（这台机器单独用一套）
+                <select
+                  value={editDialog.draft.termScheme ?? ""}
+                  onChange={(e) => patchDraft({ termScheme: e.target.value || null })}
+                >
+                  <option value="">跟随默认</option>
+                  {TERM_SCHEMES.map((s) => (
+                    <option key={s.key} value={s.key}>
+                      {s.name}
                     </option>
                   ))}
                 </select>

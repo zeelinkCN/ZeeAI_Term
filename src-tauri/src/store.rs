@@ -93,6 +93,12 @@ pub struct ConnectionProfile {
     /// 这个服务器 / 串口 / 本地终端用哪一套关键字高亮规则集（空 = 用全局默认那套）
     #[serde(default)]
     pub highlight_set_id: Option<String>,
+    /// 这个服务器 / 串口 / 本地终端用哪套终端配色（空 = 用全局那套）
+    #[serde(default)]
+    pub term_scheme: Option<String>,
+    /// 配合 term_scheme = "custom" 的自定义配色 JSON
+    #[serde(default)]
+    pub term_scheme_custom: Option<String>,
 }
 
 fn default_auth_kind() -> String {
@@ -210,6 +216,10 @@ pub struct Settings {
     pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
     /// 命名规则集：服务器 / 串口 / 本地终端可以各绑一套（见 ConnectionProfile::highlight_set_id）
     pub highlight_rule_sets: Vec<HighlightRuleSet>,
+    /// 本地终端按 shell 各自绑的配色方案（powershell / cmd / wsl → 方案 key）
+    pub term_scheme_by_shell: std::collections::HashMap<String, String>,
+    /// 本地终端按 shell 各自绑的高亮规则集（powershell / cmd / wsl → 规则集 id）
+    pub highlight_set_by_shell: std::collections::HashMap<String, String>,
     /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
     pub ai_notify_taskbar: bool,
     /// 是否在左侧活动栏的 AI 星号上显示红点/数字
@@ -243,6 +253,8 @@ impl Default for Settings {
             // 空 → 由 load_settings 用 highlight_rules（或预设）填出名为「默认」的那套，
             // 这样老配置里用户自己调过的规则不会丢
             highlight_rule_sets: Vec::new(),
+            term_scheme_by_shell: std::collections::HashMap::new(),
+            highlight_set_by_shell: std::collections::HashMap::new(),
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
             ai_notify_badge: true,
@@ -409,8 +421,21 @@ mod settings_tests {
         )
         .unwrap();
         assert_eq!(p.highlight_set_id.as_deref(), Some("prod"));
+        assert!(p.term_scheme.is_none(), "没配就是 None（跟随全局）");
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("highlightSetId"), "{json}");
+    }
+
+    /// 每台服务器可以各存一套配色方案；不写就是 None
+    #[test]
+    fn profile_can_carry_its_own_palette() {
+        let p: ConnectionProfile = serde_json::from_str(
+            r##"{"id":"x","type":"ssh","name":"n","group":"g","termScheme":"dracula",
+                "termSchemeCustom":"{\"red\":\"#ff0000\"}"}"##,
+        )
+        .unwrap();
+        assert_eq!(p.term_scheme.as_deref(), Some("dracula"));
+        assert!(p.term_scheme_custom.unwrap().contains("ff0000"));
     }
 }
 
