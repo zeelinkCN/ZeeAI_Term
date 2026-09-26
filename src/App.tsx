@@ -345,12 +345,14 @@ export default function App() {
   const [profiles, setProfiles] = useState<ConnectionProfile[]>([]);
   const [sessions, setSessions] = useState<OpenSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
-  // 状态栏里的轻提示（完成类消息走这里，不弹中央挡视线）
+  /**
+   * 所有提示都只走底部状态栏（`statusMsg`）。
+   * 曾经有过一个中央浮层 toast，用户明确要求"不要在这里悬浮任何消息"——已彻底移除。
+   */
   const [statusMsg, setStatusMsg] = useState<{
     text: string;
     at: number;
-    kind: "info" | "warn";
+    kind: "info" | "warn" | "error";
   } | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
@@ -563,6 +565,21 @@ export default function App() {
     aiWasRunning.current = true;
     pushAiNotice(`已在「${cur.title}」里启动 ${tool}，它跑完我会提醒你`);
   }
+
+  /**
+   * 干掉 WebView2 / Edge **自带的**右键菜单。
+   * 用户看到的那些"刷新""从左到右书写""从右到左书写""语音"全都是浏览器菜单，
+   * 不是我们做的 —— 对一个终端工具来说纯属噪音。
+   * 我们自己的菜单是自己画的（组件里 onContextMenu → preventDefault → 渲染自定义菜单），
+   * React 的事件委托挂在 #root 上，会比这里的 document 监听先执行，所以不受影响。
+   */
+  useEffect(() => {
+    const blockNativeMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    document.addEventListener("contextmenu", blockNativeMenu);
+    return () => document.removeEventListener("contextmenu", blockNativeMenu);
+  }, []);
 
   // 命令面板：Ctrl+Shift+P 打开，输入过滤，回车执行
   useEffect(() => {
@@ -996,7 +1013,26 @@ export default function App() {
         await new Promise((r) => setTimeout(r, 16000));
         setShowServers(false);
         setShowSettings(true);
-        await new Promise((r) => setTimeout(r, 16000));
+        await new Promise((r) => setTimeout(r, 18000));
+        setShowSettings(false);
+        await new Promise((r) => setTimeout(r, 1500));
+        // 验证：终端右键应该弹出我们自己的菜单（复制/粘贴/全选/清屏），
+        // 而不是 WebView2 自带的"刷新 / 从左到右书写 / 语音"
+        const termHost = document.querySelector(".terminal-host") as HTMLElement | null;
+        termHost?.dispatchEvent(
+          new MouseEvent("contextmenu", {
+            bubbles: true,
+            cancelable: true,
+            clientX: 600,
+            clientY: 420,
+          }),
+        );
+        await new Promise((r) => setTimeout(r, 15000));
+        const backdrop = document.querySelector(".ctx-backdrop") as HTMLElement | null;
+        backdrop?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        // 验证：错误提示只出现在底部状态栏（红底 + 闪一下），不再有中央浮层
+        notify("测试：这是一条错误提示 —— 应该出现在底部状态栏并闪红，而不是悬浮在窗口中间");
+        await new Promise((r) => setTimeout(r, 15000));
       })();
     }).then((f) => {
       unlisten = f;
@@ -1140,29 +1176,30 @@ export default function App() {
   }
 
   /**
-   * 统一的提示入口。
-   * - 出错 / 需要你立刻处理 → 中央红色 toast（挡住视线的只有这种，值得）
-   * - 完成类（已上传、已删除、AI 跑完…）→ 底部状态栏，几秒后自己消失
+   * 统一的提示入口 —— **只写底部状态栏，不做任何悬浮弹层**。
+   * 按内容分成三档，用颜色/符号区分：
+   *   info  完成类（已上传、已删除、AI 跑完…）→ ✓
+   *   warn  需要留意但不致命（还没好、已重试 N 次…）→ ⚠ 琥珀黄
+   *   error 出错（失败、无法、请先…）→ ❗ 红底加粗并闪一下
    */
-  const raiseToast = setToast;
   function notify(text: string) {
-    if (/失败|错误|不能|请|无法|不支持|被拒绝|不正确|超时|不存在|为空/.test(text)) {
-      raiseToast(text);
-    } else {
-      // 「……还没好/已尝试 N 次」这类需要你留意但不致命的，用黄色 + 感叹号
-      const kind: "info" | "warn" = /还没|没有|已尝试|重试|注意|不可|未/.test(text)
+    const kind: "info" | "warn" | "error" = /失败|错误|不能|请|无法|不支持|被拒绝|不正确|超时|不存在|为空/.test(
+      text,
+    )
+      ? "error"
+      : /还没|没有|已尝试|重试|注意|不可|未/.test(text)
         ? "warn"
         : "info";
-      setStatusMsg({ text, at: Date.now(), kind });
-    }
+    setStatusMsg({ text, at: Date.now(), kind });
   }
 
-  // 状态栏提示 8 秒后自动消失
+  // 状态栏提示自动消失（错误留久一点，让你看清）
   useEffect(() => {
     if (!statusMsg) return;
+    const ttl = statusMsg.kind === "error" ? 12000 : 8000;
     const t = window.setTimeout(() => {
       setStatusMsg((cur) => (cur && cur.at === statusMsg.at ? null : cur));
-    }, 8000);
+    }, ttl);
     return () => window.clearTimeout(t);
   }, [statusMsg]);
 
@@ -3838,6 +3875,7 @@ export default function App() {
                             scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
+                            onNotice={notify}
                           />
                         ) : (
                           <div className="pane-empty">
@@ -3878,6 +3916,7 @@ export default function App() {
                     scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
+                    onNotice={notify}
                   />
                 </div>
               ))
@@ -4028,12 +4067,6 @@ export default function App() {
         <span className="stat">UTF-8</span>
         <span className="stat">xterm-256color</span>
       </div>
-
-      {toast && (
-        <div className="toast" onClick={() => setToast(null)}>
-          {toast}
-        </div>
-      )}
 
       {transfers.length > 0 && (
         <div className="transfer-dock">

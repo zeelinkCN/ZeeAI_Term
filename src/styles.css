@@ -2011,6 +2011,24 @@ body {
   content: "⚠";
 }
 
+/* 出错：红底 + 加粗 + 闪三下（不悬浮，就在状态栏里） */
+.statusbar .status-notice.error {
+  background: rgba(196, 62, 62, 0.96);
+  color: #fff;
+  font-weight: 600;
+  animation: status-blink 0.9s ease-in-out 3;
+}
+
+.statusbar .status-notice.error::before {
+  content: "❗";
+}
+
+@keyframes status-blink {
+  50% {
+    opacity: 0.45;
+  }
+}
+
 /* 正在记录终端日志的标签：小红点 */
 .rec-dot {
   flex: none;
@@ -2032,18 +2050,4 @@ body {
   }
 }
 
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 44px;
-  transform: translateX(-50%);
-  background: #5a1d1d;
-  border: 1px solid #a33;
-  color: #ffd9d9;
-  padding: 8px 14px;
-  border-radius: 6px;
-  font-size: 12.5px;
-  max-width: 70vw;
-  cursor: pointer;
-  z-index: 50;
-}
+/* 中央浮层已经删掉了：所有提示只在底部状态栏出现（.status-notice） */

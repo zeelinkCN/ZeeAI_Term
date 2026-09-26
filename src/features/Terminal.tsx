@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -16,6 +16,8 @@ interface Props {
   scrollback?: number;
   /** shell 通过 OSC 7 上报当前工作目录时回调（非 tmux 会话也能跟踪 cwd） */
   onCwd?: (path: string) => void;
+  /** 需要给用户提示时回调（走状态栏，不弹浮层） */
+  onNotice?: (text: string) => void;
 }
 
 /** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
@@ -88,10 +90,13 @@ export default function TerminalView({
   light = false,
   scrollback = 10000,
   onCwd,
+  onNotice,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // 终端自己的右键菜单（复制/粘贴/清空/全选）—— 浏览器那套菜单已被全局屏蔽
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
   const onCwdRef = useRef<Props["onCwd"]>(onCwd);
   onCwdRef.current = onCwd;
@@ -209,5 +214,104 @@ export default function TerminalView({
     }
   }, [fontSize, light, scrollback, sessionId]);
 
-  return <div className="terminal-host" ref={hostRef} />;
+  /** 终端右键菜单的动作 */
+  async function copySelection() {
+    const term = termRef.current;
+    const text = term?.getSelection() ?? "";
+    if (!text) {
+      onNotice?.("没有选中内容");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      onNotice?.(`已复制 ${text.length} 个字符`);
+    } catch (e) {
+      onNotice?.("复制失败：" + String(e));
+    }
+  }
+
+  async function pasteClipboard() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) return;
+      void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(text)));
+    } catch {
+      // 剪贴板读取被拒绝时，告诉用户用 Ctrl+V（xterm 自己处理粘贴，不需要权限）
+      onNotice?.("读取剪贴板被拒绝，请用 Ctrl+V 粘贴");
+    }
+  }
+
+  return (
+    <>
+      <div
+        className="terminal-host"
+        ref={hostRef}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
+      />
+      {menu && (
+        <div
+          className="ctx-backdrop"
+          onClick={() => setMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu(null);
+          }}
+        >
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(menu.x, Math.max(0, window.innerWidth - 170)),
+              top: Math.min(menu.y, Math.max(0, window.innerHeight - 150)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                void copySelection();
+              }}
+            >
+              复制
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                void pasteClipboard();
+              }}
+            >
+              粘贴
+            </button>
+            <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                termRef.current?.selectAll();
+              }}
+            >
+              全选
+            </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                termRef.current?.clear();
+              }}
+            >
+              清屏
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
