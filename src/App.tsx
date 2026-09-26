@@ -563,6 +563,9 @@ export default function App() {
   // 自动检查更新用的是定时器回调，闭包里的 settings 会过期，所以这里存一份最新的
   const settingsRef = useRef<AppSettings>(settings);
   settingsRef.current = settings;
+  // 字号（Ctrl + 滚轮 / Ctrl + +/- 用）：ref 里放"还没落盘"的临时值，避免连点时读到旧值
+  const fontRef = useRef<number | null>(null);
+  const fontSaveTimer = useRef<number | null>(null);
   const serialPortsRef = useRef<SerialPortInfo[]>([]);
   // 远程文件浏览器属于「当前会话」，所以读目录/读文件也要用当前会话实际登录的用户
   const activeUserRef = useRef<string | undefined>(undefined);
@@ -711,6 +714,20 @@ export default function App() {
         setPaletteOpen((v) => !v);
       } else if (e.key === "Escape") {
         setPaletteOpen(false);
+      } else if (e.ctrlKey && !e.altKey) {
+        // 字体缩放：Ctrl + ＋ / － / 0（和浏览器、VS Code 一个习惯）
+        // 这几个组合键在 shell / tmux 里都没有含义，抢过来不会影响终端输入
+        const k = e.key;
+        if (k === "+" || k === "=" || e.code === "NumpadAdd") {
+          e.preventDefault();
+          bumpFont(1);
+        } else if (k === "-" || k === "_" || e.code === "NumpadSubtract") {
+          e.preventDefault();
+          bumpFont(-1);
+        } else if (k === "0" || e.code === "Numpad0") {
+          e.preventDefault();
+          applyFontSize(13);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -2305,8 +2322,33 @@ export default function App() {
   }
 
   function bumpFont(delta: number) {
-    const next = Math.min(26, Math.max(8, settings.fontSize + delta));
-    void updateSettings({ fontSize: next });
+    applyFontSize(currentFontSize() + delta);
+  }
+
+  /** 当前字号：优先用"还没落盘的临时值"，保证滚轮连点时每次都在前一档上加减 */
+  function currentFontSize(): number {
+    return fontRef.current ?? settingsRef.current.fontSize ?? 13;
+  }
+
+  /**
+   * 立刻改字号（界面马上生效），落盘延后 400ms。
+   *
+   * 为什么不一格一格直接写设置：`Ctrl + 鼠标滚轮` 一滚就是十几次事件，
+   * 每次都写一遍 settings.json 既没必要也伤盘。
+   */
+  function applyFontSize(next: number) {
+    const v = Math.min(26, Math.max(8, next));
+    if (v === currentFontSize()) return;
+    fontRef.current = v;
+    setSettings((s) => ({ ...s, fontSize: v }));
+    if (fontSaveTimer.current !== null) window.clearTimeout(fontSaveTimer.current);
+    fontSaveTimer.current = window.setTimeout(() => {
+      fontSaveTimer.current = null;
+      fontRef.current = null;
+      void settingsSet({ ...settingsRef.current }).catch((e) =>
+        notify("保存字号失败：" + String(e)),
+      );
+    }, 400);
   }
 
   function clearActiveTerminal() {
@@ -2702,9 +2744,10 @@ export default function App() {
         key: "view",
         label: "视图",
         items: [
-          { sep: false, label: "放大字体", action: () => bumpFont(1) },
-          { sep: false, label: "缩小字体", action: () => bumpFont(-1) },
-          { sep: false, label: "重置字体", action: () => void updateSettings({ fontSize: 13 }) },
+          // 快捷键提示写进标签，顺便当教学（Ctrl + 滚轮 也管用）
+          { sep: false, label: "放大字体（Ctrl + ＋）", action: () => bumpFont(1) },
+          { sep: false, label: "缩小字体（Ctrl + －）", action: () => bumpFont(-1) },
+          { sep: false, label: "重置字体（Ctrl + 0）", action: () => applyFontSize(13) },
           { sep: false, label: "终端配色…", action: () => setShowTermTheme(true) },
           { sep: true },
           {
@@ -3290,129 +3333,6 @@ export default function App() {
           <div className="side-body">
             {module === "remote" && sideTab === "sessions" && (
               <>
-                <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn primary"
-                    onClick={() => openNewSessionDialog()}
-                  >
-                    <IconPlus size={14} /> 新建会话
-                  </button>
-                </div>
-
-                {showForm && (
-                  <div className="form">
-                    <label>
-                      名称
-                      <input
-                        value={form.name}
-                        placeholder="可留空"
-                        onChange={(e) => setForm({ ...form, name: e.target.value })}
-                      />
-                    </label>
-                    <label>
-                      主机
-                      <input
-                        value={form.host}
-                        placeholder="例如 203.0.113.10"
-                        onChange={(e) => setForm({ ...form, host: e.target.value })}
-                      />
-                    </label>
-                    <div className="row">
-                      <label className="grow">
-                        端口
-                        <input
-                          value={form.port}
-                          onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
-                        />
-                      </label>
-                      <label className="grow">
-                        用户
-                        <input
-                          value={form.user}
-                          onChange={(e) => setForm({ ...form, user: e.target.value })}
-                        />
-                      </label>
-                    </div>
-                    <label>
-                      分组
-                      <input
-                        value={form.group}
-                        onChange={(e) => setForm({ ...form, group: e.target.value })}
-                      />
-                    </label>
-                    <label>
-                      私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
-                      <input
-                        value={form.keyPath}
-                        placeholder="C:\Users\me\.ssh\id_ed25519"
-                        onChange={(e) => setForm({ ...form, keyPath: e.target.value })}
-                      />
-                    </label>
-                    <button type="button" className="btn primary" onClick={() => void submitProfile()}>
-                      保存
-                    </button>
-                  </div>
-                )}
-
-                {grouped.length === 0 && !showForm && (
-                  <div className="hint">
-                    还没有连接。点「新建连接」添加一台服务器，
-                    <br />
-                    认证使用你本机已配置的 SSH 密钥。
-                  </div>
-                )}
-
-                {tmuxTarget && (
-                  <div className="tmux-panel">
-                    <div className="tmux-head">
-                      <span>tmux · {tmuxTarget.name}</span>
-                      <span className="tmux-actions">
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void refreshTmux(tmuxTarget)}
-                        >
-                          刷新
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => setTmuxTarget(null)}
-                        >
-                          关闭
-                        </button>
-                      </span>
-                    </div>
-                    {tmuxLoading && <div className="hint">正在读取…</div>}
-                    {!tmuxLoading && tmuxSessions.length === 0 && (
-                      <div className="hint">没有 tmux 会话（或服务器未安装 tmux）。</div>
-                    )}
-                    {tmuxSessions.map((s) => (
-                      <div key={s.name} className="tmux-row">
-                        <IconTerminal size={14} />
-                        <span className="grow">{s.name}</span>
-                        <span className="dim">{s.windows} 窗口</span>
-                        {s.attached && <span className="tag">已连接</span>}
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void openSshSession(tmuxTarget, "name", s.name)}
-                        >
-                          连接
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void killTmux(tmuxTarget, s.name)}
-                        >
-                          结束
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
                 <div className="tree-group">
                   已保存的服务器
                   <button
@@ -3545,6 +3465,130 @@ export default function App() {
                     })}
                   </div>
                 ))}
+
+                <div className="side-actions">
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => openNewSessionDialog()}
+                  >
+                    <IconPlus size={14} /> 新建会话
+                  </button>
+                </div>
+
+                {showForm && (
+                  <div className="form">
+                    <label>
+                      名称
+                      <input
+                        value={form.name}
+                        placeholder="可留空"
+                        onChange={(e) => setForm({ ...form, name: e.target.value })}
+                      />
+                    </label>
+                    <label>
+                      主机
+                      <input
+                        value={form.host}
+                        placeholder="例如 203.0.113.10"
+                        onChange={(e) => setForm({ ...form, host: e.target.value })}
+                      />
+                    </label>
+                    <div className="row">
+                      <label className="grow">
+                        端口
+                        <input
+                          value={form.port}
+                          onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                        />
+                      </label>
+                      <label className="grow">
+                        用户
+                        <input
+                          value={form.user}
+                          onChange={(e) => setForm({ ...form, user: e.target.value })}
+                        />
+                      </label>
+                    </div>
+                    <label>
+                      分组
+                      <input
+                        value={form.group}
+                        onChange={(e) => setForm({ ...form, group: e.target.value })}
+                      />
+                    </label>
+                    <label>
+                      私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
+                      <input
+                        value={form.keyPath}
+                        placeholder="C:\Users\me\.ssh\id_ed25519"
+                        onChange={(e) => setForm({ ...form, keyPath: e.target.value })}
+                      />
+                    </label>
+                    <button type="button" className="btn primary" onClick={() => void submitProfile()}>
+                      保存
+                    </button>
+                  </div>
+                )}
+
+                {grouped.length === 0 && !showForm && (
+                  <div className="hint">
+                    还没有连接。点「新建连接」添加一台服务器，
+                    <br />
+                    认证使用你本机已配置的 SSH 密钥。
+                  </div>
+                )}
+
+                {tmuxTarget && (
+                  <div className="tmux-panel">
+                    <div className="tmux-head">
+                      <span>tmux · {tmuxTarget.name}</span>
+                      <span className="tmux-actions">
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void refreshTmux(tmuxTarget)}
+                        >
+                          刷新
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => setTmuxTarget(null)}
+                        >
+                          关闭
+                        </button>
+                      </span>
+                    </div>
+                    {tmuxLoading && <div className="hint">正在读取…</div>}
+                    {!tmuxLoading && tmuxSessions.length === 0 && (
+                      <div className="hint">没有 tmux 会话（或服务器未安装 tmux）。</div>
+                    )}
+                    {tmuxSessions.map((s) => (
+                      <div key={s.name} className="tmux-row">
+                        <IconTerminal size={14} />
+                        <span className="grow">{s.name}</span>
+                        <span className="dim">{s.windows} 窗口</span>
+                        {s.attached && <span className="tag">已连接</span>}
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void openSshSession(tmuxTarget, "name", s.name)}
+                        >
+                          连接
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void killTmux(tmuxTarget, s.name)}
+                        >
+                          结束
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
               </>
             )}
 
@@ -4405,6 +4449,7 @@ export default function App() {
                             palette={termPalette}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
+                            onZoom={bumpFont}
                           />
                         ) : (
                           <div className="pane-empty">
@@ -4447,6 +4492,7 @@ export default function App() {
                     palette={termPalette}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                     onNotice={notify}
+                    onZoom={bumpFont}
                   />
                 </div>
               ))
@@ -5792,13 +5838,13 @@ export default function App() {
             <div className="modal-head">设置</div>
             <div className="modal-body">
               <label className="modal-field">
-                终端字体大小：{settings.fontSize}px
+                终端字体大小：{settings.fontSize}px（也可直接 Ctrl + 滚轮 或 Ctrl + ＋ / －）
                 <input
                   type="range"
                   min={8}
                   max={26}
                   value={settings.fontSize}
-                  onChange={(e) => void updateSettings({ fontSize: Number(e.target.value) })}
+                  onChange={(e) => applyFontSize(Number(e.target.value))}
                 />
               </label>
 

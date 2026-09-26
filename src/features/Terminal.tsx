@@ -21,6 +21,8 @@ interface Props {
   onCwd?: (path: string) => void;
   /** 需要给用户提示时回调（走状态栏，不弹浮层） */
   onNotice?: (text: string) => void;
+  /** Ctrl + 鼠标滚轮缩放字号：+1 变大，-1 变小 */
+  onZoom?: (delta: number) => void;
 }
 
 /** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
@@ -95,6 +97,7 @@ export default function TerminalView({
   scrollback = 10000,
   onCwd,
   onNotice,
+  onZoom,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -104,6 +107,8 @@ export default function TerminalView({
   // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
   const onCwdRef = useRef<Props["onCwd"]>(onCwd);
   onCwdRef.current = onCwd;
+  const onZoomRef = useRef<Props["onZoom"]>(onZoom);
+  onZoomRef.current = onZoom;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -173,10 +178,32 @@ export default function TerminalView({
     const ro = new ResizeObserver(() => doFit());
     ro.observe(host);
 
+    // Ctrl + 鼠标滚轮 = 缩放字号（和浏览器/VS Code 一个习惯）。
+    // 用 capture 阶段拦下来：xterm 自己的滚轮处理在冒泡阶段，
+    // 这里 stopPropagation 之后它就不会顺手滚动缓冲，两者不会打架。
+    let acc = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) {
+        acc = 0;
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      // 触摸板一次滑动会发很多小 deltaY，累计到一档再动，避免抖得太快
+      acc += e.deltaY;
+      const step = 40;
+      if (Math.abs(acc) >= step) {
+        onZoomRef.current?.(acc > 0 ? -1 : 1);
+        acc = 0;
+      }
+    };
+    host.addEventListener("wheel", onWheel, { passive: false, capture: true });
+
     return () => {
       disposed = true;
       for (const t of timers) window.clearTimeout(t);
       ro.disconnect();
+      host.removeEventListener("wheel", onWheel, { capture: true });
       sub.dispose();
       osc7.dispose();
       bus.detach(sessionId);
