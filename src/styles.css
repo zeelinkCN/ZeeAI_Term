@@ -1236,6 +1236,35 @@ body {
 }
 
 /* 状态栏上的「AI 已完成」提示：闪一下 + 强调色，点一下切到那个会话 */
+.sub-tab-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 8px;
+  background: var(--border);
+}
+
+/* "文件"分组标签：让下面的胶囊一眼看出是文件，不是终端 */
+.sub-tabs-label {
+  flex: none;
+  padding-right: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* 文件标签做成胶囊（虚线边 + 圆角），和实心的"终端"标签明显区分 */
+.sub-tab.file {
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sub-tab.file.active {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .ai-status-chip {
   border: 0;
   background: var(--accent-soft);
@@ -1268,21 +1297,26 @@ body {
 /* 产物文件名：点一下就能看（远端走应用内预览） */
 .ai-artifact {
   max-width: 100%;
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  background: var(--accent-soft);
+  padding: 3px 9px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: rgba(55, 148, 255, 0.18);
   color: var(--fg);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   font-family: "Cascadia Mono", Consolas, monospace;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 0.08s ease, background 0.12s ease;
 }
 
 .ai-artifact:hover {
-  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .ai-alert-dock {

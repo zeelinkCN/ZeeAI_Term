@@ -28,6 +28,10 @@ interface Props {
   setOptions?: { id: string; name: string }[];
   boundSetId?: string;
   onBindSet?: (id: string) => void;
+  /** 关键字高亮的总开关与"编辑规则"入口（收进这个对话框，不再单独占一个一级按钮） */
+  highlightEnabled?: boolean;
+  onHighlightEnabled?: (v: boolean) => void;
+  onOpenHighlightRules?: () => void;
 }
 
 /** 16 色预览条：一眼看出这套配色长什么样 */
@@ -136,6 +140,9 @@ export default function TermThemeDialog({
   setOptions,
   boundSetId,
   onBindSet,
+  highlightEnabled,
+  onHighlightEnabled,
+  onOpenHighlightRules,
 }: Props) {
   // 自定义配色：从当前生效值起步（用户改到一半切走也不丢，因为每次都写进 settings）
   const [customDraft, setCustomDraft] = useState<TermPalette>(() =>
@@ -192,7 +199,7 @@ export default function TermThemeDialog({
               {onBindSet && (
                 <>
                   <span className="hint" style={{ padding: "0 6px 0 12px" }}>
-                    关键字高亮
+                    高亮规则
                   </span>
                   <select value={boundSetId ?? ""} onChange={(e) => onBindSet(e.target.value)}>
                     <option value="">跟随默认那套</option>
@@ -204,6 +211,27 @@ export default function TermThemeDialog({
                   </select>
                 </>
               )}
+            </div>
+          )}
+          {/* 关键字高亮收在这里（原来在设置里单独占一个一级按钮，字又小、很难找） */}
+          {onHighlightEnabled && (
+            <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+              <label className="form-check" style={{ padding: 0 }}>
+                <input
+                  type="checkbox"
+                  checked={highlightEnabled ?? false}
+                  onChange={(e) => onHighlightEnabled(e.target.checked)}
+                />
+                <span>关键字高亮</span>
+              </label>
+              <button
+                type="button"
+                className="mini-btn"
+                style={{ marginLeft: 10 }}
+                onClick={() => onOpenHighlightRules?.()}
+              >
+                编辑高亮规则…
+              </button>
             </div>
           )}
           <Preview palette={isCustom ? customDraft : palette} />

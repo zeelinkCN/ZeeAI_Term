@@ -287,17 +287,28 @@ function dirBase(p: string): string {
 }
 
 /**
+ * 会话类型 → 我们对外暴露的 4 种"终端类型"（作用范围就用这几种）
+ * remote=SSH；powershell/cmd/wsl 都是本地终端；serial=串口；adb=Android
+ */
+function kindOfSession(kind: string): "ssh" | "local" | "serial" | "adb" {
+  if (kind === "remote") return "ssh";
+  if (kind === "serial") return "serial";
+  if (kind === "adb") return "adb";
+  return "local";
+}
+
+/**
  * 某个会话该用哪一套高亮规则：
- * 会话上临时选的 > 这台服务器/串口绑定的 > 本地这种 shell 绑定的 > 全局默认那套。
+ * 会话上临时选的 > 这台服务器/设备绑定的 > 该终端类型绑定的 > 全局默认那套。
  */
 function highlightRulesFor(
   settings: AppSettings,
   sessionSetId: string | null | undefined,
   profile: ConnectionProfile | undefined,
-  shellKind?: string,
+  terminalKind?: string,
 ): HighlightRule[] {
-  const byShell = shellKind ? settings.highlightSetByShell?.[shellKind] : "";
-  const id = (sessionSetId || profile?.highlightSetId || byShell || "").trim();
+  const byKind = terminalKind ? settings.highlightSetByKind?.[terminalKind] : "";
+  const id = (sessionSetId || profile?.highlightSetId || byKind || "").trim();
   const set = id ? settings.highlightRuleSets.find((s) => s.id === id) : undefined;
   if (set) return set.rules;
   const fallback = settings.highlightRuleSets.find((s) => s.id === "default");
@@ -306,15 +317,15 @@ function highlightRulesFor(
 
 /**
  * 某个会话该用哪套终端配色（16 色）：
- * 这台服务器/串口绑定的 > 本地这种 shell 绑定的 > 全局那套。
+ * 这台服务器/设备绑定的 > 该终端类型绑定的 > 全局那套。
  */
 function termSchemeFor(
   settings: AppSettings,
   profile: ConnectionProfile | undefined,
-  shellKind?: string,
+  terminalKind?: string,
 ): { key: string; custom?: string } {
-  const byShell = shellKind ? settings.termSchemeByShell?.[shellKind] : "";
-  const key = (profile?.termScheme || byShell || settings.termScheme || "").trim();
+  const byKind = terminalKind ? settings.termSchemeByKind?.[terminalKind] : "";
+  const key = (profile?.termScheme || byKind || settings.termScheme || "").trim();
   const custom = profile?.termSchemeCustom ?? settings.termSchemeCustom;
   return { key: key || settings.termScheme, custom };
 }
@@ -323,9 +334,9 @@ function termSchemeFor(
 function termPaletteFor(
   settings: AppSettings,
   profile: ConnectionProfile | undefined,
-  shellKind?: string,
+  terminalKind?: string,
 ): TermPalette {
-  const look = termSchemeFor(settings, profile, shellKind);
+  const look = termSchemeFor(settings, profile, terminalKind);
   return resolveTermPalette(look.key, look.custom);
 }
 
@@ -407,8 +418,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   highlightRules: [],
   // 规则集由后端给（core::highlight::presets 兜底），前端启动后就有内容
   highlightRuleSets: [],
-  termSchemeByShell: {},
-  highlightSetByShell: {},
+  termSchemeByKind: {},
+  highlightSetByKind: {},
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
   aiNotifyBadge: true,
@@ -661,9 +672,9 @@ export default function App() {
   const [aiAlerts, setAiAlerts] = useState<
     { id: string; text: string; sessionId: string; time: number }[]
   >([]);
-  /// 已经通知过的那一轮（避免同一条消息反复弹）
-  const aiTurnKey = useRef("");
-  const aiSeeded = useRef(false);
+  /// 已经通知过的那一轮 —— **按会话分别记**（共用一个 key 会让两个会话互相"看起来是新的"，数字会一直涨）
+  const aiTurnKey = useRef<Record<string, string>>({});
+  const aiSeeded = useRef<Record<string, boolean>>({});
   /// 这一轮跑完之后的产物（卡片下面那排文件名）
   const [aiArtifacts, setAiArtifacts] = useState<AiArtifact[]>([]);
   /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
@@ -1074,20 +1085,20 @@ export default function App() {
     const needsMe = snap.state === "needs-approval" || snap.state === "waiting-user";
     const hasMessage = snap.lastTurnCompletedAt > 0 && snap.lastMessage.trim().length > 0;
     const turnKey = `${snap.sessionId}:${snap.lastTurnCompletedAt}:${snap.lastMessage.length}`;
-    // 第一次拿到这个会话的快照时只记下来，不提醒（否则一开应用就会把上一轮翻出来弹）
-    if (!aiSeeded.current) {
-      aiSeeded.current = true;
-      aiTurnKey.current = turnKey;
+    // 第一次拿到**这个会话**的快照时只记下来，不提醒（否则一开应用就会把上一轮翻出来弹）
+    if (!aiSeeded.current[cur.id]) {
+      aiSeeded.current[cur.id] = true;
+      aiTurnKey.current[cur.id] = turnKey;
       return;
     }
-    const freshTurn = hasMessage && turnKey !== aiTurnKey.current;
+    const freshTurn = hasMessage && turnKey !== aiTurnKey.current[cur.id];
     if (!needsMe && !freshTurn) return;
 
     // 人就在看这个终端（窗口在前台 + 正打开它）→ 一般不打扰；
     // 但"这一轮产出了文件"是另一回事：那是要你去看的东西，照样提醒。
     const watching =
       document.hasFocus() && cur.id === activeId && cur.activeTab === "terminal" && aiPanelOpen;
-    if (freshTurn) aiTurnKey.current = turnKey;
+    if (freshTurn) aiTurnKey.current[cur.id] = turnKey;
 
     if (freshTurn) {
       // 有新消息时顺手把"这一轮产出的文件"翻出来，提示里带上数量（列表在卡片下面）
@@ -3720,43 +3731,26 @@ export default function App() {
   // ---------- 「终端配色」对话框：先选作用范围，再给这个范围配色 + 绑高亮规则集 ----------
   const lookScopes = useMemo(
     () => [
+      // 只按"一种终端一个类型"分：SSH 就是 SSH，本地都算本地，不按单台设备再拆
       { key: "global", label: "全局默认（所有终端）" },
-      { key: "shell:powershell", label: "本地 PowerShell" },
-      { key: "shell:cmd", label: "本地 CMD" },
-      { key: "shell:wsl", label: "本地 WSL" },
-      ...profiles.map((p) => ({
-        key: `p:${p.id}`,
-        label: `${p.type === "serial" ? "串口" : p.type === "local" ? "本地" : "服务器"} · ${p.name}`,
-      })),
+      { key: "kind:ssh", label: "远程 SSH" },
+      { key: "kind:local", label: "本地终端（PowerShell / CMD / WSL）" },
+      { key: "kind:serial", label: "串口设备" },
+      { key: "kind:adb", label: "Android（ADB）" },
     ],
-    [profiles],
+    [],
   );
-  const lookProfile = lookScope.startsWith("p:")
-    ? profiles.find((p) => p.id === lookScope.slice(2))
-    : undefined;
-  const lookShell = lookScope.startsWith("shell:") ? lookScope.slice(6) : "";
+  const lookKind = lookScope.startsWith("kind:") ? lookScope.slice(5) : "";
   /** 当前作用范围实际生效的配色（用作对话框里"当前"的显示） */
-  const lookPalette = termPaletteFor(settings, lookProfile, lookShell || undefined);
-  const lookScheme = termSchemeFor(settings, lookProfile, lookShell || undefined);
+  const lookPalette = termPaletteFor(settings, undefined, lookKind || undefined);
+  const lookScheme = termSchemeFor(settings, undefined, lookKind || undefined);
 
-  /** 给当前作用范围选配色方案（服务器/串口写进 profile，本地 shell 写进设置） */
+  /** 给当前作用范围（全局 / 某类终端）选配色方案 */
   async function setLookScheme(key: string, custom?: string) {
-    if (lookProfile) {
-      try {
-        await saveProfile({
-          ...lookProfile,
-          termScheme: key,
-          termSchemeCustom:
-            custom !== undefined ? custom : (lookProfile.termSchemeCustom ?? settings.termSchemeCustom),
-        });
-        await refresh();
-      } catch (e) {
-        notify("保存这台机器的配色失败：" + String(e));
-      }
-      return;
-    }
-    if (lookShell) {
-      void updateSettings({ termSchemeByShell: { ...settings.termSchemeByShell, [lookShell]: key } });
+    if (lookKind) {
+      void updateSettings({
+        termSchemeByKind: { ...settings.termSchemeByKind, [lookKind]: key },
+      });
       return;
     }
     void updateSettings({
@@ -3765,19 +3759,12 @@ export default function App() {
     });
   }
 
-  /** 给当前作用范围绑高亮规则集 */
+  /** 给当前作用范围（某类终端）绑高亮规则集 */
   async function setLookSet(id: string) {
-    if (lookProfile) {
-      try {
-        await saveProfile({ ...lookProfile, highlightSetId: id || null });
-        await refresh();
-      } catch (e) {
-        notify("保存这台机器的高亮规则集失败：" + String(e));
-      }
-      return;
-    }
-    if (lookShell) {
-      void updateSettings({ highlightSetByShell: { ...settings.highlightSetByShell, [lookShell]: id } });
+    if (lookKind) {
+      void updateSettings({
+        highlightSetByKind: { ...settings.highlightSetByKind, [lookKind]: id },
+      });
     }
   }
 
@@ -5008,6 +4995,9 @@ export default function App() {
               >
                 <IconTerminal size={14} /> 终端
               </button>
+              {/* 分隔：左边是"终端"，右边是打开的文件 —— 不分开真的分不清哪个是哪个 */}
+              <span className="sub-tab-sep" />
+              <span className="sub-tabs-label">文件</span>
               {activeSession.openFiles.map((f) => (
                 <button
                   key={f.path}
@@ -5273,7 +5263,7 @@ export default function App() {
                               title={`${a.path} · ${humanSize(a.size)}`}
                               onClick={() => void openArtifact(activeSession, snap.cwd, a)}
                             >
-                              {a.name}
+                              📄 {a.name}
                             </button>
                           ))}
                         </div>
@@ -6657,6 +6647,7 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">设置</div>
             <div className="modal-body">
+              <div className="tree-group">外观</div>
               <label className="modal-field">
                 终端字体大小：{settings.fontSize}px（也可直接 Ctrl + 滚轮 或 Ctrl + ＋ / －）
                 <input
@@ -6768,37 +6759,16 @@ export default function App() {
               </label>
 
               <div className="modal-inline-action">
-                <button type="button" className="mini-btn" onClick={() => setShowTermTheme(true)}>
-                  终端配色…
+                <button type="button" className="btn" onClick={() => setShowTermTheme(true)}>
+                  终端配色与关键字高亮…
                 </button>
                 <span className="hint" style={{ padding: "0 0 0 8px" }}>
-                  当前：{currentTermSchemeName()}
+                  当前配色：{currentTermSchemeName()}（可在里面按"终端类型"分别设置）
                 </span>
               </div>
+              <div className="tree-group">终端与会话</div>
 
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.highlightEnabled}
-                  onChange={(e) => void updateSettings({ highlightEnabled: e.target.checked })}
-                />
-                <span>
-                  终端关键字高亮（ERROR / WARN / OK / panic 等高亮显示；SSH、串口、本地终端共用）
-                </span>
-              </label>
-              <div className="modal-inline-action">
-                <button type="button" className="mini-btn" onClick={() => setShowHighlight(true)}>
-                  关键字高亮规则…
-                </button>
-                <span className="hint" style={{ padding: "0 0 0 8px" }}>
-                  当前 {settings.highlightRules.filter((r) => r.enabled).length} 条规则生效，
-                  共 {settings.highlightRules.length} 条
-                </span>
-              </div>
-
-              <div className="ai-section" style={{ paddingLeft: 14 }}>
-                AI 通知
-              </div>
+              <div className="tree-group">通知</div>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -6968,8 +6938,11 @@ export default function App() {
           scopeKey={lookScope}
           onScopeChange={setLookScope}
           setOptions={settings.highlightRuleSets.map((s) => ({ id: s.id, name: s.name || "(未命名)" }))}
-          boundSetId={lookProfile?.highlightSetId ?? (lookShell ? settings.highlightSetByShell[lookShell] ?? "" : "")}
-          onBindSet={lookScope === "global" ? undefined : (id) => void setLookSet(id)}
+          boundSetId={lookKind ? settings.highlightSetByKind[lookKind] ?? "" : ""}
+          onBindSet={lookKind ? (id) => void setLookSet(id) : undefined}
+          highlightEnabled={settings.highlightEnabled}
+          onHighlightEnabled={(v) => void updateSettings({ highlightEnabled: v })}
+          onOpenHighlightRules={() => setShowHighlight(true)}
           onPick={(key, custom) => void setLookScheme(key, custom)}
           onClose={() => setShowTermTheme(false)}
           onNotice={notify}

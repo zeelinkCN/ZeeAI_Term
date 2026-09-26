@@ -250,10 +250,10 @@ export interface AppSettings {
   highlightRules: HighlightRule[];
   /** 命名规则集：服务器 / 串口 / 本地终端可各绑一套 */
   highlightRuleSets: HighlightRuleSet[];
-  /** 本地终端按 shell 各绑的配色方案 key（powershell / cmd / wsl） */
-  termSchemeByShell: Record<string, string>;
-  /** 本地终端按 shell 各绑的高亮规则集 id */
-  highlightSetByShell: Record<string, string>;
+  /** 按终端类型各绑的配色方案 key（ssh / local / serial / adb） */
+  termSchemeByKind: Record<string, string>;
+  /** 按终端类型各绑的高亮规则集 id（ssh / local / serial / adb） */
+  highlightSetByKind: Record<string, string>;
   /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
   aiNotifyTaskbar: boolean;
   /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */

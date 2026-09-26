@@ -216,10 +216,10 @@ pub struct Settings {
     pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
     /// 命名规则集：服务器 / 串口 / 本地终端可以各绑一套（见 ConnectionProfile::highlight_set_id）
     pub highlight_rule_sets: Vec<HighlightRuleSet>,
-    /// 本地终端按 shell 各自绑的配色方案（powershell / cmd / wsl → 方案 key）
-    pub term_scheme_by_shell: std::collections::HashMap<String, String>,
-    /// 本地终端按 shell 各自绑的高亮规则集（powershell / cmd / wsl → 规则集 id）
-    pub highlight_set_by_shell: std::collections::HashMap<String, String>,
+    /// 按**终端类型**各自绑的配色方案（ssh / local / serial / adb → 方案 key）
+    pub term_scheme_by_kind: std::collections::HashMap<String, String>,
+    /// 按**终端类型**各自绑的高亮规则集（ssh / local / serial / adb → 规则集 id）
+    pub highlight_set_by_kind: std::collections::HashMap<String, String>,
     /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
     pub ai_notify_taskbar: bool,
     /// 是否在左侧活动栏的 AI 星号上显示红点/数字
@@ -253,8 +253,8 @@ impl Default for Settings {
             // 空 → 由 load_settings 用 highlight_rules（或预设）填出名为「默认」的那套，
             // 这样老配置里用户自己调过的规则不会丢
             highlight_rule_sets: Vec::new(),
-            term_scheme_by_shell: std::collections::HashMap::new(),
-            highlight_set_by_shell: std::collections::HashMap::new(),
+            term_scheme_by_kind: std::collections::HashMap::new(),
+            highlight_set_by_kind: std::collections::HashMap::new(),
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
             ai_notify_badge: true,
