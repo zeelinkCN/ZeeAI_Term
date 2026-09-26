@@ -67,6 +67,8 @@ import {
   settingsSet,
   tmuxKill,
   tmuxList,
+  tmuxWindows,
+  tmuxAction,
 } from "./ipc";
 import { b64ToBytes, bytesToB64, uid } from "./util";
 import {
@@ -90,6 +92,7 @@ import type {
   SessionEvent,
   SessionState,
   TmuxSession,
+  TmuxWindow,
   TransferEvent,
 } from "./types";
 import {
@@ -201,6 +204,33 @@ interface Asset {
   size?: number;
   browser_download_url?: string;
 }
+
+/**
+ * 「tmux 快捷操作」面板上的按钮。
+ *
+ * 刻意做成按钮而不是帮用户改 `Ctrl+B`：`Ctrl+B` 是 tmux 的默认前缀，
+ * 动它会毁掉所有 tmux 用户的手感。这里是把**前缀 + 某个键**对应的 tmux 命令
+ * 做成可点的按钮（`title` 里写着等价快捷键，顺便当教学）。
+ */
+const TMUX_ACTIONS: { key: string; label: string; title: string }[] = [
+  { key: "new-window", label: "新建窗口", title: "等价于 Ctrl+B c" },
+  { key: "split-h", label: "左右分屏", title: "等价于 Ctrl+B %" },
+  { key: "split-v", label: "上下分屏", title: '等价于 Ctrl+B "' },
+  { key: "prev-window", label: "上个窗口", title: "等价于 Ctrl+B p" },
+  { key: "next-window", label: "下个窗口", title: "等价于 Ctrl+B n" },
+  { key: "zoom", label: "放大/还原", title: "等价于 Ctrl+B z" },
+  { key: "next-layout", label: "换布局", title: "等价于 Ctrl+B 空格" },
+  { key: "pane-left", label: "窗格 ←", title: "等价于 Ctrl+B ←" },
+  { key: "pane-up", label: "窗格 ↑", title: "等价于 Ctrl+B ↑" },
+  { key: "pane-down", label: "窗格 ↓", title: "等价于 Ctrl+B ↓" },
+  { key: "pane-right", label: "窗格 →", title: "等价于 Ctrl+B →" },
+  { key: "copy-mode", label: "滚动查看", title: "等价于 Ctrl+B [（进入滚动/复制模式）" },
+  { key: "copy-mode-exit", label: "退出滚动", title: "等价于 Ctrl+B q 或 Esc" },
+  { key: "rename-window", label: "重命名窗口", title: "等价于 Ctrl+B ," },
+  { key: "kill-pane", label: "关闭窗格", title: "等价于 Ctrl+B x" },
+  { key: "kill-window", label: "关闭窗口", title: "等价于 Ctrl+B &" },
+  { key: "detach", label: "脱离会话", title: "等价于 Ctrl+B d：断开但会话继续在服务器上跑" },
+];
 
 const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
@@ -467,6 +497,12 @@ export default function App() {
   /** 当前这份是怎么装上的：nsis / msi / portable */
   const [installKind, setInstallKind] = useState<string>("");
   const [updateApplying, setUpdateApplying] = useState(false);
+  // tmux 快捷操作面板（只在当前会话是 tmux 会话时出现）
+  const [tmuxDockOpen, setTmuxDockOpen] = useState(true);
+  const [tmuxWinList, setTmuxWinList] = useState<TmuxWindow[]>([]);
+  const [tmuxBusy, setTmuxBusy] = useState(false);
+  // 正在重命名窗口时的临时输入（用自绘输入框，不弹浏览器 prompt）
+  const [tmuxRename, setTmuxRename] = useState<string | null>(null);
 
   const [adbList, setAdbList] = useState<AdbDevice[]>([]);
   const [adbVer, setAdbVer] = useState("");
@@ -2347,6 +2383,92 @@ export default function App() {
     }
   }
 
+  /**
+   * 当前会话对应的 tmux 会话名（普通 shell 会话是空串）。
+   * 「tmux 快捷操作」面板只在这个不为空时出现。
+   */
+  const curTmuxSession = activeSession?.tmuxName ?? "";
+  const curTmuxProfileId = activeSession?.profileId ?? "";
+
+  /** 读一下这个 tmux 会话里现在有哪些窗口 */
+  async function refreshTmuxWindows() {
+    if (!curTmuxSession || !curTmuxProfileId) {
+      setTmuxWinList([]);
+      return;
+    }
+    try {
+      const list = await tmuxWindows(
+        curTmuxProfileId,
+        curTmuxSession,
+        activeSession?.user ?? null,
+      );
+      setTmuxWinList(list);
+    } catch {
+      // 读不到就先空着（服务器断开等），别拿红字刷状态栏
+      setTmuxWinList([]);
+    }
+  }
+
+  /**
+   * 执行一个 tmux 快捷操作。
+   *
+   * 走的是另开一条 ssh 跑 `tmux xxx`，**不是**往终端里塞按键 ——
+   * 所以不抢 Ctrl+B，也不受"当前窗格正在跑程序"的影响。
+   */
+  async function runTmuxAction(action: string, arg?: string) {
+    if (!curTmuxSession || !curTmuxProfileId) return;
+    setTmuxBusy(true);
+    try {
+      const out = await tmuxAction(
+        curTmuxProfileId,
+        curTmuxSession,
+        action,
+        arg ?? null,
+        activeSession?.user ?? null,
+      );
+      if (out.trim()) notify(out.trim());
+      await refreshTmuxWindows();
+    } catch (e) {
+      notify("tmux 操作失败：" + String(e));
+    } finally {
+      setTmuxBusy(false);
+    }
+  }
+
+  /**
+   * 切到别的 tmux 会话、或者把面板展开时，读一次窗口列表；
+   * 之后每 10 秒对一次表，这样你在终端里自己按 Ctrl+B 切了窗口，面板也能跟上。
+   * （只在面板展开时才轮询，收起就完全不打扰服务器。）
+   */
+  useEffect(() => {
+    if (!curTmuxSession || !tmuxDockOpen) {
+      setTmuxWinList([]);
+      return;
+    }
+    void refreshTmuxWindows();
+    const timer = window.setInterval(() => void refreshTmuxWindows(), 10000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curTmuxSession, curTmuxProfileId, tmuxDockOpen]);
+
+  /**
+   * 点活动栏图标（VS Code 的行为，而不是"只能切模块"）：
+   * - 点的就是当前这个模块，且侧栏正展开 → **折叠**侧栏；
+   * - 其它情况（点了别的模块，或侧栏本来收着）→ 切到该模块并**展开**侧栏。
+   *
+   * 所以"藏/显示侧栏"不用再专门去「视图」菜单点，日常顺手点图标就行；
+   * 视图菜单里那一项保留，作为备选入口。
+   */
+  function activateModule(key: ModuleKey) {
+    if (module === key && showSidebar) {
+      setShowSidebar(false);
+      return;
+    }
+    setModule(key);
+    if (key !== "remote") setSideTab("sessions");
+    setShowSidebar(true);
+  }
+
   /** 打开更新相关的外链（走系统浏览器），失败只写底部状态栏 */
   async function openUpdateLink(url: string, what: string) {
     try {
@@ -2587,7 +2709,8 @@ export default function App() {
           { sep: true },
           {
             sep: false,
-            label: showSidebar ? "隐藏侧栏" : "显示侧栏",
+            // 更贴近 VS Code 的说法；日常其实直接点左侧图标就能折叠/展开
+            label: showSidebar ? "折叠侧栏" : "展开侧栏",
             action: () => setShowSidebar((v) => !v),
           },
           { sep: true },
@@ -3114,10 +3237,7 @@ export default function App() {
               type="button"
               className={"act" + (module === m.key ? " active" : "")}
               title={m.label}
-              onClick={() => {
-                setModule(m.key);
-                if (m.key !== "remote") setSideTab("sessions");
-              }}
+              onClick={() => activateModule(m.key)}
             >
               {m.node}
             </button>
@@ -4050,6 +4170,110 @@ export default function App() {
               </>
             )}
           </div>
+
+          {/* tmux 快捷操作：只在当前会话是 tmux 会话时出现，钉在侧栏底部 */}
+          {module === "remote" && curTmuxSession !== "" && (
+            <div className="tmux-dock">
+              <button
+                type="button"
+                className="tmux-head"
+                title="不想记 Ctrl+B 的话，点这里的按钮就行（Ctrl+B 本身照旧可用）"
+                onClick={() => setTmuxDockOpen((v) => !v)}
+              >
+                {tmuxDockOpen ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
+                <span className="grow">tmux 快捷操作</span>
+                <span className="tag">{curTmuxSession}</span>
+              </button>
+
+              {tmuxDockOpen && (
+                <div className="tmux-body">
+                  <div className="tmux-grid">
+                    {TMUX_ACTIONS.map((a) => (
+                      <button
+                        key={a.key}
+                        type="button"
+                        className="mini-btn tmux-btn"
+                        title={a.title}
+                        disabled={tmuxBusy}
+                        onClick={() => {
+                          if (a.key === "rename-window") {
+                            const cur = tmuxWinList.find((w) => w.active);
+                            setTmuxRename(cur?.name ?? "");
+                            return;
+                          }
+                          void runTmuxAction(a.key);
+                        }}
+                      >
+                        {a.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {tmuxRename !== null && (
+                    <div className="tmux-rename">
+                      <input
+                        autoFocus
+                        value={tmuxRename}
+                        placeholder="给当前窗口起个名字"
+                        onChange={(e) => setTmuxRename(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            void runTmuxAction("rename-window", tmuxRename);
+                            setTmuxRename(null);
+                          } else if (e.key === "Escape") {
+                            setTmuxRename(null);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => {
+                          void runTmuxAction("rename-window", tmuxRename);
+                          setTmuxRename(null);
+                        }}
+                      >
+                        确定
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="tmux-sub">
+                    <span className="grow">窗口（点一下切过去）</span>
+                    <button
+                      type="button"
+                      className="mini-x"
+                      style={{ opacity: 1 }}
+                      title="刷新窗口列表"
+                      onClick={() => void refreshTmuxWindows()}
+                    >
+                      ↻
+                    </button>
+                  </div>
+                  <div className="tmux-wins">
+                    {tmuxWinList.length === 0 && (
+                      <div className="hint" style={{ padding: "2px 8px" }}>
+                        没读到窗口（服务器可能刚断开，点 ↻ 重试）
+                      </div>
+                    )}
+                    {tmuxWinList.map((w) => (
+                      <button
+                        key={w.index}
+                        type="button"
+                        className={"tmux-win" + (w.active ? " active" : "")}
+                        title={w.panes > 1 ? `${w.panes} 个窗格` : undefined}
+                        onClick={() => void runTmuxAction("select-window", String(w.index))}
+                      >
+                        <span className="dim">{w.index}</span>
+                        <span className="grow ellipsis">{w.name || "—"}</span>
+                        {w.panes > 1 && <span className="tag">{w.panes} 格</span>}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </aside>
 
         <main className="main">

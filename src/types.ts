@@ -73,6 +73,14 @@ export interface TmuxSession {
   attached: boolean;
 }
 
+/** tmux 会话里的一个窗口（「tmux 快捷操作」面板用来列出来点着切） */
+export interface TmuxWindow {
+  index: number;
+  name: string;
+  active: boolean;
+  panes: number;
+}
+
 export interface RemoteEntry {
   name: string;
   isDir: boolean;

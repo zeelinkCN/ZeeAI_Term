@@ -967,6 +967,40 @@ pub async fn tmux_kill(
     Ok(())
 }
 
+/// 列出某个 tmux 会话里的窗口（给「tmux 快捷操作」面板用）
+#[tauri::command]
+pub async fn tmux_windows(
+    profile_id: String,
+    session: String,
+    user_override: Option<String>,
+) -> Result<Vec<tmux::TmuxWindow>, String> {
+    log::info!("ipc: tmux_windows profile_id={profile_id} session={session}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out =
+        run_remote_capture(&profile_id, &cfg, &tmux::list_windows_command(&session)).await?;
+    Ok(tmux::parse_windows(&out))
+}
+
+/// 「tmux 快捷操作」面板：执行一个白名单动作。
+///
+/// 走的是**另开一条 ssh 跑 tmux 命令**，不是往终端里塞按键 ——
+/// 好处是不用抢 `Ctrl+B` 这个 tmux 前缀，也不会因为当前窗格正在跑程序而按键失效。
+#[tauri::command]
+pub async fn tmux_action(
+    profile_id: String,
+    session: String,
+    action: String,
+    arg: Option<String>,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cmd = tmux::action_command(&session, &action, arg.as_deref())
+        .ok_or_else(|| format!("不支持的操作: {action}"))?;
+    log::info!("ipc: tmux_action {action} on {session}");
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &cmd).await?;
+    Ok(out.trim().to_string())
+}
+
 /// 列出远端目录（不传 path 则用登录后的家目录）。
 /// 走真 SFTP：路径是字面量，不经过远端 shell。
 #[tauri::command]

@@ -1121,6 +1121,121 @@ body {
   margin: 14px 0 12px;
 }
 
+/* ---------- tmux 快捷操作面板（钉在侧栏底部，仅 tmux 会话出现） ---------- */
+.tmux-dock {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  max-height: 62%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.app.light .tmux-dock {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.tmux-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+
+.tmux-head:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.tmux-body {
+  padding: 0 8px 8px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.tmux-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.tmux-btn {
+  width: 100%;
+  text-align: center;
+  padding: 4px 2px;
+}
+
+.tmux-rename {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.tmux-rename input {
+  flex: 1;
+  min-width: 0;
+  background: var(--input, rgba(255, 255, 255, 0.06));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.tmux-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 8px 0 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tmux-wins {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tmux-win {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+
+.tmux-win:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.tmux-win.active {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--accent);
+}
+
+.app.light .tmux-win:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.app.light .tmux-win.active {
+  background: rgba(0, 0, 0, 0.09);
+}
+
 /* ---------- 终端配色对话框 ---------- */
 .tt-preview {
   border: 1px solid var(--border);

@@ -359,6 +359,8 @@ pub fn run() {
       commands::session_close,
       commands::tmux_list,
       commands::tmux_kill,
+      commands::tmux_windows,
+      commands::tmux_action,
       commands::remote_pwd,
       commands::fs_list,
       commands::fs_read,

@@ -4,6 +4,7 @@ import type {
   SessionEvent,
   SessionInfo,
   TmuxSession,
+  TmuxWindow,
   RemoteListing,
   HistoryEntry,
   AppSettings,
@@ -306,6 +307,39 @@ export async function tmuxKill(
   return invoke("tmux_kill", {
     profileId,
     name,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 列出某个 tmux 会话里的窗口 */
+export async function tmuxWindows(
+  profileId: string,
+  session: string,
+  userOverride?: string | null,
+): Promise<TmuxWindow[]> {
+  return invoke<TmuxWindow[]>("tmux_windows", {
+    profileId,
+    session,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/**
+ * 执行一个 tmux 快捷操作（白名单动作，后端映射成具体 tmux 命令）。
+ * 走另开一条 ssh 跑命令，不抢 `Ctrl+B` 前缀、也不依赖终端焦点。
+ */
+export async function tmuxAction(
+  profileId: string,
+  session: string,
+  action: string,
+  arg?: string | null,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("tmux_action", {
+    profileId,
+    session,
+    action,
+    arg: arg ?? null,
     userOverride: userOverride ?? null,
   });
 }
