@@ -2336,11 +2336,15 @@ pub fn history_list() -> Vec<HistoryEntry> {
 #[tauri::command]
 pub fn history_save(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
     if entry.id.trim().is_empty() {
-        entry.id = format!(
-            "h-{}-{}",
-            entry.profile_id,
-            entry.tmux_session.clone().unwrap_or_else(|| "default".into())
-        );
+        // 普通 shell 的 id 也要带名字，否则同一台机器的多个普通 shell 会撞成同一个 id
+        let tail = entry
+            .tmux_session
+            .clone()
+            .map(|t| format!("tmux-{t}"))
+            .unwrap_or_else(|| {
+                format!("plain-{}", entry.title.clone().unwrap_or_else(|| "shell".into()))
+            });
+        entry.id = format!("h-{}-{}", entry.profile_id, tail);
     }
     log::info!(
         "ipc: history_save profile={} tmux={:?}",

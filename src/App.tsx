@@ -635,6 +635,8 @@ export default function App() {
     attachTarget: string;
     user: string;
     rememberUser: boolean;
+    /** 会话名字（留空 = 自动命名；普通 shell 会自动编号） */
+    title?: string;
     /** 这次会话临时选的高亮规则集（空 = 跟随服务器绑定） */
     highlightSetId?: string | null;
   } | null>(null);
@@ -767,6 +769,8 @@ export default function App() {
   } | null>(null);
   const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [sessionRename, setSessionRename] = useState<{ id: string; value: string } | null>(null);
+  /** 正在被拖动的标签（用来实现左右拖动排序） */
+  const [dragTabId, setDragTabId] = useState<string | null>(null);
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
   fsPathRef.current = fsPath;
@@ -1963,6 +1967,8 @@ export default function App() {
   }
 
   async function closeSession(id: string) {
+    // 关标签时顺手清掉拖动状态
+    setDragTabId(null);
     // 先记下它在标签栏里的位置，关掉之后要顶上来一个
     const list = sessionsRef.current;
     const idx = list.findIndex((s) => s.id === id);
@@ -1983,7 +1989,24 @@ export default function App() {
     });
   }
 
-  /** 一次关掉一批会话（「关闭全部本地终端」「关闭全部会话」用这个） */
+ /** 一次关掉一批会话（「关闭全部本地终端」「关闭全部会话」用这个） */
+  /**
+   * 把 `fromId` 这个标签挪到 `toId` 那个的位置 —— 标签左右拖动排序用。
+   * 顺序保存在 sessions 数组里，而工作区快照就是按这个顺序存的，所以**下次打开还是你排的序**。
+   */
+  function moveTab(fromId: string | null, toId: string) {
+    if (!fromId || fromId === toId) return;
+    setSessions((prev) => {
+      const from = prev.findIndex((s) => s.id === fromId);
+      const to = prev.findIndex((s) => s.id === toId);
+      if (from < 0 || to < 0) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }
+
   async function closeSessions(list: OpenSession[], what: string) {
     if (list.length === 0) {
       notify(`现在没有打开的${what}`);
@@ -2317,6 +2340,7 @@ export default function App() {
       attachTarget: "",
       user: target.ssh?.user ?? "",
       rememberUser: true,
+      title: "",
     });
     if (useTmux) void loadDialogTmux(target.id, target.ssh?.user);
   }
@@ -2332,26 +2356,43 @@ export default function App() {
     setDialogBusy(true);
     try {
       const wantedUser = newDialog.user.trim();
-      if (wantedUser && wantedUser !== (profile.ssh?.user ?? "") && newDialog.rememberUser) {
-        await saveProfile({
-          ...profile,
-          ssh: { ...(profile.ssh as NonNullable<ConnectionProfile["ssh"]>), user: wantedUser },
-        });
-        await refresh();
-      }
+      // 这里**不再写回服务器配置**：以前那个"把用户名保存到配置里"的勾选，
+      // 一不小心填错就把整台服务器的登录用户改掉了，风险远大于便利。
+      // 现在登录用户只作为"这次会话的临时覆盖"，配置里的用户永远由「服务器管理」里改。
       const userOverride = wantedUser || null;
+      // 会话名字：填了就用；普通 shell 留空则**自动编号**（同一台机器开多个也能分得清，
+      // 而且历史记录按名字分开存，不会再互相覆盖）
+      const plainCount = history.filter(
+        (h) => h.profileId === profile.id && !h.tmuxSession,
+      ).length;
+      const autoTitle = `${profile.name} · 普通 shell ${plainCount + 1}`;
+      const wantedTitle = (newDialog.title ?? "").trim();
       if (!newDialog.useTmux) {
-        await openSshSession(profile, "none", null, userOverride, null, newDialog.highlightSetId);
+        await openSshSession(
+          profile,
+          "none",
+          null,
+          userOverride,
+          wantedTitle || autoTitle,
+          newDialog.highlightSetId,
+        );
       } else if (newDialog.tmuxKind === "new") {
         const name = newDialog.tmuxName.trim() || defaultTmuxName(profile);
-        await openSshSession(profile, "name", name, userOverride, null, newDialog.highlightSetId);
+        await openSshSession(
+          profile,
+          "name",
+          name,
+          userOverride,
+          wantedTitle || null,
+          newDialog.highlightSetId,
+        );
       } else {
         await openSshSession(
           profile,
           "name",
           newDialog.attachTarget,
           userOverride,
-          null,
+          wantedTitle || null,
           newDialog.highlightSetId,
         );
       }
@@ -4961,7 +5002,33 @@ export default function App() {
               <button
                 key={s.id}
                 type="button"
-                className={"session-tab" + (s.id === activeId ? " active" : "")}
+                className={
+                  "session-tab" +
+                  (s.id === activeId ? " active" : "") +
+                  (s.id === dragTabId ? " dragging" : "")
+                }
+                // 左右拖动排序：把一个标签拖到另一个上面，就插到它前面/后面
+                draggable
+                onDragStart={(e) => {
+                  setDragTabId(s.id);
+                  e.dataTransfer.effectAllowed = "move";
+                  try {
+                    e.dataTransfer.setData("text/plain", s.id);
+                  } catch {
+                    /* 某些环境不允许设置数据，忽略即可 */
+                  }
+                }}
+                onDragOver={(e) => {
+                  if (!dragTabId || dragTabId === s.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  moveTab(dragTabId ?? e.dataTransfer.getData("text/plain"), s.id);
+                  setDragTabId(null);
+                }}
+                onDragEnd={() => setDragTabId(null)}
                 onClick={() => setActiveId(s.id)}
                 onContextMenu={(e) => {
                   e.preventDefault();
@@ -7190,15 +7257,18 @@ export default function App() {
                   }}
                 />
               </label>
-              <label className="form-check">
+              <div className="hint" style={{ padding: "0 0 8px 14px" }}>
+                登录用户只对**这次会话**生效，不会改动服务器配置（要改配置请用「服务器管理」）
+              </div>
+              {/* 会话名字：留空 = 自动命名（普通 shell 会自动编号 1、2、3…），
+                  这样同一台机器开多个普通会话，历史列表里也能一一对应、不会互相覆盖 */}
+              <label className="modal-field">
+                会话名字（可留空）
                 <input
-                  type="checkbox"
-                  checked={newDialog.rememberUser}
-                  onChange={(e) =>
-                    setNewDialog({ ...newDialog, rememberUser: e.target.checked })
-                  }
+                  value={newDialog.title ?? ""}
+                  placeholder={`留空 = 自动命名（例如 ${`${profiles.find((p) => p.id === newDialog.profileId)?.name ?? "服务器"} · 普通 shell 1`}）`}
+                  onChange={(e) => setNewDialog({ ...newDialog, title: e.target.value })}
                 />
-                <span>把这个用户名保存到该服务器的配置里</span>
               </label>
 
               <label className="form-check">

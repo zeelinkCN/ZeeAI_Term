@@ -1236,6 +1236,15 @@ body {
 }
 
 /* 状态栏上的「AI 已完成」提示：闪一下 + 强调色，点一下切到那个会话 */
+/* 标签拖动排序：拖起来时半透明 + 抓手光标 */
+.session-tab {
+  cursor: grab;
+}
+
+.session-tab.dragging {
+  opacity: 0.45;
+}
+
 /* 设置对话框：左边分类，右边内容（二级菜单） */
 .settings-split {
   display: flex;

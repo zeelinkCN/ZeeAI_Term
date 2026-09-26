@@ -344,9 +344,34 @@ pub fn save_history(entries: &[HistoryEntry]) -> Result<(), String> {
 }
 
 /// 同一个「配置 + tmux 会话」只保留一条，按最近使用排序。
+/// 历史记录的去重键：tmux 会话按「服务器 + tmux 名」；
+/// **普通 shell 按「服务器 + 会话名」** —— 以前不看名字，同一台机器的所有普通 shell
+/// 都被算成同一条互相覆盖，用户开了好几个却只看到一行（数量永远不涨）。
+pub fn history_key(profile_id: &str, tmux_session: &Option<String>, title: &str) -> String {
+    match tmux_session
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(name) => format!("{profile_id}|tmux:{name}"),
+        None => format!("{profile_id}|plain:{}", title.trim()),
+    }
+}
+
 pub fn upsert_history(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
     let mut all = load_history();
-    all.retain(|e| !(e.profile_id == entry.profile_id && e.tmux_session == entry.tmux_session));
+    let new_key = history_key(
+        &entry.profile_id,
+        &entry.tmux_session,
+        entry.title.as_deref().unwrap_or(""),
+    );
+    all.retain(|e| {
+        history_key(
+            &e.profile_id,
+            &e.tmux_session,
+            e.title.as_deref().unwrap_or(""),
+        ) != new_key
+    });
     entry.last_used = now_secs();
     all.insert(0, entry);
     all.truncate(50);
@@ -459,4 +484,33 @@ pub fn save(profiles: &[ConnectionProfile]) -> Result<(), String> {
     let text =
         serde_json::to_string_pretty(profiles).map_err(|e| format!("序列化配置失败: {e}"))?;
     fs::write(store_file(), text).map_err(|e| format!("写入配置失败: {e}"))
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::history_key;
+
+    #[test]
+    fn tmux_sessions_dedupe_by_name() {
+        let a = history_key("p1", &Some("my-sess".into()), "随便什么名字");
+        let b = history_key("p1", &Some("my-sess".into()), "另一个名字");
+        assert_eq!(a, b, "tmux 会话按会话名去重");
+        let c = history_key("p1", &Some("other".into()), "随便什么名字");
+        assert_ne!(a, c);
+        let other_profile = history_key("p2", &Some("my-sess".into()), "");
+        assert_ne!(a, other_profile, "不同服务器不能撞");
+    }
+
+    #[test]
+    fn plain_shells_are_separate_per_name() {
+        // 这就是用户报的问题：同一台机器开了好几个普通 shell，只看到一行
+        let s1 = history_key("p1", &None, "服务器 · 普通 shell 1");
+        let s2 = history_key("p1", &None, "服务器 · 普通 shell 2");
+        assert_ne!(s1, s2, "普通 shell 要按名字分成不同记录");
+        // 同名（自动命名重复的情况）仍然算同一条，不会无限堆积
+        let s1b = history_key("p1", &None, "服务器 · 普通 shell 1");
+        assert_eq!(s1, s1b);
+        // 空 tmux 名也要走 plain 分支（不能和 tmux: 撞）
+        assert_eq!(history_key("p1", &Some("  ".into()), "x"), history_key("p1", &None, "x"));
+    }
 }
