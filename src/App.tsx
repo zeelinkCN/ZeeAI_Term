@@ -299,16 +299,17 @@ function kindOfSession(kind: string): "ssh" | "local" | "serial" | "adb" {
 
 /**
  * 某个会话该用哪一套高亮规则：
- * 会话上临时选的 > 这台服务器/设备绑定的 > 该终端类型绑定的 > 全局默认那套。
+ * 这台服务器/设备**独立**设过 → 用它自己的（全局怎么改都不动它）；
+ * 没设过（= 在服务器配置里勾了「跟随全局」）→ 用"该终端类型"那一档 → 再兜底到全局默认。
  */
 function highlightRulesFor(
   settings: AppSettings,
-  sessionSetId: string | null | undefined,
   profile: ConnectionProfile | undefined,
   terminalKind?: string,
 ): HighlightRule[] {
   const byKind = terminalKind ? settings.highlightSetByKind?.[terminalKind] : "";
-  const id = (sessionSetId || profile?.highlightSetId || byKind || "").trim();
+  // profile 上存了值 = 这台机器选了"独立"，优先级最高（这正是用户要的：独立的不被全局覆盖）
+  const id = (profile?.highlightSetId || byKind || "").trim();
   const set = id ? settings.highlightRuleSets.find((s) => s.id === id) : undefined;
   if (set) return set.rules;
   const fallback = settings.highlightRuleSets.find((s) => s.id === "default");
@@ -317,7 +318,7 @@ function highlightRulesFor(
 
 /**
  * 某个会话该用哪套终端配色（16 色）：
- * 这台服务器/设备绑定的 > 该终端类型绑定的 > 全局那套。
+ * 这台服务器/设备独立设过 → 用它自己的；否则用"该终端类型"那一档 → 全局那套。
  */
 function termSchemeFor(
   settings: AppSettings,
@@ -5086,7 +5087,6 @@ export default function App() {
                             highlightEnabled={settings.highlightEnabled}
                             highlightRules={highlightRulesFor(
                               settings,
-                              ps.highlightSetId,
                               profiles.find((p) => p.id === ps.profileId),
                               kindOfSession(ps.kind),
                             )}
@@ -5140,7 +5140,6 @@ export default function App() {
                     highlightEnabled={settings.highlightEnabled}
                     highlightRules={highlightRulesFor(
                       settings,
-                      s.highlightSetId,
                       profiles.find((p) => p.id === s.profileId),
                       kindOfSession(s.kind),
                     )}
@@ -6474,34 +6473,58 @@ export default function App() {
                   onChange={(e) => patchDraft({ group: e.target.value })}
                 />
               </label>
-              <label className="modal-field">
-                关键字高亮规则集（这台机器单独用一套）
-                <select
-                  value={editDialog.draft.highlightSetId ?? ""}
-                  onChange={(e) => patchDraft({ highlightSetId: e.target.value || null })}
-                >
-                  <option value="">跟随默认</option>
-                  {settings.highlightRuleSets.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name || "(未命名)"}（{s.rules.length} 条）
-                    </option>
-                  ))}
-                </select>
+              {/* 外观：勾上=跟着"整体设置里那一类终端"走（全局一改它就跟着变）；
+                  取消勾选=这台机器独立一套，以后全局怎么改都不动它 */}
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={!editDialog.draft.termScheme && !editDialog.draft.highlightSetId}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      patchDraft({ termScheme: null, termSchemeCustom: null, highlightSetId: null });
+                    } else {
+                      // 独立：从"当前生效的那套"起步，方便微调
+                      const kind = editDialog.draft.type === "serial" ? "serial" : "ssh";
+                      const cur = termSchemeFor(settings, undefined, kind);
+                      const curSet = settings.highlightSetByKind?.[kind] ?? "";
+                      patchDraft({ termScheme: cur.key, highlightSetId: curSet || null });
+                    }
+                  }}
+                />
+                <span>
+                  外观跟随全局设置（{editDialog.draft.type === "serial" ? "串口设备" : "远程 SSH"}那一档）；
+                  取消勾选就是独立一套，以后改全局不会动它
+                </span>
               </label>
-              <label className="modal-field">
-                终端配色方案（这台机器单独用一套）
-                <select
-                  value={editDialog.draft.termScheme ?? ""}
-                  onChange={(e) => patchDraft({ termScheme: e.target.value || null })}
-                >
-                  <option value="">跟随默认</option>
-                  {TERM_SCHEMES.map((s) => (
-                    <option key={s.key} value={s.key}>
-                      {s.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {(!editDialog.draft.termScheme && !editDialog.draft.highlightSetId) === false && (
+                <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
+                  <select
+                    value={editDialog.draft.termScheme ?? ""}
+                    onChange={(e) => patchDraft({ termScheme: e.target.value || null })}
+                    title="这台机器独立的配色方案"
+                  >
+                    <option value="">（跟随全局那档）</option>
+                    {TERM_SCHEMES.map((s) => (
+                      <option key={s.key} value={s.key}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    style={{ marginLeft: 6 }}
+                    value={editDialog.draft.highlightSetId ?? ""}
+                    onChange={(e) => patchDraft({ highlightSetId: e.target.value || null })}
+                    title="这台机器独立的高亮规则集"
+                  >
+                    <option value="">（跟随全局那档）</option>
+                    {settings.highlightRuleSets.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name || "(未命名)"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <label className="modal-field">
                 主机
                 <input
