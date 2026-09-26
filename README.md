@@ -22,7 +22,7 @@ HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开�
 
 ### 便携版
 
-`portable/ZeeAI_Term-0.1.4-portable.zip`（解压即用，内含内置 platform-tools，
+`portable/ZeeAI_Term-0.1.5-portable.zip`（解压即用，内含内置 platform-tools，
 ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 
 ### 功能现状
@@ -70,6 +70,13 @@ Monokai / Dracula / One Dark / Gruvbox / Tango 浅色），点一下立即生效
 **侧栏折叠**：点左侧活动栏**当前那个图标**折叠侧栏，点别的图标切过去并展开（VS Code 习惯）；
 「视图」菜单里的「折叠/展开侧栏」作为备选入口。
 
+**字号随手调**：在终端里 `Ctrl + 鼠标滚轮` 直接缩放，或 `Ctrl + ＋ / － / 0`（重置）。
+范围 8–26px，和设置里的滑块同一套数值；界面即时生效、写盘 400ms 防抖，缩放不会顺带滚终端缓冲。
+
+**服务器列表**：标题行是「服务器 ＋新建 服务器管理」两个看得见的文字按钮；
+只有一个分组时不显示分组标题（没填分组的在多分组时才以「未分组」出现）；
+列表上方有「展开全部会话 / 折叠全部会话」一键切换。
+
 **tmux 快捷操作面板**：连上 tmux 会话后，侧栏底部出现一版面按钮 —— 新建窗口、上下/左右分屏、
 切换窗口与窗格、放大窗格、换布局、滚动查看、重命名窗口、关闭窗格/窗口、脱离会话。
 按钮等价于对应的 `Ctrl+B xxx`（悬停会提示），但实现方式是**另开一条 ssh 跑 tmux 命令**，
@@ -104,9 +111,9 @@ SSH 断线自动重连（指数退避，可关）。
 ### 产出物
 
 - 免安装版：`src-tauri/target/release/ZeeAI_Term.exe`
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.4_x64-setup.exe`
-- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.4_x64_en-US.msi`
-- 便携版：`portable/ZeeAI_Term-0.1.4-portable.zip`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.5_x64-setup.exe`
+- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.5_x64_en-US.msi`
+- 便携版：`portable/ZeeAI_Term-0.1.5-portable.zip`
 
 应用名与可执行文件名统一为 **`ZeeAI_Term`**（`productName` / `mainBinaryName`），
 配置仍放在 `%APPDATA%\ZeeAI-Terminal\`（所以改名不会丢你的服务器、历史和日志）。
