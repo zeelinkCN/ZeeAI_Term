@@ -20,6 +20,8 @@ export interface ConnectionProfile {
   name: string;
   group: string;
   color?: string;
+  /** 这台服务器 / 串口 / 本地终端用哪一套高亮规则集（空 = 用全局默认那套） */
+  highlightSetId?: string | null;
   ssh?: SshConfig;
   serial?: SerialConfig;
   local?: { shell: "powershell" | "cmd" | "wsl"; distro?: string; cwd?: string };
@@ -101,6 +103,15 @@ export interface HistoryEntry {
   /** 用户给这个会话起的名字 */
   title?: string | null;
   lastUsed: number;
+}
+
+/**
+ * 一套命名的高亮规则集（服务器 / 串口 / 本地终端各自绑定一套）。
+ */
+export interface HighlightRuleSet {
+  id: string;
+  name: string;
+  rules: HighlightRule[];
 }
 
 /**
@@ -233,6 +244,8 @@ export interface AppSettings {
   highlightEnabled: boolean;
   /** 终端关键字高亮规则 */
   highlightRules: HighlightRule[];
+  /** 命名规则集：服务器 / 串口 / 本地终端可各绑一套 */
+  highlightRuleSets: HighlightRuleSet[];
   /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
   aiNotifyTaskbar: boolean;
   /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */

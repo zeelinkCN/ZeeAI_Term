@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { highlightPresets } from "../ipc";
 import { uid } from "../util";
-import type { HighlightRule } from "../types";
+import type { HighlightRule, HighlightRuleSet } from "../types";
 
 interface Props {
-  rules: HighlightRule[];
+  /** 全部规则集（每套有名字，服务器/串口/本地终端各自绑定一套） */
+  sets: HighlightRuleSet[];
   enabled: boolean;
   onEnabledChange: (v: boolean) => void;
-  onChange: (rules: HighlightRule[]) => void;
+  onChange: (sets: HighlightRuleSet[]) => void;
   onClose: () => void;
   /** 提示只走底部状态栏（不弹浮层） */
   onNotice: (text: string) => void;
@@ -81,18 +82,19 @@ function ColorRow({
  * 得让终端再吐几行才看得出来 —— 对话框里给了实时预览，不用去终端里试。
  */
 export default function HighlightDialog({
-  rules,
+  sets,
   enabled,
   onEnabledChange,
   onChange,
   onClose,
   onNotice,
 }: Props) {
-  const [draft, setDraft] = useState<HighlightRule[]>(rules ?? []);
+  const [draft, setDraft] = useState<HighlightRuleSet[]>(sets ?? []);
+  const [activeId, setActiveId] = useState<string>((sets ?? [])[0]?.id ?? "default");
 
   // 每次改动都写盘太勤（连着拖颜色选择器会写爆），这里攒 300ms 再落一次
   const timer = useRef<number | null>(null);
-  const pending = useRef<HighlightRule[] | null>(null);
+  const pending = useRef<HighlightRuleSet[] | null>(null);
   const commitRef = useRef(onChange);
   commitRef.current = onChange;
 
@@ -108,7 +110,7 @@ export default function HighlightDialog({
     }
   }
 
-  function update(next: HighlightRule[]) {
+  function update(next: HighlightRuleSet[]) {
     setDraft(next);
     pending.current = next;
     if (timer.current === null) {
@@ -122,17 +124,26 @@ export default function HighlightDialog({
   // 关掉对话框（或组件卸载）时把还没落盘的那次改动补上
   useEffect(() => () => flush(), []);
 
+  const activeSet = draft.find((s) => s.id === activeId) ?? draft[0];
+  const rules: HighlightRule[] = activeSet?.rules ?? [];
+
+  /** 改"当前这套规则集"里的规则 */
+  function updateRules(next: HighlightRule[]) {
+    if (!activeSet) return;
+    update(draft.map((s) => (s.id === activeSet.id ? { ...s, rules: next } : s)));
+  }
+
   function patch(id: string, part: Partial<HighlightRule>) {
-    update(draft.map((r) => (r.id === id ? { ...r, ...part } : r)));
+    updateRules(rules.map((r) => (r.id === id ? { ...r, ...part } : r)));
   }
 
   function remove(id: string) {
-    update(draft.filter((r) => r.id !== id));
+    updateRules(rules.filter((r) => r.id !== id));
   }
 
   function addRule() {
-    update([
-      ...draft,
+    updateRules([
+      ...rules,
       {
         id: uid(),
         name: "新规则",
@@ -146,13 +157,42 @@ export default function HighlightDialog({
     ]);
   }
 
+  /** 新建 / 复制 / 删除规则集 */
+  function addSet(copyCurrent: boolean) {
+    const id = uid();
+    update([
+      ...draft,
+      {
+        id,
+        name: copyCurrent && activeSet ? `${activeSet.name} 副本` : "新规则集",
+        rules: copyCurrent && activeSet ? activeSet.rules.map((r) => ({ ...r, id: uid() })) : [],
+      },
+    ]);
+    setActiveId(id);
+  }
+
+  function removeSet() {
+    if (draft.length <= 1) {
+      onNotice("至少要留一套规则集");
+      return;
+    }
+    const rest = draft.filter((s) => s.id !== activeSet?.id);
+    update(rest);
+    setActiveId(rest[0].id);
+  }
+
+  function renameSet(name: string) {
+    if (!activeSet) return;
+    update(draft.map((s) => (s.id === activeSet.id ? { ...s, name } : s)));
+  }
+
   async function loadPresets() {
     try {
       const presets = await highlightPresets();
       // 同名（同 id）的预设直接覆盖，用户自己加的规则保留
-      const byId = new Map(draft.map((r) => [r.id, r]));
+      const byId = new Map(rules.map((r) => [r.id, r]));
       for (const p of presets) byId.set(p.id, p);
-      update([...byId.values()]);
+      updateRules([...byId.values()]);
       onNotice(`已载入 ${presets.length} 套预设规则`);
     } catch (e) {
       onNotice("载入预设失败：" + String(e));
@@ -183,6 +223,37 @@ export default function HighlightDialog({
           </div>
 
           <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
+            {/* 规则集：服务器 / 串口 / 本地终端可以各绑一套 */}
+            <select
+              value={activeSet?.id ?? ""}
+              onChange={(e) => setActiveId(e.target.value)}
+              title="选择要编辑的规则集"
+            >
+              {draft.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name || "(未命名)"}（{s.rules.length} 条）
+                </option>
+              ))}
+            </select>
+            <input
+              style={{ width: 130, marginLeft: 6 }}
+              value={activeSet?.name ?? ""}
+              onChange={(e) => renameSet(e.target.value)}
+              placeholder="规则集名字"
+              title="给这套规则改个名字（比如「生产机」「串口调试」）"
+            />
+            <button type="button" className="mini-btn" style={{ marginLeft: 6 }} onClick={() => addSet(false)}>
+              ＋ 新建
+            </button>
+            <button type="button" className="mini-btn" style={{ marginLeft: 6 }} onClick={() => addSet(true)}>
+              复制
+            </button>
+            <button type="button" className="mini-btn" style={{ marginLeft: 6 }} onClick={removeSet}>
+              删除
+            </button>
+          </div>
+
+          <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
             <button type="button" className="mini-btn" onClick={() => void loadPresets()}>
               载入预设规则
             </button>
@@ -197,7 +268,7 @@ export default function HighlightDialog({
           </div>
 
           <div className="hl-list">
-            {draft.map((r) => (
+            {rules.map((r) => (
               <div className={"hl-rule" + (r.enabled ? "" : " off")} key={r.id}>
                 <div className="hl-rule-head">
                   <input
@@ -281,7 +352,7 @@ export default function HighlightDialog({
                 </div>
               </div>
             ))}
-            {draft.length === 0 && (
+            {rules.length === 0 && (
               <div className="hint" style={{ padding: "8px 2px" }}>
                 还没有规则。点「载入预设规则」拿一份 ERROR / WARN / OK / panic 的开箱配置，
                 或者自己「新增规则」。

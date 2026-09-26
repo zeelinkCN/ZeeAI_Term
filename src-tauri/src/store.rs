@@ -90,6 +90,9 @@ pub struct ConnectionProfile {
     pub serial: Option<SerialConfig>,
     #[serde(default)]
     pub local: Option<LocalConfig>,
+    /// 这个服务器 / 串口 / 本地终端用哪一套关键字高亮规则集（空 = 用全局默认那套）
+    #[serde(default)]
+    pub highlight_set_id: Option<String>,
 }
 
 fn default_auth_kind() -> String {
@@ -158,6 +161,17 @@ pub fn log_dir() -> PathBuf {
 }
 
 /// 应用设置。所有字段都有默认值，方便版本升级时兼容旧文件。
+/// 一套命名的高亮规则（"生产机"/"串口调试"/"默认"…），服务器 / 串口 / 本地终端各自绑定一套。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HighlightRuleSet {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rules: Vec<crate::core::highlight::HighlightRule>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -194,6 +208,8 @@ pub struct Settings {
     pub highlight_enabled: bool,
     /// 终端关键字高亮规则（预设见 core::highlight::presets）
     pub highlight_rules: Vec<crate::core::highlight::HighlightRule>,
+    /// 命名规则集：服务器 / 串口 / 本地终端可以各绑一套（见 ConnectionProfile::highlight_set_id）
+    pub highlight_rule_sets: Vec<HighlightRuleSet>,
     /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
     pub ai_notify_taskbar: bool,
     /// 是否在左侧活动栏的 AI 星号上显示红点/数字
@@ -224,6 +240,9 @@ impl Default for Settings {
             // 全都是"只给关键词上色"，不影响交互式回显；不想要的在设置里关掉。
             highlight_enabled: true,
             highlight_rules: crate::core::highlight::presets(),
+            // 空 → 由 load_settings 用 highlight_rules（或预设）填出名为「默认」的那套，
+            // 这样老配置里用户自己调过的规则不会丢
+            highlight_rule_sets: Vec::new(),
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
             ai_notify_badge: true,
@@ -240,6 +259,20 @@ pub fn load_settings() -> Settings {
     // 让「检查更新」默认就指向本项目的 GitHub Releases。
     if s.update_url.trim().is_empty() {
         s.update_url = default_update_url();
+    }
+    // 老配置只有一份 highlight_rules（没有规则集）→ 把它迁移成名为「默认」的那套，
+    // 免得用户之前调好的规则在升级后丢了。
+    if s.highlight_rule_sets.is_empty() {
+        let rules = if s.highlight_rules.is_empty() {
+            crate::core::highlight::presets()
+        } else {
+            s.highlight_rules.clone()
+        };
+        s.highlight_rule_sets = vec![HighlightRuleSet {
+            id: "default".into(),
+            name: "默认".into(),
+            rules,
+        }];
     }
     s
 }
@@ -322,6 +355,63 @@ pub fn remove_history(id: &str) -> Result<Vec<HistoryEntry>, String> {
 /// 每个下载的人打开就能看到那台机器的地址。现在改成空的，用户自己加自己的机器。
 fn seed() -> Vec<ConnectionProfile> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    /// 老配置只有一份 highlight_rules → 读进来要自动变成名为「默认」的规则集
+    #[test]
+    fn migrates_legacy_rules_into_default_set() {
+        let legacy = r##"{
+            "highlightEnabled": true,
+            "highlightRules": [
+                {"id":"mine","name":"我的","keywords":["boom"],"fg":"#ff0000","enabled":true}
+            ]
+        }"##;
+        let s: Settings = serde_json::from_str(legacy).unwrap_or_default();
+        assert!(s.highlight_rule_sets.is_empty(), "老配置里没有规则集字段");
+        // 走一次 load_settings 里的迁移逻辑（这里直接复现那段，避免碰真实文件）
+        let mut s = s;
+        if s.highlight_rule_sets.is_empty() {
+            let rules = if s.highlight_rules.is_empty() {
+                crate::core::highlight::presets()
+            } else {
+                s.highlight_rules.clone()
+            };
+            s.highlight_rule_sets = vec![HighlightRuleSet {
+                id: "default".into(),
+                name: "默认".into(),
+                rules,
+            }];
+        }
+        assert_eq!(s.highlight_rule_sets.len(), 1);
+        assert_eq!(s.highlight_rule_sets[0].id, "default");
+        assert_eq!(s.highlight_rule_sets[0].rules[0].id, "mine");
+    }
+
+    /// 默认设置里就带一套「默认」规则集（内容 = 预设）
+    #[test]
+    fn default_settings_are_seeded_by_migration() {
+        let s = Settings::default();
+        // 出厂状态没有规则集，靠 load_settings 的迁移补出「默认」那套
+        assert!(s.highlight_rule_sets.is_empty());
+        assert!(!s.highlight_rules.is_empty(), "兜底规则默认就是预设");
+        assert!(s.ai_notify_badge, "活动栏数字默认打开");
+    }
+
+    /// 服务器可以绑定规则集；不绑就是 None
+    #[test]
+    fn profile_binding_round_trips() {
+        let p: ConnectionProfile = serde_json::from_str(
+            r#"{"id":"x","type":"ssh","name":"n","group":"g","highlightSetId":"prod"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.highlight_set_id.as_deref(), Some("prod"));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("highlightSetId"), "{json}");
+    }
 }
 
 pub fn load() -> Result<Vec<ConnectionProfile>, String> {

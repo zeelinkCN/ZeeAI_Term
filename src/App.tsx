@@ -99,6 +99,7 @@ import type {
   GitBranch,
   GitCommit,
   GitStatus,
+  HighlightRule,
   HistoryEntry,
   RemoteEntry,
   SerialConfig,
@@ -146,6 +147,8 @@ interface OpenSession {
   title: string;
   kind: ModuleKey;
   profileId?: string;
+  /** 这个会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
+  highlightSetId?: string | null;
   /** 该会话实际登录的用户名（可能来自新建会话时的临时覆盖） */
   user?: string;
   tmuxName?: string;
@@ -282,6 +285,22 @@ function dirBase(p: string): string {
   return parts.length ? parts[parts.length - 1] : "";
 }
 
+/**
+ * 某个会话该用哪一套高亮规则：
+ * 会话上临时选的 > 这台服务器/串口/本地终端绑定的 > 全局默认那套。
+ */
+function highlightRulesFor(
+  settings: AppSettings,
+  sessionSetId: string | null | undefined,
+  profile: ConnectionProfile | undefined,
+): HighlightRule[] {
+  const id = (sessionSetId || profile?.highlightSetId || "").trim();
+  const set = id ? settings.highlightRuleSets.find((s) => s.id === id) : undefined;
+  if (set) return set.rules;
+  const fallback = settings.highlightRuleSets.find((s) => s.id === "default");
+  return fallback?.rules ?? settings.highlightRules;
+}
+
 const EMPTY_PROFILE = {
   name: "",
   host: "",
@@ -358,6 +377,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 预设规则由后端给（core::highlight::presets），前端这里只留空；
   // 设置读回来之后就有内容了，用户也可以自己改。
   highlightRules: [],
+  // 规则集由后端给（core::highlight::presets 兜底），前端启动后就有内容
+  highlightRuleSets: [],
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
   aiNotifyBadge: true,
@@ -563,6 +584,8 @@ export default function App() {
     attachTarget: string;
     user: string;
     rememberUser: boolean;
+    /** 这次会话临时选的高亮规则集（空 = 跟随服务器绑定） */
+    highlightSetId?: string | null;
   } | null>(null);
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
@@ -1815,6 +1838,8 @@ export default function App() {
     tmuxName?: string | null,
     userOverride?: string | null,
     titleOverride?: string | null,
+    /** 这次会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
+    highlightSetId?: string | null,
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
@@ -1829,6 +1854,7 @@ export default function App() {
       user: userOverride ?? profile.ssh?.user,
       tmuxName: explicitName ?? undefined,
       tmuxMode,
+      highlightSetId: highlightSetId ?? null,
       state: "connecting",
       openFiles: [],
       activeTab: "terminal",
@@ -2261,12 +2287,19 @@ export default function App() {
       }
       const userOverride = wantedUser || null;
       if (!newDialog.useTmux) {
-        await openSshSession(profile, "none", null, userOverride);
+        await openSshSession(profile, "none", null, userOverride, null, newDialog.highlightSetId);
       } else if (newDialog.tmuxKind === "new") {
         const name = newDialog.tmuxName.trim() || defaultTmuxName(profile);
-        await openSshSession(profile, "name", name, userOverride);
+        await openSshSession(profile, "name", name, userOverride, null, newDialog.highlightSetId);
       } else {
-        await openSshSession(profile, "name", newDialog.attachTarget, userOverride);
+        await openSshSession(
+          profile,
+          "name",
+          newDialog.attachTarget,
+          userOverride,
+          null,
+          newDialog.highlightSetId,
+        );
       }
       setNewDialog(null);
     } finally {
@@ -4951,7 +4984,11 @@ export default function App() {
                             light={themeKind(settings.theme) === "light"}
                             palette={termPalette}
                             highlightEnabled={settings.highlightEnabled}
-                            highlightRules={settings.highlightRules}
+                            highlightRules={highlightRulesFor(
+                              settings,
+                              ps.highlightSetId,
+                              profiles.find((p) => p.id === ps.profileId),
+                            )}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
                             onNotice={notify}
                             onZoom={bumpFont}
@@ -4996,7 +5033,11 @@ export default function App() {
                     light={themeKind(settings.theme) === "light"}
                     palette={termPalette}
                     highlightEnabled={settings.highlightEnabled}
-                    highlightRules={settings.highlightRules}
+                    highlightRules={highlightRulesFor(
+                      settings,
+                      s.highlightSetId,
+                      profiles.find((p) => p.id === s.profileId),
+                    )}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
                     onNotice={notify}
                     onZoom={bumpFont}
@@ -6322,6 +6363,20 @@ export default function App() {
                 />
               </label>
               <label className="modal-field">
+                关键字高亮规则集（这台机器单独用一套）
+                <select
+                  value={editDialog.draft.highlightSetId ?? ""}
+                  onChange={(e) => patchDraft({ highlightSetId: e.target.value || null })}
+                >
+                  <option value="">跟随默认</option>
+                  {settings.highlightRuleSets.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name || "(未命名)"}（{s.rules.length} 条）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="modal-field">
                 主机
                 <input
                   value={editDialog.draft.ssh?.host ?? ""}
@@ -6803,10 +6858,20 @@ export default function App() {
 
       {showHighlight && (
         <HighlightDialog
-          rules={settings.highlightRules}
+          sets={
+            settings.highlightRuleSets.length > 0
+              ? settings.highlightRuleSets
+              : [{ id: "default", name: "默认", rules: settings.highlightRules }]
+          }
           enabled={settings.highlightEnabled}
           onEnabledChange={(v) => void updateSettings({ highlightEnabled: v })}
-          onChange={(rules) => void updateSettings({ highlightRules: rules })}
+          onChange={(sets) =>
+            void updateSettings({
+              highlightRuleSets: sets,
+              // 兼容：把「默认」那套的规则也写回旧字段，老逻辑/兜底都还能用
+              highlightRules: sets.find((s) => s.id === "default")?.rules ?? settings.highlightRules,
+            })
+          }
           onClose={() => setShowHighlight(false)}
           onNotice={notify}
         />
@@ -6838,6 +6903,21 @@ export default function App() {
                   {sshProfiles.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}（{p.ssh?.user}@{p.ssh?.host}）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {/* 这次开会话用哪套高亮规则（默认跟着服务器绑定走，也可以临时挑一套） */}
+              <label className="modal-field">
+                关键字高亮规则
+                <select
+                  value={newDialog.highlightSetId ?? ""}
+                  onChange={(e) => setNewDialog({ ...newDialog, highlightSetId: e.target.value || null })}
+                >
+                  <option value="">跟随服务器设置</option>
+                  {settings.highlightRuleSets.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name || "(未命名)"}
                     </option>
                   ))}
                 </select>
