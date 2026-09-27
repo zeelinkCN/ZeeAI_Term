@@ -1140,3 +1140,23 @@ NSIS + MSI + 便携版 zip + 单文件 exe 四个产物，产物 sha256 与本�
 `%TEMP%\ZeeAI-Term-update\` 里躺着 0.1.2 / 0.1.4 / 0.1.5 / 0.1.6 四个旧安装包，
 其中一个还叫 `.corrupt-20260926`（1MB 半截包）—— 这就是"升级包从不清理 + 半截下载"
 两个 bug 的实物证据。新代码会在下次升级时自动清掉这类残留。
+
+### 0.1.8 发版记录（可复核）
+
+- tag：`v0.1.8`，commit `67b3ec6`
+- GitHub Release：id `397539912`，`releases/latest` 已指向 `v0.1.8`（非 draft、非 prerelease）
+- 四个产物（本地 sha256 与 GitHub 返回的 `digest` 已逐一比对一致）：
+
+| 文件 | 大小 (B) | sha256 |
+|---|---|---|
+| `ZeeAI_Term_0.1.8_x64-setup.exe` | 6,314,737 | `2db920db6a40fccd6f3028e342cc9da95774c290de020c468ea31144149b8093` |
+| `ZeeAI_Term_0.1.8_x64_en-US.msi` | 9,486,336 | `d8cc611216e8803740a25f0ca03adb0d9b7407d7ed58b0a784cde649d370c618` |
+| `ZeeAI_Term-0.1.8-portable.zip` | 8,884,837 | `b4e8335f65fd577da4f79a2030e785cab72532c3bb2555e6b30218036d937c3a` |
+| `ZeeAI_Term.exe` | 8,434,176 | `72bb81bc2d07575415df9e5bbc3bc326a70ff140b3e7414f4bd665081485e13e` |
+
+- 更新源地址还是 `https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest`；
+  前端挑产物用的规则是"`*.exe` 且带 setup"→ NSIS、"`*.msi`"→ MSI、"`*.zip`"→ 便携版，
+  这一版的三个文件名都符合，所以**从 0.1.8 起一键升级应当能自己挑对包**
+  （真正端到端验证要等下一次发版时从 0.1.8 升上去）。
+- 推送通道仍是 origin 的 push 地址（`ssh://git@ssh.github.com:443/...`）；
+  `gh` 在这台机器上没装，Release 是用 REST API 建的（token 从 `git credential fill` 取，不落盘）。
