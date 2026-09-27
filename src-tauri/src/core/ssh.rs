@@ -152,7 +152,9 @@ pub fn tmux_command(session_name: &str, start_dir: Option<&str>) -> String {
     //
     // 为什么放在连接命令里而不是要求用户升级 tmux：用户有几十台别人的服务器，
     // 不可能都去升级；而这两条设置是"能设就设、不能设就算了"，对任何版本都安全。
-    let tune = "tmux set-option -g aggressive-resize on 2>/dev/null; \
+    // 注意 `-gw`：aggressive-resize 是**窗口选项**，写成 `-g` 会被老 tmux 判成
+    // "unknown option: aggressive-resize"（实测踩过），而 -gw 从 tmux 1.x 起就支持。
+    let tune = "tmux set-option -gw aggressive-resize on 2>/dev/null; \
 tmux set-option -g window-size latest 2>/dev/null; ";
     let mut tmux = format!("tmux new-session -A -s '{}'", session_name.replace('\'', ""));
     if let Some(dir) = start_dir {
