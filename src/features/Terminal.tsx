@@ -100,6 +100,16 @@ const LIGHT_THEME = {
 const MIN_COLS = 20;
 const MIN_ROWS = 5;
 
+/**
+ * 连续 resize 的合并窗口。
+ *
+ * 为什么要合并：拖动窗口边缘、拖侧栏宽度、开关右侧 AI 面板时，ResizeObserver 会**连着触发几十次**。
+ * 每一次都立刻 fit + session_resize，等于给 tmux 发一串 SIGWINCH —— 全屏 TUI（codex）会跟着重画几十次，
+ * 渲染器偶尔就在空白区留下一片"点"（用户截图里那种），而且老 tmux 还会跳出
+ * "Size … from a smaller client"。合并到 150ms 之后，一次拖动只发一次真正的尺寸变化。
+ */
+const RESIZE_DEBOUNCE_MS = 150;
+
 export default function TerminalView({
   sessionId,
   bus,
@@ -119,6 +129,8 @@ export default function TerminalView({
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const hlRef = useRef<Highlighter | null>(null);
+  /** 统一走"合并 + 只在真的变了才发"的 resize；给下面几个 effect 复用 */
+  const doFitRef = useRef<(() => void) | null>(null);
   // 终端自己的右键菜单（复制/粘贴/清空/全选）—— 浏览器那套菜单已被全局屏蔽
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
@@ -170,6 +182,30 @@ export default function TerminalView({
     fitRef.current = fit;
 
     let disposed = false;
+    let resizeTimer: number | null = null;
+    let lastSent = { cols: 0, rows: 0 };
+
+    /** 把"当前尺寸"合并上报：连续变化只发最后一次，尺寸没变就不发 */
+    const scheduleResize = () => {
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        if (disposed) return;
+        const cols = term.cols;
+        const rows = term.rows;
+        if (cols < MIN_COLS || rows < MIN_ROWS) return;
+        if (cols === lastSent.cols && rows === lastSent.rows) return;
+        lastSent = { cols, rows };
+        void sessionResize(sessionId, cols, rows);
+        // 尺寸变完强制重画一遍，清掉渲染器可能留下的残影（那种"一片点"）
+        try {
+          term.refresh(0, rows - 1);
+        } catch {
+          /* ignore */
+        }
+      }, RESIZE_DEBOUNCE_MS);
+    };
+
     const doFit = () => {
       if (disposed) return;
       try {
@@ -177,10 +213,9 @@ export default function TerminalView({
       } catch {
         return;
       }
-      if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
-        void sessionResize(sessionId, term.cols, term.rows);
-      }
+      scheduleResize();
     };
+    doFitRef.current = doFit;
     doFit();
 
     // 首次布局可能晚于挂载，多补几次，确保最终尺寸正确
@@ -242,6 +277,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
       for (const t of timers) window.clearTimeout(t);
       ro.disconnect();
       host.removeEventListener("wheel", onWheel, { capture: true });
@@ -254,6 +290,7 @@ export default function TerminalView({
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
+      doFitRef.current = null;
     };
   }, [sessionId, bus]);
 
@@ -266,16 +303,9 @@ export default function TerminalView({
 
   useEffect(() => {
     if (active && termRef.current) {
-      const term = termRef.current;
-      try {
-        fitRef.current?.fit();
-      } catch {
-        /* ignore */
-      }
-      if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
-        void sessionResize(sessionId, term.cols, term.rows);
-      }
-      term.focus();
+      // 走同一套"合并 + 变了才发"的逻辑，别在这里直接 session_resize
+      doFitRef.current?.();
+      termRef.current.focus();
     }
   }, [active, sessionId]);
 
@@ -286,14 +316,13 @@ export default function TerminalView({
     term.options.fontSize = fontSize;
     term.options.theme = palette ?? (light ? LIGHT_THEME : THEME);
     term.options.scrollback = scrollback;
+    // 字号/主题变了，尺寸多半也会跟着变 —— 仍然交给统一的合并逻辑
     try {
       fitRef.current?.fit();
     } catch {
       /* ignore */
     }
-    if (term.cols >= MIN_COLS && term.rows >= MIN_ROWS) {
-      void sessionResize(sessionId, term.cols, term.rows);
-    }
+    doFitRef.current?.();
     // palette 每次渲染都是新对象时不该重建终端，所以用它的 JSON 当依赖
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fontSize, light, palette && JSON.stringify(palette), scrollback, sessionId]);

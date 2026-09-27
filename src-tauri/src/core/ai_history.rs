@@ -61,15 +61,29 @@ pub fn list() -> Vec<AiTurnRecord> {
     };
     let mut v: Vec<AiTurnRecord> = serde_json::from_str(&text).unwrap_or_default();
     v.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+    // 自愈：早期版本的去重键里带了会话标题，同一台服务器上多个标签会把同一轮记成多条。
+    // 读的时候按"环境|服务器|cwd|完成时间"再合一次，历史里的重复记录会自己消失。
+    let mut seen: Vec<String> = Vec::new();
+    v.retain(|r| {
+        let key = format!("{}|{}|{}|{}", r.env, r.server, r.cwd, r.completed_at);
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
     v
 }
 
 /// 记一条（按 id 去重）。返回**是不是新记录** —— 前端靠它决定要不要刷新列表。
 pub fn record(mut entry: AiTurnRecord) -> bool {
     if entry.id.trim().is_empty() {
+        // 去重键**不含 sessionTitle**：同一台服务器上多个标签读到的是同一份 rollout 快照，
+        // 带上标签名就会把"同一轮任务"记成多条（用户实测截图就是这个）。
         entry.id = format!(
-            "{}|{}|{}|{}|{}",
-            entry.env, entry.server, entry.session_title, entry.cwd, entry.completed_at
+            "{}|{}|{}|{}",
+            entry.env, entry.server, entry.cwd, entry.completed_at
         );
     }
     let mut all = list();
@@ -130,10 +144,21 @@ mod tests {
     #[test]
     fn dedupe_key_is_stable_and_merges_late_fields() {
         let mut a = rec(100, "", vec![]);
-        a.id = format!("{}|{}|{}|{}|{}", a.env, a.server, a.session_title, a.cwd, a.completed_at);
+        a.id = format!("{}|{}|{}|{}", a.env, a.server, a.cwd, a.completed_at);
         let b = rec(100, "补上的消息", vec!["out.md".into()]);
-        assert_eq!(a.id, format!("{}|{}|{}|{}|{}", b.env, b.server, b.session_title, b.cwd, b.completed_at),
-            "同一条记录的键必须一致，否则会重复");
+        assert_eq!(
+            a.id,
+            format!("{}|{}|{}|{}", b.env, b.server, b.cwd, b.completed_at),
+            "同一条记录的键必须一致，否则会重复"
+        );
+        // 关键回归：同一台服务器、同一轮、只是标签标题不同的两条，必须算同一条
+        let mut c = rec(100, "补上的消息", vec!["out.md".into()]);
+        c.session_title = "另一个标签".into();
+        assert_eq!(
+            a.id,
+            format!("{}|{}|{}|{}", c.env, c.server, c.cwd, c.completed_at),
+            "去重键里不能带 sessionTitle"
+        );
         // 合并规则：空字段才补
         if a.message.is_empty() {
             a.message = b.message.clone();

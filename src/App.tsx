@@ -704,6 +704,13 @@ export default function App() {
   /// 已经通知过的那一轮 —— **按会话分别记**（共用一个 key 会让两个会话互相"看起来是新的"，数字会一直涨）
   const aiTurnKey = useRef<Record<string, string>>({});
   const aiSeeded = useRef<Record<string, boolean>>({});
+  /**
+   * 已经"处理过"的 AI 轮次（记的是**任务**的身份，不是标签页的）。
+   *
+   * 为什么必须是全局一份：同一台服务器上多个标签拿到的是同一份 rollout 快照，
+   * 按标签去重会导致"一个任务被记两次 / 提醒两次"（实测踩过）。
+   */
+  const aiHandledTurns = useRef<Set<string>>(new Set());
   /// 这一轮跑完之后的产物（卡片下面那排文件名）
   const [aiArtifacts, setAiArtifacts] = useState<AiArtifact[]>([]);
   /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
@@ -1150,21 +1157,38 @@ export default function App() {
   async function considerSnapshot(cur: OpenSession, snap: AiSessionSnapshot) {
     const needsMe = snap.state === "needs-approval" || snap.state === "waiting-user";
     const hasMessage = snap.lastTurnCompletedAt > 0 && snap.lastMessage.trim().length > 0;
-    const turnKey = `${snap.sessionId}:${snap.lastTurnCompletedAt}:${snap.lastMessage.length}`;
+    // ⚠️ 这里必须按"**这一轮 AI 任务**"去重，而不是按"我们这个标签页"。
+    //
+    // 踩过的坑：同一台服务器上开着两个标签（比如 lz · codexAAA 和 lz · 普通 shell 1）时，
+    // 两个标签拿到的是**同一份** rollout 快照（快照是"那台机器上最新的 rollout"，跟标签无关），
+    // 而"处理过没有"如果按标签记，两个标签就会各记一条 —— 时间线上出现两条一模一样的记录
+    // （用户实测截图证实：两条只差 sessionTitle 一个字段）。
+    // 同一个毛病还会让"等你批准"每 10 秒重复提醒一次（红点数字自己往上涨的老问题）。
+    const server = boardEnvOf(cur).server;
+    const turnKey = `${snap.sessionId || server}|${snap.lastTurnCompletedAt}|${snap.lastMessage.length}`;
     // 第一次拿到**这个会话**的快照时只记下来，不提醒（否则一开应用就会把上一轮翻出来弹）
     if (!aiSeeded.current[cur.id]) {
       aiSeeded.current[cur.id] = true;
       aiTurnKey.current[cur.id] = turnKey;
+      aiHandledTurns.current.add(turnKey);
       return;
     }
-    const freshTurn = hasMessage && turnKey !== aiTurnKey.current[cur.id];
-    if (!needsMe && !freshTurn) return;
+    // "新一轮跑完"只认全局没见过的那一轮
+    const freshTurn = hasMessage && !aiHandledTurns.current.has(turnKey);
+    // "在等你"同样要按"同一件事"去重，否则每次轮询都会再提醒一遍
+    const askKey = needsMe ? `ask|${server}|${snap.state}|${snap.lastAction}` : "";
+    const freshAsk = needsMe && askKey !== "" && !aiHandledTurns.current.has(askKey);
+    if (!freshAsk && !freshTurn) return;
 
     // 人就在看这个终端（窗口在前台 + 正打开它）→ 一般不打扰；
     // 但"这一轮产出了文件"是另一回事：那是要你去看的东西，照样提醒。
     const watching =
       document.hasFocus() && cur.id === activeId && cur.activeTab === "terminal" && aiPanelOpen;
-    if (freshTurn) aiTurnKey.current[cur.id] = turnKey;
+    if (freshTurn) {
+      aiTurnKey.current[cur.id] = turnKey;
+      aiHandledTurns.current.add(turnKey);
+    }
+    if (freshAsk) aiHandledTurns.current.add(askKey);
 
     if (freshTurn) {
       // 有新消息时顺手把"这一轮产出的文件"翻出来，提示里带上数量（列表在卡片下面）
