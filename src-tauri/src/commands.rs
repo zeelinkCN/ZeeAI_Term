@@ -2487,6 +2487,36 @@ pub fn workspace_save(data: String) -> Result<(), String> {
     store::save_workspace(&data)
 }
 
+// ---------- AI 任务时间线（G-01） ----------
+
+/// 读整条 AI 任务时间线（新的在前）。
+///
+/// 这是"我离开电脑再回来，昨晚跑了什么"的答案：看板只显示当前这一轮，
+/// 而这份记录是落盘的，重启应用也还在。
+#[tauri::command]
+pub fn ai_timeline_list() -> Vec<crate::core::ai_history::AiTurnRecord> {
+    crate::core::ai_history::list()
+}
+
+/// 记一条"这一轮跑完了"。前端在发现新一轮完成时调用（那一刻它手上有全部信息）。
+/// 返回 true 表示是新记录（前端据此刷新列表）。
+#[tauri::command]
+pub fn ai_timeline_add(entry: crate::core::ai_history::AiTurnRecord) -> bool {
+    let at = entry.completed_at;
+    let server = entry.server.clone();
+    let is_new = crate::core::ai_history::record(entry);
+    if is_new {
+        log::info!("ai_timeline: 记下一条新的完成记录 server={server} at={at}");
+    }
+    is_new
+}
+
+/// 清空时间线
+#[tauri::command]
+pub fn ai_timeline_clear() {
+    crate::core::ai_history::clear();
+}
+
 /// 读取上次的工作区快照（没有就返回 null）
 #[tauri::command]
 pub fn workspace_load() -> Option<String> {

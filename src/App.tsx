@@ -23,6 +23,9 @@ import {
   aiTasksRemote,
   aiSessionSnapshot,
   aiTaskArtifacts,
+  aiTimelineAdd,
+  aiTimelineClear,
+  aiTimelineList,
   isAdmin,
   openAdminShell,
   restartAsAdmin,
@@ -94,6 +97,7 @@ import type {
   AiProbe,
   AiSessionSnapshot,
   AiArtifact,
+  AiTurnRecord,
   AiTask,
   AppSettings,
   ConnectionProfile,
@@ -436,6 +440,8 @@ const DEFAULT_SETTINGS: AppSettings = {
 };
 
 const APP_VERSION = "0.1.8";
+/** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
+const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
@@ -680,7 +686,13 @@ export default function App() {
   const aiWasRunning = useRef(false);
   // AI 任务看板（v1）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片
   const [boardTasks, setBoardTasks] = useState<AiTask[]>([]);
+  /** AI 任务时间线（落盘的历史，G-01） */
+  const [timeline, setTimeline] = useState<AiTurnRecord[]>([]);
+  /** 各会话最近一次命令的退出码（G-02：只有注入过 shell 集成的会话才有） */
+  const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
   const boardBusy = useRef(false);
+  /** 上次扫本机进程表的时刻（本机扫描比远端探针贵得多，单独限流） */
+  const lastLocalScan = useRef(0);
   // 会话日志快照（有新消息/在等你/耗时/token 都从这儿来）
   const [aiSnapshot, setAiSnapshot] = useState<AiSessionSnapshot | null>(null);
   /// 需要你处理的事情还没被看过时，活动栏 AI 图标上的红点
@@ -949,6 +961,7 @@ export default function App() {
     if (boardBusy.current) return;
     boardBusy.current = true;
     try {
+      const now = Date.now();
       const jobs: Promise<AiTask[]>[] = [];
       const seenRemote = new Set<string>();
       const seenLocal = new Set<string>();
@@ -964,6 +977,10 @@ export default function App() {
           // 每种本地终端只扫一次（多开几个 PowerShell 没必要扫好几遍进程表）
           if (seenLocal.has(s.kind)) continue;
           seenLocal.add(s.kind);
+          // 本机扫描要起一个 PowerShell 去枚举进程（实测 0.6~1 秒），比远端探针贵得多，
+          // 所以单独限流：最多 60 秒一次。看板对"本机多出来了哪个 AI"并不需要秒级新鲜度。
+          if (now - lastLocalScan.current < LOCAL_SCAN_MIN_INTERVAL_MS) continue;
+          lastLocalScan.current = now;
           jobs.push(aiTasksLocal(s.kind, shellLabelOf(s.kind), null).catch(() => []));
         }
       }
@@ -1005,6 +1022,15 @@ export default function App() {
       await aiTasksClearFinished(env, server).catch(() => {});
     }
     await refreshBoard();
+  }
+
+  /** 读一次落盘的任务时间线（G-01） */
+  async function loadTimeline() {
+    try {
+      setTimeline(await aiTimelineList());
+    } catch {
+      // 读不到就当空列表，不打扰用户（第一次运行本来就没有）
+    }
   }
 
   /**
@@ -1142,7 +1168,28 @@ export default function App() {
 
     if (freshTurn) {
       // 有新消息时顺手把"这一轮产出的文件"翻出来，提示里带上数量（列表在卡片下面）
+      const board = boardEnvOf(cur);
       void refreshArtifacts(cur, snap).then((list) => {
+        // G-01：不管最后提不提醒，都先把"这一轮跑完了"记进**落盘**的时间线。
+        // 这样"我离开电脑再回来"才能回看昨晚跑了什么 —— 看板本身只有当前这一轮。
+        void aiTimelineAdd({
+          id: "",
+          env: board.env,
+          server: board.server,
+          sessionTitle: cur.title,
+          cwd: snap.cwd ?? "",
+          tool: "codex",
+          completedAt: snap.lastTurnCompletedAt,
+          durationMs: snap.lastTurnDurationMs,
+          message: snap.lastMessage,
+          tokensTotal: snap.usage?.total ?? 0,
+          artifacts: list.map((a) => a.name),
+        })
+          .then((isNew) => {
+            if (isNew) void loadTimeline();
+          })
+          .catch(() => {});
+
         if (list.length === 0 && watching) return; // 没产物 + 你正看着 → 不打扰
         const extra = list.length > 0 ? `（产出 ${list.length} 个文件，卡片下面可点开）` : "";
         raiseAiAttention(
@@ -1181,6 +1228,7 @@ export default function App() {
     if (!aiPanelOpen) return;
     void refreshAi();
     void refreshBoard();
+    void loadTimeline();
     // 会话日志是通知的主判据，跟着面板一起刷
     void refreshSnapshot();
     const t = window.setInterval(() => void refreshAi(), 8000);
@@ -5307,6 +5355,9 @@ export default function App() {
                               kindOfSession(ps.kind),
                             )}
                             onCwd={(path) => handleTerminalCwd(ps.id, path)}
+                            onCommandDone={(code) =>
+                              setCmdExit((prev) => ({ ...prev, [ps.id]: { exit: code, at: Date.now() } }))
+                            }
                             onNotice={notify}
                             onZoom={bumpFont}
                           />
@@ -5360,6 +5411,9 @@ export default function App() {
                       kindOfSession(s.kind),
                     )}
                     onCwd={(path) => handleTerminalCwd(s.id, path)}
+                    onCommandDone={(code) =>
+                      setCmdExit((prev) => ({ ...prev, [s.id]: { exit: code, at: Date.now() } }))
+                    }
                     onNotice={notify}
                     onZoom={bumpFont}
                   />
@@ -5476,6 +5530,17 @@ export default function App() {
                           {snap.lastAction}
                         </div>
                       ) : null}
+                      {/* G-02：shell 集成报上来的退出码（只有注入过 PROMPT_COMMAND 的会话才有；
+                          tmux 会话拿不到，那一侧受限于老 tmux，见 core/ssh.rs 里的说明） */}
+                      {snap && activeId && cmdExit[activeId] ? (
+                        <div
+                          className="ai-task-meta"
+                          title={new Date(cmdExit[activeId].at).toLocaleString("zh-CN")}
+                        >
+                          最近一条命令退出码 {cmdExit[activeId].exit}
+                          {cmdExit[activeId].exit === 0 ? "（成功）" : "（失败）"}
+                        </div>
+                      ) : null}
                       <div
                         className="ai-task-meta ellipsis"
                         title={`${t.command || "（拿不到命令行）"}\npid ${t.pid} · ${aiSourceLabel(
@@ -5514,6 +5579,96 @@ export default function App() {
                     </button>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* ---------- AI 任务时间线（G-01）：落盘的历史，应用重启后还在 ---------- */}
+            <div className="ai-section">
+              最近任务{timeline.length > 0 ? `（${timeline.length}）` : ""}
+              <button
+                type="button"
+                className="mini-x"
+                style={{ marginLeft: "auto", opacity: 1 }}
+                title="刷新"
+                onClick={() => void loadTimeline()}
+              >
+                ⟳
+              </button>
+              {timeline.length > 0 && (
+                <button
+                  type="button"
+                  className="mini-x"
+                  style={{ opacity: 1 }}
+                  title="清空时间线（只删记录，不动会话和文件）"
+                  onClick={() => {
+                    void aiTimelineClear()
+                      .then(() => setTimeline([]))
+                      .catch(() => {});
+                    notify("已清空 AI 任务时间线");
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            {timeline.length === 0 ? (
+              <div className="hint" style={{ padding: "2px 12px 8px" }}>
+                还没有记录。AI 跑完一轮会记在这里（重启应用也还在）。
+              </div>
+            ) : (
+              <div className="ai-timeline">
+                {timeline.slice(0, 40).map((r) => {
+                  // 能不能"切过去"：找标题相同的已打开会话
+                  const target = sessions.find(
+                    (s) => (s.title ?? "").trim() === (r.sessionTitle ?? "").trim(),
+                  );
+                  return (
+                    <div className="ai-tl-row" key={r.id}>
+                      <div className="ai-tl-line">
+                        <span className="grow ellipsis" title={r.sessionTitle}>
+                          {new Date(r.completedAt * 1000).toLocaleString("zh-CN", {
+                            month: "2-digit",
+                            day: "2-digit",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                          {` · ${r.server}`}
+                          {r.cwd ? ` · ${dirBase(r.cwd)}` : ""}
+                        </span>
+                        <span className="dim">
+                          {r.durationMs > 0 ? aiDurationText(r.durationMs) : ""}
+                        </span>
+                      </div>
+                      <div className="ai-tl-msg ellipsis" title={r.message}>
+                        {r.message || "（这一轮没有留下文字）"}
+                      </div>
+                      <div className="ai-tl-actions">
+                        {r.artifacts.slice(0, 3).map((n) => (
+                          <span className="ai-tag" key={n}>
+                            📄 {n}
+                          </span>
+                        ))}
+                        {r.artifacts.length > 3 && (
+                          <span className="dim">+{r.artifacts.length - 3}</span>
+                        )}
+                        {target ? (
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            title={`切到「${target.title}」`}
+                            onClick={() => {
+                              setActiveId(target.id);
+                              setAiUnread(0);
+                              notify(`已切到「${target.title}」`);
+                            }}
+                          >
+                            切过去
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
 

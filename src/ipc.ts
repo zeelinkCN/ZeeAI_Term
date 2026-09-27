@@ -11,6 +11,7 @@ import type {
   AdbDevice,
   SerialPortInfo,
   GitStatus,
+  AiTurnRecord,
   GitCommit,
   GitBranch,
   AdbFile,
@@ -611,4 +612,21 @@ export async function updateDownloadInstall(
     version,
     expectedSha: expectedSha ?? null,
   });
+}
+
+// ---------- AI 任务时间线（G-01） ----------
+
+/** 读落盘的任务时间线（新的在前） */
+export async function aiTimelineList(): Promise<AiTurnRecord[]> {
+  return invoke<AiTurnRecord[]>("ai_timeline_list");
+}
+
+/** 记一条"这一轮跑完了"；返回是否是新的（前端据此刷新列表） */
+export async function aiTimelineAdd(entry: AiTurnRecord): Promise<boolean> {
+  return invoke<boolean>("ai_timeline_add", { entry });
+}
+
+/** 清空时间线 */
+export async function aiTimelineClear(): Promise<void> {
+  return invoke("ai_timeline_clear");
 }

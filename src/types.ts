@@ -217,6 +217,28 @@ export interface AiArtifact {
   mtime: number;
 }
 
+/**
+ * AI 任务时间线的一条记录（G-01）。
+ *
+ * 看板只有"当前这一轮"，这份是**落盘**的历史 —— 应用重启后还在，
+ * 用来回答"昨晚我不在的时候它跑完了哪些活、产出了什么"。
+ */
+export interface AiTurnRecord {
+  id: string;
+  env: string;
+  server: string;
+  sessionTitle: string;
+  cwd: string;
+  tool: string;
+  /** 这一轮结束时间（Unix 秒） */
+  completedAt: number;
+  durationMs: number;
+  message: string;
+  tokensTotal: number;
+  /** 这一轮产出的文件（名字，点开走已有预览） */
+  artifacts: string[];
+}
+
 export interface AppSettings {
   fontSize: number;
   defaultShell: "powershell" | "cmd" | "wsl";

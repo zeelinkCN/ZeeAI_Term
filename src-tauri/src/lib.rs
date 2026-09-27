@@ -424,6 +424,9 @@ pub fn run() {
       commands::ai_tasks_clear_finished,
       commands::ai_session_snapshot,
       commands::ai_task_artifacts,
+      commands::ai_timeline_list,
+      commands::ai_timeline_add,
+      commands::ai_timeline_clear,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

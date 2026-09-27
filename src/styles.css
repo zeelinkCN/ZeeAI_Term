@@ -1142,6 +1142,46 @@ body {
 
 /* ---------- AI 任务看板（多环境汇总卡片） ---------- */
 
+/* ---------- AI 任务时间线（落盘的历史，G-01） ---------- */
+
+.ai-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0 8px 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.ai-tl-row {
+  border-left: 2px solid var(--border);
+  padding: 3px 6px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 4px;
+}
+
+.ai-tl-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ai-tl-msg {
+  font-size: 12px;
+  color: var(--fg);
+  opacity: 0.85;
+}
+
+.ai-tl-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
 .ai-board {
   display: flex;
   flex-direction: column;

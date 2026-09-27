@@ -188,6 +188,16 @@ fn workspace_file() -> PathBuf {
     store_dir().join("workspace.json")
 }
 
+/// AI 任务时间线（`docs/impl-log` 里说的 G-01）落盘位置
+pub fn ai_turns_file() -> PathBuf {
+    store_dir().join("ai_turns.json")
+}
+
+/// 写 AI 任务时间线（原子写，理由同 [`write_atomic`]）
+pub fn write_ai_turns(text: &str) -> Result<(), String> {
+    write_atomic(&ai_turns_file(), text)
+}
+
 pub fn save_workspace(data: &str) -> Result<(), String> {
     write_atomic(&workspace_file(), data)
 }

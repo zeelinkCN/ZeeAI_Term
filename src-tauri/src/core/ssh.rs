@@ -168,7 +168,28 @@ exec \"${{SHELL:-/bin/bash}}\"; fi"
 /// PROMPT_COMMAND 通过 export 传进去：bash 启动时会从环境导入它，
 /// 交互式运行时每次画提示符都会执行，所以不需要改服务器上任何 rc 文件。
 pub fn shell_with_cwd_report() -> String {
-    r#"if [ -n "$BASH_VERSION" ] || [ "$(basename "${SHELL:-bash}")" = "bash" ]; then PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; export PROMPT_COMMAND; fi; exec "${SHELL:-/bin/bash}""#.to_string()
+    // 除了 OSC 7（上报当前目录），这里还捎带做 G-02 的 shell 集成：OSC 133 的
+    // A（提示符开始）/ B（提示符结束）/ C（命令开始）/ D;exit（命令结束 + 退出码）。
+    //
+    // 为什么用 PROMPT_COMMAND：它每次画提示符都会执行，不需要改服务器上任何 rc 文件——
+    // 和当初做 OSC 7 是同一套做法（见 docs/decisions.md 第七轮）。
+    //
+    // 已知限制（如实记录）：**tmux 会话上这条路走不通**。tmux 里 shell 的环境来自
+    // tmux server，而 server 可能是别的客户端先起的；本机这台服务器 tmux 还是 2.7，
+    // 没有 `-e` 传环境变量、也不允许我们模拟按键（用户明确禁止）。所以 tmux 会话
+    // 仍然只有 OSC 7 那一条（由 tmux 的 `-c` 起始目录 + 进程信息推断）。
+    // 除了 OSC 7（上报当前目录），这里捎带做 G-02：OSC 133 的 `D;<退出码>` ——
+    // 每个命令结束时把**退出码**报上来，卡片就能显示"上一轮退出码 0"、并拿到精确的结束时刻。
+    //
+    // 只发 D，不去改 PS1 / 不发 A/B/C：这条命令会被塞进 ssh 的远端命令里，
+    // 越短越不容易踩转义坑；而"命令结束 + 退出码"恰好是最有用的那一个信号。
+    // 注意 `$?` 必须是 PROMPT_COMMAND 里**第一个**被求值的东西，否则会被前面的命令覆盖。
+    //
+    // 已知限制（如实记录）：**tmux 会话上这条路走不通** —— tmux 里 shell 的环境来自
+    // tmux server，而 server 可能是别的客户端先起的；这台服务器 tmux 还是 2.7，
+    // 没有 `-e` 传环境变量，而模拟按键又被明确禁止。所以 tmux 会话拿不到退出码。
+    r#"if [ -n "$BASH_VERSION" ] || [ "$(basename "${SHELL:-bash}")" = "bash" ]; then PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; export PROMPT_COMMAND; fi; exec "${SHELL:-/bin/bash}""#
+        .to_string()
 }
 
 /// 组装一次非交互式 `ssh <host> "<cmd>"` 调用（用于 tmux 列表 / kill 这类一次性命令）。

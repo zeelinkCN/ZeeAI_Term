@@ -16,8 +16,86 @@
 use serde::Serialize;
 use serde_json::Value;
 
-/// 一次读取的日志尾巴上限（40 万字节，够覆盖最近几轮）
-pub const TAIL_BYTES: u64 = 400_000;
+/// 扫描窗口：只读文件最后这么多字节。
+///
+/// 为什么不再用"截最后 40 万字节"：实测某条会话最后一次 `task_complete` 距文件尾已经有
+/// **293KB** —— 窗口只要被一轮大输出撑爆，"AI 跑完了 / 等你批准"就会**静默失效**
+/// （正是 0.1.7 想解决的那个问题）。现在窗口放大到 4MB（十几倍余量），
+/// 而且下面**按记录类型各取最后几条**，所以传输量反而从固定 400KB 掉到几 KB。
+pub const SCAN_BYTES: u64 = 4_000_000;
+/// 每种记录各保留最后几条（保住顺序由 line_no 排序实现）
+const PER_BUCKET_KEEP: usize = 3;
+
+/// 把一行归到某个"状态桶"里。**宁可多归**：多归只是多传几行，漏归才会把状态算错。
+/// 真正的判定仍然由 `parse_rollout` 按解析后的 `payload.type` 做，所以正文里出现这些词不会误判。
+fn bucket_of(line: &str) -> Option<u8> {
+    if line.contains("task_complete") {
+        Some(0)
+    } else if line.contains("task_started") {
+        Some(1)
+    } else if line.contains("token_count") || line.contains("token_usage_record") {
+        Some(2)
+    } else if line.contains("function_call")
+        || line.contains("custom_tool_call")
+        || line.contains("local_shell_call")
+        || line.contains("web_search_call")
+        || line.contains("mcp_tool_call")
+    {
+        Some(3)
+    } else if line.contains("approval")
+        || line.contains("request_user_input")
+        || line.contains("elicitation")
+    {
+        Some(4)
+    } else if line.contains("agent_message")
+        || line.contains("user_message")
+        || line.contains("reasoning")
+    {
+        Some(5)
+    } else if line.contains("turn_context") || line.contains("session_meta") {
+        Some(6)
+    } else {
+        None
+    }
+}
+
+/// 从一段 JSONL 里挑出"和状态有关的"记录：每类各留最后 [`PER_BUCKET_KEEP`] 条，再按原顺序拼回去。
+///
+/// 这样无论中间夹了多少噪声输出，决定状态的那几条（最后一条 `task_complete`、
+/// 最后一条 `task_started`、最后一次用量……）都不会被挤掉。
+fn select_related(raw: &str) -> Option<String> {
+    let mut picked: Vec<(usize, &str)> = Vec::new();
+    let mut counts = [0usize; 7];
+    let mut rings: [Vec<(usize, &str)>; 7] = Default::default();
+    for (idx, line) in raw.lines().enumerate() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.len() < 5 || !line.starts_with('{') {
+            continue;
+        }
+        let Some(b) = bucket_of(line) else { continue };
+        let b = b as usize;
+        counts[b] += 1;
+        let slot = counts[b] % PER_BUCKET_KEEP;
+        if rings[b].len() < PER_BUCKET_KEEP {
+            rings[b].push((idx, line));
+        } else {
+            rings[b][slot] = (idx, line);
+        }
+    }
+    for ring in rings.iter() {
+        picked.extend(ring.iter().copied());
+    }
+    if picked.is_empty() {
+        return None;
+    }
+    picked.sort_by_key(|(i, _)| *i);
+    let out = picked
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(out)
+}
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -372,13 +450,32 @@ pub fn parse_ts(s: &str) -> Option<i64> {
     Some(days * 86400 + h * 3600 + mi * 60 + sec)
 }
 
-/// 远端取"最新的那个 rollout 的尾巴"（一条命令搞定，输出前缀一行文件路径）
+/// 远端取"最新的那个 rollout 里**和状态有关的最后若干条记录**"（一条命令搞定）
+///
+/// 输出格式：第一行 `ZFILE|<路径>`，后面是挑出来的 JSONL 记录（保持原始先后顺序）。
+///
+/// 为什么不是 `tail -c 400000`：见 [`SCAN_BYTES`] 的说明 —— 按字节截会漏掉被大输出挤出
+/// 窗口的 `task_complete`。现在只读窗口内的 4MB，再**按记录类型各取最后几条**
+/// （和本机 [`select_related`] 同一套规则），回传量从固定 400KB 掉到几 KB，**又准又省**。
 pub fn remote_tail_script() -> String {
     format!(
         "f=$(ls -t \"$HOME\"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -1); \
-if [ -n \"$f\" ]; then printf 'ZFILE|%s\\n' \"$f\"; tail -c {TAIL_BYTES} \"$f\"; fi"
+if [ -n \"$f\" ]; then printf 'ZFILE|%s\\n' \"$f\"; \
+tail -c {scan} \"$f\" | awk '{awk}' | sort -n | cut -d: -f2-; fi",
+        scan = SCAN_BYTES,
+        awk = REMOTE_PICK_AWK,
     )
 }
+
+/// 远端那支 awk：按类型各留最后 3 条，输出 `行号:原始行`；外层再 `sort -n` 还原顺序。
+///
+/// 规则必须和本机 [`bucket_of`] 保持一致，否则两端看到的状态会不一样。
+/// 注意：这段会被塞进 shell 的单引号里，所以**不能出现单引号**。
+///
+/// **必须写成一行**：这个文件在 Windows 上是 CRLF，而 Rust 的原始字符串会把行尾的 `\r`
+/// 一起带进程序文本 —— 远端 awk 会把这些 `\r` 当成语法错误直接报错（实测踩过）。
+/// 写成一行既躲开这个坑，也让整条远端命令更好读。
+const REMOTE_PICK_AWK: &str = r#"{n=NR;b=-1;if(index($0,"task_complete"))b=0;else if(index($0,"task_started"))b=1;else if(index($0,"token_count")||index($0,"token_usage_record"))b=2;else if(index($0,"function_call")||index($0,"custom_tool_call")||index($0,"local_shell_call")||index($0,"web_search_call")||index($0,"mcp_tool_call"))b=3;else if(index($0,"approval")||index($0,"request_user_input")||index($0,"elicitation"))b=4;else if(index($0,"agent_message")||index($0,"user_message")||index($0,"reasoning"))b=5;else if(index($0,"turn_context")||index($0,"session_meta"))b=6;else next;c[b]++;r[b,c[b]%3]=NR":"$0}END{for(b in c){for(i=0;i<3&&i<c[b];i++)print r[b,(c[b]-i)%3]}}"#;
 
 /// 任务产物：某个文件是"这一轮跑完之后新出现/被改过"的
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -545,13 +642,21 @@ pub fn local_snapshot() -> Option<AiSessionSnapshot> {
     let home = std::env::var("USERPROFILE").ok()?;
     let root = std::path::Path::new(&home).join(".codex").join("sessions");
     let newest = newest_rollout(&root, 0)?;
-    let text = read_tail(&newest, TAIL_BYTES)?;
+    // 读窗口内的记录、按类型各取最后几条。窗口 4MB，实测那次"被挤出 40 万字节窗口"的
+    // 情况在这里有十几倍余量；而真正喂给解析器的只有十几行。
+    let text = read_related_tail(&newest, SCAN_BYTES)?;
     let snap = parse_rollout(&text);
     if snap.lines_seen == 0 {
         None
     } else {
         Some(snap)
     }
+}
+
+/// 读文件尾巴并挑出关键记录（保持原顺序）；一条都没匹配上时退回整个尾巴（不比以前差）。
+fn read_related_tail(path: &std::path::Path, window: u64) -> Option<String> {
+    let raw = read_tail(path, window)?;
+    Some(select_related(&raw).unwrap_or(raw))
 }
 
 /// 递归找最新的 rollout-*.jsonl（目录结构是 sessions/年/月/日/，最多三层的递归）
@@ -668,5 +773,57 @@ mod tests {
         assert_eq!(parse_ts("1970-01-01T00:00:00.000Z"), Some(0));
         assert_eq!(parse_ts("2026-09-26T10:46:31.038Z"), Some(1790419591));
         assert_eq!(parse_ts("garbage"), None);
+    }
+
+    /// 把"这一轮跑完"埋在 1.5MB 的噪声**前面**，旧实现（截最后 40 万字节）会读不到它。
+    /// 这正是实测到的现场：最后一次 task_complete 距文件尾 293KB，一轮大输出就能把它挤出去。
+    #[test]
+    fn finds_completion_even_when_buried_under_noise() {
+        let mut raw = String::new();
+        raw.push_str(
+            r#"{"timestamp":"2026-09-27T10:00:00.000Z","type":"session_meta","payload":{"session_id":"s1","cwd":"/home/x"}}"#,
+        );
+        raw.push('\n');
+        raw.push_str(
+            r#"{"timestamp":"2026-09-27T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+        );
+        raw.push('\n');
+        raw.push_str(
+            r#"{"timestamp":"2026-09-27T10:00:30.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"我把 Markdown 写好了","completed_at":1790419591,"duration_ms":29000}}"#,
+        );
+        raw.push('\n');
+        // 之后塞 ~1.5MB 噪声（每行 500 字节 × 3000 行）
+        let filler = "x".repeat(450);
+        for i in 0..3000 {
+            raw.push_str(&format!(
+                r#"{{"timestamp":"2026-09-27T10:01:00.000Z","type":"response_item","payload":{{"type":"function_call_output","output":"{i}{filler}"}}}}"#
+            ));
+            raw.push('\n');
+        }
+        assert!(raw.len() > 1_400_000, "构造的噪声要够大，实际 {}", raw.len());
+
+        let picked = select_related(&raw).expect("应该挑得出记录");
+        assert!(
+            picked.len() < 20_000,
+            "挑完之后要明显变小，实际 {} 字节",
+            picked.len()
+        );
+        let snap = parse_rollout(&picked);
+        assert_eq!(
+            snap.last_turn_completed_at, 1790419591,
+            "被噪声埋在 1.5MB 之前也要能读到 task_complete"
+        );
+        assert!(snap.last_message.contains("Markdown"), "{}", snap.last_message);
+        assert_eq!(snap.state, "idle", "那一轮已经跑完，不应该还报 running");
+    }
+
+    #[test]
+    fn remote_script_picks_records_instead_of_dumping_bytes() {
+        let s = remote_tail_script();
+        // 关键：不再是"tail -c 400000 然后祈祷"，而是按类型挑记录
+        assert!(s.contains("awk"), "{s}");
+        assert!(s.contains("task_complete"), "{s}");
+        assert!(s.contains(&SCAN_BYTES.to_string()), "{s}");
+        assert!(s.starts_with("f=$(ls -t"), "{s}");
     }
 }

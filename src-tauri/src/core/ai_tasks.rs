@@ -195,14 +195,47 @@ fn take_token(s: &str) -> (Option<&str>, &str) {
 /// 用系统自带的 `Get-CimInstance`（不引任何库）。**全进程表扫描偏重**，
 /// 所以前端只在真有本机会话的时候、15~30 秒一次地调它。
 pub fn windows_script() -> String {
-    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+    // 用 replace 而不是 format!：PowerShell 脚本里全是 `{` `}`，走 format! 得逐个转义，
+    // 太容易写错（这个坑刚踩过一次）。占位符只有一个，替换更稳。
+    const TEMPLATE: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
 $OutputEncoding=[System.Text.Encoding]::UTF8; \
 $ErrorActionPreference='SilentlyContinue'; \
 $now=Get-Date; \
-Get-CimInstance Win32_Process | ForEach-Object { \
+Get-CimInstance Win32_Process -Filter \"{filter}\" | ForEach-Object { \
 $et=''; if ($_.CreationDate) { $d=($now - $_.CreationDate).TotalSeconds; if ($d -ge 0) { $et=[int]$d } }; \
-'ZPROC|' + $_.ProcessId + '|' + $_.ParentProcessId + '|' + $et + '|' + $_.CommandLine }"
-        .to_string()
+'ZPROC|' + $_.ProcessId + '|' + $_.ParentProcessId + '|' + $et + '|' + $_.CommandLine }";
+    TEMPLATE.replace("{filter}", &windows_name_filter())
+}
+
+/// 本机扫描要看的进程名白名单（WQL `Name='x'` 的 OR 列表）。
+///
+/// 为什么要过滤：全表枚举在这台机器上要 260~480ms，而其中真正可能相关的只有几个 ——
+/// 过滤之后 WMI 少物化几百个对象，也不会把无关进程（各种 IDE、驱动、系统服务）的
+/// 命令行带出来。名单故意放宽：宁可多查几个名字，也别漏掉将来新增的 AI CLI。
+fn windows_name_filter() -> String {
+    let mut names: Vec<String> = Vec::new();
+    for t in TOOLS.iter() {
+        names.push(format!("{t}.exe"));
+    }
+    for l in LAUNCHERS.iter() {
+        // sh/bash 在 Windows 上没有意义，跳过（它们只出现在远端）
+        if *l == "sh" || *l == "bash" || *l == "env" || *l == "sudo" {
+            continue;
+        }
+        names.push(format!("{l}.exe"));
+    }
+    // 常见的包装入口：cmd/powershell 里跑的 codex.cmd、以及 wsl 里的一层
+    names.push("cmd.exe".into());
+    names.push("powershell.exe".into());
+    names.push("pwsh.exe".into());
+    names.push("wsl.exe".into());
+    names.sort();
+    names.dedup();
+    names
+        .iter()
+        .map(|n| format!("Name='{n}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 /// 解析 PowerShell 采集脚本的输出

@@ -21,6 +21,13 @@ interface Props {
   scrollback?: number;
   /** shell 通过 OSC 7 上报当前工作目录时回调（非 tmux 会话也能跟踪 cwd） */
   onCwd?: (path: string) => void;
+  /**
+   * shell 通过 OSC 133 上报"命令结束 + 退出码"时回调（G-02）。
+   *
+   * 只在我们注入过 PROMPT_COMMAND 的会话里有信号（普通 shell / WSL）；
+   * tmux 会话因为注入不进去，收不到 —— 前端对此必须容忍"永远不回调"。
+   */
+  onCommandDone?: (exitCode: number) => void;
   /** 需要给用户提示时回调（走状态栏，不弹浮层） */
   onNotice?: (text: string) => void;
   /** Ctrl + 鼠标滚轮缩放字号：+1 变大，-1 变小 */
@@ -102,6 +109,7 @@ export default function TerminalView({
   palette,
   scrollback = 10000,
   onCwd,
+  onCommandDone,
   onNotice,
   onZoom,
   highlightEnabled = false,
@@ -116,6 +124,8 @@ export default function TerminalView({
   // 回调用 ref 存，避免因为父组件重渲染导致终端被重建
   const onCwdRef = useRef<Props["onCwd"]>(onCwd);
   onCwdRef.current = onCwd;
+  const onCommandDoneRef = useRef<Props["onCommandDone"]>(onCommandDone);
+  onCommandDoneRef.current = onCommandDone;
   const onZoomRef = useRef<Props["onZoom"]>(onZoom);
   onZoomRef.current = onZoom;
   // 高亮规则也在重建终端时读一次就行（后续变化走下面的热更新 effect）
@@ -198,6 +208,14 @@ export default function TerminalView({
       return true; // 已消费，不要在屏幕上打印
     });
 
+    // OSC 133（shell 集成的命令标记）：我们只关心 `D;<退出码>`。
+    // 报上来之后交给上层 —— 卡片上显示"退出码 N"，并把这个时刻当成"这一轮真正结束"。
+    const osc133 = term.parser.registerOscHandler(133, (data) => {
+      const m = /^D;(-?\d+)/.exec(data.trim());
+      if (m) onCommandDoneRef.current?.(Number(m[1]));
+      return true;
+    });
+
     const ro = new ResizeObserver(() => doFit());
     ro.observe(host);
 
@@ -229,6 +247,7 @@ export default function TerminalView({
       host.removeEventListener("wheel", onWheel, { capture: true });
       sub.dispose();
       osc7.dispose();
+      osc133.dispose();
       bus.detach(sessionId);
       hl.dispose();
       hlRef.current = null;
