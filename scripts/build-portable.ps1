@@ -50,24 +50,48 @@ if ($Clean) {
 }
 
 Write-Host "== 组装便携版目录（$outDir）=="
-if (Test-Path $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
-New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources') | Out-Null
+# 先在临时目录组装，再尝试同步到 portable/ZeeAI_Term。
+#
+# 为什么不在原地删了重建：便携版可能**正被用户双击运行**，那个 exe 是被锁住的，
+# 硬删会 Access denied 并让整个脚本失败（连 zip 都出不来）。所以组装和"刷新用户看到的目录"
+# 分开：zip 一定要产出来；同步失败只给一句人话提示。
+$stage = Join-Path $env:TEMP ("zeeai-portable-stage-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'resources') | Out-Null
 
-Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
-Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
-Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
+Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZeeAI_Term.exe') -Force
+Copy-Item -LiteralPath $readme -Destination (Join-Path $stage 'README-portable.txt') -Force
+Copy-Item -LiteralPath $resDir -Destination (Join-Path $stage 'resources/platform-tools') -Recurse -Force
 
 Write-Host '== 压缩 =='
 if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
 [System.IO.Compression.ZipFile]::CreateFromDirectory(
-  (Resolve-Path $outDir).Path,
+  $stage,
   (Join-Path (Get-Location) $zip),
   [System.IO.Compression.CompressionLevel]::Optimal,
   $false
 )
 
+Write-Host '== 同步到解压即用的目录 =='
+$locked = $false
+try {
+  if (Test-Path $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction Stop }
+  New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources') | Out-Null
+  Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
+  Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
+  Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
+  Write-Host '   已刷新（解压即用的目录也是这一版了）'
+} catch {
+  $locked = $true
+  Write-Warning "同步失败：$outDir 里的文件正被占用（多半是便携版还在运行）。zip 已经正常产出，不受影响；"
+  Write-Warning "想刷新那个目录，请先关掉正在跑的 ZeeAI_Term，再重跑一次本脚本。"
+}
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host '== 产物 =='
-foreach ($f in @((Join-Path $outDir 'ZeeAI_Term.exe'), $zip)) {
+$folderExe = Join-Path $outDir 'ZeeAI_Term.exe'
+foreach ($f in @($folderExe, $zip)) {
+  # 目录里那份可能还是旧的（正被占用，没同步成功），那种情况就别把它的哈希当成本次产物
+  if ($locked -and $f -eq $folderExe) { continue }
   $item = Get-Item $f
   $hash = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()
   Write-Host ('   {0,-46} {1,10:N0} B  sha256={2}' -f $item.Name, $item.Length, $hash)

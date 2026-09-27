@@ -435,7 +435,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   aiNotifyBadge: true,
 };
 
-const APP_VERSION = "0.1.7";
+const APP_VERSION = "0.1.8";
 
 /** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
 function compareVersion(a: string, b: string): number {
