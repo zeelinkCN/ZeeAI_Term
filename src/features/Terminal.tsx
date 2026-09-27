@@ -129,6 +129,8 @@ export default function TerminalView({
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const hlRef = useRef<Highlighter | null>(null);
+  /** WebGL 渲染器（重绘时要清它的字形图集，否则会留下"一片点"那种残影） */
+  const webglRef = useRef<WebglAddon | null>(null);
   /** 统一走"合并 + 只在真的变了才发"的 resize；给下面几个 effect 复用 */
   const doFitRef = useRef<(() => void) | null>(null);
   // 终端自己的右键菜单（复制/粘贴/清空/全选）—— 浏览器那套菜单已被全局屏蔽
@@ -174,6 +176,7 @@ export default function TerminalView({
         }
       });
       term.loadAddon(webgl);
+      webglRef.current = webgl;
     } catch {
       /* WebGL 不可用时自动回退到 canvas/dom 渲染 */
     }
@@ -197,7 +200,15 @@ export default function TerminalView({
         if (cols === lastSent.cols && rows === lastSent.rows) return;
         lastSent = { cols, rows };
         void sessionResize(sessionId, cols, rows);
-        // 尺寸变完强制重画一遍，清掉渲染器可能留下的残影（那种"一片点"）
+        // 尺寸变完之后做一次"硬重绘"：
+        // 1) 清掉 WebGL 的字形图集 —— 缩放/换宽之后图集里可能留着按旧单元格尺寸栅格化的字形，
+        //    空白区域会被画成"一片点"，这正是用户截图里的现象；
+        // 2) 再让 xterm 按新尺寸整屏重画一次。
+        try {
+          webglRef.current?.clearTextureAtlas();
+        } catch {
+          /* 没有 WebGL（回退到 canvas/dom 渲染）时忽略 */
+        }
         try {
           term.refresh(0, rows - 1);
         } catch {
@@ -287,6 +298,7 @@ export default function TerminalView({
       bus.detach(sessionId);
       hl.dispose();
       hlRef.current = null;
+      webglRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

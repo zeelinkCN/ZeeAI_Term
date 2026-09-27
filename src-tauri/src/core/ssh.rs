@@ -143,6 +143,17 @@ pub fn tmux_session_name(template: &str, host: &str, user: &str) -> String {
 /// 远端命令：优先 attach/新建 tmux 会话；若服务器没装 tmux，
 /// 自动降级为普通 shell 并在终端里打印安装提示（不会替用户安装任何东西）。
 pub fn tmux_command(session_name: &str, start_dir: Option<&str>) -> String {
+    // 连上就顺手把"窗口尺寸该听谁的"这个策略设成我们想要的样子，**并且兼容老版本**：
+    // - `aggressive-resize on`：tmux 1.8 起就有。窗口尺寸跟着"把这个窗口显示在前台的那个客户端"走，
+    //   而不是被别的后台客户端拖着 —— 老 tmux（2.9 之前没有 window-size）就靠它缓解"小客户端说了算"；
+    // - `window-size latest`：tmux 2.9 才有。让窗口跟着最近活动的客户端，
+    //   老版本上没有这个选项，`2>/dev/null` 把报错吞掉即可（**不是**用 `|| true` 忽略一切，
+    //   只是不让一句"unknown option"打断后面的连接）。
+    //
+    // 为什么放在连接命令里而不是要求用户升级 tmux：用户有几十台别人的服务器，
+    // 不可能都去升级；而这两条设置是"能设就设、不能设就算了"，对任何版本都安全。
+    let tune = "tmux set-option -g aggressive-resize on 2>/dev/null; \
+tmux set-option -g window-size latest 2>/dev/null; ";
     let mut tmux = format!("tmux new-session -A -s '{}'", session_name.replace('\'', ""));
     if let Some(dir) = start_dir {
         let dir = dir.replace('\'', "");
@@ -153,7 +164,7 @@ pub fn tmux_command(session_name: &str, start_dir: Option<&str>) -> String {
 
     // 注意：这里的提示信息保持 ASCII，避免远端 locale 不是 UTF-8 时中文变乱码。
     format!(
-        "if command -v tmux >/dev/null 2>&1; then exec {tmux}; \
+        "if command -v tmux >/dev/null 2>&1; then {tune}exec {tmux}; \
 else printf '\\n[ZeeAI] tmux not found on this server - falling back to a plain shell.\\n\
 [ZeeAI] Install it to get persistent sessions:  yum install -y tmux   (or: apt-get install -y tmux)\\n\\n'; \
 exec \"${{SHELL:-/bin/bash}}\"; fi"
