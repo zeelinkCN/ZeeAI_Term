@@ -140,15 +140,56 @@ fn read_text(path: &PathBuf) -> std::io::Result<String> {
     Ok(text.trim_start_matches('\u{feff}').to_string())
 }
 
+/// **原子写**：先写同目录的 `.tmp`，再 `rename` 覆盖目标。
+///
+/// 为什么必须这样：以前是 `fs::write(目标, text)` 直接覆盖。升级脚本会在 App 退出后
+/// 立刻覆盖安装（等不到退出还会 `taskkill /F`），一旦撞上正在写盘的那一瞬间，文件就会
+/// 变成半截 JSON；下一次启动 `load_settings()` / `store::load()` 解析失败，
+/// **静默回落默认值** —— 用户看到的就是「服务器列表突然空了」「主题/配色/高亮规则全没了」，
+/// 而且没有任何提示。NTFS 上同目录 rename 是原子的，所以要么是完整的旧文件，要么是完整的新文件。
+fn write_atomic(path: &PathBuf, text: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(store_dir);
+    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("写临时文件失败: {e}"))?;
+    // Windows 上 rename 到已存在的目标会失败，所以先把目标挪开再放新的
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        // 失败也把临时文件清掉，免得留一地 .tmp
+        let _ = fs::remove_file(&tmp);
+        format!("保存失败: {e}")
+    })
+}
+
+/// 解析失败时把坏文件另存一份 `.bad-<时间戳>`，方便事后找回。
+///
+/// 为什么不直接删：坏文件里可能还有用户手工加过的内容，留着比丢掉强；
+/// 同时也让「配置被重置」这件事在磁盘上留下证据，而不是无声无息。
+pub fn backup_broken(path: &PathBuf) {
+    let stamp = now_secs();
+    let mut backup = path.clone();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    backup.set_file_name(format!("{name}.bad-{stamp}"));
+    if fs::rename(path, &backup).is_ok() {
+        log::warn!("配置解析失败，已备份为 {}", backup.display());
+    }
+}
+
 /// 上次退出时的工作区快照（JSON 字符串，前端自己定义结构）
 fn workspace_file() -> PathBuf {
     store_dir().join("workspace.json")
 }
 
 pub fn save_workspace(data: &str) -> Result<(), String> {
-    let dir = store_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    fs::write(workspace_file(), data).map_err(|e| format!("写入工作区失败: {e}"))
+    write_atomic(&workspace_file(), data)
 }
 
 pub fn load_workspace() -> Option<String> {
@@ -263,10 +304,19 @@ impl Default for Settings {
 }
 
 pub fn load_settings() -> Settings {
-    let Ok(text) = read_text(&settings_file()) else {
+    let path = settings_file();
+    let Ok(text) = read_text(&path) else {
         return Settings::default();
     };
-    let mut s = serde_json::from_str::<Settings>(&text).unwrap_or_default();
+    let mut s = match serde_json::from_str::<Settings>(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            // 解析不了就先把坏文件留证，再用默认值起来（总不能让应用起不来）
+            log::error!("settings.json 解析失败（{e}），已备份并回落默认值");
+            backup_broken(&path);
+            Settings::default()
+        }
+    };
     // 老配置里 update_url 是空字符串，会盖掉默认值 —— 这里补回来，
     // 让「检查更新」默认就指向本项目的 GitHub Releases。
     if s.update_url.trim().is_empty() {
@@ -295,10 +345,8 @@ fn default_update_url() -> String {
 }
 
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
-    let dir = store_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
     let text = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化失败: {e}"))?;
-    fs::write(settings_file(), text).map_err(|e| format!("写入设置失败: {e}"))
+    write_atomic(&settings_file(), &text)
 }
 
 /// 一条会话历史：记录「用哪个配置、附加了哪个 tmux 会话、什么时候用过」。
@@ -475,20 +523,47 @@ pub fn load() -> Result<Vec<ConnectionProfile>, String> {
     if text.trim().is_empty() {
         return Ok(vec![]);
     }
-    serde_json::from_str::<Vec<ConnectionProfile>>(&text).map_err(|e| format!("解析配置失败: {e}"))
+    match serde_json::from_str::<Vec<ConnectionProfile>>(&text) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 半截 JSON（例如写盘时被升级安装打断）会走到这里。
+            // 以前是直接报错 → 上层 `unwrap_or_default()` → **服务器列表静默变空**。
+            // 现在：把坏文件备份留证，然后给一份可用的初始列表，用户至少能继续干活。
+            log::error!("profiles.json 解析失败（{e}），已备份并重建初始列表");
+            backup_broken(&path);
+            let seeded = seed();
+            let _ = save(&seeded);
+            Ok(seeded)
+        }
+    }
 }
 
 pub fn save(profiles: &[ConnectionProfile]) -> Result<(), String> {
-    let dir = store_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
     let text =
         serde_json::to_string_pretty(profiles).map_err(|e| format!("序列化配置失败: {e}"))?;
-    fs::write(store_file(), text).map_err(|e| format!("写入配置失败: {e}"))
+    write_atomic(&store_file(), &text)
 }
 
 #[cfg(test)]
 mod history_tests {
-    use super::history_key;
+    use super::{history_key, write_atomic};
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join("zeeai-store-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("atomic.json");
+        let _ = std::fs::remove_file(&f);
+
+        write_atomic(&f, "{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"v\":1}");
+        // 再写一次：必须整体替换，而不是追加
+        write_atomic(&f, "{\"v\":22}").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"v\":22}");
+        // 不能留下 .tmp
+        assert!(!f.with_extension("json.tmp").exists(), "留下了临时文件");
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn tmux_sessions_dedupe_by_name() {

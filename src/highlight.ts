@@ -251,6 +251,14 @@ export class Highlighter {
   private pending = "";
   /** 整行高亮模式下，当前这一行还没写出去的内容 */
   private lineBuf = "";
+  /**
+   * 最近一次写出去的**普通文本的最后一个字符**。
+   *
+   * 为什么需要它：`hitAt` 判断"整词匹配"时要看关键词前面那个字符，而分片会把这个上下文切断
+   * —— `PIN` 和 `OKED` 如果落在两片里，第二片开头的 `OK` 前面看着像"行首"，
+   * 于是被误判成独立单词而高亮（`PIN**OK**ED` 这种）。留着上一片的末字符就能挡住。
+   */
+  private lastTextChar = "";
   private anyWholeLine = false;
   private maxKeywordLen = 0;
   private sgr = new SgrState();
@@ -424,6 +432,7 @@ export class Highlighter {
     if (wl) {
       const start = sgrStart(wl.fg, wl.bg);
       this.emit(start + body + this.sgr.restore() + (hasNl ? "\n" : ""));
+      if (body) this.lastTextChar = body[body.length - 1];
     } else {
       this.emit(this.colorizeMixed(line));
     }
@@ -445,7 +454,12 @@ export class Highlighter {
           out += text.slice(i);
           break;
         }
-        out += text.slice(i, end);
+        const seq = text.slice(i, end);
+        out += seq;
+        // 这里原来是"原样透传、不喂 SgrState"。但 `colorize()` 会用 SgrState 去把颜色恢复回去，
+        // 状态一旦落后于终端，插入高亮之后被恢复的就是**错的颜色**（典型触发：flush() 吐出
+        // 一条被切在分片边界上的 SGR 序列）。补上喂入；同一条序列喂两次是幂等的。
+        if (isSgr(seq)) this.sgr.feed(seq);
         i = end;
         continue;
       }
@@ -497,6 +511,8 @@ export class Highlighter {
         i++;
       }
     }
+    // 记下这一段的末字符，供下一片判断"整词"的左边界（见 lastTextChar 的注释）
+    this.lastTextChar = seg[seg.length - 1];
     return out;
   }
 
@@ -509,7 +525,8 @@ export class Highlighter {
         const same = rule.caseSensitive ? piece === w.text : piece.toLowerCase() === w.lower;
         if (!same) continue;
         if (rule.wholeWord) {
-          const before = i > 0 ? seg[i - 1] : "";
+          // 段首没有前一个字符时，用上一片写出去的末字符兜底（否则跨分片会误判成词首）
+          const before = i > 0 ? seg[i - 1] : this.lastTextChar;
           const after = i + len < seg.length ? seg[i + len] : "";
           if (isWordChar(before) || isWordChar(after)) continue;
         }

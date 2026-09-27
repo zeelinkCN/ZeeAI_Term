@@ -1,4 +1,4 @@
-# 发版脚本（Windows / PowerShell 5.1）
+﻿# 发版脚本（Windows / PowerShell 5.1）
 #
 # 用法：
 #   $env:GH_TOKEN = '你的 GitHub token'      # 只用环境变量，绝不写进仓库
@@ -38,6 +38,28 @@ foreach ($v in @($tauri, $pkg, $cargo, $app)) {
   if ($v -ne $Version) { throw "版本号不一致：参数 $Version，文件里是 $v（tauri=$tauri pkg=$pkg cargo=$cargo App=$app）" }
 }
 Write-Host "   四个位置都是 $Version，OK"
+
+# 文档里的版本号也要跟着走 —— 以前只校验上面四处，README / 便携版说明各藏一个，
+# 全靠手改，漂移过一次（README 长期写着"未实现进度条/断点续传"，其实早就做了）。
+Write-Host '   顺便扫一遍文档里的版本号…'
+$docChecks = @(
+  @{ file = 'README.md';                   pattern = 'ZeeAI_Term-(\d+\.\d+\.\d+)-portable\.zip' },
+  @{ file = 'README.md';                   pattern = 'ZeeAI_Term_(\d+\.\d+\.\d+)_x64-setup\.exe' },
+  @{ file = 'README.md';                   pattern = 'ZeeAI_Term_(\d+\.\d+\.\d+)_x64_en-US\.msi' },
+  @{ file = 'portable/README-portable.txt'; pattern = 'ZeeAI Terminal (\d+\.\d+\.\d+)' }
+)
+foreach ($c in $docChecks) {
+  if (-not (Test-Path $c.file)) { continue }
+  $text = Get-Content $c.file -Raw
+  foreach ($m in [regex]::Matches($text, $c.pattern)) {
+    $found = $m.Groups[1].Value
+    if ($found -ne $Version) {
+      throw "$($c.file) 里还写着 $found（应为 $Version）：$($m.Value)"
+    }
+  }
+}
+Write-Host '   文档版本号一致，OK'
+
 if (-not (Test-Path $notes)) { throw "缺少发版说明 $notes" }
 
 $assets = @(
@@ -48,7 +70,9 @@ $assets = @(
 )
 Write-Host '== 2) 检查产物 =='
 foreach ($a in $assets) {
-  if (-not (Test-Path $a)) { throw "产物不存在：$a（先跑 npm run tauri build 和便携版打包）" }
+  if (-not (Test-Path $a)) {
+    throw "产物不存在：$a（先跑 npm run tauri build，再跑 .\scripts\build-portable.ps1）"
+  }
   Write-Host ('   {0}  {1:N2} MB' -f $a, ((Get-Item $a).Length / 1MB))
 }
 

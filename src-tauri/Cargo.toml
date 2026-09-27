@@ -42,3 +42,18 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# 发布构建：体积优先。
+#
+# 之前这里什么都没有，等于全用默认值 —— 连 LTO / strip / 单 codegen-unit 都没开，
+# 于是 release exe 是 16.63MB（旁边还带一个 9.4MB 的 .pdb 一起被打进安装包）。
+# 这几行不碰任何业务逻辑，只影响优化与裁剪：
+# - `lto = "thin"`：跨 crate 内联/去重（fat 更小但编译明显更慢，先取 thin）
+# - `codegen-units = 1`：牺牲一点编译时间换更紧凑的代码
+# - `strip = true`：去掉符号表
+# - `panic = "abort"`：去掉 unwind 表（已确认代码里没有 catch_unwind / panic hook 依赖）
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

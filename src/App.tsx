@@ -778,12 +778,22 @@ export default function App() {
   const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
   /** 侧栏宽度（可拖动调整，存 localStorage，下次打开还是你调好的宽度） */
   const [sidebarWidth, setSidebarWidth] = useState(() => {
-    const v = Number(localStorage.getItem("zeeai.sidebarWidth"));
-    return v >= 180 && v <= 620 ? v : 240;
+    // localStorage 在配额满/隐私模式下会抛异常；读和写都要兜住，
+    // 否则一个存宽度的小功能能把整个渲染提交打断。
+    try {
+      const v = Number(localStorage.getItem("zeeai.sidebarWidth"));
+      return v >= 180 && v <= 620 ? v : 240;
+    } catch {
+      return 240;
+    }
   });
   // 拖动结束后把宽度记下来（下次打开还是你调好的宽度）
   useEffect(() => {
-    localStorage.setItem("zeeai.sidebarWidth", String(sidebarWidth));
+    try {
+      localStorage.setItem("zeeai.sidebarWidth", String(sidebarWidth));
+    } catch {
+      /* 存不下就算了，不影响使用 */
+    }
   }, [sidebarWidth]);
   // 供异步流程（如自动演示）读取最新路径，避免闭包拿到旧值
   const fsPathRef = useRef(fsPath);
@@ -1932,6 +1942,36 @@ export default function App() {
     const title =
       titleOverride?.trim() ||
       (explicitName ? `${profile.name} · ${explicitName}` : plainTitle());
+
+    // ---------- 同一个会话不开第二份（这是"终端显示不全 / 历史被压窄"的根因） ----------
+    //
+    // 为什么必须挡在这里：应用用的是 `tmux new-session -A -s <name>`（没有 `-d`），
+    // 同一个 tmux 会话被 attach 第二次时，两个客户端会**同时挂着**；老的 tmux（比如 2.7）
+    // 会把窗口尺寸按**最小的客户端**算，于是 pane 被压窄、全屏 TUI 按窄宽度重画，
+    // 那一段历史就永久坏掉（详细分析见 docs/review/bug-tmux-scrollback-narrow.md）。
+    //
+    // 以前只在「点会话历史」那条路上做了去重（connectFromHistory），
+    // 但 tmux 管理面板的「连接」按钮、以及"新建会话 tmux 新建 + 名字留空"这两条路没挡 ——
+    // 同一个默认名（模板 {host}-{user}）点两次就是两个客户端。现在统一提到这里，
+    // 所有入口一次性生效。
+    const wantedTmux =
+      tmuxMode === "none"
+        ? null
+        : explicitName ?? defaultTmuxName(profile, userOverride ?? undefined);
+    const alreadyOpen = sessionsRef.current.find((s) => {
+      if (s.profileId !== profile.id) return false;
+      if (wantedTmux) return s.tmuxName === wantedTmux;
+      // 普通 shell：只有"名字完全相同"才算同一个（自动编号的名字不会撞，所以不受影响）
+      return !s.tmuxName && (s.title ?? "").trim() === title.trim();
+    });
+    if (alreadyOpen) {
+      setActiveId(alreadyOpen.id);
+      notify(
+        `「${alreadyOpen.title}」已经开着了，直接帮你切过去（同一会话开两个客户端会把画面挤变形）`,
+      );
+      return alreadyOpen.id;
+    }
+
     addSession({
       id,
       title,
@@ -1968,7 +2008,13 @@ export default function App() {
                 // 2) 普通 shell（没 tmux）→ 用我们算好的自动编号名字；
                 // 3) tmux → 用后端回来的真实会话名（initial default 模式事先拿不到名字）。
                 title:
-                  titleOverride?.trim() || tmuxMode === "none" ? title : info.title || title,
+                  // 嵌套三元，不要写成 `a || b ? x : y` —— 后者在 JS 里等价于 `(a || b) ? x : y`，
+                  // 手填了名字时会连 `info.title` 那一支一起短路，和上下文的意图不是一回事。
+                  titleOverride?.trim()
+                    ? title
+                    : tmuxMode === "none"
+                      ? title
+                      : info.title || title,
                 tmuxName: info.tmuxSession ?? undefined,
                 user: info.user ?? s.user,
               }
@@ -2961,7 +3007,12 @@ export default function App() {
   }
 
   async function updateSettings(patch: Partial<AppSettings>) {
-    const next = { ...settings, ...patch };
+    // 基于 settingsRef（最新值）合并，而不是闭包里的 settings。
+    // 后者在"同一拍里连着改两次设置"时，第二次会拿渲染时的旧对象去覆盖第一次的结果
+    // （典型：外观对话框里连着调 updateSettings + setLookSet）。
+    // 顺手把 ref 也更新掉，这样同一拍内的下一次调用能立刻看到这一次的结果。
+    const next = { ...settingsRef.current, ...patch };
+    settingsRef.current = next;
     setSettings(next);
     try {
       await settingsSet(next);
@@ -7187,7 +7238,7 @@ export default function App() {
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> 0.1.7
+                <b>ZeeAI Terminal</b> {APP_VERSION}
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />

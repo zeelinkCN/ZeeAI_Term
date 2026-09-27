@@ -13,28 +13,52 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde::Serialize;
+
+/// 攒够这么多字节就落一次盘
+const FLUSH_BYTES: usize = 64 * 1024;
+/// 或者距上次落盘超过这么久也落一次（保证"看日志"能跟上，最多滞后这么久）
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// ANSI/控制序列过滤器。
 #[derive(Default)]
 pub struct AnsiFilter {
     state: u8,
+    /// 见到了一个 CR，但还不知道它后面跟不跟 LF（`\r\n` 要算**一个**换行）
+    pending_cr: bool,
 }
 
 impl AnsiFilter {
     pub fn new() -> Self {
-        Self { state: 0 }
+        Self {
+            state: 0,
+            pending_cr: false,
+        }
     }
 
     /// 把 input 过滤后追加到 out
     pub fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
         for &b in input {
+            // 先把"挂起的 CR"结掉。
+            //
+            // 以前 CR 是**直接丢掉**的（理由是"避免 \r\n 变成两个换行"）。问题是
+            // `docker pull` / `curl` / `npm install` 这类**用 \r 原地刷新的进度输出**根本没有 LF，
+            // 丢掉 CR 就等于把一次次刷新拼成一条没有分隔的超长行，日志没法读。
+            // 现在：CR 后面跟 LF → 一个换行（和以前一样）；CR 后面跟别的 → 一个换行。
+            if self.pending_cr {
+                self.pending_cr = false;
+                out.push(b'\n');
+                if b == b'\n' {
+                    continue; // CRLF 已经用掉这个 LF，别再输出第二个换行
+                }
+            }
             match self.state {
                 // 正常文本
                 0 => match b {
                     0x1b => self.state = 1, // ESC
-                    0x0d => {}              // CR：丢掉，避免 \r\n 变成两个换行
+                    0x0d => self.pending_cr = true,
                     0x08 => {
                         // 退格：删掉已经写出的最后一个字符
                         if out.last().map(|c| *c != b'\n').unwrap_or(false) {
@@ -76,6 +100,10 @@ struct OpenLog {
     writer: BufWriter<File>,
     filter: AnsiFilter,
     scratch: Vec<u8>,
+    /// 距上次落盘之后攒了多少字节
+    pending: usize,
+    /// 上次落盘的时刻
+    last_flush: Instant,
 }
 
 #[derive(Clone, Serialize)]
@@ -118,6 +146,8 @@ impl LogRegistry {
                 writer: BufWriter::new(file),
                 filter: AnsiFilter::new(),
                 scratch: Vec::new(),
+                pending: 0,
+                last_flush: Instant::now(),
             },
         );
         log::info!("session_log: 开始记录 {session_id} -> {}", path.display());
@@ -139,6 +169,12 @@ impl LogRegistry {
     }
 
     /// 有新数据进来时调用；没在记录就直接返回（几乎零开销）
+    ///
+    /// **批量落盘**：以前每收到一片 PTY 输出就 `flush()` 一次。PTY 的读循环按 16KB 一片，
+    /// 但交互式输出（提示符、逐行日志、`tail -f`）往往远小于一片 —— 于是变成每秒上千次
+    /// write + flush，而 Windows Defender 对每次写都做实时扫描，"开了日志就变卡"多半来自这里。
+    /// 现在改成"攒够 64KB 或过了 200ms 才落一次"：正常情况下最多滞后 200ms 就能 tail 到，
+    /// 代价是应用被强杀时可能丢掉最后不到 200ms 的内容（正常退出走 stop/stop_all，会收尾 flush）。
     pub fn write(&self, session_id: &str, bytes: &[u8]) {
         let Ok(mut logs) = self.logs.lock() else {
             return;
@@ -151,7 +187,12 @@ impl LogRegistry {
         entry.filter.filter(bytes, &mut scratch);
         if !scratch.is_empty() {
             let _ = entry.writer.write_all(&scratch);
-            let _ = entry.writer.flush();
+            entry.pending += scratch.len();
+            if entry.pending >= FLUSH_BYTES || entry.last_flush.elapsed() >= FLUSH_INTERVAL {
+                let _ = entry.writer.flush();
+                entry.pending = 0;
+                entry.last_flush = Instant::now();
+            }
         }
         entry.scratch = scratch;
     }
@@ -218,6 +259,15 @@ mod tests {
     #[test]
     fn drops_carriage_return_keeps_newline() {
         assert_eq!(filt(&[b"line1\r\nline2"]), "line1\nline2");
+    }
+
+    #[test]
+    fn lone_carriage_return_becomes_newline() {
+        // 进度条风格（docker pull / curl / npm）靠 \r 原地刷新，没有 LF。
+        // 日志里必须断开成多行，否则一整轮进度会被拼成一条读不了的长行。
+        assert_eq!(filt(&[b"10%\r50%\r100%\n"]), "10%\n50%\n100%\n");
+        // CR 出现在分片边界上也要成立
+        assert_eq!(filt(&[b"aaa\r", b"bbb"]), "aaa\nbbb");
     }
 
     #[test]

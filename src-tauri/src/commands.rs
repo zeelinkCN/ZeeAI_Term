@@ -227,9 +227,21 @@ pub fn session_write(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| format!("解码输入失败: {e}"))?;
-    let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
-    let handle = sessions.get(&id).ok_or_else(|| "会话不存在".to_string())?;
-    let mut writer = handle.writer.lock().map_err(|e| e.to_string())?;
+    // ★ 只在这把全局锁里**取出 Arc**，拿到就放锁，再做阻塞写。
+    //
+    // 以前是"持着 sessions 锁 → 锁 writer → write_all + flush"一路到底：只要有一个会话
+    // 的远端不再读（回显停了、管道缓冲写满），write_all 就会一直阻塞，而全局锁被它握着，
+    // 于是**所有**会话操作（连 session_close 想关掉这个卡住的会话）全部排队 —— 整个应用
+    // 看起来像死了，只能杀进程。Arc 本来就是共享所有权，克隆出来不需要改数据结构。
+    let writer = {
+        let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&id)
+            .ok_or_else(|| "会话不存在".to_string())?
+            .writer
+            .clone()
+    };
+    let mut writer = writer.lock().map_err(|e| e.to_string())?;
     writer.write_all(&bytes).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())
 }
@@ -241,12 +253,16 @@ pub fn session_resize(
     rows: u16,
     registry: State<'_, SessionRegistry>,
 ) -> Result<(), String> {
-    let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
-    let handle = sessions.get(&id).ok_or_else(|| "会话不存在".to_string())?;
-    let master = handle
-        .master
-        .as_ref()
-        .ok_or_else(|| "该会话不支持调整尺寸（例如串口）".to_string())?;
+    // 同 session_write：先把 Arc 拿出来、放掉全局锁，再做可能阻塞的 resize
+    let master = {
+        let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&id)
+            .ok_or_else(|| "会话不存在".to_string())?
+            .master
+            .clone()
+            .ok_or_else(|| "该会话不支持调整尺寸（例如串口）".to_string())?
+    };
     let master = master.lock().map_err(|e| e.to_string())?;
     master
         .resize(PtySize {
@@ -260,8 +276,13 @@ pub fn session_resize(
 
 #[tauri::command]
 pub fn session_close(id: String, registry: State<'_, SessionRegistry>) -> Result<(), String> {
-    let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
-    if let Some(handle) = sessions.remove(&id) {
+    // 先把 handle 从表里摘出来、**放掉全局锁**，再去 kill。
+    // 否则 kill 的等待时间也会占着全局锁，同样会拖住别的会话。
+    let handle = {
+        let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.remove(&id)
+    };
+    if let Some(handle) = handle {
         if let Some(child) = handle.child.as_ref() {
             if let Ok(mut child) = child.lock() {
                 let _ = child.kill();
@@ -1324,34 +1345,55 @@ fn password_for(profile_id: &str, cfg: &store::SshConfig) -> Option<String> {
     }
 }
 
+/// 一次性远端命令的超时上限。
+///
+/// 为什么必须有：下游的 AI 看板探针（`ai_tasks_remote` / `ai_session_snapshot`）是每 10~20 秒
+/// 打一轮的，而系统 ssh **没有配 ConnectTimeout / ServerAliveInterval**（Windows OpenSSH 带
+/// `-o ConnectTimeout` 会额外空等，所以刻意没加）。一旦服务器 sshd 排队或网络黑洞，
+/// `Cmd::output()` 可能几十分钟不返回 —— 前端 `refreshBoard` 的 `boardBusy` 守卫就永远
+/// 松不下来，**看板从此再也不刷新**（`App.tsx:938-985`）。所以在这里兜一层超时：
+/// 超时算这次探测失败，调用方本来就把"探测失败"当非致命错误处理。
+const REMOTE_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// 跑一条一次性远端命令：有密码就用 russh exec（系统 ssh 喂不了密码），
 /// 否则还是走系统 ssh（更快，也复用用户的 known_hosts / config）。
+///
+/// 整条链路（连接 + 执行 + 读输出）都套在 [`REMOTE_CAPTURE_TIMEOUT`] 里。
 async fn run_remote_capture(
     profile_id: &str,
     cfg: &store::SshConfig,
     command: &str,
 ) -> Result<String, String> {
-    if let Some(pw) = password_for(profile_id, cfg) {
-        let conn = sftp::connect(
+    let inner = async {
+        if let Some(pw) = password_for(profile_id, cfg) {
+            let conn = sftp::connect(
+                &cfg.host,
+                cfg.port,
+                &cfg.user,
+                cfg.key_path.as_deref(),
+                Some(&pw),
+                cfg.jump.as_deref(),
+            )
+            .await?;
+            return sftp::exec(&conn, command).await;
+        }
+        let args = ssh::ssh_exec_args(
             &cfg.host,
             cfg.port,
             &cfg.user,
             cfg.key_path.as_deref(),
-            Some(&pw),
+            command,
             cfg.jump.as_deref(),
-        )
-        .await?;
-        return sftp::exec(&conn, command).await;
+        );
+        run_ssh_capture(&args).await
+    };
+    match tokio::time::timeout(REMOTE_CAPTURE_TIMEOUT, inner).await {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "远端命令超时（超过 {} 秒没返回），已放弃本次探测",
+            REMOTE_CAPTURE_TIMEOUT.as_secs()
+        )),
     }
-    let args = ssh::ssh_exec_args(
-        &cfg.host,
-        cfg.port,
-        &cfg.user,
-        cfg.key_path.as_deref(),
-        command,
-        cfg.jump.as_deref(),
-    );
-    run_ssh_capture(&args).await
 }
 
 // ---------- 凭据（Windows 凭据管理器） ----------
@@ -1766,6 +1808,11 @@ pub fn open_external_url(url: String) -> Result<(), String> {
 
 // ---------- 一键升级：下载新版安装包 → 静默覆盖安装 → 自动重启 ----------
 
+/// 允许自动下载安装的**唯一来源**前缀（本项目自己的 Release）。
+///
+/// 「不要下错」这条要求的底线：只有这个前缀下的地址才允许走"下载并静默执行"这条链路。
+const UPDATE_REPO_PREFIX: &str = "https://github.com/zeelinkCN/ZeeAI_Term/releases/download/";
+
 /// 当前这份是怎么装上的：`nsis` / `msi` / `portable`。
 ///
 /// - `nsis`：我们的 NSIS 安装包按当前用户装到 `%LOCALAPPDATA%\ZeeAI_Term\`，
@@ -1818,18 +1865,20 @@ pub fn update_take_result() -> Option<String> {
     }
 }
 
-/// 下载新版安装包并做基本校验（大小 + 文件头），返回落盘路径。
+/// 下载新版安装包并做校验（大小 + 文件头 + 官方 sha256），返回落盘路径。
 ///
 /// 为什么要绕这么一圈：
 /// - **不用第三方 HTTP 库**：直接用 Windows 自带的 `curl.exe`（Win10 1803+ 内置，
 ///   走系统 Schannel），不往程序里塞一整套 TLS 栈，exe 体积不变；
-/// - **分片下载 + 断点续传**：实测这条线路对"长时间保持的下载连接"很不友好
-///   （整包 9MB 经常传着传着就被掐断，卡在几个百分点），但 1MB 左右的分段请求
-///   每次都能正常返回。所以这里按 1MB 一段发 `Range` 请求，从已有文件大小接着下，
-///   中途断了、甚至关掉应用重来，都能从断点继续，不用从头再来；
+/// - **单请求整包下载**：0.1.5 试过"按 1MB 分段发 Range 请求接着下"，结果并发写同一个
+///   文件把包写坏了（那次事故见 `docs/decisions.md`），所以现在是**一次请求下完整个包**；
+///   但失败不会永远从 0 重来 —— `.part` 留着，下一次（包括重启应用之后）用 `curl -C -`
+///   从已有字节接着下。注意这是**单请求续传**，不是分片并发写；
 /// - **抽成独立函数**：`examples/update_spike.rs` 可以拿真实 Release 地址直接验证。
 ///
-/// `on_progress(done, total)` 在每段下完后回调一次。
+/// 最多试三次，每次策略不同：① 有系统代理先用代理（带续传）；② 去掉代理走直连（带续传）；
+/// ③ 丢掉 `.part` 从 0 来一遍。**只有网络层失败才保留 `.part`** —— 校验不过说明内容本身
+/// 有问题，续传只会把坏内容续成"完整的坏包"，直接丢弃。
 pub fn fetch_update_package(
     url: &str,
     expected_size: u64,
@@ -1850,45 +1899,97 @@ pub fn fetch_update_package(
     let dest = dir.join(format!("ZeeAI_Term_{safe_version}_setup.{ext}"));
     // 临时名：校验全过之前，这个文件永远不算"下好了"
     let part = dir.join(format!("ZeeAI_Term_{safe_version}_setup.{ext}.part"));
+    // 顺手清掉**别的版本**留下的残留（每个包 9~14MB，不清会一直堆在 %TEMP% 里）
+    sweep_update_dir(&dir, &[&dest, &part]);
     // 有系统代理就先用代理试（国内直连 GitHub 的下载 CDN 经常慢到几乎不动），
     // 第二次改成直连，避免"代理开着但其实没启动"时彻底下不来。
     let proxy = system_proxy();
 
+    // 上一次（甚至上一次开应用时）留下的半截文件：能续就续，别再从头下一遍
+    let leftover = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0) > 0;
+    let plans: [(bool, bool); 3] = [
+        (proxy.is_some(), leftover),
+        (false, leftover),
+        (false, false),
+    ];
+
     let mut last_err = String::new();
-    for attempt in 1..=2u8 {
-        let _ = std::fs::remove_file(&part);
-        let use_proxy = if attempt == 1 { proxy.as_deref() } else { None };
+    for (step, (use_proxy, resume)) in plans.into_iter().enumerate() {
+        let attempt = step + 1;
+        let use_proxy = if use_proxy { proxy.as_deref() } else { None };
         log::info!(
-            "update: 第 {attempt} 次整包下载 {url}（proxy={use_proxy:?}，期望 {expected_size} 字节）"
+            "update: 第 {attempt} 次整包下载 {url}（proxy={use_proxy:?}，续传={resume}，期望 {expected_size} 字节）"
         );
-        let one = run_curl_download(&curl, url, &part, expected_size, use_proxy, &mut on_progress)
-            .and_then(|()| {
-                match package_problem(&part, ext, expected_size, expected_sha) {
-                    None => Ok(()),
-                    Some(why) => Err(why),
+        match run_curl_download(
+            &curl,
+            url,
+            &part,
+            expected_size,
+            use_proxy,
+            resume,
+            &mut on_progress,
+        ) {
+            // 网络层失败（断流 / 超时）：`.part` 留着，下一次接着下
+            Err(e) => last_err = e,
+            Ok(()) => match package_problem(&part, ext, expected_size, expected_sha) {
+                None => {
+                    // 校验全过 → 原子改名成正式包
+                    let _ = std::fs::remove_file(&dest);
+                    std::fs::rename(&part, &dest).map_err(|e| format!("重命名更新包失败: {e}"))?;
+                    let done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                    on_progress(done, done);
+                    log::info!("update: 更新包已下好并校验通过 {}", dest.display());
+                    return Ok(dest);
                 }
-            });
-        match one {
-            Ok(()) => {
-                // 校验全过 → 原子改名成正式包
-                let _ = std::fs::remove_file(&dest);
-                std::fs::rename(&part, &dest).map_err(|e| format!("重命名更新包失败: {e}"))?;
-                let done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                on_progress(done, done);
-                log::info!("update: 更新包已下好并校验通过 {}", dest.display());
-                return Ok(dest);
-            }
-            Err(e) => {
-                last_err = e;
-                log::warn!("update: 第 {attempt} 次下载/校验没过：{last_err}");
-                let _ = std::fs::remove_file(&part);
-                if attempt == 1 {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                // 内容本身不对（大小不符 / 文件头不对 / sha256 对不上）：留下只会续成坏包
+                Some(why) => {
+                    last_err = why;
+                    let _ = std::fs::remove_file(&part);
                 }
-            }
+            },
+        }
+        log::warn!("update: 第 {attempt} 次下载/校验没过：{last_err}");
+        // 文件已经"下满"却仍然失败（例如续传时本地文件本来就完整、服务器回 416），
+        // 说明这半截文件不可信：丢掉，让下一次从 0 来
+        let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if expected_size > 0 && size >= expected_size {
+            let _ = std::fs::remove_file(&part);
+        }
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(if attempt == 1 { 1500 } else { 500 }));
         }
     }
-    Err(format!("更新包下载或校验失败（已自动重试一次）：{last_err}"))
+    Err(format!("更新包下载或校验失败（已自动重试两次）：{last_err}"))
+}
+
+/// 清掉下载目录里**别的版本**留下的残留（安装包、半截的 `.part`、curl 的 `.stderr`）。
+///
+/// 为什么需要：老的升级脚本只在**失败**时删包，成功就直接结束 —— 每升一次就在 `%TEMP%`
+/// 留一份 9.15MB（NSIS）/ 14.08MB（MSI），升十个版本就是上百 MB，而且不在"磁盘清理"的
+/// 常规视野里。脚本那边已经补成"成功也删包"（见 [`apply_update_script`]），这里再兜一层：
+/// 万一用户升级到一半把应用杀了、脚本没跑完，下次下载时也顺手收干净。
+///
+/// `keep` 里的路径（本次要用的正式名和临时名）不动；只删我们自己命名的文件，
+/// 不碰用户可能放在同一个目录里的别的东西。
+fn sweep_update_dir(dir: &std::path::Path, keep: &[&std::path::Path]) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if keep.iter().any(|k| path == **k) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // 只删我们自己命名的下载产物；**别碰 `apply_update.cmd`**
+        // （正在跑的批处理被删掉会中途断）
+        let mine = name.starts_with("ZeeAI_Term_") || name.ends_with(".stderr");
+        if mine && path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// 读 Windows「Internet 选项」里的代理设置。
@@ -1983,14 +2084,17 @@ fn header_ok(path: &std::path::Path, ext: &str) -> bool {
     }
 }
 
-/// 调一次 curl：**整包一次下完**（不分片、不续传），支持代理。
+/// 调一次 curl：**整包一次下完**（不分片），可选从已有字节续传，支持代理。
 ///
 /// 三条都是 0.1.5 事故留下的教训：
 /// - **带超时**：连不上 15 秒、或 60 秒内平均速率低于 2KB/s 就判失败去重试，
 ///   顺序挂在这里等死（0.1.5 那个僵尸 curl 就是这么来的）；
 /// - **stderr 写文件不写管道**：管道没人读、写满之后双方互等 = 死锁；
 /// - **挂进 Job Object**：App 退出/被强杀时 curl 跟着被收掉，不留孤儿进程。
+///   （注意：升级**辅助脚本**不能挂 Job，原因见 [`update_download_install`]。）
 ///
+/// `resume = true` 时带 `-C -`：从 `dest` 已有的大小接着下。配合 `--retry`，
+/// 同一个 curl 进程内部的重连也是接着下，而不是把已经下好的几 MB 再传一遍。
 /// 进度靠轮询文件大小（整包下载也能有进度条）。
 fn run_curl_download(
     curl: &std::path::Path,
@@ -1998,12 +2102,19 @@ fn run_curl_download(
     dest: &std::path::Path,
     expected_size: u64,
     proxy: Option<&str>,
+    resume: bool,
     on_progress: &mut impl FnMut(u64, u64),
 ) -> Result<(), String> {
     let mut err_path = dest.as_os_str().to_os_string();
     err_path.push(".stderr");
     let err_path = std::path::PathBuf::from(err_path);
-    let _ = std::fs::remove_file(dest);
+    // 不续传才清空目标文件；续传时留着，curl 从它的长度往后接着要
+    let have = if resume {
+        std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
+    } else {
+        let _ = std::fs::remove_file(dest);
+        0
+    };
     let _ = std::fs::remove_file(&err_path);
 
     let mut cmd = std::process::Command::new(curl);
@@ -2024,6 +2135,10 @@ fn run_curl_download(
         .arg("--retry-delay")
         .arg("2")
         .arg("--retry-all-errors");
+    if have > 0 {
+        // 已经有一部分了：从断点接着下（没有这部分时加不加都一样，curl 会从 0 开始）
+        cmd.arg("-C").arg("-");
+    }
     if let Some(p) = proxy {
         cmd.arg("--proxy").arg(p);
     }
@@ -2039,7 +2154,7 @@ fn run_curl_download(
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
 
-    on_progress(0, expected_size);
+    on_progress(have, expected_size.max(have));
     let mut child = cmd.spawn().map_err(|e| format!("启动 curl 失败: {e}"))?;
     crate::core::job::assign(child.id());
     let status = loop {
@@ -2128,6 +2243,15 @@ fn package_problem(
 /// - **必须检查安装器的退出码**。那次下载到的安装包被残留 curl 并发写坏，安装器弹
 ///   "NSIS Error" 后以退出码 2 结束，而脚本照样一声不响地退出 —— 用户看不到任何反馈。
 ///   现在失败会记一行日志、把坏包丢掉（下次自动重下），并把旧版重新拉起来。
+///
+/// 后来又补了三处（见 `docs/review/raw/perf-packaging.md` 的 PP-02 / PP-03）：
+/// - **MSI 也要自动重启**：`msiexec` 命令行带上 `AUTOLAUNCHAPP=1`。WiX 模板里
+///   `LaunchApplication` 的前提是 `AUTOLAUNCHAPP AND NOT Installed`，以前没传这个属性，
+///   于是 MSI 用户看到的是"应用自己关了、再也没回来"；
+/// - **成功也要删包**：以前只有失败分支删，升一次就在 `%TEMP%` 留一份 9~14MB；
+/// - **拉起应用兜底**：装完先等一会儿看进程在不在，不在就自己 `start` 一次。
+///   正常情况下 NSIS 的 `/S /R` 和 MSI 的 `AUTOLAUNCHAPP=1` 已经把它拉起来了，
+///   这里只兜"两边都没生效"的情况（等 5 轮 × 约 2 秒，确定没起来才自己启动，避免开出两个窗口）。
 fn apply_update_script(
     kind: &str,
     dest: &std::path::Path,
@@ -2135,10 +2259,19 @@ fn apply_update_script(
     exe_path: &std::path::Path,
     pid: u32,
 ) -> String {
+    let exe_name = exe_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ZeeAI_Term.exe".to_string());
     // 安装那一步单独一行：无论成不成，退出码都拿得到（0 = 成功）
     let install = if kind == "msi" {
-        // MSI：msiexec 静默升级（/qb 显示一个进度条；perMachine 会弹一次 UAC）
-        format!("msiexec /i \"{}\" /qb /norestart", dest.display())
+        // MSI：msiexec 静默升级（/qb 显示一个进度条；perMachine 会弹一次 UAC）。
+        // AUTOLAUNCHAPP=1 是 WiX 模板里"装完把应用拉起来"那个自定义动作的开关，
+        // 不传它，MSI 用户升完就是"应用没了"。
+        format!(
+            "msiexec /i \"{}\" /qb /norestart AUTOLAUNCHAPP=1",
+            dest.display()
+        )
     } else {
         // NSIS：/S 静默安装 + /R 装完自动重启应用
         format!("\"{}\" /S /R", dest.display())
@@ -2162,17 +2295,35 @@ ping -n 2 127.0.0.1 >nul\r\n\
 {install}\r\n\
 set RC=%ERRORLEVEL%\r\n\
 echo %DATE% %TIME% installer exit=%RC% >> \"{log}\"\r\n\
-if \"%RC%\"==\"0\" goto done\r\n\
-if \"%RC%\"==\"3010\" goto done\r\n\
+if \"%RC%\"==\"0\" goto ok\r\n\
+if \"%RC%\"==\"3010\" goto ok\r\n\
 del /f /q \"{dest}\" >nul 2>&1\r\n\
 echo %DATE% %TIME% 安装失败，已丢弃这次下载的更新包 >> \"{log}\"\r\n\
 start \"\" \"{exe}\"\r\n\
-:done\r\n",
+goto end\r\n\
+:ok\r\n\
+rem 装成功了：安装包已经没用，删掉（不删就是每次升级在 %TEMP% 里留 9~14MB）\r\n\
+del /f /q \"{dest}\" >nul 2>&1\r\n\
+rem 正常应该由安装包把应用拉起来（NSIS 的 /R、MSI 的 AUTOLAUNCHAPP=1）；\r\n\
+rem 万一没起来，这里兜一次底 —— 等 5 轮（每轮约 2 秒）还没见到进程，就自己启动\r\n\
+set relaunch=0\r\n\
+:waitapp\r\n\
+ping -n 3 127.0.0.1 >nul\r\n\
+tasklist /FI \"IMAGENAME eq {exe_name}\" /NH | find /I \"{exe_name}\" >nul\r\n\
+if not errorlevel 1 goto end\r\n\
+set /a relaunch+=1\r\n\
+if !relaunch! GEQ 5 goto startapp\r\n\
+goto waitapp\r\n\
+:startapp\r\n\
+echo %DATE% %TIME% 安装完成但应用没自己起来，脚本代为启动 >> \"{log}\"\r\n\
+start \"\" \"{exe}\"\r\n\
+:end\r\n",
         pid = pid,
         install = install,
         log = log.display(),
         dest = dest.display(),
         exe = exe_path.display(),
+        exe_name = exe_name,
     )
 }
 
@@ -2195,8 +2346,18 @@ pub async fn update_download_install(
     version: String,
 ) -> Result<String, String> {
     let u = url.trim().to_string();
-    if !(u.starts_with("https://github.com/") && u.contains("/releases/download/")) {
-        return Err("更新地址不是 GitHub Release 的下载地址，已拒绝执行".into());
+    // 「不要下错」的第一道闸：**只认本项目自己的 Release**。
+    // 以前只校验"是不是 github.com 的 release 下载地址"，等于任何仓库都放行；
+    // 而校验用的 size / sha256 是渲染层传进来的（可以不传），一旦省掉就只剩"文件头是 MZ"，
+    // 这条链路就能变成"下载并静默执行任意安装包"。所以这里把 owner/repo 钉死。
+    if !u.starts_with(UPDATE_REPO_PREFIX) {
+        return Err(format!(
+            "更新地址不是本项目的 GitHub Release（只允许 {UPDATE_REPO_PREFIX}…），已拒绝执行"
+        ));
+    }
+    if expected_size == 0 {
+        // 没有官方字节数就没法判断"下没下全"，宁可拒绝也不装一个来路不明/半截的包
+        return Err("缺少官方文件大小，无法校验更新包，已拒绝执行".into());
     }
     let kind = update_install_kind();
     if kind == "portable" {
@@ -2298,8 +2459,16 @@ pub async fn update_download_install(
     }
     let child = cmd.spawn().map_err(|e| format!("启动升级脚本失败: {e}"))?;
     log::info!("update: 升级脚本已启动 pid={}", child.id());
-    // 顺手把升级脚本也挂进 Job Object：万一它自己卡住，App 退出时会一起被收掉
-    crate::core::job::assign(child.id());
+    // ★ 千万别把升级脚本挂进 Job Object。
+    //
+    // 这个 Job 带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`（见 core/job.rs），App 一退出
+    // 句柄关闭、job 里的进程全被杀。而脚本的**第一步就是等 App 退出**（见
+    // apply_update_script 的 :wait 循环）——两边一撞，脚本恰好在它唯一需要活下去的那一刻
+    // 被系统杀掉，安装器永远不会启动，`apply_update.log` 也不会写，用户看到的就是
+    // 「点了升级、应用关了、版本没变、也没有任何提示」（0.1.5 那次事故的真身）。
+    //
+    // 脚本自带 2 分钟等待上限 + 退出码检查 + 失败拉回旧版，本来就不需要跟 App 同生共死。
+    // 真正需要挂 Job 的是 curl 和终端子进程（它们才怕变孤儿），那些照旧。
 
     // 给脚本一点时间就位，然后走正常退出路径（收干净会话进程）；重启由脚本/安装包负责
     let app_for_exit = app.clone();
@@ -2438,10 +2607,64 @@ mod update_tests {
         );
         // NSIS 走 /S /R（静默装 + 装完重启）
         assert!(s.contains("/S /R"), "{s}");
+        // 成功路径**也要删包**（老版本只在失败分支删，每升一次在 %TEMP% 留 9~14MB）
+        assert!(s.contains(":ok"), "{s}");
+        let ok_block = s.split(":ok").nth(1).unwrap_or("");
+        assert!(
+            ok_block.contains("del /f /q"),
+            "成功分支必须删安装包：{s}"
+        );
+        // 装完要有"应用没起来就自己拉一次"的兜底
+        assert!(s.contains(":waitapp"), "{s}");
+        assert!(s.contains(":startapp"), "{s}");
 
         // MSI 走 msiexec，且 3010（要重启）也算成功
         let m = apply_update_script("msi", &dest, &log, &exe, 7);
         assert!(m.contains("msiexec /i"), "{m}");
-        assert!(m.contains("\"%RC%\"==\"3010\" goto done"), "{m}");
+        assert!(m.contains("\"%RC%\"==\"3010\" goto ok"), "{m}");
+        // MSI 必须传 AUTOLAUNCHAPP=1，否则装完应用不会自己回来
+        assert!(
+            m.contains("AUTOLAUNCHAPP=1"),
+            "MSI 分支缺 AUTOLAUNCHAPP=1，升级后应用不会重启：{m}"
+        );
+    }
+
+    #[test]
+    fn update_only_accepts_our_own_release_url() {
+        // 本项目自己的 Release 地址要放行（大小 > 0 才行，这里只测前缀判定）
+        assert!(UPDATE_REPO_PREFIX.ends_with("/releases/download/"));
+        let ours = format!("{UPDATE_REPO_PREFIX}v0.1.8/ZeeAI_Term_0.1.8_x64-setup.exe");
+        assert!(ours.starts_with(UPDATE_REPO_PREFIX));
+        // 别的仓库（哪怕也是 GitHub Release）必须被拒
+        let other = "https://github.com/someone/evil/releases/download/v1/x.exe";
+        assert!(!other.starts_with(UPDATE_REPO_PREFIX));
+    }
+
+    #[test]
+    fn sweep_update_dir_keeps_current_files_and_spares_the_helper_script() {
+        let dir = std::env::temp_dir().join("zeeai-cmd-tests-sweep");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let keep = dir.join("ZeeAI_Term_0.1.9_setup.exe");
+        let stale_exe = dir.join("ZeeAI_Term_0.1.8_setup.exe");
+        let stale_part = dir.join("ZeeAI_Term_0.1.8_setup.exe.part");
+        let stale_err = dir.join("ZeeAI_Term_0.1.8_setup.exe.part.stderr");
+        // 正在跑的升级脚本和用户自己的文件都不能被删
+        let helper = dir.join("apply_update.cmd");
+        let user_file = dir.join("我的笔记.txt");
+        for p in [&keep, &stale_exe, &stale_part, &stale_err, &helper, &user_file] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        sweep_update_dir(&dir, &[&keep]);
+
+        assert!(keep.exists(), "本次要用的文件不能删");
+        assert!(helper.exists(), "升级脚本不能被清掉（它可能正在跑）");
+        assert!(user_file.exists(), "不是我们命名的文件不能动");
+        assert!(!stale_exe.exists(), "别的版本的安装包应该清掉");
+        assert!(!stale_part.exists(), "别的版本的半截文件应该清掉");
+        assert!(!stale_err.exists(), "curl 的 stderr 应该清掉");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
