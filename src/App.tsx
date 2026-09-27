@@ -688,6 +688,8 @@ export default function App() {
   const [boardTasks, setBoardTasks] = useState<AiTask[]>([]);
   /** AI 任务时间线（落盘的历史，G-01） */
   const [timeline, setTimeline] = useState<AiTurnRecord[]>([]);
+  /** 看板快照（给"这条提醒该算在哪个窗口头上"用） */
+  const boardTasksRef = useRef<AiTask[]>([]);
   /** 各会话最近一次命令的退出码（G-02：只有注入过 shell 集成的会话才有） */
   const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
   const boardBusy = useRef(false);
@@ -1014,6 +1016,7 @@ export default function App() {
         if (better) Object.assign(hit, t);
       }
       setBoardTasks(merged);
+      boardTasksRef.current = merged;
     } finally {
       boardBusy.current = false;
     }
@@ -1063,7 +1066,9 @@ export default function App() {
         null,
       );
       setAiSnapshot(snap);
-      if (snap) considerSnapshot(cur, snap);
+      // 同样要"算到真正在跑 AI 的那个窗口头上"：当前窗口可能是普通 shell，
+      // 而 AI 在同一个服务器的 tmux 窗口里跑（用户实测就是这么被带错的）。
+      if (snap) considerSnapshot(pickAiSession(boardEnvOf(cur).server) ?? cur, snap);
     } catch {
       // 读不到日志很正常（比如这台机器还没跑过 Codex），静默即可
     }
@@ -1098,13 +1103,43 @@ export default function App() {
   }
 
   /**
+   * 这条快照应该算在**哪个窗口**头上（决定提醒挂谁的名字、以及"切过去"跳哪儿）。
+   *
+   * 为什么需要：快照是"**这台服务器上最新的那份 rollout**"，跟窗口无关 —— 同一台机器上
+   * 开着 codexAAA 和「普通 shell 1」时，两个窗口读到的是同一份快照。以前谁先轮询到，
+   * 提醒就挂谁的名字上，于是"在 tmux 里跑的 AI，提醒却让你去普通 shell 看"（用户实测报过）。
+   *
+   * 判定顺序：① 用看板里这台机器上**有 tmux 窗格**的 AI 任务，拿窗格名（codexAAA:0.0）
+   * 去匹配会话的 tmux 名 → 最准；② 匹配不上就优先 tmux 会话（AI 基本都跑在 tmux 里）；
+   * ③ 再不行才退回第一个候选。
+   */
+  function pickAiSession(server: string): OpenSession | null {
+    const cands = sessionsRef.current.filter((s) => boardEnvOf(s).server === server);
+    if (cands.length <= 1) return cands[0] ?? null;
+    const pane = boardTasksRef.current.find((t) => t.server === server && t.pane)?.pane ?? "";
+    const sessName = pane.split(":")[0];
+    if (sessName) {
+      const hit = cands.find((s) => (s.tmuxName ?? "") === sessName);
+      if (hit) return hit;
+    }
+    const tmuxOnes = cands.filter((s) => s.tmuxName);
+    return tmuxOnes[0] ?? cands[0];
+  }
+
+  /**
    * 顺带盯一下**其它开着的会话**（30 秒一次）。
    * 这样你切到 ADB / CMD / 别的服务器上干活时，一样能收到"那个 AI 已经干完了"的提示。
    */
   async function refreshOtherSnapshots() {
+    // 同一台服务器只探一次（快照本来就是"那台机器上最新的那一份"），
+    // 探完把结果算到"真正在跑 AI 的那个窗口"头上。
+    const done = new Set<string>();
     for (const s of sessionsRef.current) {
       if (s.id === activeId) continue;
       if (s.kind === "cmd" || s.kind === "serial" || s.kind === "adb") continue;
+      const key = s.profileId ?? s.kind;
+      if (done.has(key)) continue;
+      done.add(key);
       try {
         const snap = await aiSessionSnapshot(
           s.profileId ?? null,
@@ -1112,7 +1147,7 @@ export default function App() {
           s.kind === "remote" ? null : s.kind,
           null,
         );
-        if (snap) await considerSnapshot(s, snap);
+        if (snap) await considerSnapshot(pickAiSession(boardEnvOf(s).server) ?? s, snap);
       } catch {
         // 单个会话读不到（没跑过 Codex / 网络抖动）不影响其它
       }
