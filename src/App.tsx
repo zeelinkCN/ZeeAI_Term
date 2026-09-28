@@ -696,8 +696,14 @@ export default function App() {
   const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
   /** 这台机器的「AI 状态来源」：装了 herdr 就是它的 agent 状态机，否则是我们自己的探测 */
   const [aiSource, setAiSource] = useState<AiSourceInfo | null>(null);
-  /** 上次探测 herdr 的时间（这东西不会天天变，没必要每次刷新面板都 ssh 一次） */
-  const lastSourceProbe = useRef(0);
+  /**
+   * 每台机器探测一次就记住（key = profileId / 本地终端类型）。
+   *
+   * 为什么不用定时节流：这台机器装没装 herdr 不会自己变，而"装/不装"只有三种触发时机 ——
+   * 打开面板、切到另一台服务器、用户自己点了重探。所以**缓存就够了，不需要时间窗口**：
+   * 换会话、重开面板都不会再 ssh 一次；想刷新就点那行来源。
+   */
+  const aiSourceCache = useRef<Map<string, AiSourceInfo>>(new Map());
   const boardBusy = useRef(false);
   /** 上次扫本机进程表的时刻（本机扫描比远端探针贵得多，单独限流） */
   const lastLocalScan = useRef(0);
@@ -1062,10 +1068,16 @@ export default function App() {
       setAiSource(null);
       return;
     }
-    if (!force && Date.now() - lastSourceProbe.current < 5 * 60 * 1000) return;
-    lastSourceProbe.current = Date.now();
+    const key = cur.profileId ?? cur.kind;
+    const cached = aiSourceCache.current.get(key);
+    if (cached && !force) {
+      setAiSource(cached);
+      return;
+    }
     try {
-      setAiSource(await aiSourceProbe(cur.profileId ?? null, cur.user ?? null));
+      const info = await aiSourceProbe(cur.profileId ?? null, cur.user ?? null);
+      aiSourceCache.current.set(key, info);
+      setAiSource(info);
     } catch {
       // 探不到就当"没有 herdr"处理：看板会显示来源不明确，但功能照旧
       setAiSource(null);
@@ -1315,7 +1327,8 @@ export default function App() {
   useEffect(() => {
     if (!aiPanelOpen) return;
     void refreshAi();
-    void refreshAiSource(true);
+    // 不带 force：命中缓存就不再 ssh（同一台机器一个进程里只探一次）
+    void refreshAiSource();
     void refreshBoard();
     void loadTimeline();
     // 会话日志是通知的主判据，跟着面板一起刷
@@ -5555,10 +5568,12 @@ export default function App() {
             {aiSource ? (
               <div
                 className="ai-source-line"
+                role="button"
+                onClick={() => void refreshAiSource(true)}
                 title={
                   aiSource.herdrVersion
-                    ? `${aiSource.herdrPath}（herdr 当前认识 ${aiSource.agents} 个 agent）`
-                    : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。"
+                    ? `${aiSource.herdrPath}（herdr 当前认识 ${aiSource.agents} 个 agent）· 点击重新探测`
+                    : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。点击重新探测。"
                 }
               >
                 {aiSource.herdrVersion
