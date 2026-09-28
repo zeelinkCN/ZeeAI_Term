@@ -494,11 +494,42 @@ pub struct AiSourceInfo {
     pub herdr_path: String,
     /// 它当前认识的 agent 数量（0 也可能是"server 没在跑"）
     pub agents: u32,
+    /// herdr 自报的**协议号**（0 = 拿不到）。对接看的是它，不是版本号。
+    pub protocol: u32,
+    /// 协议 schema 的版本号（herdr 自己会递增）
+    pub schema_version: u32,
+    /// `api schema --json` 的 sha256 前 8 位 —— 协议号没变但 schema 变了也能发现
+    pub schema_fingerprint: String,
+    /// ok / untested / too_old / unknown（见 [`compat_of`]）
+    pub compat: String,
 }
 
 impl AiSourceInfo {
     pub fn has_herdr(&self) -> bool {
         !self.herdr_version.trim().is_empty()
+    }
+}
+
+/// 我们**实测过**的协议号。当前 herdr 0.9.1 自报 `protocol: 22`。
+pub const TESTED_PROTOCOL: u32 = 22;
+/// 低于这个协议号就不启用了（宁可回退到我们自己的探测，也不去猜）
+pub const MIN_PROTOCOL: u32 = 20;
+
+/// 兼容性判定：**跟协议不跟版本**。
+///
+/// 为什么这样：herdr 半年发了 40 多个版本，追版本号必死；但它把线协议单独版本化
+/// （`latest.json` 里有 `protocol` / `endpoint_generation`，二进制自己也能 `api schema` 打出来），
+/// 而且官方明确说"client 和 server 版本不必一致"。所以我们的判据是协议号 + schema 指纹。
+pub fn compat_of(protocol: u32) -> String {
+    if protocol == 0 {
+        "unknown".into()
+    } else if protocol < MIN_PROTOCOL {
+        "too_old".into()
+    } else if protocol == TESTED_PROTOCOL {
+        "ok".into()
+    } else {
+        // 比我们实测的新：照用，但标出来（出问题好定位）
+        "untested".into()
     }
 }
 
@@ -508,7 +539,11 @@ impl AiSourceInfo {
 /// 官方 `install.sh` 默认就装在后者，而且**可能不在 PATH 里**（它自己会 warn 一下）。
 /// 只做只读探测：跑 `--version` 和 `agent list`，不启动、不安装、不改任何东西。
 pub fn remote_source_script() -> String {
-    r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi; if [ -n "$H" ]; then printf 'HERDR|%s|%s|%s\n' "$("$H" --version 2>/dev/null | head -1 | tr -d '\r')" "$H" "$("$H" agent list 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' ')"; else printf 'HERDR|none||0\n'; fi"#
+    // 输出一行 7 段：HERDR|版本|路径|agent数|协议号|schema版本|schema指纹
+    //
+    // 两处都只读：`--version`、`agent list`、`api schema`（后者是它自己二进制里带的元数据，
+    // 276KB 在服务器本地算个 sha256，不产生网络流量）。
+    r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi; if [ -n "$H" ]; then V=$("$H" --version 2>/dev/null | head -1 | tr -d '\r'); A=$("$H" agent list 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' '); S=$("$H" api schema 2>/dev/null | head -4 | tr -d '\r'); P=$(printf '%s\n' "$S" | sed -n 's/^protocol: *//p' | head -1); SV=$(printf '%s\n' "$S" | sed -n 's/^schema_version: *//p' | head -1); F=$("$H" api schema --json 2>/dev/null | sha256sum | cut -c1-8); printf 'HERDR|%s|%s|%s|%s|%s|%s\n' "$V" "$H" "$A" "${P:-0}" "${SV:-0}" "$F"; else printf 'HERDR|none||0|0|0|\n'; fi"#
         .to_string()
 }
 
@@ -519,20 +554,29 @@ pub fn parse_source(out: &str) -> AiSourceInfo {
         let Some(rest) = line.trim().strip_prefix("HERDR|") else {
             continue;
         };
-        let parts: Vec<&str> = rest.splitn(3, '|').collect();
+        let parts: Vec<&str> = rest.splitn(6, '|').collect();
         if parts.len() < 2 {
             continue;
         }
         let ver = parts[0].trim();
         if ver != "none" && !ver.is_empty() {
-            info.herdr_version = ver.to_string();
+            // `herdr --version` 打的是 "herdr 0.9.1"，把前缀去掉 —— UI 里我们自己会写 "herdr x.y.z"，
+            // 否则会显示成 "herdr herdr 0.9.1"
+            info.herdr_version = ver.trim_start_matches("herdr ").trim().to_string();
         }
         info.herdr_path = parts[1].trim().to_string();
-        info.agents = parts
-            .get(2)
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0);
+        let num = |i: usize| -> u32 {
+            parts
+                .get(i)
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        info.agents = num(2);
+        info.protocol = num(3);
+        info.schema_version = num(4);
+        info.schema_fingerprint = parts.get(5).map(|s| s.trim().to_string()).unwrap_or_default();
     }
+    info.compat = compat_of(info.protocol);
     info
 }
 
@@ -559,8 +603,28 @@ pub fn local_source() -> AiSourceInfo {
     info.herdr_path = first.clone();
     if let Ok(v) = std::process::Command::new(&first).arg("--version").output() {
         let text = String::from_utf8_lossy(&v.stdout);
-        info.herdr_version = text.lines().next().unwrap_or("").trim().to_string();
+        info.herdr_version = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches("herdr ")
+            .trim()
+            .to_string();
     }
+    // 协议号 / schema 指纹（和远端同一套判据）
+    if let Ok(out) = std::process::Command::new(&first).arg("api").arg("schema").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let l = line.trim();
+            if let Some(v) = l.strip_prefix("protocol:") {
+                info.protocol = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = l.strip_prefix("schema_version:") {
+                info.schema_version = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    info.compat = compat_of(info.protocol);
     info
 }
 

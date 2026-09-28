@@ -5572,12 +5572,16 @@ export default function App() {
                 onClick={() => void refreshAiSource(true)}
                 title={
                   aiSource.herdrVersion
-                    ? `${aiSource.herdrPath}（herdr 当前认识 ${aiSource.agents} 个 agent）· 点击重新探测`
+                    ? `${aiSource.herdrPath}\n协议 ${aiSource.protocol} · schema v${aiSource.schemaVersion} · 指纹 ${aiSource.schemaFingerprint || "—"}\nherdr 当前认识 ${aiSource.agents} 个 agent\n点击重新探测`
                     : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。点击重新探测。"
                 }
               >
                 {aiSource.herdrVersion
-                  ? `状态来源：herdr ${aiSource.herdrVersion}（第一手）`
+                  ? aiSource.compat === "too_old"
+                    ? `herdr ${aiSource.herdrVersion} 太旧（协议 ${aiSource.protocol} < 20）→ 已回退到本机探测`
+                    : aiSource.compat === "untested"
+                      ? `状态来源：herdr ${aiSource.herdrVersion}（协议 ${aiSource.protocol} · 未实测，保守模式）`
+                      : `状态来源：herdr ${aiSource.herdrVersion}（协议 ${aiSource.protocol} · 已实测）`
                   : "状态来源：本机探测（这台机器没装 herdr）"}
               </div>
             ) : null}

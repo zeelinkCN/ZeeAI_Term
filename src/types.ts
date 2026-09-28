@@ -250,6 +250,14 @@ export interface AiSourceInfo {
   herdrPath: string;
   /** 它当前认识的 agent 数量（0 也可能是 server 没在跑） */
   agents: number;
+  /** herdr 自报的协议号（0 = 拿不到）。我们对接的是它，不是版本号 */
+  protocol: number;
+  /** 协议 schema 版本号 */
+  schemaVersion: number;
+  /** `api schema --json` 的 sha256 前 8 位：协议号没变但 schema 变了也能发现 */
+  schemaFingerprint: string;
+  /** ok / untested / too_old / unknown */
+  compat: string;
 }
 
 export interface AppSettings {
