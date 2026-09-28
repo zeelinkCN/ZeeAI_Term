@@ -335,6 +335,44 @@ pub fn run() {
                 ),
                 Err(e) => log::error!("SELFTEST: git_status failed -> {e}"),
               }
+              // herdr 链路自检（**要显式开关**：它可能往服务器写 ~/.local/bin/herdr）：
+              // 探测 → 读官方清单 → Windows 侧下载 → 校验 sha256 → scp → 安装 → 只读自检。
+              // 不设变量时连探测都不跑 —— 免得默认打扰别人的服务器。
+              if std::env::var("ZEEAI_SELFTEST_HERDR").is_ok() {
+                // 先对**每一台** SSH 服务器只读探一遍 agent 列表（这是看板的 herdr 数据源）
+                for p in profiles.iter().filter(|p| p.ssh.is_some()) {
+                  match crate::commands::herdr_agents(p.id.clone(), None).await {
+                    Ok(list) => log::info!(
+                      "SELFTEST: herdr_agents({}) -> {} 个：{}",
+                      p.name,
+                      list.len(),
+                      list.iter()
+                        .map(|a| format!("{}@{}={}", a.kind, a.pane_id, a.status))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                    ),
+                    Err(e) => log::error!("SELFTEST: herdr_agents({}) failed -> {e}", p.name),
+                  }
+                }
+                match crate::commands::herdr_install_inner(
+                  profile.id.clone(),
+                  None,
+                  |s: &str| log::info!("SELFTEST: herdr {s}"),
+                )
+                .await
+                {
+                  Ok(rep) => log::info!(
+                    "SELFTEST: herdr_install ok -> v{} 协议 {} 平台 {} 来源 {} {} 字节 sha {}",
+                    rep.version,
+                    rep.protocol,
+                    rep.platform,
+                    rep.source,
+                    rep.bytes,
+                    &rep.sha256[..rep.sha256.len().min(12)]
+                  ),
+                  Err(e) => log::error!("SELFTEST: herdr_install -> {e}"),
+                }
+              }
             }
             None => log::warn!("SELFTEST: no ssh profile found"),
           }
@@ -345,8 +383,10 @@ pub fn run() {
       Ok(())
     })
     .manage(SessionRegistry::new())
+    // herdr 观察窗的元信息 + 输入泵
+    .manage(crate::core::HerdrPaneRegistry::default())
     .manage(std::sync::Arc::new(
-      crate::core::session_log::LogRegistry::new(),
+        crate::core::session_log::LogRegistry::new(),
     ))
     // 「AI 任务看板」里"App 自己启动的"那批任务的账本
     .manage(crate::core::ai_tasks::AiTaskRegistry::new())
@@ -428,6 +468,12 @@ pub fn run() {
       commands::ai_timeline_add,
       commands::ai_timeline_clear,
       commands::ai_source_probe,
+      commands::herdr_agents,
+      commands::herdr_pane_resize,
+      commands::herdr_pane_input_start,
+      commands::herdr_pane_type,
+      commands::herdr_pane_key,
+      commands::herdr_install,
     ])
     .on_window_event(|window, event| {
       // 「关闭时收进托盘」：拦截关闭请求并隐藏窗口（托盘菜单可唤回）

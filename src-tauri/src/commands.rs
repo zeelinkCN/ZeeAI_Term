@@ -5,8 +5,8 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, ai_sessions, ai_tasks, elevate, git, highlight, pty, remote_fs, serial, sftp, ssh,
-    tmux, AiTaskRegistry, SessionEvent, SessionRegistry,
+    adb, ai, ai_sessions, ai_tasks, elevate, git, herdr, highlight, pty, remote_fs, serial, sftp,
+    ssh, tmux, AiTaskRegistry, HerdrPaneRegistry, SessionEvent, SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -97,6 +97,7 @@ pub fn open_local(
         rows.unwrap_or(30),
         on_event,
         logs.inner().clone(),
+        pty::SpawnOpts::default(),
     )?;
     registry
         .sessions
@@ -128,6 +129,7 @@ pub fn open_ssh(
     rows: Option<u16>,
     on_event: Channel<SessionEvent>,
     registry: State<'_, SessionRegistry>,
+    panes: State<'_, HerdrPaneRegistry>,
     logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
 ) -> Result<SessionInfo, String> {
     log::info!(
@@ -156,6 +158,82 @@ pub fn open_ssh(
     // 其他 = 按配置里的默认策略（开了就用模板名，没开就普通 shell）。
     let mode = tmux_mode.unwrap_or_else(|| "default".into());
     let use_herdr = backend.as_deref() == Some("herdr");
+
+    // ---------- herdr 观察窗（backend = "herdr-pane"） ----------
+    //
+    // 这一路**不跑 herdr 自己的 TUI**，只把某个窗格的只读字节流引过来（见 core::herdr 顶部说明）。
+    // 为什么值得单开一条：TUI attach 会跟别的客户端抢窗口尺寸，退出时还会留下花屏；
+    // `terminal session observe` 是只读、可多开、按观察者自己的行列数渲染的。
+    if backend.as_deref() == Some("herdr-pane") {
+        let pane = tmux_name.clone().unwrap_or_default();
+        if pane.trim().is_empty() {
+            return Err("缺少 herdr 窗格号，无法打开观察窗".into());
+        }
+        let c = cols.unwrap_or(110);
+        let r = rows.unwrap_or(30);
+        let cmd = herdr::observe_command(&pane, c, r);
+        let args = ssh::ssh_args(
+            &cfg.host,
+            cfg.port,
+            &effective_user,
+            cfg.key_path.as_deref(),
+            Some(&cmd),
+            !cfg.allow_password,
+            cfg.jump.as_deref(),
+        );
+        let title = format!(
+            "{} · herdr {}",
+            profile.name,
+            herdr::sanitize_pane(&pane)
+        );
+        let close_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = pty::spawn(
+            &id,
+            "ssh",
+            &title,
+            &ssh::ssh_exe(),
+            &args,
+            None,
+            c,
+            r,
+            on_event.clone(),
+            logs.inner().clone(),
+            pty::SpawnOpts {
+                filter: pty::Filter::HerdrObserve,
+                close_flag: close_flag.clone(),
+            },
+        )?;
+        registry
+            .sessions
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(id.clone(), handle);
+        panes.panes.lock().map_err(|e| e.to_string())?.insert(
+            id.clone(),
+            crate::core::session::HerdrPaneMeta {
+                profile_id: profile_id.clone(),
+                user: user_override
+                    .as_ref()
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty()),
+                pane_id: pane.clone(),
+                cols: c,
+                rows: r,
+                channel: on_event,
+                close_flag,
+            },
+        );
+        log::info!("ipc: open_ssh(herdr-pane) pane={pane} {c}x{r} -> {id}");
+        return Ok(SessionInfo {
+            id,
+            profile_id,
+            title,
+            kind: "ssh".into(),
+            tmux_session: None,
+            user: Some(effective_user),
+            host: Some(cfg.host.clone()),
+        });
+    }
     let mut resolved_tmux: Option<String> = None;
     let remote_cmd = match mode.as_str() {
         // 不用 tmux：给普通 shell 注入「上报当前目录」，文件面板才能跟着 cd 走
@@ -211,6 +289,7 @@ pub fn open_ssh(
         rows.unwrap_or(30),
         on_event,
         logs.inner().clone(),
+        pty::SpawnOpts::default(),
     )?;
     registry
         .sessions
@@ -286,13 +365,25 @@ pub fn session_resize(
 }
 
 #[tauri::command]
-pub fn session_close(id: String, registry: State<'_, SessionRegistry>) -> Result<(), String> {
+pub fn session_close(
+    id: String,
+    registry: State<'_, SessionRegistry>,
+    panes: State<'_, HerdrPaneRegistry>,
+) -> Result<(), String> {
     // 先把 handle 从表里摘出来、**放掉全局锁**，再去 kill。
     // 否则 kill 的等待时间也会占着全局锁，同样会拖住别的会话。
     let handle = {
         let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
         sessions.remove(&id)
     };
+    // herdr 观察窗还有两样东西要一起收：元信息，和那条常驻的「输入泵」。
+    // 输入泵是**把 stdin 关掉**就结束（远端 `read` 拿到 EOF 自己退出），不用 kill。
+    if let Ok(mut m) = panes.panes.lock() {
+        m.remove(&id);
+    }
+    if let Ok(mut m) = panes.inputs.lock() {
+        m.remove(&id);
+    }
     if let Some(handle) = handle {
         if let Some(child) = handle.child.as_ref() {
             if let Ok(mut child) = child.lock() {
@@ -920,6 +1011,7 @@ pub fn open_adb_shell(
         rows.unwrap_or(30),
         on_event,
         logs.inner().clone(),
+        pty::SpawnOpts::default(),
     )?;
     registry
         .sessions
@@ -2547,6 +2639,548 @@ pub async fn ai_source_probe(
         return Ok(info);
     }
     Ok(ai_sessions::local_source())
+}
+
+// ---------- herdr：状态源 / 观察窗 / 一键安装 ----------
+
+/// 读这台服务器上 herdr 认得的 agent（**只读**：就是一条 `agent list`）。
+///
+/// 为什么要单独一条命令，而不是并进 `ai_tasks_remote`：看板每 10~20 秒刷一次，
+/// 那条探针本身已经在扫 ps / tmux 了；herdr 的 agent 状态是"第一手"，
+/// 但只有**这台机器确实装了 herdr** 才值得多花一次往返。前端探到有 herdr 才调它。
+#[tauri::command]
+pub async fn herdr_agents(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<Vec<herdr::HerdrAgent>, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::agents_command()).await?;
+    let agents = herdr::parse_agents(&out);
+    log::info!("ipc: herdr_agents -> {} 个 agent", agents.len());
+    Ok(agents)
+}
+
+/// 观察窗的尺寸变了：把 observe 流**重开**一次。
+///
+/// herdr 的观察者是在开流时声明自己行列数的（不会去改窗格本身的尺寸 —— 这正是我们
+/// 想要的）。所以"窗口变大"对我们是"重开一条更大观察者"，而不是去 resize 别人的窗格。
+#[tauri::command]
+pub fn herdr_pane_resize(
+    id: String,
+    cols: u16,
+    rows: u16,
+    registry: State<'_, SessionRegistry>,
+    panes: State<'_, HerdrPaneRegistry>,
+    logs: State<'_, std::sync::Arc<crate::core::session_log::LogRegistry>>,
+) -> Result<(), String> {
+    // 和前端同一道闸：太小的尺寸一律不发（首次布局时容器可能是 0）
+    if cols < 20 || rows < 5 {
+        return Ok(());
+    }
+    let meta = {
+        let m = panes.panes.lock().map_err(|e| e.to_string())?;
+        m.get(&id).map(|x| {
+            (
+                x.profile_id.clone(),
+                x.user.clone(),
+                x.pane_id.clone(),
+                x.cols,
+                x.rows,
+                x.channel.clone(),
+                x.close_flag.clone(),
+            )
+        })
+    };
+    let Some((profile_id, user, pane_id, old_cols, old_rows, channel, close_flag)) = meta else {
+        return Ok(()); // 不是观察窗会话（普通 ssh/tmux），交给原来的 session_resize
+    };
+    if old_cols == cols && old_rows == rows {
+        return Ok(());
+    }
+    let effective_user = user
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    let cfg = ssh_config_for(&profile_id, user)?;
+    let effective_user = effective_user.unwrap_or_else(|| cfg.user.clone());
+
+    // 1) 先让旧线程别再报 "closed"，再把旧进程收掉
+    close_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let old = {
+        let mut sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.remove(&id)
+    };
+    if let Some(h) = old {
+        if let Some(child) = h.child.as_ref() {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
+        }
+    }
+
+    // 2) 擦掉旧画面再铺新的：新流是按**新的宽度**渲染的，不擦会和上面的残影叠在一起
+    let clear = base64::engine::general_purpose::STANDARD.encode(b"\x1b[2J\x1b[H");
+    let _ = channel.send(SessionEvent::Data { data: clear });
+
+    // 3) 开一条新的观察者
+    let cmd = herdr::observe_command(&pane_id, cols, rows);
+    let args = ssh::ssh_args(
+        &cfg.host,
+        cfg.port,
+        &effective_user,
+        cfg.key_path.as_deref(),
+        Some(&cmd),
+        !cfg.allow_password,
+        cfg.jump.as_deref(),
+    );
+    let title = format!("herdr {}", herdr::sanitize_pane(&pane_id));
+    let new_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = pty::spawn(
+        &id,
+        "ssh",
+        &title,
+        &ssh::ssh_exe(),
+        &args,
+        None,
+        cols,
+        rows,
+        channel.clone(),
+        logs.inner().clone(),
+        pty::SpawnOpts {
+            filter: pty::Filter::HerdrObserve,
+            close_flag: new_flag.clone(),
+        },
+    )?;
+    registry
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), handle);
+    if let Ok(mut m) = panes.panes.lock() {
+        if let Some(x) = m.get_mut(&id) {
+            x.cols = cols;
+            x.rows = rows;
+            x.close_flag = new_flag;
+        }
+    }
+    log::info!("ipc: herdr_pane_resize -> {id} {old_cols}x{old_rows} => {cols}x{rows}");
+    Ok(())
+}
+
+/// 给观察窗配一条常驻的「输入泵」。
+///
+/// 为什么要常驻：如果每次按键都起一条 ssh，打字会变成"一个字半秒"。
+/// 这条进程的 stdin 就是指令通道，按行读：
+/// `T<base64 文本>` = 把文本按字面敲进窗格；`K<按键名>` = 敲一个逻辑按键。
+#[tauri::command]
+pub fn herdr_pane_input_start(
+    id: String,
+    profile_id: String,
+    user_override: Option<String>,
+    pane_id: String,
+    panes: State<'_, HerdrPaneRegistry>,
+) -> Result<(), String> {
+    let cfg = ssh_config_for(&profile_id, user_override.clone())?;
+    let effective_user = user_override
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| cfg.user.clone());
+    // 密码登录的服务器：系统 ssh 喂不了密码，输入泵会卡在认证上。
+    // 这里**提前说清楚**，比"看起来能打字、实际一个字都进不去"强。
+    if password_for(&profile_id, &cfg).is_some() {
+        return Err(
+            "这台服务器用的是密码登录：观察窗只能看，输入请用 tmux/普通 shell 会话".into(),
+        );
+    }
+    let cmd = herdr::input_pump_command(&pane_id);
+    let args = ssh::ssh_args(
+        &cfg.host,
+        cfg.port,
+        &effective_user,
+        cfg.key_path.as_deref(),
+        Some(&cmd),
+        true,
+        cfg.jump.as_deref(),
+    );
+    // 用**标准库**的 Command：它的 ChildStdin 实现了 std::io::Write，
+    // 这样"敲一个字"就是一次同步的小写入，不用为了几字节去 await 一个异步管道。
+    let mut c = std::process::Command::new(ssh::ssh_exe());
+    c.args(&args);
+    c.stdin(std::process::Stdio::piped());
+    c.stdout(std::process::Stdio::null());
+    c.stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = c.spawn().map_err(|e| format!("启动输入通道失败: {e}"))?;
+    // 跟着应用生命周期走：App 退出/被强杀时不会留下孤儿 ssh
+    crate::core::job::assign(child.id());
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "拿不到输入通道的 stdin".to_string())?;
+    panes
+        .inputs
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), stdin);
+    // Child 句柄本身不留在注册表里：我们只关心它的 stdin（它在表里，管道就不会断）。
+    // 远端那条循环是 `while read`，stdin 一关（会话结束）它自己就退出了。
+    drop(child);
+    log::info!("ipc: herdr_pane_input_start {id} pane={pane_id}");
+    Ok(())
+}
+
+/// 往观察窗里**按字面**送一段文本（等价于在窗格里敲键盘）
+#[tauri::command]
+pub fn herdr_pane_type(
+    id: String,
+    text: String,
+    panes: State<'_, HerdrPaneRegistry>,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    herdr_write_input(&panes, &id, &format!("T{b64}\n"))
+}
+
+/// 往观察窗里送一个**逻辑按键**（enter / esc / ctrl+c / up …）
+///
+/// 白名单校验：这个值会被拼进远端命令行，所以只允许 `[a-z0-9+-]`，且不超过 16 个字符。
+#[tauri::command]
+pub fn herdr_pane_key(
+    id: String,
+    key: String,
+    panes: State<'_, HerdrPaneRegistry>,
+) -> Result<(), String> {
+    let k = key.trim().to_ascii_lowercase();
+    let ok = !k.is_empty()
+        && k.len() <= 16
+        && k.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '+' || c == '-');
+    if !ok {
+        return Err(format!("不认这个按键名：{key}"));
+    }
+    herdr_write_input(&panes, &id, &format!("K{k}\n"))
+}
+
+/// 往输入泵写一行指令（写失败时把这条通道从表里摘掉，下次输入会自动重开）
+fn herdr_write_input(
+    panes: &State<'_, HerdrPaneRegistry>,
+    id: &str,
+    line: &str,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    // 写的是内存管道、一行就几十字节，正常永远写得进去；真写满了也只会短暂阻塞这一下。
+    let mut dead = false;
+    let res = {
+        let mut m = panes.inputs.lock().map_err(|e| e.to_string())?;
+        match m.get_mut(id) {
+            None => Err("输入通道还没建立".to_string()),
+            Some(s) => match s.write_all(line.as_bytes()) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    dead = true;
+                    Err(format!("输入通道断了（下次输入会自动重连）: {e}"))
+                }
+            },
+        }
+    };
+    if dead {
+        if let Ok(mut m) = panes.inputs.lock() {
+            m.remove(id);
+        }
+    }
+    res
+}
+
+/// 一键安装 herdr 的结果（前端拿去显示"装了什么版本、来自哪、校验对不对"）
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrInstallReport {
+    pub version: String,
+    pub protocol: u32,
+    pub platform: String,
+    pub source: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub path: String,
+}
+
+/// 一键安装 herdr：**Windows 侧下载 → 校验 → scp 上去**。
+///
+/// 几条硬规矩（用户明确要求过，这里逐条落地）：
+/// 1. **不下错**：版本号和 sha256 都取自官方 `latest.json`；官方直链失败才退到镜像，
+///    但**不管是官方还是镜像，都按同一份 sha256 校验**，对不上就删掉换下一个来源；
+/// 2. **不乱装**：绝不执行远端安装脚本、绝不 sudo、不碰系统目录；只放进 `~/.local/bin`，
+///    而且**已经有一个能用的 herdr 就不覆盖**（宁可报错让用户决定）；
+/// 3. **可回滚**：装完做一次只读自检（`--version` + 协议号），不达标就把刚装的文件删掉；
+/// 4. 每一步都往状态栏回一条进度，失败时把原因原样带出来（前端直接显示）。
+#[tauri::command]
+pub async fn herdr_install(
+    profile_id: String,
+    user_override: Option<String>,
+    on_progress: Channel<String>,
+) -> Result<HerdrInstallReport, String> {
+    herdr_install_inner(profile_id, user_override, move |s: &str| {
+        let _ = on_progress.send(s.to_string());
+    })
+    .await
+}
+
+/// 安装进度的小包装：既写日志，也交给调用方（界面通道 / 自检）。
+/// 用 `Arc` 包一层是因为下载那一段要丢到阻塞线程里跑，而回调得跟着进那个线程。
+struct Say<F: Fn(&str)>(std::sync::Arc<F>);
+
+impl<F: Fn(&str)> Clone for Say<F> {
+    fn clone(&self) -> Self {
+        Say(self.0.clone())
+    }
+}
+
+impl<F: Fn(&str)> Say<F> {
+    fn say(&self, s: &str) {
+        log::info!("herdr_install: {s}");
+        (self.0)(s);
+    }
+}
+
+/// [`herdr_install`] 的实现体（**故意**和命令壳分开）。
+///
+/// 分开的原因：进度通道是给界面看的，而自检（`ZEEAI_SELFTEST_HERDR=1`）需要在不建
+/// Channel 的情况下把整条链路跑一遍。把进度回调抽成 `Fn(&str)`，两边就都能用了 ——
+/// 这样"我验证过的"和"用户点按钮跑到的"是**同一段代码**，不是两套。
+pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
+    profile_id: String,
+    user_override: Option<String>,
+    say: F,
+) -> Result<HerdrInstallReport, String> {
+    let cfg = ssh_config_for(&profile_id, user_override.clone())?;
+    let effective_user = user_override
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| cfg.user.clone());
+    let say = Say(std::sync::Arc::new(say));
+
+    // ---- 0) 这台机器是什么平台 ----
+    say.say("正在读取服务器平台…");
+    let uname = run_remote_capture(&profile_id, &cfg, &herdr::uname_command()).await?;
+    let platform = herdr::platform_key(&uname)
+        .ok_or_else(|| format!("这台机器的平台不支持一键安装：{}", uname.trim()))?;
+    if !herdr::is_supported_platform(&platform) {
+        return Err(format!("一键安装目前只支持 Linux 服务器（这台是 {platform}）"));
+    }
+
+    // ---- 1) 已经装了就不动它 ----
+    let existing = run_remote_capture(&profile_id, &cfg, &herdr::installed_check_command()).await?;
+    if let Some((ver, proto)) = herdr::parse_installed(&existing) {
+        if proto >= herdr::MIN_PROTOCOL {
+            return Err(format!(
+                "这台机器上已经有 herdr {ver}（协议 {proto}），不覆盖。要升级请在服务器上自己执行 herdr update"
+            ));
+        }
+        say.say(&format!("发现 herdr {ver} 太旧（协议 {proto}），继续安装新版"));
+    }
+
+    // ---- 2) 官方清单 ----
+    say.say("正在读取 herdr 官方版本清单（herdr.dev）…");
+    let curl = find_curl()
+        .ok_or_else(|| "找不到系统自带的 curl.exe，请手动下载安装".to_string())?;
+    let manifest_text = curl_text(&curl, herdr::LATEST_MANIFEST_URL, 30)?;
+    let manifest = herdr::parse_manifest(&manifest_text)?;
+    let asset = manifest
+        .asset(&platform)
+        .ok_or_else(|| format!("官方清单里没有 {platform} 这个平台的产物"))?
+        .to_string();
+    let want_sha = manifest
+        .sha(&platform)
+        .ok_or_else(|| "官方清单里没给 sha256，拒绝安装（不敢赌下到的是什么）".to_string())?
+        .to_string();
+    if manifest.protocol > 0 && manifest.protocol < herdr::MIN_PROTOCOL {
+        say.say(&format!(
+            "注意：官方最新版协议 {}  低于我们实测的 {}，装完可能不兼容",
+            manifest.protocol,
+            herdr::MIN_PROTOCOL
+        ));
+    }
+    say.say(&format!(
+        "官方最新版 herdr {}（协议 {}，sha256 {}…）",
+        manifest.version,
+        manifest.protocol,
+        &want_sha[..want_sha.len().min(12)]
+    ));
+
+    // ---- 3) 在 Windows 侧下载（官方不通就走镜像，校验标准不变） ----
+    let dir = std::env::temp_dir().join("zeeai-herdr");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    let dest = dir.join(format!("herdr-{}-{platform}", manifest.version));
+    let candidates = herdr::sources(&asset);
+    let proxy = system_proxy();
+    // 下载整段放到阻塞线程里：它可能要跑几分钟，放在 async 运行时的 worker 上会拖住别的命令
+    let (bytes, got_from) = {
+        let curl = curl.clone();
+        let dest = dest.clone();
+        let want_sha = want_sha.clone();
+        let proxy = proxy.clone();
+        let progress = say.clone();
+        let candidates = candidates.clone();
+        tokio::task::spawn_blocking(move || -> Result<(u64, String), String> {
+            if dest.exists() {
+                let have = sha256_of(&dest).unwrap_or_default();
+                if have == want_sha {
+                    let n = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                    return Ok((n, "本地缓存（校验一致）".to_string()));
+                }
+                let _ = std::fs::remove_file(&dest);
+            }
+            let mut last_err = String::new();
+            for src in &candidates {
+                // 每个来源先直连、再试系统代理（不少用户是靠本地代理访问 GitHub 的）
+                for (tag, p) in [("直连", None), ("系统代理", proxy.as_deref())] {
+                    if tag == "系统代理" && proxy.is_none() {
+                        continue;
+                    }
+                    progress.say(&format!("正在下载（{}·{}）…", src.label, tag));
+                    let _ = std::fs::remove_file(&dest);
+                    let mut last_mb = 0u64;
+                    let r = run_curl_download(
+                        &curl,
+                        &src.url,
+                        &dest,
+                        0,
+                        p,
+                        false,
+                        &mut |done, _total| {
+                            // 跨过 1MB 才回一条进度，免得状态栏被刷屏
+                            if done / 1_048_576 > last_mb {
+                                last_mb = done / 1_048_576;
+                                progress.say(&format!(
+                                    "下载中（{}）：{} MB",
+                                    src.label, last_mb
+                                ));
+                            }
+                        },
+                    );
+                    match r {
+                        Ok(()) => {
+                            let have = sha256_of(&dest).unwrap_or_default();
+                            if have != want_sha {
+                                last_err = format!(
+                                    "{}·{} 下到的文件 sha256 和官方不一致（拿到 {}…），已丢弃",
+                                    src.label,
+                                    tag,
+                                    &have[..have.len().min(12)]
+                                );
+                                let _ = std::fs::remove_file(&dest);
+                                continue;
+                            }
+                            let n = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                            return Ok((n, format!("{}·{}", src.label, tag)));
+                        }
+                        Err(e) => last_err = format!("{}·{} 失败：{e}", src.label, tag),
+                    }
+                }
+            }
+            Err(format!(
+                "所有下载来源都没成功（最后一个：{last_err}）。可以稍后重试，或手动下载后在服务器上安装"
+            ))
+        })
+        .await
+        .map_err(|e| format!("下载线程失败: {e}"))??
+    };
+    let pct = format!("{:.1} MB", bytes as f64 / 1_048_576.0);
+    say.say(&format!("下载完成（{got_from}，{pct}，sha256 已核对）"));
+
+    // ---- 4) scp 上去 + chmod + 只读自检 ----
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmp = format!("/tmp/zeeai-herdr-{stamp}");
+    say.say("正在上传到服务器（scp → /tmp）…");
+    let scp_args = ssh::scp_args(
+        cfg.port,
+        cfg.key_path.as_deref(),
+        false,
+        &dest.to_string_lossy(),
+        &ssh::scp_remote(&cfg.host, &effective_user, &tmp),
+    );
+    run_scp(&scp_args).await?;
+
+    say.say("正在安装到 ~/.local/bin/herdr（不需要 root）…");
+    let install_cmd = format!(
+        "set -e; mkdir -p \"$HOME/.local/bin\"; install -m 755 '{tmp}' \"$HOME/.local/bin/herdr\"; rm -f '{tmp}'; {}",
+        herdr::installed_check_command()
+    );
+    let out = run_remote_capture(&profile_id, &cfg, &install_cmd).await?;
+    let parsed = herdr::parse_installed(&out);
+
+    // ---- 5) 自检不过就回滚 ----
+    let Some((ver, proto)) = parsed else {
+        let _ = run_remote_capture(
+            &profile_id,
+            &cfg,
+            "rm -f \"$HOME/.local/bin/herdr\"; printf 'rolled back\\n'",
+        )
+        .await;
+        return Err(format!(
+            "装完后自检没通过（herdr --version 拿不到版本），已把刚放上去的文件删掉。远端原话：{}",
+            out.trim()
+        ));
+    };
+    if proto < herdr::MIN_PROTOCOL {
+        let _ = run_remote_capture(
+            &profile_id,
+            &cfg,
+            "rm -f \"$HOME/.local/bin/herdr\"; printf 'rolled back\\n'",
+        )
+        .await;
+        return Err(format!(
+            "装上的 herdr {ver} 协议号 {proto} 低于我们支持的下限 {}，已回滚",
+            herdr::MIN_PROTOCOL
+        ));
+    }
+    say.say(&format!("安装完成：herdr {ver}（协议 {proto}）"));
+    Ok(HerdrInstallReport {
+        version: ver,
+        protocol: proto,
+        platform,
+        source: got_from,
+        sha256: want_sha,
+        bytes,
+        path: "$HOME/.local/bin/herdr".into(),
+    })
+}
+
+/// 用 curl 取一小段文本（清单文件只有几十 KB）。失败时带出 curl 的原话。
+fn curl_text(curl: &std::path::Path, url: &str, timeout_secs: u64) -> Result<String, String> {
+    let out = std::process::Command::new(curl)
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            &timeout_secs.to_string(),
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("执行 curl 失败: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.status.success() && !text.trim().is_empty() {
+        return Ok(text);
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if err.is_empty() {
+        format!("下载 {url} 失败（curl 退出码 {:?}）", out.status.code())
+    } else {
+        err
+    })
 }
 
 /// 读取上次的工作区快照（没有就返回 null）

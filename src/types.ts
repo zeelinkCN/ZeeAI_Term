@@ -172,6 +172,49 @@ export interface AiTask {
   startedAt?: number | null;
   /** 退出码；v1 拿不到就是 null */
   exitCode?: number | null;
+  /**
+   * herdr 给的窗格号（形如 w1:p1）；这张卡不是来自 herdr 就是空。
+   * 有它就能开「观察窗」直接看这个窗格。
+   */
+  herdrPane?: string | null;
+  /** 这张 herdr 卡片属于哪台服务器配置（开观察窗要用） */
+  herdrProfileId?: string | null;
+  /**
+   * herdr 的原始状态：working / blocked / done / idle / unknown。
+   * 有了它卡片能显示成「等你处理」——这是我们自己扫进程永远拿不到的那一档。
+   */
+  agentStatus?: string | null;
+  /** 这一条是不是在"等人接手"（= herdr 说 blocked） */
+  attention?: boolean;
+}
+
+/** herdr 认出来的一个 agent（来自 `herdr agent list`） */
+export interface HerdrAgent {
+  kind: string;
+  /** working / blocked / done / idle / unknown */
+  status: string;
+  cwd: string;
+  /** 窗格号（形如 w1:p1），同时也是给它发命令用的"名字" */
+  paneId: string;
+  tabId: string;
+  workspaceId: string;
+  title: string;
+  focused: boolean;
+  /** 在等我们做事（= blocked） */
+  attention: boolean;
+}
+
+/** 一键安装 herdr 的结果 */
+export interface HerdrInstallReport {
+  version: string;
+  protocol: number;
+  platform: string;
+  /** 这份安装文件是从哪条路拿到的（官方 / 镜像，直连 / 代理） */
+  source: string;
+  sha256: string;
+  bytes: number;
+  /** 装到哪了（固定是 ~/.local/bin/herdr） */
+  path: string;
 }
 
 /** Codex 会话日志里读出来的用量（token 以"个"为单位，界面自己折成 M 显示） */

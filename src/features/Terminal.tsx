@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
+import { herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
 import { bytesToB64 } from "../util";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
@@ -36,6 +37,15 @@ interface Props {
   highlightEnabled?: boolean;
   /** 关键字高亮规则 */
   highlightRules?: HighlightRule[];
+  /**
+   * herdr 观察窗：这个终端的输出是 herdr 的**只读**窗格流，输入得走 herdr 的
+   * `pane send-text` / `pane send-keys`（另开一条常驻 ssh），不能写进本地的 PTY。
+   *
+   * 为什么这么设计见 core/herdr.rs 顶部：不在标签页里跑 herdr 的 TUI。
+   */
+  herdrPane?: { paneId: string };
+  /** 输入通道还没建好/断了时，让上层去建（同一个会话只会建一次） */
+  onHerdrInputNeeded?: () => void;
 }
 
 /** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
@@ -110,6 +120,92 @@ const MIN_ROWS = 5;
  */
 const RESIZE_DEBOUNCE_MS = 150;
 
+/** 这台机器能不能用 WebGL2（不能就别挂 WebglAddon，原因见上面那段说明） */
+function webgl2Available(): boolean {
+  try {
+    const c = document.createElement("canvas");
+    return !!c.getContext("webgl2");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * xterm 的 `onData` 给的是**字节序列**（`\r`、`\x1b[A`…），而 herdr 要的是**逻辑按键名**
+ * （`enter`、`up`…）。这里做一次翻译。
+ *
+ * 拆成"一串动作"而不是"一个动作"：一次粘贴/一次快速敲击可能一次塞进来好几个字符，
+ * 里面还可能混着回车 —— 拆开之后每一段用最合适的方式送（文本走 send-text，按键走 send-keys）。
+ */
+export function herdrActions(
+  data: string,
+): ({ kind: "key"; key: string } | { kind: "text"; text: string })[] {
+  const seqKeys: Record<string, string> = {
+    "\x1b[A": "up",
+    "\x1b[B": "down",
+    "\x1b[C": "right",
+    "\x1b[D": "left",
+    "\x1b[H": "home",
+    "\x1b[F": "end",
+    "\x1b[3~": "delete",
+  };
+  const ctrlKeys: Record<string, string> = {
+    "\x03": "ctrl+c",
+    "\x04": "ctrl+d",
+    "\x1a": "ctrl+z",
+    "\x0c": "ctrl+l",
+    "\x01": "ctrl+a",
+    "\x05": "ctrl+e",
+    "\x0b": "ctrl+k",
+    "\x15": "ctrl+u",
+  };
+  const out: ({ kind: "key"; key: string } | { kind: "text"; text: string })[] = [];
+  let text = "";
+  const flush = () => {
+    if (text) {
+      out.push({ kind: "text", text });
+      text = "";
+    }
+  };
+  for (let i = 0; i < data.length; i++) {
+    const c = data[i];
+    if (c === "\x1b") {
+      const four = data.slice(i, i + 4);
+      const three = data.slice(i, i + 3);
+      const k = seqKeys[three] ?? seqKeys[four];
+      flush();
+      out.push({ kind: "key", key: k ?? "esc" });
+      i += k ? (seqKeys[four] ? 3 : 2) : 0;
+      continue;
+    }
+    if (c === "\r" || c === "\n") {
+      flush();
+      out.push({ kind: "key", key: "enter" });
+      continue;
+    }
+    if (c === "\x7f") {
+      flush();
+      out.push({ kind: "key", key: "backspace" });
+      continue;
+    }
+    if (c === "\t") {
+      flush();
+      out.push({ kind: "key", key: "tab" });
+      continue;
+    }
+    if (ctrlKeys[c]) {
+      flush();
+      out.push({ kind: "key", key: ctrlKeys[c] });
+      continue;
+    }
+    // 其它控制字符不认识 —— 宁可这一个键丢掉，也不要瞎猜一个按键名发过去
+    if (c < " ") continue;
+    text += c;
+  }
+  flush();
+  return out;
+}
+
 export default function TerminalView({
   sessionId,
   bus,
@@ -124,6 +220,8 @@ export default function TerminalView({
   onZoom,
   highlightEnabled = false,
   highlightRules,
+  herdrPane,
+  onHerdrInputNeeded,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -147,6 +245,11 @@ export default function TerminalView({
   hlRulesRef.current = highlightRules ?? [];
   const hlOnRef = useRef(highlightEnabled);
   hlOnRef.current = highlightEnabled;
+  // herdr 观察窗标记也放 ref：终端只建一次（deps 里没有它），改会话类型不该重建终端
+  const herdrPaneRef = useRef<Props["herdrPane"]>(herdrPane);
+  herdrPaneRef.current = herdrPane;
+  const needHerdrInputRef = useRef<Props["onHerdrInputNeeded"]>(onHerdrInputNeeded);
+  needHerdrInputRef.current = onHerdrInputNeeded;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -166,17 +269,26 @@ export default function TerminalView({
     term.open(host);
 
     try {
-      const webgl = new WebglAddon();
-      // WebGL 上下文丢失时退回 canvas 渲染，避免出现花屏
-      webgl.onContextLoss(() => {
-        try {
-          webgl.dispose();
-        } catch {
-          /* ignore */
-        }
-      });
-      term.loadAddon(webgl);
-      webglRef.current = webgl;
+      // 先自己问一句"这台机器到底有没有 WebGL2"，有才挂 addon。
+      //
+      // 为什么不能"挂了再说"：WebglAddon 在**激活到一半**失败时（没有 WebGL2 的机器，
+      // 比如无显卡加速的虚拟机 / 远程桌面 / 无头环境），xterm 内部的渲染器可能已经被
+      // 换掉、尺寸又没算出来，随后任何一次 refresh 都会抛
+      // `Cannot read properties of undefined (reading 'dimensions')` —— 终端整块不动了。
+      // （这是用无头浏览器跑功能测试时实测到的，不是猜的。）
+      if (webgl2Available()) {
+        const webgl = new WebglAddon();
+        // WebGL 上下文丢失时退回 canvas 渲染，避免出现花屏
+        webgl.onContextLoss(() => {
+          try {
+            webgl.dispose();
+          } catch {
+            /* ignore */
+          }
+        });
+        term.loadAddon(webgl);
+        webglRef.current = webgl;
+      }
     } catch {
       /* WebGL 不可用时自动回退到 canvas/dom 渲染 */
     }
@@ -199,6 +311,12 @@ export default function TerminalView({
         if (cols < MIN_COLS || rows < MIN_ROWS) return;
         if (cols === lastSent.cols && rows === lastSent.rows) return;
         lastSent = { cols, rows };
+        if (herdrPaneRef.current) {
+          // herdr 观察窗：行列数是在"开流时"声明的，所以这里让后端把流按新尺寸重开一次
+          // （重开**不会**去改窗格本身的尺寸，也不会影响别的客户端）
+          void herdrPaneResize(sessionId, cols, rows);
+          return;
+        }
         void sessionResize(sessionId, cols, rows);
         // 尺寸变完之后做一次"硬重绘"：
         // 1) 清掉 WebGL 的字形图集 —— 缩放/换宽之后图集里可能留着按旧单元格尺寸栅格化的字形，
@@ -243,6 +361,18 @@ export default function TerminalView({
       else term.write(bytes);
     });
     const sub = term.onData((data) => {
+      // herdr 观察窗：输入不能写进本地 PTY（那条 PTY 只是 `observe` 的输出管道），
+      // 得走 herdr 自己的 `pane send-text` / `pane send-keys`
+      if (herdrPaneRef.current) {
+        for (const a of herdrActions(data)) {
+          if (a.kind === "text") {
+            void herdrPaneType(sessionId, a.text).catch(() => needHerdrInputRef.current?.());
+          } else {
+            void herdrPaneKey(sessionId, a.key).catch(() => needHerdrInputRef.current?.());
+          }
+        }
+        return;
+      }
       void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(data)));
     });
 
@@ -414,6 +544,33 @@ export default function TerminalView({
               粘贴
             </button>
             <div className="menu-sep" />
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                // 「清屏并重画」= 把终端状态整个重置回干净态：
+                // 全屏 TUI（codex / herdr / vim）异常退出后偶尔会留下花屏或"一片点"，
+                // reset 会把字符集、颜色、鼠标模式、备用屏这些统统复位，
+                // 再用 refresh 让渲染器按当前尺寸整屏重画一次。
+                const term = termRef.current;
+                if (!term) return;
+                try {
+                  term.reset();
+                  try {
+                    webglRef.current?.clearTextureAtlas();
+                  } catch {
+                    /* 没有 WebGL 时忽略 */
+                  }
+                  term.refresh(0, term.rows - 1);
+                } catch {
+                  /* ignore */
+                }
+                onNotice?.("已清屏并重画");
+              }}
+            >
+              清屏并重画
+            </button>
             <button
               type="button"
               className="menu-item"

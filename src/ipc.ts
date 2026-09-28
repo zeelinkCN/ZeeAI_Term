@@ -21,6 +21,8 @@ import type {
   AiSessionSnapshot,
   AiArtifact,
   HighlightRule,
+  HerdrAgent,
+  HerdrInstallReport,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {
@@ -68,8 +70,13 @@ export async function openSsh(
   cols?: number,
   rows?: number,
   userOverride?: string | null,
-  /** 会话后端：tmux（默认）/ herdr */
-  backend?: "tmux" | "herdr" | null,
+  /**
+   * 会话后端：
+   * - `tmux`（默认）/ `herdr`：跑一个真终端；
+   * - `herdr-pane`：**只读观察窗** —— 用 herdr 的 observe 通道看某个窗格，
+   *   不跑 herdr 自己的 TUI（那条路会花屏、还会跟别的客户端抢尺寸）。
+   */
+  backend?: "tmux" | "herdr" | "herdr-pane" | null,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -643,5 +650,58 @@ export async function aiSourceProbe(
   return invoke<AiSourceInfo>("ai_source_probe", {
     profileId: profileId ?? null,
     userOverride: userOverride ?? null,
+  });
+}
+
+// ---------- herdr ----------
+
+/** 读这台服务器上 herdr 认得的 agent（只读；这台机器没装 herdr 时返回空数组） */
+export async function herdrAgents(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<HerdrAgent[]> {
+  return invoke<HerdrAgent[]>("herdr_agents", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 观察窗尺寸变了：让后端把 observe 流按新尺寸重开一次 */
+export async function herdrPaneResize(id: string, cols: number, rows: number): Promise<void> {
+  return invoke("herdr_pane_resize", { id, cols, rows });
+}
+
+/** 给观察窗建一条常驻输入通道（同一个会话只需要建一次） */
+export async function herdrPaneInputStart(
+  id: string,
+  profileId: string,
+  userOverride: string | null,
+  paneId: string,
+): Promise<void> {
+  return invoke("herdr_pane_input_start", { id, profileId, userOverride, paneId });
+}
+
+/** 往观察窗里按字面送一段文本 */
+export async function herdrPaneType(id: string, text: string): Promise<void> {
+  return invoke("herdr_pane_type", { id, text });
+}
+
+/** 往观察窗里送一个逻辑按键（enter / esc / ctrl+c / up …） */
+export async function herdrPaneKey(id: string, key: string): Promise<void> {
+  return invoke("herdr_pane_key", { id, key });
+}
+
+/** 一键安装 herdr：Windows 侧下载 → 校验 sha256 → scp 到 ~/.local/bin */
+export async function herdrInstall(
+  profileId: string,
+  userOverride: string | null,
+  onProgress: (text: string) => void,
+): Promise<HerdrInstallReport> {
+  const ch = new Channel<string>();
+  ch.onmessage = onProgress;
+  return invoke<HerdrInstallReport>("herdr_install", {
+    profileId,
+    userOverride,
+    onProgress: ch,
   });
 }

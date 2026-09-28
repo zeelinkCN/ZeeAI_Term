@@ -5,6 +5,7 @@ pub mod ai_sessions;
 pub mod ai_tasks;
 pub mod elevate;
 pub mod git;
+pub mod herdr;
 pub mod highlight;
 pub mod job;
 pub mod pty;
@@ -18,4 +19,4 @@ pub mod ssh;
 pub mod tmux;
 
 pub use ai_tasks::AiTaskRegistry;
-pub use session::{SessionEvent, SessionRegistry};
+pub use session::{HerdrPaneRegistry, SessionEvent, SessionRegistry};

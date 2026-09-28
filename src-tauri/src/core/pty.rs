@@ -9,6 +9,43 @@ use tauri::ipc::Channel;
 use super::session::{SessionEvent, SessionHandle};
 use super::job;
 
+/// 输出流的**后处理**方式。
+///
+/// 目前只有一种特殊流：herdr 的 `terminal session observe` —— 它吐的是一行行 JSON
+/// （`{"bytes":"<base64 的原始终端字节>"}`），必须先解出来才是能喂给 xterm 的字节。
+/// 为什么不在远端用 `sed + base64 -d` 拼：那样每来一片就要在服务器上多起两个进程，
+/// 而且 shell 引号一多就容易出错 —— 放在 Rust 里只有一个状态机，服务器侧零额外开销。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Filter {
+    /// 原样转发
+    #[default]
+    Raw,
+    /// herdr observe：JSON 行 → base64 解成原始字节
+    HerdrObserve,
+}
+
+/// 起进程时的两个开关
+#[derive(Clone, Debug)]
+pub struct SpawnOpts {
+    pub filter: Filter,
+    /// **故意重开**时用：不要因为这一路流结束就往前端报 "closed"。
+    ///
+    /// 为什么是共享开关而不是一个 bool：herdr 的 observe 流在"用户改了窗口大小"时要重开，
+    /// 而重开前必须先杀掉旧进程 —— 旧进程的读取线程此时会 EOF。用 bool 的话这个值在起
+    /// 线程时就定死了，没法事后告诉它"这次是我让你停的"。所以给一个共享标志：
+    /// 重开之前把它置上，旧线程看到它就不会误报"会话已关闭"。
+    pub close_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for SpawnOpts {
+    fn default() -> Self {
+        Self {
+            filter: Filter::Raw,
+            close_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
 /// 用系统 PTY 起一个进程（本地终端，或把 ssh.exe 跑在 PTY 里充当远程终端）。
 pub fn spawn(
     session_id: &str,
@@ -21,6 +58,7 @@ pub fn spawn(
     rows: u16,
     channel: Channel<SessionEvent>,
     logs: std::sync::Arc<super::session_log::LogRegistry>,
+    opts: SpawnOpts,
 ) -> Result<SessionHandle, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -71,10 +109,33 @@ pub fn spawn(
     let sid = session_id.to_string();
     thread::spawn(move || {
         let mut buf = [0u8; 16384];
+        // herdr observe 的行缓冲：JSON 是按行来的，一次 read 里可能是半行/多行
+        let mut pending: Vec<u8> = Vec::new();
+        let flush = |bytes: &[u8],
+                     ch: &Channel<SessionEvent>,
+                     logs: &std::sync::Arc<super::session_log::LogRegistry>| {
+            if bytes.is_empty() {
+                return true;
+            }
+            logs.write(&sid, bytes);
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            ch.send(SessionEvent::Data { data }).is_ok()
+        };
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if opts.filter == Filter::HerdrObserve {
+                        // 一次 read 可能切在半行上：push 只吐"完整行解出来的东西"，
+                        // 剩下的半截留在 pending 里等下一片（分片边界必须处理，
+                        // 否则 JSON 会被腰斩 → 解不出来 → 画面断片）。
+                        for chunk in push_observe_bytes(&mut pending, &buf[..n]) {
+                            if !flush(&chunk, &ch, &logs) {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     // 会话日志：顺手把这一片原始输出落盘（没开日志时是空操作）
                     logs.write(&sid, &buf[..n]);
                     let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
@@ -85,9 +146,21 @@ pub fn spawn(
                 Err(_) => break,
             }
         }
-        let _ = ch.send(SessionEvent::State {
-            state: "closed".into(),
-        });
+        // 收尾：observe 流最后可能还剩半行（正常情况不会有），解出来别丢
+        if opts.filter == Filter::HerdrObserve && !pending.is_empty() {
+            let text = String::from_utf8_lossy(&pending).to_string();
+            if let Ok(bytes) = decode_observe_line(&text) {
+                let _ = flush(&bytes, &ch, &logs);
+            }
+        }
+        if !opts
+            .close_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = ch.send(SessionEvent::State {
+                state: "closed".into(),
+            });
+        }
     });
 
     Ok(SessionHandle {
@@ -97,4 +170,103 @@ pub fn spawn(
         master: Some(Arc::new(Mutex::new(pair.master))),
         child: Some(Arc::new(Mutex::new(child))),
     })
+}
+
+/// 解一行 herdr observe 的输出：`{"bytes":"<base64>"}` → 原始字节。
+///
+/// 返回 `Err(())` 表示"这行不是 observe 的数据帧"（调用方会原样转发）。
+/// 把新收到的一片字节喂进行缓冲，返回**可以立刻转发**的若干段：
+/// 每条完整的行要么解成原始字节（数据帧），要么原样带过（不是 JSON 的错误文本）。
+///
+/// 为什么单独抽出来：herdr 的流是**按行**的 JSON，而 socket 读到的分片**不保证**落在
+/// 行边界上 —— 一条 JSON 可能被切成两片（甚至跨三片）。这种"粘包/半包"必须自己缓冲，
+/// 否则会出现"偶尔花屏/断片"，而且多半在网速慢的时候才复现（最难查的那一类 bug）。
+pub fn push_observe_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<Vec<u8>> {
+    pending.extend_from_slice(chunk);
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = pending.drain(..=pos).collect();
+        let text = String::from_utf8_lossy(&line).to_string();
+        match decode_observe_line(&text) {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    out.push(bytes);
+                }
+            }
+            // 不是 JSON 行（远端自己打了句错误、或者 herdr 直接写非 JSON 的东西）：
+            // **原样放过去**，让用户看得见，总比"什么都不显示"强。
+            Err(()) => out.push(line),
+        }
+    }
+    out
+}
+
+fn decode_observe_line(line: &str) -> Result<Vec<u8>, ()> {
+    let t = line.trim();
+    if !t.starts_with('{') {
+        return Err(());
+    }
+    let v: serde_json::Value = serde_json::from_str(t).map_err(|_| ())?;
+    let b = v.get("bytes").and_then(|x| x.as_str()).ok_or(())?;
+    if b.is_empty() {
+        return Ok(Vec::new());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(b.as_bytes())
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn observe_line_decodes_base64_payload() {
+        let raw = b"\x1b[31mhello\x1b[0m\r\n";
+        let json = format!(
+            "{{\"bytes\":\"{}\"}}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        );
+        assert_eq!(decode_observe_line(&json).unwrap(), raw);
+    }
+
+    #[test]
+    fn observe_line_passes_through_non_json() {
+        assert!(decode_observe_line("herdr: something went wrong").is_err());
+        assert!(decode_observe_line("{\"other\":1}").is_err());
+    }
+
+    #[test]
+    fn observe_stream_survives_split_across_reads() {
+        // 一条 JSON 被切成三片喂进来 —— 这正是网速慢时会发生的情况
+        let frame = format!(
+            "{{\"bytes\":\"{}\"}}\n",
+            base64::engine::general_purpose::STANDARD.encode(b"HELLO\r\n")
+        );
+        let bytes = frame.as_bytes();
+        let mut pending = Vec::new();
+        assert!(push_observe_bytes(&mut pending, &bytes[..5]).is_empty());
+        assert!(push_observe_bytes(&mut pending, &bytes[5..11]).is_empty());
+        let got = push_observe_bytes(&mut pending, &bytes[11..]);
+        assert_eq!(got, vec![b"HELLO\r\n".to_vec()]);
+        assert!(pending.is_empty(), "完整行解完之后不该留东西");
+
+        // 一片里塞两行半：前两行要立刻出来，剩下的半行留着
+        let two = format!(
+            "{{\"bytes\":\"{}\"}}\n{{\"bytes\":\"{}\"}}\n{{\"bytes\":",
+            base64::engine::general_purpose::STANDARD.encode(b"AA"),
+            base64::engine::general_purpose::STANDARD.encode(b"BB")
+        );
+        let mut p2 = Vec::new();
+        let got2 = push_observe_bytes(&mut p2, two.as_bytes());
+        assert_eq!(got2, vec![b"AA".to_vec(), b"BB".to_vec()]);
+        assert!(!p2.is_empty(), "半截行必须留在缓冲里");
+        // 非 JSON 的错误文本要原样带出去（否则用户什么都看不到）
+        let mut p3 = Vec::new();
+        assert_eq!(
+            push_observe_bytes(&mut p3, b"herdr: boom\n"),
+            vec![b"herdr: boom\n".to_vec()]
+        );
+    }
 }

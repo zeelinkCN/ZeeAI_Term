@@ -27,6 +27,11 @@ import {
   aiTimelineClear,
   aiTimelineList,
   aiSourceProbe,
+  herdrAgents,
+  herdrInstall,
+  herdrPaneInputStart,
+  herdrPaneKey,
+  herdrPaneType,
   isAdmin,
   openAdminShell,
   restartAsAdmin,
@@ -98,9 +103,10 @@ import type {
   AiProbe,
   AiSessionSnapshot,
   AiArtifact,
+  AiTask,
+  HerdrAgent,
   AiTurnRecord,
   AiSourceInfo,
-  AiTask,
   AppSettings,
   ConnectionProfile,
   GitBranch,
@@ -160,6 +166,11 @@ interface OpenSession {
   user?: string;
   tmuxName?: string;
   tmuxMode?: "default" | "none" | "name";
+  /**
+   * herdr 观察窗：这个标签页看的是哪个窗格（形如 w1:p1）。
+   * 有它就说明这是"只看不跑 TUI"的观察窗（见 core/herdr.rs 顶部说明）。
+   */
+  herdrPane?: string;
   /** 终端当前工作目录（OSC 7 或 tmux 上报） */
   cwd?: string;
   /** 正在记录终端日志时的文件路径（没记录就是 undefined） */
@@ -243,12 +254,65 @@ function aiSourceLabel(src: string): string {
   switch (src) {
     case "app":
       return "App 启动（最准）";
+    case "herdr":
+      return "herdr 状态";
     case "tmux":
       return "tmux 窗格";
     case "winproc":
       return "Windows 进程表";
     default:
       return "ps 扫描";
+  }
+}
+
+/**
+ * 信号源的"可信度"排序，合并同一张卡时用。
+ * App 自己启动的最准（开始时间/结束都是自己记的）；herdr 次之（它真在管这个 agent，
+ * 能给 working/blocked）；再往下是 tmux 窗格和裸进程表。
+ */
+function srcRank(src: string): number {
+  if (src === "app") return 3;
+  if (src === "herdr") return 2;
+  if (src === "tmux") return 1;
+  return 0;
+}
+
+/** 把 herdr 的一个 agent 映射成看板卡片（时长/pid 拿不到，就留空 —— 不编） */
+function herdrAgentToTask(a: HerdrAgent, server: string, profileId: string): AiTask {
+  return {
+    id: `herdr|${server}|${a.paneId}`,
+    env: "remote",
+    server,
+    tool: a.kind || "ai",
+    command: "",
+    cwd: a.cwd,
+    pane: a.paneId,
+    source: "herdr",
+    state: a.status === "working" ? "running" : "done",
+    durationMs: 0,
+    pid: 0,
+    startedAt: null,
+    exitCode: null,
+    herdrPane: a.paneId,
+    herdrProfileId: profileId,
+    agentStatus: a.status,
+    attention: a.attention,
+  };
+}
+
+/** herdr 的状态 → 卡片上那句中文（blocked 是"等你处理"，不是"跑完了"） */
+function herdrStateLabel(status: string): string {
+  switch (status) {
+    case "working":
+      return "运行中";
+    case "blocked":
+      return "等你处理";
+    case "done":
+      return "已完成";
+    case "idle":
+      return "空闲";
+    default:
+      return "状态未知";
   }
 }
 
@@ -641,8 +705,6 @@ export default function App() {
   const [newDialog, setNewDialog] = useState<{
     profileId: string;
     useTmux: boolean;
-    /** 用 herdr 代替 tmux（只在探测到这台机器有可用 herdr 时才可勾） */
-    useHerdr: boolean;
     tmuxKind: "new" | "attach";
     tmuxName: string;
     attachTarget: string;
@@ -710,6 +772,45 @@ export default function App() {
   const aiSourceCache = useRef<Map<string, AiSourceInfo>>(new Map());
   /** 各服务器有没有可用的 herdr（「新建会话」里据此决定 herdr 能不能勾） */
   const [herdrAvail, setHerdrAvail] = useState<Record<string, AiSourceInfo | null>>({});
+  /**
+   * `herdrAvail` 的 ref 镜像。
+   *
+   * 为什么必须有：`refreshBoard` 是"定时器里跑起来的长流程"，它读到的是**那一次渲染的闭包**。
+   * 只用 state 的话，探针刚回来的结果它看不见 —— 于是会**反复**去探、反复排队重刷
+   * （我第一版就是这样，直接把界面刷成死循环；无头测试当场抓住了）。
+   * 探测/缓存/安装都同时更新这份 ref，读的人永远看到最新值。
+   */
+  const herdrAvailRef = useRef<Record<string, AiSourceInfo | null>>({});
+  /** 「正在探这台机器」也要用 ref —— 同上，闭包里的 state 会是旧值 */
+  const probingHerdrRef = useRef<Record<string, boolean>>({});
+
+  /** 记下某台机器的 herdr 探测结果（state 给界面，ref 给异步流程读） */
+  function rememberHerdrAvail(profileId: string, info: AiSourceInfo | null) {
+    herdrAvailRef.current = { ...herdrAvailRef.current, [profileId]: info };
+    setHerdrAvail((m) => ({ ...m, [profileId]: info }));
+  }
+
+  /**
+   * 写会话历史列表时的**唯一入口**。
+   *
+   * 为什么不让调用方直接 `setHistory(x)`：侧栏渲染里有 `history.filter(...)`，
+   * 一旦某次拿到的是空值，**整个界面会白屏**（不是侧栏局部出错，是 React 整棵树崩）。
+   * 这个坑是真被无头功能测试逼出来的：假后端少实现一个 `history_save` 就复现了。
+   * 所以这里统一挡一道：不是数组就保留旧列表，宁可少一条记录，也不能把界面打崩。
+   */
+  function applyHistory(next: unknown) {
+    if (Array.isArray(next)) {
+      setHistory(next as HistoryEntry[]);
+    }
+  }
+  /** 已经建好输入通道的观察窗会话（一个会话只建一次；断了会从这里删掉再重连） */
+  const herdrInputs = useRef<Set<string>>(new Set());
+  /** 已经为哪些"herdr 在等人"的窗格提醒过（离开 blocked 之后再进会重新提醒） */
+  const herdrNotified = useRef<Set<string>>(new Set());
+  /** 「探到 herdr 之后要不要再刷一次看板」的排队标记（见 refreshBoard 的 finally） */
+  const boardRefreshQueued = useRef(false);
+  /** 正在安装 herdr 的服务器（防重复点击；同时给界面显示"进行到哪一步"） */
+  const [herdrInstalling, setHerdrInstalling] = useState<Record<string, string>>({});
   /** 正在探的服务器（避免"打开对话框"和"切服务器"同时发起两次探测） */
   const [probingHerdr, setProbingHerdr] = useState<Record<string, boolean>>({});
   const newDialogHerdr = newDialog ? herdrAvail[newDialog.profileId] : undefined;
@@ -1005,6 +1106,30 @@ export default function App() {
           jobs.push(
             aiTasksRemote(s.profileId, boardEnvOf(s).server, s.user ?? null).catch(() => []),
           );
+          // herdr 是"第一手"状态源：装了它的机器上，`agent list` 能给出 working / blocked
+          // 这种我们扫进程拿不到的判定，还能直接定位到窗格（点卡片就能开观察窗）。
+          // 没装（或还没探过）就照旧只看 ps/tmux 那两条路 —— 探测结果按服务器缓存，不会反复 ssh。
+          const src = herdrAvailRef.current[s.profileId];
+          if (src === undefined) {
+            // 第一次遇到这台机器：探测是异步的，这一轮看板还拿不到 herdr 的 agent。
+            // 探完再补刷一次，不然用户要盯着"暂无运行中的 AI"等下一个 20 秒周期。
+            const pid0 = s.profileId;
+            void probeHerdrFor(s.profileId, s.user).then(() => {
+              // 只有"这一次真的把结果拿到了"才补刷；否则（比如同一台机器已经在探）
+              // 交给那个在飞的探针去收尾，免得两边互相触发、把看板刷成死循环。
+              if (herdrAvailRef.current[pid0] !== undefined) {
+                boardRefreshQueued.current = true;
+              }
+            });
+          } else if (src && src.herdrVersion && src.compat !== "too_old") {
+            const server = boardEnvOf(s).server;
+            const pid = s.profileId; // 闭包里 TS 认不出上面的非空收窄，这里钉一下
+            jobs.push(
+              herdrAgents(pid, s.user ?? null)
+                .then((list) => list.map((a) => herdrAgentToTask(a, server, pid)))
+                .catch(() => []),
+            );
+          }
         } else if (s.kind === "powershell" || s.kind === "wsl" || s.kind === "cmd") {
           // 每种本地终端只扫一次（多开几个 PowerShell 没必要扫好几遍进程表）
           if (seenLocal.has(s.kind)) continue;
@@ -1033,15 +1158,38 @@ export default function App() {
           continue;
         }
         const better =
-          (!hit.pane && !!t.pane) ||
-          (hit.source !== "app" && t.source === "app") ||
-          (hit.source === t.source && hit.durationMs < t.durationMs);
+          srcRank(t.source) > srcRank(hit.source) ||
+          (srcRank(t.source) === srcRank(hit.source) &&
+            ((!hit.pane && !!t.pane) || hit.durationMs < t.durationMs));
         if (better) Object.assign(hit, t);
       }
       setBoardTasks(merged);
       boardTasksRef.current = merged;
+      // herdr 说"有人在等你"：这是最值钱的一路信号（我们自己的进程扫描永远拿不到）。
+      // 同一张卡"进入 blocked"只提醒一次；它离开 blocked 之后再进会重新提醒。
+      const waiting = new Set<string>();
+      for (const t of merged) {
+        if (!t.attention || !t.herdrPane) continue;
+        const key = `${t.herdrProfileId ?? ""}|${t.herdrPane}`;
+        waiting.add(key);
+        if (herdrNotified.current.has(key)) continue;
+        herdrNotified.current.add(key);
+        raiseAiAttention(
+          `「${t.server}」的 ${aiToolLabel(t.tool)} 在等你处理${t.cwd ? `（${t.cwd}）` : ""}` +
+            `${t.herdrProfileId ? " · 可点「查看窗格」" : ""}`,
+          "",
+        );
+      }
+      for (const k of Array.from(herdrNotified.current)) {
+        if (!waiting.has(k)) herdrNotified.current.delete(k);
+      }
     } finally {
       boardBusy.current = false;
+      // 这一轮里"探测 herdr 完事"是异步回来的：等当前这轮真的结束再补刷，避免互相顶掉
+      if (boardRefreshQueued.current) {
+        boardRefreshQueued.current = false;
+        void refreshBoard();
+      }
     }
   }
 
@@ -1090,6 +1238,8 @@ export default function App() {
       const info = await aiSourceProbe(cur.profileId ?? null, cur.user ?? null);
       aiSourceCache.current.set(key, info);
       setAiSource(info);
+      // 顺手同步给"看板那份"：面板顶上的来源和卡片上的 herdr 状态应该是同一份事实
+      if (cur.profileId) rememberHerdrAvail(cur.profileId, info);
       // 强制重探时给一句回执 —— 否则结果和上次一样，用户会以为"点了没反应"（实测反馈）
       if (force) {
         notify(
@@ -1101,6 +1251,7 @@ export default function App() {
     } catch {
       // 探不到就当"没有 herdr"处理：看板会显示来源不明确，但功能照旧
       setAiSource(null);
+      if (cur.profileId) rememberHerdrAvail(cur.profileId, null);
       if (force) notify("探测 herdr 失败，已按「没有 herdr」处理");
     } finally {
       setAiSourceProbing(false);
@@ -1116,19 +1267,118 @@ export default function App() {
   async function probeHerdrFor(profileId: string, user?: string | null) {
     const cached = aiSourceCache.current.get(profileId);
     if (cached) {
-      setHerdrAvail((m) => ({ ...m, [profileId]: cached }));
+      rememberHerdrAvail(profileId, cached);
       return;
     }
-    if (probingHerdr[profileId]) return; // 已经在探了，别重复 ssh
+    if (probingHerdrRef.current[profileId]) return; // 已经在探了，别重复 ssh
+    probingHerdrRef.current = { ...probingHerdrRef.current, [profileId]: true };
     setProbingHerdr((m) => ({ ...m, [profileId]: true }));
     try {
       const info = await aiSourceProbe(profileId, user ?? null);
       aiSourceCache.current.set(profileId, info);
-      setHerdrAvail((m) => ({ ...m, [profileId]: info }));
+      rememberHerdrAvail(profileId, info);
     } catch {
-      setHerdrAvail((m) => ({ ...m, [profileId]: null }));
+      rememberHerdrAvail(profileId, null);
     } finally {
+      probingHerdrRef.current = { ...probingHerdrRef.current, [profileId]: false };
       setProbingHerdr((m) => ({ ...m, [profileId]: false }));
+    }
+  }
+
+  /**
+   * 给一个 herdr 观察窗建输入通道（同一个会话只建一次；失败会记录下来下次重试）。
+   *
+   * 为什么输入要单独一条通道：观察窗的"输出"是 herdr 的只读流，那条 PTY 不能写；
+   * 按键得由 herdr 自己去敲（`pane send-text` / `pane send-keys`），所以后端常驻一条
+   * ssh 专门收指令（见 commands.rs::herdr_pane_input_start）。
+   */
+  async function ensureHerdrInput(
+    id: string,
+    profileId: string,
+    user: string | null,
+    paneId: string,
+  ) {
+    if (herdrInputs.current.has(id)) return;
+    herdrInputs.current.add(id);
+    try {
+      await herdrPaneInputStart(id, profileId, user, paneId);
+    } catch (e) {
+      herdrInputs.current.delete(id);
+      notify("观察窗的输入通道没建起来：" + String(e));
+    }
+  }
+
+  /**
+   * 打开一个 herdr 观察窗（只看某个窗格）。
+   *
+   * 为什么不是"attach 她的 TUI"：TUI 退出时会把终端留在花屏状态，而且它自己会跟别的
+   * 客户端抢窗格尺寸（用户截图里那两件事）。observe 是只读流，不抢键盘也不抢尺寸。
+   */
+  async function openHerdrPane(
+    profileId: string,
+    paneId: string,
+    label?: string,
+    userOverride?: string | null,
+  ) {
+    const profile = profiles.find((p) => p.id === profileId);
+    if (!profile) {
+      notify("这台服务器的配置已经不在了");
+      return;
+    }
+    const user = userOverride ?? profile.ssh?.user ?? null;
+    // 标题里带上窗格号：同一台机器上开了两个 codex 时，光看"lz · codex"分不清点的是哪个
+    const title = `${profile.name} · ${(label ?? "").trim() || "herdr"} ${paneId}`;
+    const id = await openSshSession(
+      profile,
+      "name",
+      paneId,
+      user,
+      title,
+      null,
+      "herdr-pane",
+      paneId,
+    );
+    await ensureHerdrInput(id, profileId, user, paneId);
+  }
+
+  /**
+   * 一键安装 herdr（Windows 侧下载 → 校验 sha256 → scp 到 ~/.local/bin）。
+   *
+   * 为什么由我们下载再传：服务器上直连 GitHub 经常只有十几 KB/s（官方 install.sh 的
+   * 10 秒超时必然失败，用户手动装就是这么失败的）；而 herdr.dev 和镜像在国内都快得多。
+   * 不管走哪条路，都拿**官方清单里的 sha256** 校验，对不上就删掉重来 —— 来源可以换，字节不能换。
+   */
+  async function installHerdrFor(profileId: string, user?: string | null) {
+    const profile = profiles.find((p) => p.id === profileId);
+    if (!profile) return;
+    if (herdrInstalling[profileId]) {
+      notify("这台服务器正在装 herdr，别急");
+      return;
+    }
+    setHerdrInstalling((m) => ({ ...m, [profileId]: "准备中…" }));
+    try {
+      const rep = await herdrInstall(profileId, user ?? null, (s) =>
+        setHerdrInstalling((m) => ({ ...m, [profileId]: s })),
+      );
+      notify(
+        `herdr 装好了：v${rep.version}（协议 ${rep.protocol}）来自 ${rep.source}，sha256 已核对`,
+      );
+      // 重新探一次，让「新建会话」里那个勾和看板的来源标注立刻变成可用
+      aiSourceCache.current.delete(profileId);
+      const info = await aiSourceProbe(profileId, user ?? null).catch(() => null);
+      if (info) {
+        aiSourceCache.current.set(profileId, info);
+        rememberHerdrAvail(profileId, info);
+        setAiSource((cur) => (cur === null ? info : cur));
+      }
+    } catch (e) {
+      notify("安装 herdr 失败：" + String(e));
+    } finally {
+      setHerdrInstalling((m) => {
+        const next = { ...m };
+        delete next[profileId];
+        return next;
+      });
     }
   }
 
@@ -1341,26 +1591,31 @@ export default function App() {
         if (list.length === 0 && watching) return; // 没产物 + 你正看着 → 不打扰
         const extra = list.length > 0 ? `（产出 ${list.length} 个文件，卡片下面可点开）` : "";
         raiseAiAttention(
-          cur,
           `「${cur.title}」有新消息${extra}：${aiShorten(snap.lastMessage, 60)}`,
+          cur.id,
         );
       });
       return;
     }
     if (watching && !needsMe) return;
     raiseAiAttention(
-      cur,
       snap.state === "needs-approval"
         ? `「${cur.title}」等你批准：${snap.lastAction}`
         : `「${cur.title}」等你回话`,
+      cur.id,
     );
   }
 
-  /** 提醒用户：红点（总会）+ 状态栏一行 + 按设置闪任务栏 / 右下角提示 */
-  function raiseAiAttention(cur: OpenSession, text: string) {
+  /**
+   * 提醒用户：红点（总会）+ 状态栏一行 + 按设置闪任务栏 / 右下角提示。
+   *
+   * `sessionId` 只是"点这条告警要切到哪个标签页"（没有就传空串）——
+   * herdr 报上来的"有人在等你"未必对应我们本地开着哪个标签页。
+   */
+  function raiseAiAttention(text: string, sessionId: string) {
     setAiUnread((n) => n + 1);
     setAiAlerts((prev) =>
-      [{ id: uid(), text, sessionId: cur.id, time: Date.now() }, ...prev].slice(0, 5),
+      [{ id: uid(), text, sessionId, time: Date.now() }, ...prev].slice(0, 5),
     );
     notify(text);
     if (settingsRef.current.aiNotifyTaskbar && !document.hasFocus()) {
@@ -1754,7 +2009,7 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
-        setHistory(await historyList());
+        applyHistory(await historyList());
       } catch {
         /* 历史读取失败不影响主流程 */
       }
@@ -2136,7 +2391,9 @@ export default function App() {
     /** 这次会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
     highlightSetId?: string | null,
     /** 会话后端：tmux（默认）/ herdr */
-    backend?: "tmux" | "herdr",
+    backend?: "tmux" | "herdr" | "herdr-pane",
+    /** herdr 观察窗要看哪个窗格（backend = "herdr-pane" 时必填） */
+    herdrPane?: string,
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
@@ -2175,6 +2432,8 @@ export default function App() {
         : explicitName ?? defaultTmuxName(profile, userOverride ?? undefined);
     const alreadyOpen = sessionsRef.current.find((s) => {
       if (s.profileId !== profile.id) return false;
+      // herdr 观察窗：同一个窗格只开一个 —— 开两个也是看同一份画面，纯属浪费
+      if (backend === "herdr-pane") return s.herdrPane === herdrPane;
       if (wantedTmux) return s.tmuxName === wantedTmux;
       // 普通 shell：只有"名字完全相同"才算同一个（自动编号的名字不会撞，所以不受影响）
       return !s.tmuxName && (s.title ?? "").trim() === title.trim();
@@ -2182,7 +2441,9 @@ export default function App() {
     if (alreadyOpen) {
       setActiveId(alreadyOpen.id);
       notify(
-        `「${alreadyOpen.title}」已经开着了，直接帮你切过去（同一会话开两个客户端会把画面挤变形）`,
+        backend === "herdr-pane"
+          ? `「${alreadyOpen.title}」的观察窗已经开着了，直接切过去`
+          : `「${alreadyOpen.title}」已经开着了，直接帮你切过去（同一会话开两个客户端会把画面挤变形）`,
       );
       return alreadyOpen.id;
     }
@@ -2193,7 +2454,9 @@ export default function App() {
       kind: "remote",
       profileId: profile.id,
       user: userOverride ?? profile.ssh?.user,
-      tmuxName: explicitName ?? undefined,
+      // 观察窗的"名字"是 herdr 窗格号，不记进 tmuxName（那个字段是给 tmux 面板用的）
+      tmuxName: backend === "herdr-pane" ? undefined : explicitName ?? undefined,
+      herdrPane: backend === "herdr-pane" ? herdrPane : undefined,
       tmuxMode,
       highlightSetId: highlightSetId ?? null,
       state: "connecting",
@@ -2206,8 +2469,9 @@ export default function App() {
         id,
         profile.id,
         (e) => handleEvent(id, e),
-        tmuxMode,
-        tmuxName ?? null,
+        // 观察窗靠 tmuxName 这个参数把窗格号带给后端（后端拿它当 pane id 用）
+        backend === "herdr-pane" ? "name" : tmuxMode,
+        backend === "herdr-pane" ? herdrPane ?? null : tmuxName ?? null,
         undefined,
         undefined,
         userOverride ?? null,
@@ -2240,7 +2504,7 @@ export default function App() {
       // 记录到会话历史（可在设置里关闭，也可在侧栏里逐条删除）
       if (settings.recordHistory) {
         try {
-          setHistory(
+          applyHistory(
             await historySave({
               id: "",
               profileId: profile.id,
@@ -2268,6 +2532,8 @@ export default function App() {
   async function closeSession(id: string) {
     // 关标签时顺手清掉拖动状态
     setDragTabId(null);
+    // 观察窗的输入通道跟着会话一起收（后端会把那条常驻 ssh 的 stdin 关掉）
+    herdrInputs.current.delete(id);
     // 先记下它在标签栏里的位置，关掉之后要顶上来一个
     const list = sessionsRef.current;
     const idx = list.findIndex((s) => s.id === id);
@@ -2660,7 +2926,6 @@ export default function App() {
     setNewDialog({
       profileId: target.id,
       useTmux,
-      useHerdr: false,
       tmuxKind: "new",
       tmuxName: defaultTmuxName(target),
       attachTarget: "",
@@ -2712,7 +2977,6 @@ export default function App() {
           userOverride,
           wantedTitle || null,
           newDialog.highlightSetId,
-          newDialog.useHerdr ? "herdr" : "tmux",
         );
       } else {
         await openSshSession(
@@ -2763,7 +3027,7 @@ export default function App() {
 
   async function removeHistoryEntry(id: string) {
     try {
-      setHistory(await historyRemove(id));
+      applyHistory(await historyRemove(id));
     } catch (e) {
       notify("删除历史失败：" + String(e));
     }
@@ -4003,7 +4267,7 @@ export default function App() {
     }
     const p = profiles.find((x) => x.id === s.profileId);
     try {
-      setHistory(
+      applyHistory(
         await historySave({
           id: "",
           profileId: s.profileId,
@@ -5532,6 +5796,15 @@ export default function App() {
                             }
                             onNotice={notify}
                             onZoom={bumpFont}
+                            herdrPane={ps.herdrPane ? { paneId: ps.herdrPane } : undefined}
+                            onHerdrInputNeeded={() =>
+                              void ensureHerdrInput(
+                                ps.id,
+                                ps.profileId ?? "",
+                                ps.user ?? null,
+                                ps.herdrPane ?? "",
+                              )
+                            }
                           />
                         ) : (
                           <div className="pane-empty">
@@ -5588,6 +5861,15 @@ export default function App() {
                     }
                     onNotice={notify}
                     onZoom={bumpFont}
+                    herdrPane={s.herdrPane ? { paneId: s.herdrPane } : undefined}
+                    onHerdrInputNeeded={() =>
+                      void ensureHerdrInput(
+                        s.id,
+                        s.profileId ?? "",
+                        s.user ?? null,
+                        s.herdrPane ?? "",
+                      )
+                    }
                   />
                 </div>
               ))
@@ -5657,6 +5939,28 @@ export default function App() {
                   : "状态来源：本机探测（这台机器没装 herdr）"}
               </div>
             ) : null}
+            {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
+                scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
+            {aiSource && !aiSource.herdrVersion && activeSession?.profileId ? (
+              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
+                {herdrInstalling[activeSession.profileId] ? (
+                  <span className="hint">
+                    正在装 herdr：{herdrInstalling[activeSession.profileId]}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    title="从 herdr.dev 拿官方版本号与 sha256，在 Windows 侧下载并校验后上传到 ~/.local/bin/herdr（不需要 root）"
+                    onClick={() =>
+                      void installHerdrFor(activeSession.profileId ?? "", activeSession.user ?? null)
+                    }
+                  >
+                    一键安装 herdr
+                  </button>
+                )}
+              </div>
+            ) : null}
             <div className="ai-section">
               AI 任务看板
               <button
@@ -5683,15 +5987,20 @@ export default function App() {
                   // 进程还活着但这一轮说完了 ≠ 任务结束 —— 分开说，别让看板自相矛盾
                   const processAlive = t.state === "running";
                   const label =
-                    state === "needs-approval"
-                      ? "等你批准"
-                      : state === "waiting-user"
-                        ? "等你回话"
-                        : state === "running"
-                          ? "运行中"
-                          : processAlive
-                            ? "这一轮完成"
-                            : "已结束";
+                    // herdr 那边认出来的状态优先（它是第一手：working / blocked / done / idle）
+                    t.agentStatus
+                      ? herdrStateLabel(t.agentStatus)
+                      : state === "needs-approval"
+                        ? "等你批准"
+                        : state === "waiting-user"
+                          ? "等你回话"
+                          : state === "running"
+                            ? "运行中"
+                            : processAlive
+                              ? "这一轮完成"
+                              : "已结束";
+                  // "等你处理"要显眼：红点 + 卡片红边（她的 blocked = 在等人批准/回话）
+                  const attention = !!t.attention || state === "needs-approval";
                   const project = dirBase(t.cwd || snap?.cwd || "");
                   const usage = snap?.usage;
                   const pct =
@@ -5699,9 +6008,16 @@ export default function App() {
                       ? Math.min(100, Math.round((usage.total / usage.contextWindow) * 100))
                       : 0;
                   return (
-                    <div className={"ai-task " + state} key={t.id}>
+                    <div
+                      className={"ai-task " + (attention ? "needs-approval" : state)}
+                      key={t.id}
+                    >
                       <div className="ai-task-line">
-                        <span className={"dot " + (state === "running" ? "ok" : "idle")} />
+                        <span
+                          className={
+                            "dot " + (attention ? "warn" : state === "running" ? "ok" : "idle")
+                          }
+                        />
                         <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
                         <span className="ai-tag">{aiEnvLabel(t.env)}</span>
                         <span className={"ai-state " + state}>{label}</span>
@@ -5745,6 +6061,26 @@ export default function App() {
                       >
                         耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
                       </div>
+                      {/* herdr 卡片能直接开观察窗：只看那个窗格的实时画面，不抢它的尺寸、
+                          也不会像 attach TUI 那样退出时花屏（见 core/herdr.rs 顶部说明） */}
+                      {t.herdrPane ? (
+                        <div className="ai-task-actions">
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() =>
+                              void openHerdrPane(
+                                t.herdrProfileId ?? "",
+                                t.herdrPane ?? "",
+                                t.tool,
+                              )
+                            }
+                            title="开一个只读观察窗（不会影响窗格本身的尺寸）"
+                          >
+                            查看窗格
+                          </button>
+                        </div>
+                      ) : null}
                       {/* 这一轮产出的文件：点一下直接看（远端走应用内预览，本地用资源管理器） */}
                       {snap && aiArtifacts.length > 0 && activeSession ? (
                         <div className="ai-artifacts">
@@ -7779,9 +8115,14 @@ export default function App() {
                 <span>使用 tmux（断网后可回到同一个会话）</span>
               </label>
 
-              {/* herdr 后端：这台机器探测到有可用 herdr 才允许勾（不偷偷装、不猜） */}
-              <label
+              {/* herdr 不在这里"代替 tmux"了。
+                  以前那个勾是直接跑 herdr 自己的界面，问题有两个：它退出时会把终端留在花屏状态；
+                  它自己还会跟别的客户端抢窗格尺寸。现在 herdr 的位置是：
+                    1) AI 看板的状态来源（working / blocked 这些第一手判定）；
+                    2) 看板上每张卡片可以直接「查看窗格」——只读观察窗，不抢键盘也不抢尺寸。 */}
+              <div
                 className="form-check"
+                style={{ cursor: "default" }}
                 onClick={() => {
                   // 还没探过（例如刚切过来）就先探；已经探过就不用管
                   if (newDialogHerdr === undefined) {
@@ -7795,26 +8136,41 @@ export default function App() {
                       ? probingHerdr[newDialog.profileId]
                         ? "正在探测这台机器有没有 herdr…"
                         : "还没探测这台机器。点一下这行即可探测。"
-                      : "这台机器上没有可用的 herdr。它只是「更准的一路信号」，没有也能正常用 tmux 或普通 shell。"
+                      : "这台机器上没有 herdr。没有它也能正常用 tmux 或普通 shell，只是看板少一路更准的状态。"
                 }
               >
-                <input
-                  type="checkbox"
-                  checked={newDialog.useHerdr}
-                  disabled={!newDialogCanHerdr}
-                  onChange={(e) => setNewDialog({ ...newDialog, useHerdr: e.target.checked })}
-                />
                 <span>
-                  用 herdr 代替 tmux
-                  {newDialogCanHerdr
-                    ? `（herdr ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
-                    : newDialogHerdr === undefined
-                      ? probingHerdr[newDialog.profileId]
-                        ? "（探测中…）"
-                        : "（未探测 · 点这行探测）"
-                      : "（这台机器没装）"}
+                  herdr：
+                  {newDialogHerdr === undefined
+                    ? probingHerdr[newDialog.profileId]
+                      ? "探测中…"
+                      : "未探测（点这行探测）"
+                    : newDialogCanHerdr
+                      ? `已装 ${newDialogHerdr?.herdrVersion}（协议 ${newDialogHerdr?.protocol}）· 可在 AI 面板点「查看窗格」`
+                      : "没装（它只是更准的一路状态，可选）"}
                 </span>
-              </label>
+              </div>
+
+              {/* 探测结果是"没有 herdr"时，顺手给一个一键安装入口。
+                  安装过程由 Windows 侧下载 + 校验 sha256 后 scp 上去，不跑远端脚本、不要 root。 */}
+              {newDialogHerdr !== undefined && !newDialogCanHerdr ? (
+                <div className="modal-inline-action" style={{ paddingLeft: 14 }}>
+                  {herdrInstalling[newDialog.profileId] ? (
+                    <span className="hint">
+                      正在装 herdr：{herdrInstalling[newDialog.profileId]}
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="从 herdr.dev 拿官方版本号与 sha256，Windows 侧下载并校验后上传到 ~/.local/bin/herdr（不需要 root）"
+                      onClick={() => void installHerdrFor(newDialog.profileId, newDialog.user)}
+                    >
+                      一键安装 herdr
+                    </button>
+                  )}
+                </div>
+              ) : null}
 
               {newDialog.useTmux && (
                 <div className="tmux-choice">

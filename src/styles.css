@@ -1806,6 +1806,24 @@ body {
   background: var(--muted);
 }
 
+/* 「有人在等你」：红点 + 红左边框（和状态栏的告警同一个色系，一眼能对上） */
+.dot.warn {
+  background: var(--red);
+  box-shadow: 0 0 0 2px rgba(205, 49, 49, 0.25);
+}
+
+.ai-task.needs-approval {
+  border-left-color: var(--red);
+  background: rgba(205, 49, 49, 0.08);
+}
+
+/* 卡片上的操作按钮（目前只有「查看窗格」）：和上面的信息行留一点距离 */
+.ai-task-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 5px;
+}
+
 .form-check {
   display: flex;
   align-items: center;
