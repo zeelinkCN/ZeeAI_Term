@@ -115,6 +115,26 @@ pub fn ssh_args(
     args
 }
 
+/// 和 [`ssh_args`] 一样，但**不申请远端 PTY**（不带 `-tt`）。
+///
+/// 给谁用：herdr 的终端流（观察窗 / 可写控制流）。那条协议是"行分隔 JSON"，
+/// 不需要任何终端语义；反而 **申请 PTY 会坏事** —— 远端会做回显/换行转换，
+/// 而本地这边我们也不走 ConPTY（原因见 core::herdr_stream 顶部）。
+pub fn ssh_args_no_tty(
+    host: &str,
+    port: u16,
+    user: &str,
+    key_path: Option<&str>,
+    remote_cmd: &str,
+    jump: Option<&str>,
+) -> Vec<String> {
+    ssh_args(host, port, user, key_path, Some(remote_cmd), true, jump)
+        .into_iter()
+        // ssh_args 固定把 -tt 放在第一位，这里只去掉它
+        .filter(|a| a != "-tt")
+        .collect()
+}
+
 /// tmux 的会话名不允许包含 `.` `:` 等字符，这里统一替换成 `-`。
 fn sanitize(name: &str) -> String {
     name.chars()

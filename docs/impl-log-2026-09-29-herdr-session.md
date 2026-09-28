@@ -174,3 +174,56 @@
   （"先装 PowerShell 7 再用这个按钮"），而不是甩一句 `spawn failed`。
 - pwsh 会话在侧栏里**归到 PowerShell 面板**（kind 仍是 powershell），
   但标题/编号按各自的口味分开算（"PowerShell 7"、"PowerShell 7 2"），不会互相串号。
+
+## 7. "herdr 会话黑屏"的根因：**不能走 ConPTY**（同日第四轮）
+
+用户连续开了两个 herdr 窗格，都是**黑屏没有反应**。
+
+### 怎么定位的
+
+先做对照，把范围缩到"本地这一段"：
+
+| 实验 | 结果 |
+|---|---|
+| Windows 侧 `ssh -tt lz "…terminal session control wN:p1…"` 直接写进文件 | ✅ 9738 字节，帧正常 |
+| 服务器侧 `script -qc "…control…"`（远端有 PTY） | ✅ 帧正常 |
+| 服务器侧不带 PTY 跑 | ✅ 帧正常 |
+| **用应用自己的本地路径**（`pty::spawn_with_sink` + `ssh -tt`） | ❌ **0 字节** |
+| 同上但去掉 `-tt` | ❌ 还是 0 字节 |
+| 同上但换成"本地 cmd echo" | ❌ 只收到 4 字节：`ESC[6n` |
+
+最后一行是决定性的：那 4 字节是 **ConPTY 的"光标在哪"终端握手**，必须由终端回答。
+而我们的 herdr 过滤器**只认"整行 JSON"**，把这 4 个没有换行的字节当"半行"缓冲住了 →
+xterm 永远收不到 → 无法回答 → ConPTY 一直等 → **一帧都不出来**（黑屏）。
+普通 ssh/tmux 会话不受影响，因为那些走 `Filter::Raw`，字节直接进 xterm、xterm 会回答握手。
+另外 ConPTY 还会把**超长的 JSON 行按控制台宽度折行**，就算握手过了，帧也会坏。
+
+### 怎么修的
+
+新增 `core/herdr_stream.rs`：herdr 的两条流（只读观察 + 可写控制）改成**管道传输**
+（`std::process` + stdin/stdout/stderr 管道，不申请远端 PTY、本地也不过 ConPTY）：
+
+- 没有终端握手 → 不会再被"半行缓冲"卡死；
+- 没有折行 → 超长 JSON 行完好；
+- 不惊动 conhost → 顺带把 6.2 那类 AppHang 也一起躲开；
+- stderr 单独一个线程读回来、作为"状态栏告警"送到前端（以前 herdr 的报错会被丢掉，
+  用户只看到一个空窗口）；
+- 输入/尺寸走同一条 stdin（`terminal.input` / `terminal.resize`），关标签发 `terminal.release`。
+
+`pty.rs` 里那条已证明走不通的 herdr 分支删掉了（解码函数 `push_herdr_bytes` 留着并复用，
+单测也照旧跑）。观察窗的输入泵同样改成管道（不需要 PTY，也不需要回显）。
+
+### 验证
+
+新增 `src-tauri/examples/herdr_probe.rs`：**用应用自己的代码路径**在真机上复现/验证
+（`ZEEAI_PROBE_USER=lz cargo run --example herdr_probe`）。修完的结果：
+
+```
+== 2) 用新的管道传输接管它（herdr_stream，不申请 PTY）
+== 3) 5 秒里本地收到
+   数据事件 1 个，解出来 3574 字节
+   第一帧开头：[?2026h[?25l]8;;\[2J[1;1H[0;39;49m[lz@iZbp13lx01nj91v37nkv2uZ ~]$ …
+== 结论 == 本机能收到帧 → 本地这一段没问题
+```
+
+（同一支复现器在改之前是 `数据事件 0 个，解出来 0 字节`。）

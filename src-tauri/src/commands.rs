@@ -197,32 +197,32 @@ pub fn open_ssh(
         } else {
             herdr::observe_command(&pane, c, r)
         };
-        let args = ssh::ssh_args(
+        // **不申请远端 PTY**、本地也不走 ConPTY（走管道）：
+        // ConPTY 的终端握手会被我们的 JSON 行缓冲吃掉，导致整条流不出一帧（黑屏）；
+        // 而且它还会把超长的 JSON 行按宽度折行。详见 core::herdr_stream 顶部。
+        let args = ssh::ssh_args_no_tty(
             &cfg.host,
             cfg.port,
             &effective_user,
             cfg.key_path.as_deref(),
-            Some(&cmd),
-            !cfg.allow_password,
+            &cmd,
             cfg.jump.as_deref(),
         );
         let title = format!("{} · herdr {}", profile.name, herdr::sanitize_pane(&pane));
         let close_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handle = pty::spawn(
+        let handle = crate::core::herdr_stream::spawn(
             &id,
-            "ssh",
             &title,
             &ssh::ssh_exe(),
             &args,
-            None,
-            c,
-            r,
-            on_event.clone(),
-            logs.inner().clone(),
-            pty::SpawnOpts {
-                filter: pty::Filter::HerdrStream,
-                close_flag: close_flag.clone(),
+            {
+                let ch = on_event.clone();
+                move |ev| {
+                    let _ = ch.send(ev);
+                }
             },
+            logs.inner().clone(),
+            close_flag.clone(),
         )?;
         registry
             .sessions
@@ -2831,39 +2831,33 @@ pub async fn herdr_pane_resize(
 
     // 3) 开一条新的观察者
     let cmd = herdr::observe_command(&pane_id, cols, rows);
-    let args = ssh::ssh_args(
+    let args = ssh::ssh_args_no_tty(
         &cfg.host,
         cfg.port,
         &effective_user,
         cfg.key_path.as_deref(),
-        Some(&cmd),
-        !cfg.allow_password,
+        &cmd,
         cfg.jump.as_deref(),
     );
     let title = format!("herdr {}", herdr::sanitize_pane(&pane_id));
     let new_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 开一个 PTY = 让 conhost 起来，这一步也可能慢 —— 同样挪到阻塞线程
+    // 起进程这一步也可能慢（要握手/认证）→ 一样丢给阻塞线程
     let spawn_id = id.clone();
     let spawn_program = ssh::ssh_exe();
     let spawn_channel = channel.clone();
     let spawn_logs = logs.inner().clone();
     let spawn_flag = new_flag.clone();
     let handle = tokio::task::spawn_blocking(move || {
-        pty::spawn(
+        crate::core::herdr_stream::spawn(
             &spawn_id,
-            "ssh",
             &title,
             &spawn_program,
             &args,
-            None,
-            cols,
-            rows,
-            spawn_channel,
-            spawn_logs,
-            pty::SpawnOpts {
-                filter: pty::Filter::HerdrStream,
-                close_flag: spawn_flag,
+            move |ev| {
+                let _ = spawn_channel.send(ev);
             },
+            spawn_logs,
+            spawn_flag,
         )
     })
     .await
@@ -2911,13 +2905,14 @@ pub fn herdr_pane_input_start(
         );
     }
     let cmd = herdr::input_pump_command(&pane_id);
-    let args = ssh::ssh_args(
+    // 输入泵也不需要 PTY：它只是"按行收指令、按行执行"，管道最干净
+    //（申请 PTY 反而会带来回显和换行转换）。
+    let args = ssh::ssh_args_no_tty(
         &cfg.host,
         cfg.port,
         &effective_user,
         cfg.key_path.as_deref(),
-        Some(&cmd),
-        true,
+        &cmd,
         cfg.jump.as_deref(),
     );
     // 用**标准库**的 Command：它的 ChildStdin 实现了 std::io::Write，
