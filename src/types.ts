@@ -11,6 +11,11 @@ export interface SshConfig {
   jump?: string | null;
   tmuxEnabled: boolean;
   tmuxTemplate: string;
+  /**
+   * 这台服务器的新会话**默认用 herdr 打开**（和 tmuxEnabled 一个性质）。
+   * 勾上之后，新建会话时 herdr 那个勾会**默认打勾**，不再每次问你。
+   */
+  herdrEnabled: boolean;
   startDir?: string;
 }
 
@@ -344,6 +349,17 @@ export interface AppSettings {
   aiNotifyTaskbar: boolean;
   /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */
   aiNotifyBadge: boolean;
+  /**
+   * 通知策略：**每一轮跑完**就提醒。
+   * 默认关 —— 用户原话"跑的小任务太多，每跑一个都弹一条，很烦"。
+   */
+  aiNotifyComplete: boolean;
+  /** 通知策略：这一轮产出了文档（HTML / Markdown）才提醒。默认开 */
+  aiNotifyDocs: boolean;
+  /** 通知策略：AI 在等你（批准 / 回话 / 做选择题）时提醒。默认开（这条最不该漏） */
+  aiNotifyNeedsYou: boolean;
+  /** 产物范围：true = 任何新文件都算；false = 只算 HTML / Markdown 文档（默认） */
+  aiNotifyAllArtifacts: boolean;
 }
 
 export interface GitFile {

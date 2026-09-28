@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
@@ -29,6 +29,7 @@ import {
   aiSourceProbe,
   herdrAgents,
   herdrInstall,
+  herdrWorkspaceCreate,
   herdrPaneInputStart,
   herdrPaneKey,
   herdrPaneType,
@@ -171,6 +172,8 @@ interface OpenSession {
    * 有它就说明这是"只看不跑 TUI"的观察窗（见 core/herdr.rs 顶部说明）。
    */
   herdrPane?: string;
+  /** herdr 窗格的打开方式：observe = 只读观察；control = 可读可写（进她的环境里干活） */
+  herdrMode?: "observe" | "control";
   /** 终端当前工作目录（OSC 7 或 tmux 上报） */
   cwd?: string;
   /** 正在记录终端日志时的文件路径（没记录就是 undefined） */
@@ -331,6 +334,18 @@ function clockText(sec: number): string {
   const d = new Date(sec * 1000);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 这个文件名算不算"要你去看的文档产物"？
+ *
+ * 用户的原话是"我选择只看生成的 HTML 或者 MD 文档"——所以默认口径里，
+ * 只有 HTML / Markdown 才算"值得为它提醒一次"；其它文件（日志、临时脚本、图片…）
+ * 一律不弹（想让它们也触发，去设置里把「产物范围」改成"所有文件"）。
+ */
+function isDocName(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  return n.endsWith(".md") || n.endsWith(".markdown") || n.endsWith(".html") || n.endsWith(".htm");
 }
 
 /** 一行短文本（通知里用）：压成一行并截断 */
@@ -503,6 +518,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
   aiNotifyBadge: true,
+  // 「什么时候才提醒我」的默认口径（和后端 store.rs 保持一致）：
+  // 小任务太多，跑完就弹会很吵 → 默认关；
+  // 真正要人接手的两种（产出了 HTML/MD 文档、AI 在等你做选择题）默认开。
+  aiNotifyComplete: false,
+  aiNotifyDocs: true,
+  aiNotifyNeedsYou: true,
+  aiNotifyAllArtifacts: false,
 };
 
 const APP_VERSION = "0.1.8";
@@ -708,6 +730,12 @@ export default function App() {
     tmuxKind: "new" | "attach";
     tmuxName: string;
     attachTarget: string;
+    /** 用 herdr 打开这次会话（默认值跟着服务器配置走，勾上就直接进她的环境） */
+    useHerdr: boolean;
+    /** herdr：新开一个窗格，还是接管已有的 */
+    herdrKind: "new" | "attach";
+    /** herdr：要接管的窗格号（形如 w1:p1） */
+    herdrTarget: string;
     user: string;
     rememberUser: boolean;
     /** 会话名字（留空 = 自动命名；普通 shell 会自动编号） */
@@ -717,6 +745,8 @@ export default function App() {
   } | null>(null);
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
+  /** 「接管已有 herdr 窗格」时列出来的 agent / 窗格（点一下那个，按需加载） */
+  const [dialogHerdr, setDialogHerdr] = useState<HerdrAgent[]>([]);
 
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -1309,16 +1339,21 @@ export default function App() {
   }
 
   /**
-   * 打开一个 herdr 观察窗（只看某个窗格）。
+   * 打开一个 herdr 窗格会话。
    *
-   * 为什么不是"attach 她的 TUI"：TUI 退出时会把终端留在花屏状态，而且它自己会跟别的
-   * 客户端抢窗格尺寸（用户截图里那两件事）。observe 是只读流，不抢键盘也不抢尺寸。
+   * - `mode = "observe"`（默认）：**只读观察窗**，可多开、不抢键盘也不抢尺寸；
+   * - `mode = "control"`：**可读可写**，等于"进到她的环境里干活"（会接管那个窗格的输入，
+   *   所以后端带 `--takeover`；关标签时会主动交还控制权，窗格本身留在服务器上）。
+   *
+   * 为什么都不是"attach 她的 TUI"：TUI 退出时会把终端留在花屏状态，而且它自己会跟别的
+   * 客户端抢窗格尺寸（用户截图里那两件事）。
    */
   async function openHerdrPane(
     profileId: string,
     paneId: string,
     label?: string,
     userOverride?: string | null,
+    mode: "observe" | "control" = "observe",
   ) {
     const profile = profiles.find((p) => p.id === profileId);
     if (!profile) {
@@ -1326,8 +1361,11 @@ export default function App() {
       return;
     }
     const user = userOverride ?? profile.ssh?.user ?? null;
-    // 标题里带上窗格号：同一台机器上开了两个 codex 时，光看"lz · codex"分不清点的是哪个
-    const title = `${profile.name} · ${(label ?? "").trim() || "herdr"} ${paneId}`;
+    // 标题里带上窗格号：同一台机器上开了两个 codex 时，光看"lz · codex"分不清点的是哪个；
+    // 可写的那条再标一个"接管"，免得跟只读观察窗混起来
+    const title = `${profile.name} · ${(label ?? "").trim() || "herdr"} ${paneId}${
+      mode === "control" ? "（接管）" : ""
+    }`;
     const id = await openSshSession(
       profile,
       "name",
@@ -1335,10 +1373,12 @@ export default function App() {
       user,
       title,
       null,
-      "herdr-pane",
+      mode === "control" ? "herdr-control" : "herdr-pane",
       paneId,
+      mode,
     );
-    await ensureHerdrInput(id, profileId, user, paneId);
+    // 可写那条的输入直接走它自己的流，不需要另建输入泵
+    if (mode === "observe") await ensureHerdrInput(id, profileId, user, paneId);
   }
 
   /**
@@ -1588,15 +1628,44 @@ export default function App() {
           })
           .catch(() => {});
 
-        if (list.length === 0 && watching) return; // 没产物 + 你正看着 → 不打扰
-        const extra = list.length > 0 ? `（产出 ${list.length} 个文件，卡片下面可点开）` : "";
+        // ---------- 「什么时候才提醒我」 ----------
+        //
+        // 用户的原话：每跑一个小任务都弹一条很烦，他要的是——
+        //   ① 产出了 HTML / Markdown 文档（那才是要他去看的成果）
+        //   ② 这一轮 AI 真的跑完了
+        //   ③ AI 在等他做选择题（批准 / 回话）
+        // 前两条各有一个开关（默认只留"文档"那条开着），第三条见下面 freshAsk 分支。
+        const cfgNow = settingsRef.current;
+        const docs = list.filter((a) => isDocName(a.name));
+        const interesting = cfgNow.aiNotifyAllArtifacts ? list : docs;
+        const wantDocs = cfgNow.aiNotifyDocs && interesting.length > 0;
+        const wantComplete = cfgNow.aiNotifyComplete;
+        if (!wantDocs && !wantComplete) return;
+        // 人就在看这个终端、而且这一轮又没产出要看的文档 → 不打扰
+        if (watching && !wantDocs) return;
+        if (wantDocs) {
+          const names = interesting
+            .slice(0, 3)
+            .map((a) => a.name)
+            .join("、");
+          raiseAiAttention(
+            `「${cur.title}」产出了 ${interesting.length} 个文档：${names}${
+              interesting.length > 3 ? " 等" : ""
+            }（卡片下面可点开）`,
+            cur.id,
+          );
+          return;
+        }
         raiseAiAttention(
-          `「${cur.title}」有新消息${extra}：${aiShorten(snap.lastMessage, 60)}`,
+          `「${cur.title}」这一轮跑完了：${aiShorten(snap.lastMessage, 60)}`,
           cur.id,
         );
       });
       return;
     }
+    // ③ 「AI 在等你做选择题」—— 这条默认开着，而且**不看你是否正在看**
+    //（等你批准 / 等你回话是必须打断的；用户明确要这一类提醒）
+    if (!settingsRef.current.aiNotifyNeedsYou) return;
     if (watching && !needsMe) return;
     raiseAiAttention(
       snap.state === "needs-approval"
@@ -1794,7 +1863,7 @@ export default function App() {
       { label: "Git：新建仓库（git init）", group: "Git", run: () => setGitInitDialog({ path: "" }) },
       { label: "关闭全部本地终端", group: "终端", run: () => void closeSessions(localTerminals, "本地终端") },
       { label: "关闭全部会话", group: "终端", run: () => void closeSessions(sessions, "会话") },
-      { label: "关于 ZeeAI Terminal", group: "帮助", run: () => setShowAbout(true) },
+      { label: "关于 ZEEAI TERM", group: "帮助", run: () => setShowAbout(true) },
       {
         label: "检查更新",
         group: "帮助",
@@ -2391,9 +2460,11 @@ export default function App() {
     /** 这次会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
     highlightSetId?: string | null,
     /** 会话后端：tmux（默认）/ herdr */
-    backend?: "tmux" | "herdr" | "herdr-pane",
+    backend?: "tmux" | "herdr" | "herdr-pane" | "herdr-control",
     /** herdr 观察窗要看哪个窗格（backend = "herdr-pane" 时必填） */
     herdrPane?: string,
+    /** herdr 窗格的打开方式（observe = 只读观察，control = 可读可写） */
+    herdrMode?: "observe" | "control",
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
@@ -2432,8 +2503,11 @@ export default function App() {
         : explicitName ?? defaultTmuxName(profile, userOverride ?? undefined);
     const alreadyOpen = sessionsRef.current.find((s) => {
       if (s.profileId !== profile.id) return false;
-      // herdr 观察窗：同一个窗格只开一个 —— 开两个也是看同一份画面，纯属浪费
-      if (backend === "herdr-pane") return s.herdrPane === herdrPane;
+      // herdr 窗格：同一个窗格、同一种打开方式只开一个
+      //（只读观察和可写接管是两回事，允许各开一个）
+      if (backend === "herdr-pane" || backend === "herdr-control") {
+        return s.herdrPane === herdrPane && (s.herdrMode ?? "observe") === (herdrMode ?? "observe");
+      }
       if (wantedTmux) return s.tmuxName === wantedTmux;
       // 普通 shell：只有"名字完全相同"才算同一个（自动编号的名字不会撞，所以不受影响）
       return !s.tmuxName && (s.title ?? "").trim() === title.trim();
@@ -2456,7 +2530,12 @@ export default function App() {
       user: userOverride ?? profile.ssh?.user,
       // 观察窗的"名字"是 herdr 窗格号，不记进 tmuxName（那个字段是给 tmux 面板用的）
       tmuxName: backend === "herdr-pane" ? undefined : explicitName ?? undefined,
-      herdrPane: backend === "herdr-pane" ? herdrPane : undefined,
+      herdrPane:
+        backend === "herdr-pane" || backend === "herdr-control" ? herdrPane : undefined,
+      herdrMode:
+        backend === "herdr-pane" || backend === "herdr-control"
+          ? herdrMode ?? "observe"
+          : undefined,
       tmuxMode,
       highlightSetId: highlightSetId ?? null,
       state: "connecting",
@@ -2469,9 +2548,11 @@ export default function App() {
         id,
         profile.id,
         (e) => handleEvent(id, e),
-        // 观察窗靠 tmuxName 这个参数把窗格号带给后端（后端拿它当 pane id 用）
-        backend === "herdr-pane" ? "name" : tmuxMode,
-        backend === "herdr-pane" ? herdrPane ?? null : tmuxName ?? null,
+        // herdr 窗格靠 tmuxName 这个参数把窗格号带给后端（后端拿它当 pane id 用）
+        backend === "herdr-pane" || backend === "herdr-control" ? "name" : tmuxMode,
+        backend === "herdr-pane" || backend === "herdr-control"
+          ? herdrPane ?? null
+          : tmuxName ?? null,
         undefined,
         undefined,
         userOverride ?? null,
@@ -2682,6 +2763,7 @@ export default function App() {
         keyPath: form.keyPath.trim() || undefined,
         tmuxEnabled: settings.tmuxDefault,
         tmuxTemplate: "{host}-{user}",
+        herdrEnabled: false,
       },
     };
     try {
@@ -2734,6 +2816,7 @@ export default function App() {
           authKind: "key",
           tmuxEnabled: settings.tmuxDefault,
           tmuxTemplate: "{host}-{user}",
+          herdrEnabled: false,
         },
       },
     });
@@ -2923,12 +3006,18 @@ export default function App() {
       return;
     }
     const useTmux = target.ssh?.tmuxEnabled ?? settings.tmuxDefault;
+    // herdr 的默认值来自**这台服务器**的配置（用户要的就是"我在这个服务器上勾了默认，
+    // 就别每次再问我"）。没装 herdr 的话那个勾是灰的，探测结果回来后自动变成不可勾。
+    const useHerdr = target.ssh?.herdrEnabled ?? false;
     setNewDialog({
       profileId: target.id,
       useTmux,
       tmuxKind: "new",
       tmuxName: defaultTmuxName(target),
       attachTarget: "",
+      useHerdr,
+      herdrKind: "new",
+      herdrTarget: "",
       user: target.ssh?.user ?? "",
       rememberUser: true,
       title: "",
@@ -2936,6 +3025,19 @@ export default function App() {
     if (useTmux) void loadDialogTmux(target.id, target.ssh?.user);
     // 顺便看看这台机器有没有 herdr（决定新会话里 herdr 能不能勾）
     void probeHerdrFor(target.id, target.ssh?.user);
+  }
+
+  /** 读一下这台机器上 herdr 认得的 agent / 窗格（「接管已有窗格」用，按需加载） */
+  async function loadDialogHerdr(profileId: string, user?: string) {
+    setDialogBusy(true);
+    try {
+      setDialogHerdr(await herdrAgents(profileId, user ?? null));
+    } catch (e) {
+      notify("读取 herdr 窗格失败：" + String(e));
+      setDialogHerdr([]);
+    } finally {
+      setDialogBusy(false);
+    }
   }
 
   async function confirmNewSession() {
@@ -2946,8 +3048,24 @@ export default function App() {
       notify("请选择一个要附加的 tmux 会话");
       return;
     }
+    if (newDialog.useHerdr && newDialog.herdrKind === "attach" && !newDialog.herdrTarget) {
+      notify("请选择一个要接管的 herdr 窗格");
+      return;
+    }
     setDialogBusy(true);
     try {
+      // 「用 herdr 打开」但还没探过这台机器 → 先探一下再决定（别让用户点了连接才发现没装）。
+      // 探完结果是"没有 herdr"就**明确降级**到 tmux / 普通 shell，并在状态栏说清楚，
+      // 而不是让 herdr 那条远端命令自己打印一句英文提示了事。
+      if (newDialog.useHerdr && herdrAvailRef.current[newDialog.profileId] === undefined) {
+        await probeHerdrFor(newDialog.profileId, newDialog.user);
+      }
+      const srcNow = herdrAvailRef.current[newDialog.profileId];
+      const canHerdrNow = !!srcNow && !!srcNow.herdrVersion && srcNow.compat !== "too_old";
+      const useHerdr = newDialog.useHerdr && canHerdrNow;
+      if (newDialog.useHerdr && !canHerdrNow) {
+        notify("这台机器上没探到可用的 herdr，这次改用 tmux / 普通 shell 打开");
+      }
       const wantedUser = newDialog.user.trim();
       // 这里**不再写回服务器配置**：以前那个"把用户名保存到配置里"的勾选，
       // 一不小心填错就把整台服务器的登录用户改掉了，风险远大于便利。
@@ -2959,7 +3077,25 @@ export default function App() {
       // 注意：这里**不要自己算自动名字**。名字的唯一性由 openSshSession 里那段
       // "撞名就顺延"的逻辑保证；对话框一旦自己算了个名字传过去，就会把那套逻辑跳过，
       // 结果就是每次都生成同一个「普通 shell 2」（实测踩过）。
-      if (!newDialog.useTmux) {
+      // herdr 优先：勾了"用 herdr 打开"就直接进她的环境，不再走 tmux / 普通 shell 那两条
+      if (useHerdr) {
+        let pane = newDialog.herdrTarget;
+        if (newDialog.herdrKind === "new") {
+          notify("正在 herdr 里新建一个窗格…");
+          pane = await herdrWorkspaceCreate(profile.id, userOverride);
+        }
+        await openSshSession(
+          profile,
+          "name",
+          pane,
+          userOverride,
+          wantedTitle || null,
+          newDialog.highlightSetId,
+          "herdr-control",
+          pane,
+          "control",
+        );
+      } else if (!newDialog.useTmux) {
         await openSshSession(
           profile,
           "none",
@@ -3319,6 +3455,12 @@ export default function App() {
   function scheduleReconnect(sessionId: string) {
     const s = sessionsRef.current.find((x) => x.id === sessionId);
     if (!s || !s.profileId) return;
+    // herdr 窗格会话**不自动重连**：
+    // - 只读观察窗的流断了多半是"窗格/她的 server 那边的事"，立刻重连也是再断一次；
+    // - 可写那条更危险：它带 `--takeover`，自动重连会把控制权从"刚接管的那个客户端"手里
+    //   抢回来，变成两边互相抢（用户明确说过不要跟别的客户端打架）。
+    // 所以这类会话只标成"已断开"，要重开就手动点标签上的 ↻（那条路会按 herdr 的方式重开）。
+    if (s.herdrPane) return;
     if (!settings.autoReconnect) return;
     const tries = reconnectTries.current[sessionId] ?? 0;
     if (tries >= 5) {
@@ -3339,6 +3481,36 @@ export default function App() {
   async function doReconnect(sessionId: string) {
     const s = sessionsRef.current.find((x) => x.id === sessionId);
     if (!s || !s.profileId) return;
+    // herdr 窗格：照原样重开（同一个窗格、同一种打开方式）
+    if (s.herdrPane) {
+      try {
+        await sessionClose(sessionId);
+      } catch {
+        /* 已经断开 */
+      }
+      setSessions((prev) =>
+        prev.map((x) => (x.id === sessionId ? { ...x, state: "connecting" } : x)),
+      );
+      try {
+        await openSsh(
+          sessionId,
+          s.profileId,
+          (e) => handleEvent(sessionId, e),
+          "name",
+          s.herdrPane,
+          undefined,
+          undefined,
+          s.user ?? null,
+          s.herdrMode === "control" ? "herdr-control" : "herdr-pane",
+        );
+        if (s.herdrMode !== "control") {
+          await ensureHerdrInput(sessionId, s.profileId, s.user ?? null, s.herdrPane);
+        }
+      } catch (e) {
+        notify("重开这个 herdr 窗格失败：" + String(e));
+      }
+      return;
+    }
     try {
       await sessionClose(sessionId);
     } catch {
@@ -4076,7 +4248,7 @@ export default function App() {
       {
         key: "help",
         label: "帮助",
-        items: [{ sep: false, label: "关于 ZeeAI Terminal", action: () => setShowAbout(true) }],
+        items: [{ sep: false, label: "关于 ZEEAI TERM", action: () => setShowAbout(true) }],
       },
     ];
   }
@@ -4554,7 +4726,7 @@ export default function App() {
           ))}
         </div>
         <div className="title">
-          ZeeAI Terminal{activeSession ? " — " + activeSession.title : ""}
+          ZEEAI TERM{activeSession ? " — " + activeSession.title : ""}
         </div>
         <div className="win-controls" aria-hidden="true">
           <span className="wbtn" />
@@ -5796,7 +5968,11 @@ export default function App() {
                             }
                             onNotice={notify}
                             onZoom={bumpFont}
-                            herdrPane={ps.herdrPane ? { paneId: ps.herdrPane } : undefined}
+                            herdrPane={
+                              ps.herdrPane
+                                ? { paneId: ps.herdrPane, mode: ps.herdrMode ?? "observe" }
+                                : undefined
+                            }
                             onHerdrInputNeeded={() =>
                               void ensureHerdrInput(
                                 ps.id,
@@ -5822,7 +5998,7 @@ export default function App() {
 
             {paneLayout === "single" && sessions.length === 0 ? (
               <div className="empty">
-                <div className="empty-title">ZeeAI Terminal</div>
+                <div className="empty-title">ZEEAI TERM</div>
                 <div className="empty-sub">
                   左侧「远程」里选一台服务器，或用 PowerShell / CMD / WSL 打开本地终端。
                 </div>
@@ -5861,7 +6037,11 @@ export default function App() {
                     }
                     onNotice={notify}
                     onZoom={bumpFont}
-                    herdrPane={s.herdrPane ? { paneId: s.herdrPane } : undefined}
+                    herdrPane={
+                      s.herdrPane
+                        ? { paneId: s.herdrPane, mode: s.herdrMode ?? "observe" }
+                        : undefined
+                    }
                     onHerdrInputNeeded={() =>
                       void ensureHerdrInput(
                         s.id,
@@ -6078,6 +6258,22 @@ export default function App() {
                             title="开一个只读观察窗（不会影响窗格本身的尺寸）"
                           >
                             查看窗格
+                          </button>
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() =>
+                              void openHerdrPane(
+                                t.herdrProfileId ?? "",
+                                t.herdrPane ?? "",
+                                t.tool,
+                                null,
+                                "control",
+                              )
+                            }
+                            title="接管这个窗格：可读可写，能直接回答它的选择题（会抢过输入；关掉标签就交还，窗格留在服务器上）"
+                          >
+                            接管
                           </button>
                         </div>
                       ) : null}
@@ -7503,6 +7699,17 @@ export default function App() {
                 />
                 <span>默认使用 tmux（新建会话时仍可临时改）</span>
               </label>
+              {/* 这台服务器"默认用 herdr 打开"。
+                  勾上之后新建会话里 herdr 那个勾会默认打上，不再每次问你。
+                  没装 herdr 的机器上勾了也没关系：真去开会话时探测到没装会明确告诉你。 */}
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={editDialog.draft.ssh?.herdrEnabled ?? false}
+                  onChange={(e) => patchDraft({}, { herdrEnabled: e.target.checked })}
+                />
+                <span>默认用 herdr 打开（新建会话时仍可临时取消）</span>
+              </label>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -7772,6 +7979,47 @@ export default function App() {
 
               {settingsTab === "notify" && (
                 <>
+              <div className="tree-group">什么时候提醒我</div>
+              <div className="hint" style={{ padding: "0 14px 6px" }}>
+                AI 跑的小任务很多，默认**不**为"跑完了"打扰你，只报下面这两类要你动手的事。
+              </div>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyDocs}
+                  onChange={(e) => void updateSettings({ aiNotifyDocs: e.target.checked })}
+                />
+                <span>产出了文档（HTML / Markdown）就告诉我 —— 推荐</span>
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyNeedsYou}
+                  onChange={(e) => void updateSettings({ aiNotifyNeedsYou: e.target.checked })}
+                />
+                <span>AI 等我做选择题（要批准 / 等回话）就告诉我 —— 推荐</span>
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyComplete}
+                  onChange={(e) => void updateSettings({ aiNotifyComplete: e.target.checked })}
+                />
+                <span>每一轮跑完都告诉我（小任务多的话会很吵，默认关）</span>
+              </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyAllArtifacts}
+                  onChange={(e) =>
+                    void updateSettings({ aiNotifyAllArtifacts: e.target.checked })
+                  }
+                />
+                <span>所有新文件都算"产物"（关 = 只算 HTML / Markdown，默认）</span>
+              </label>
+              <div className="tree-group" style={{ marginTop: 8 }}>
+                用哪种方式提醒
+              </div>
               <label className="form-check">
                 <input
                   type="checkbox"
@@ -7779,7 +8027,7 @@ export default function App() {
                   onChange={(e) => void updateSettings({ aiNotifyTaskbar: e.target.checked })}
                 />
                 <span>
-                  窗口不在前台时闪 Windows 任务栏（AI 跑完 / 需要你批准 / 等你回话时）
+                  窗口不在前台时闪 Windows 任务栏
                 </span>
               </label>
               <label className="form-check">
@@ -7790,6 +8038,9 @@ export default function App() {
                 />
                 <span>在左侧活动栏的 AI 星号上显示红点/数字</span>
               </label>
+              <div className="hint" style={{ padding: "2px 14px 8px" }}>
+                提醒只进底部状态栏（不会在窗口中间弹浮层）；点状态栏那条可以直接切过去。
+              </div>
                 </>
               )}
 
@@ -7919,7 +8170,7 @@ export default function App() {
       {showAbout && (
         <div className="modal-backdrop" onClick={() => setShowAbout(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">关于 ZeeAI Terminal</div>
+            <div className="modal-head">关于 ZEEAI TERM</div>
             <div className="modal-body">
               <div className="about-row">
                 <IconLogoRadio size={56} />
@@ -8102,54 +8353,66 @@ export default function App() {
                 />
               </label>
 
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={newDialog.useTmux}
-                  onChange={(e) => {
-                    setNewDialog({ ...newDialog, useTmux: e.target.checked });
-                    if (e.target.checked)
-                      void loadDialogTmux(newDialog.profileId, newDialog.user);
-                  }}
-                />
-                <span>使用 tmux（断网后可回到同一个会话）</span>
-              </label>
+              {/* tmux 那条：勾了 herdr 就不再显示（两条是"用哪种方式开"，同时开没有意义） */}
+              {!newDialog.useHerdr && (
+                <label className="form-check">
+                  <input
+                    type="checkbox"
+                    checked={newDialog.useTmux}
+                    onChange={(e) => {
+                      setNewDialog({ ...newDialog, useTmux: e.target.checked });
+                      if (e.target.checked)
+                        void loadDialogTmux(newDialog.profileId, newDialog.user);
+                    }}
+                  />
+                  <span>使用 tmux（断网后可回到同一个会话）</span>
+                </label>
+              )}
 
-              {/* herdr 不在这里"代替 tmux"了。
-                  以前那个勾是直接跑 herdr 自己的界面，问题有两个：它退出时会把终端留在花屏状态；
-                  它自己还会跟别的客户端抢窗格尺寸。现在 herdr 的位置是：
-                    1) AI 看板的状态来源（working / blocked 这些第一手判定）；
-                    2) 看板上每张卡片可以直接「查看窗格」——只读观察窗，不抢键盘也不抢尺寸。 */}
-              <div
+              {/* 用 herdr 打开这次会话。
+                  勾选默认值来自**这台服务器**的配置（「服务器管理」里那个"默认用 herdr 打开"），
+                  勾过一次就不用每次再点 —— 用户原话："我勾了默认打开就别再让我勾"。
+                  勾上就直接进她的环境（可读可写那条 control 流），不跑她自己的 TUI（会花屏）。 */}
+              <label
                 className="form-check"
-                style={{ cursor: "default" }}
-                onClick={() => {
-                  // 还没探过（例如刚切过来）就先探；已经探过就不用管
-                  if (newDialogHerdr === undefined) {
-                    void probeHerdrFor(newDialog.profileId, newDialog.user);
-                  }
-                }}
                 title={
                   newDialogCanHerdr
-                    ? `${newDialogHerdr?.herdrPath || ""}\n协议 ${newDialogHerdr?.protocol} · schema v${newDialogHerdr?.schemaVersion}\n当前她在管 ${newDialogHerdr?.agents} 个 agent`
+                    ? `${newDialogHerdr?.herdrPath || ""}\n协议 ${newDialogHerdr?.protocol} · schema v${newDialogHerdr?.schemaVersion}\n当前她在管 ${newDialogHerdr?.agents} 个 agent\n\n勾上 = 直接进她的环境（可读可写）；关掉标签时窗格留在服务器上，随时能回来`
                     : newDialogHerdr === undefined
                       ? probingHerdr[newDialog.profileId]
                         ? "正在探测这台机器有没有 herdr…"
                         : "还没探测这台机器。点一下这行即可探测。"
                       : "这台机器上没有 herdr。没有它也能正常用 tmux 或普通 shell，只是看板少一路更准的状态。"
                 }
+                onClick={() => {
+                  if (newDialogHerdr === undefined) {
+                    void probeHerdrFor(newDialog.profileId, newDialog.user);
+                  }
+                }}
               >
+                <input
+                  type="checkbox"
+                  checked={newDialog.useHerdr}
+                  disabled={!newDialogCanHerdr}
+                  onChange={(e) => {
+                    setNewDialog({ ...newDialog, useHerdr: e.target.checked });
+                    // 只有"接管已有窗格"才需要列表；新建窗格不用拉
+                    if (e.target.checked && newDialog.herdrKind === "attach") {
+                      void loadDialogHerdr(newDialog.profileId, newDialog.user);
+                    }
+                  }}
+                />
                 <span>
-                  herdr：
-                  {newDialogHerdr === undefined
-                    ? probingHerdr[newDialog.profileId]
-                      ? "探测中…"
-                      : "未探测（点这行探测）"
-                    : newDialogCanHerdr
-                      ? `已装 ${newDialogHerdr?.herdrVersion}（协议 ${newDialogHerdr?.protocol}）· 可在 AI 面板点「查看窗格」`
-                      : "没装（它只是更准的一路状态，可选）"}
+                  用 herdr 打开
+                  {newDialogCanHerdr
+                    ? `（已装 ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
+                    : newDialogHerdr === undefined
+                      ? probingHerdr[newDialog.profileId]
+                        ? "（探测中…）"
+                        : "（未探测 · 点这行探测）"
+                      : "（这台机器没装）"}
                 </span>
-              </div>
+              </label>
 
               {/* 探测结果是"没有 herdr"时，顺手给一个一键安装入口。
                   安装过程由 Windows 侧下载 + 校验 sha256 后 scp 上去，不跑远端脚本、不要 root。 */}
@@ -8172,7 +8435,58 @@ export default function App() {
                 </div>
               ) : null}
 
-              {newDialog.useTmux && (
+              {/* herdr 勾上之后：新开一个窗格，还是接管已有的（和 tmux 的"新建/附加"一个道理） */}
+              {newDialog.useHerdr && newDialogCanHerdr && (
+                <div className="tmux-choice">
+                  <label className="form-check">
+                    <input
+                      type="radio"
+                      checked={newDialog.herdrKind === "new"}
+                      onChange={() => setNewDialog({ ...newDialog, herdrKind: "new" })}
+                    />
+                    <span>新建一个 herdr 窗格</span>
+                  </label>
+                  <label className="form-check">
+                    <input
+                      type="radio"
+                      checked={newDialog.herdrKind === "attach"}
+                      onChange={() => {
+                        setNewDialog({ ...newDialog, herdrKind: "attach" });
+                        void loadDialogHerdr(newDialog.profileId, newDialog.user);
+                      }}
+                    />
+                    <span>接管已有窗格</span>
+                  </label>
+                  {newDialog.herdrKind === "attach" && (
+                    <div className="attach-list">
+                      {dialogBusy && <div className="hint">正在读取…</div>}
+                      {!dialogBusy && dialogHerdr.length === 0 && (
+                        <div className="hint">这台机器上 herdr 还没认出 agent。</div>
+                      )}
+                      {dialogHerdr.map((a) => (
+                        <label
+                          key={a.paneId}
+                          className="form-check"
+                          title={`${a.paneId}${a.cwd ? `　${a.cwd}` : ""}`}
+                        >
+                          <input
+                            type="radio"
+                            checked={newDialog.herdrTarget === a.paneId}
+                            onChange={() =>
+                              setNewDialog({ ...newDialog, herdrTarget: a.paneId })
+                            }
+                          />
+                          <span>
+                            {a.kind || "agent"} · {a.paneId} · {herdrStateLabel(a.status)}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!newDialog.useHerdr && newDialog.useTmux && (
                 <div className="tmux-choice">
                   <label className="form-check">
                     <input

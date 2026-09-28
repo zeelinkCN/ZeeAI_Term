@@ -3,7 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
-import { herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
+import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
 import { bytesToB64 } from "../util";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
@@ -38,12 +38,16 @@ interface Props {
   /** 关键字高亮规则 */
   highlightRules?: HighlightRule[];
   /**
-   * herdr 观察窗：这个终端的输出是 herdr 的**只读**窗格流，输入得走 herdr 的
-   * `pane send-text` / `pane send-keys`（另开一条常驻 ssh），不能写进本地的 PTY。
+   * herdr 窗格：这个终端的输出来自 herdr 的终端流。
+   *
+   * - `mode = "observe"`：**只读**。输入得走 herdr 的 `pane send-text` / `pane send-keys`
+   *   （另开一条常驻 ssh），不能写进本地的 PTY；
+   * - `mode = "control"`：**可读可写**，等于进了她的环境。输入直接以
+   *   `{"type":"terminal.input","bytes":…}` 写进这条会话的 stdin 即可。
    *
    * 为什么这么设计见 core/herdr.rs 顶部：不在标签页里跑 herdr 的 TUI。
    */
-  herdrPane?: { paneId: string };
+  herdrPane?: { paneId: string; mode?: "observe" | "control" };
   /** 输入通道还没建好/断了时，让上层去建（同一个会话只会建一次） */
   onHerdrInputNeeded?: () => void;
 }
@@ -361,9 +365,18 @@ export default function TerminalView({
       else term.write(bytes);
     });
     const sub = term.onData((data) => {
-      // herdr 观察窗：输入不能写进本地 PTY（那条 PTY 只是 `observe` 的输出管道），
-      // 得走 herdr 自己的 `pane send-text` / `pane send-keys`
-      if (herdrPaneRef.current) {
+      const pane = herdrPaneRef.current;
+      if (pane) {
+        // 可写那条（control）：这条会话的 stdin 就是 herdr 的输入口，
+        // 直接把原始字节交上去（回车之类都由 herdr 那边按终端语义处理）
+        if (pane.mode === "control") {
+          void herdrPaneInput(sessionId, bytesToB64(new TextEncoder().encode(data))).catch(
+            () => onNotice?.("这个窗格的输入没送出去（可能已被别的客户端接管）"),
+          );
+          return;
+        }
+        // 只读观察窗：输入不能写进本地 PTY（那条 PTY 只是 observe 的输出管道），
+        // 得走 herdr 自己的 `pane send-text` / `pane send-keys`
         for (const a of herdrActions(data)) {
           if (a.kind === "text") {
             void herdrPaneType(sessionId, a.text).catch(() => needHerdrInputRef.current?.());

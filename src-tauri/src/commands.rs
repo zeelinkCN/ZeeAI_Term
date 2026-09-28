@@ -159,19 +159,28 @@ pub fn open_ssh(
     let mode = tmux_mode.unwrap_or_else(|| "default".into());
     let use_herdr = backend.as_deref() == Some("herdr");
 
-    // ---------- herdr 观察窗（backend = "herdr-pane"） ----------
+    // ---------- herdr 窗格（backend = "herdr-pane" 只读观察 / "herdr-control" 可读可写） ----------
     //
-    // 这一路**不跑 herdr 自己的 TUI**，只把某个窗格的只读字节流引过来（见 core::herdr 顶部说明）。
-    // 为什么值得单开一条：TUI attach 会跟别的客户端抢窗口尺寸，退出时还会留下花屏；
-    // `terminal session observe` 是只读、可多开、按观察者自己的行列数渲染的。
-    if backend.as_deref() == Some("herdr-pane") {
+    // 这两路都**不跑 herdr 自己的 TUI**（那条路会花屏、还会跟别的客户端抢尺寸），
+    // 而是直接用她的终端流：observe = 只读、可多开；control = 可读可写、需要接管权。
+    // 两者的帧格式一样，所以解码那套代码共用（见 core::herdr 顶部说明）。
+    if backend.as_deref() == Some("herdr-pane") || backend.as_deref() == Some("herdr-control") {
+        let mode = if backend.as_deref() == Some("herdr-control") {
+            "control"
+        } else {
+            "observe"
+        };
         let pane = tmux_name.clone().unwrap_or_default();
         if pane.trim().is_empty() {
             return Err("缺少 herdr 窗格号，无法打开观察窗".into());
         }
         let c = cols.unwrap_or(110);
         let r = rows.unwrap_or(30);
-        let cmd = herdr::observe_command(&pane, c, r);
+        let cmd = if mode == "control" {
+            herdr::control_command(&pane, c, r, true)
+        } else {
+            herdr::observe_command(&pane, c, r)
+        };
         let args = ssh::ssh_args(
             &cfg.host,
             cfg.port,
@@ -181,11 +190,7 @@ pub fn open_ssh(
             !cfg.allow_password,
             cfg.jump.as_deref(),
         );
-        let title = format!(
-            "{} · herdr {}",
-            profile.name,
-            herdr::sanitize_pane(&pane)
-        );
+        let title = format!("{} · herdr {}", profile.name, herdr::sanitize_pane(&pane));
         let close_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = pty::spawn(
             &id,
@@ -199,7 +204,7 @@ pub fn open_ssh(
             on_event.clone(),
             logs.inner().clone(),
             pty::SpawnOpts {
-                filter: pty::Filter::HerdrObserve,
+                filter: pty::Filter::HerdrStream,
                 close_flag: close_flag.clone(),
             },
         )?;
@@ -217,6 +222,7 @@ pub fn open_ssh(
                     .map(|u| u.trim().to_string())
                     .filter(|u| !u.is_empty()),
                 pane_id: pane.clone(),
+                mode: mode.to_string(),
                 cols: c,
                 rows: r,
                 channel: on_event,
@@ -385,6 +391,23 @@ pub fn session_close(
         m.remove(&id);
     }
     if let Some(handle) = handle {
+        // herdr 的**可写**流（control）：关标签前主动交还控制权。
+        // 为什么值得多做这一步：万一我们是被强杀/拔线，窗格那边会还以为控制端在；
+        // 下次想接管就得 `--takeover`。主动 release 之后，下一次是"干净的接管"。
+        // 失败也无所谓（进程可能早就没了），所以忽略结果。
+        let is_control = panes
+            .panes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).map(|x| x.mode == "control"))
+            .unwrap_or(false);
+        if is_control {
+            use std::io::Write as _;
+            if let Ok(mut w) = handle.writer.lock() {
+                let _ = w.write_all(format!("{}\n", herdr::release_line()).as_bytes());
+                let _ = w.flush();
+            }
+        }
         if let Some(child) = handle.child.as_ref() {
             if let Ok(mut child) = child.lock() {
                 let _ = child.kill();
@@ -2697,6 +2720,37 @@ pub fn herdr_pane_resize(
     if old_cols == cols && old_rows == rows {
         return Ok(());
     }
+    // 控制流（可读可写那条）：尺寸是它自己的视口参数，**发一条命令就行**，
+    // 不用像只读观察窗那样把整条流重开（重开会闪一下，而且没必要）。
+    {
+        let is_control = panes
+            .panes
+            .lock()
+            .map(|m| m.get(&id).map(|x| x.mode == "control").unwrap_or(false))
+            .unwrap_or(false);
+        if is_control {
+            let writer = {
+                let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+                sessions.get(&id).map(|h| h.writer.clone())
+            };
+            if let Some(writer) = writer {
+                use std::io::Write as _;
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.write_all(herdr::resize_line(cols, rows).as_bytes());
+                    let _ = w.write_all(b"\n");
+                    let _ = w.flush();
+                }
+                if let Ok(mut m) = panes.panes.lock() {
+                    if let Some(x) = m.get_mut(&id) {
+                        x.cols = cols;
+                        x.rows = rows;
+                    }
+                }
+                log::info!("ipc: herdr_pane_resize(control) -> {id} {old_cols}x{old_rows} => {cols}x{rows}");
+                return Ok(());
+            }
+        }
+    }
     let effective_user = user
         .as_ref()
         .map(|u| u.trim().to_string())
@@ -2747,8 +2801,8 @@ pub fn herdr_pane_resize(
         channel.clone(),
         logs.inner().clone(),
         pty::SpawnOpts {
-            filter: pty::Filter::HerdrObserve,
-            close_flag: new_flag.clone(),
+        filter: pty::Filter::HerdrStream,
+        close_flag: new_flag.clone(),
         },
     )?;
     registry
@@ -2833,6 +2887,59 @@ pub fn herdr_pane_input_start(
     drop(child);
     log::info!("ipc: herdr_pane_input_start {id} pane={pane_id}");
     Ok(())
+}
+
+/// **可写**那条路（herdr-control）的输入：把一段原始字节送进窗格。
+///
+/// 为什么和观察窗的输入不一样：控制流的 stdout/stdin 本身就是"同一条线的两头"，
+/// 所以我们不用再另起一条 ssh 去跑输入泵，直接把 JSON 指令写进这个会话的 PTY 就行。
+/// JSON 长什么样（`bytes` = base64）由 `core::herdr::input_line` 负责 —— 那是实测出来的
+/// 唯一可用字段名，放在 Rust 里也便于单测。
+#[tauri::command]
+pub fn herdr_pane_input(
+    id: String,
+    data_b64: String,
+    registry: State<'_, SessionRegistry>,
+) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("解码输入失败: {e}"))?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let line = format!("{}\n", herdr::input_line(&bytes));
+    // 跟 session_write 一样：只在这把锁里把 writer 的 Arc 取出来，拿完就放锁
+    let writer = {
+        let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&id)
+            .ok_or_else(|| "会话不存在".to_string())?
+            .writer
+            .clone()
+    };
+    use std::io::Write as _;
+    let mut writer = writer.lock().map_err(|e| e.to_string())?;
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
+}
+
+/// 在 herdr 里**新开一个窗格**，返回它的窗格号（形如 w5:p1）。
+///
+/// 这就是"新建会话里勾了用 herdr → 直接进她的环境"落地时的那一步：
+/// 先在服务器上开一个属于她的 workspace，再把它的根窗格接管到我们的标签页里。
+#[tauri::command]
+pub async fn herdr_workspace_create(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::create_workspace_command()).await?;
+    let pane = herdr::pane_from_create(&out)
+        .ok_or_else(|| format!("herdr 没有返回新窗格号：{}", out.trim()))?;
+    log::info!("ipc: herdr_workspace_create -> {pane}");
+    Ok(pane)
 }
 
 /// 往观察窗里**按字面**送一段文本（等价于在窗格里敲键盘）

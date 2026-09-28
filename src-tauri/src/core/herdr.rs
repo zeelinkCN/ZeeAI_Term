@@ -253,6 +253,14 @@ pub fn agents_command() -> String {
     )
 }
 
+/// 在服务器上**新建一个 herdr workspace**（她的一个工作区，自带一个 shell 窗格）。
+///
+/// 用户勾了"用 herdr 打开新会话"时走这条：新会话在 herdr 里就是一条新工作区，
+/// 断线/关标签之后它还在服务器上（和 tmux 新建会话一个感觉）。
+pub fn create_workspace_command() -> String {
+    format!("{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" workspace create 2>/dev/null; else printf 'HERDR_NONE\\n'; fi")
+}
+
 /// 打开一个**只读观察窗**：把窗格的终端字节流引出来。
 ///
 /// `--cols/--rows` 是观察端自己声明要多大 —— herdr 支持多个观察者，而且**不会**因为这个
@@ -280,6 +288,115 @@ T*) v=${{l#T}}; [ -n \"$v\" ] && \"$H\" pane send-text \"$P\" \"$(printf '%s' \"
 K*) v=${{l#K}}; [ -n \"$v\" ] && \"$H\" pane send-keys \"$P\" \"$v\" >/dev/null 2>&1 ;; \
 esac; done"
     )
+}
+
+/// 打开一个**可写**的终端流（就是我们自己的界面"进到她的环境里"那条路）。
+///
+/// 和观察窗的区别（实测记录，见 docs/impl-log-2026-09-29-herdr.md）：
+/// - 观察窗 `terminal session observe`：只读、可多开、**不吃输入**；
+/// - 控制流 `terminal session control`：**可读可写**，一个窗格同一时间只允许一个控制端，
+///   需要抢过来时加 `--takeover`；帧格式和观察窗**完全一样**，
+///   所以解码那套代码两边共用；输入/改尺寸/退出走 stdin 上的 JSON 行（见下面的 `*_line`）。
+///
+/// 为什么不用 `herdr --session <名>` 那种整屏 TUI：那条路退出时会把终端留在花屏状态，
+/// 而且它自己会跟别的客户端抢窗格尺寸（用户截的两张图都是它）。
+pub fn control_command(pane_id: &str, cols: u16, rows: u16, takeover: bool) -> String {
+    let pane = sanitize_pane(pane_id);
+    let tk = if takeover { " --takeover" } else { "" };
+    format!(
+        "{CLI_PREFIX}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session control '{pane}'{tk} --cols {cols} --rows {rows}"
+    )
+}
+
+/// stdin 指令：把一段**原始字节**按字面送进窗格（等价于键盘敲进去）。
+///
+/// 为什么用 `bytes` + base64：实测只有这个字段名认（`data` / `data_base64` 发过去没有任何反应）；
+/// 而且 base64 之后，换行、引号、中文、方向键（`\x1b[A`）都不会破坏"一行一条 JSON"的格式。
+///
+/// 回车怎么发：**base64 里带 `\r`**（`echo hi\r`）—— 实测能提交；只发 `\n` 那种是打字，
+/// 不会执行。
+pub fn input_line(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("{{\"type\":\"terminal.input\",\"bytes\":\"{b64}\"}}")
+}
+
+/// stdin 指令：改这个控制端自己的视口大小（不用像观察窗那样把流重开一次）
+pub fn resize_line(cols: u16, rows: u16) -> String {
+    format!("{{\"type\":\"terminal.resize\",\"cols\":{cols},\"rows\":{rows}}}")
+}
+
+/// stdin 指令：主动交还控制权（窗格本身**不会**被关掉，留在服务器上等你回来）
+pub fn release_line() -> String {
+    "{\"type\":\"terminal.release\"}".to_string()
+}
+
+/// 一条流记录的解码结果
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamLine {
+    /// 数据帧：base64 解出来的原始终端字节
+    Data(Vec<u8>),
+    /// 服务端关流（例如被别的客户端接管了）—— 里面是人话，应该进状态栏而不是打进终端
+    Closed(String),
+    /// 其它（不是 JSON / 不认识的记录）—— 原样透传，免得用户什么都看不到
+    Other(Vec<u8>),
+}
+
+/// 解一条 herdr 流记录（观察窗和控制流**共用**同一种帧格式）。
+///
+/// 为什么要单独认 `terminal.closed`：它是一条合法 JSON 但没有 `bytes` 字段，
+/// 如果按"不认识就原样打印"处理，终端里会冒出一行 `{"type":"terminal.closed",...}` 的怪东西。
+pub fn classify_line(line: &str) -> StreamLine {
+    let t = line.trim();
+    if !t.starts_with('{') {
+        return StreamLine::Other(line.as_bytes().to_vec());
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        return StreamLine::Other(line.as_bytes().to_vec());
+    };
+    if v.get("type").and_then(|x| x.as_str()) == Some("terminal.closed") {
+        let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+        return StreamLine::Closed(match reason {
+            "detached" => "这个窗格被别的客户端接管了（现在看的是只读画面）".to_string(),
+            "" => "herdr 关掉了这条终端流".to_string(),
+            other => format!("herdr 关掉了这条终端流（{other}）"),
+        });
+    }
+    match v.get("bytes").and_then(|x| x.as_str()) {
+        Some(b64) => {
+            use base64::Engine as _;
+            match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                Ok(d) => StreamLine::Data(d),
+                // 解不开就当成"不是数据帧"，原样透传（宁可多打一行，也别吞掉内容）
+                Err(_) => StreamLine::Other(line.as_bytes().to_vec()),
+            }
+        }
+        None => StreamLine::Other(line.as_bytes().to_vec()),
+    }
+}
+
+/// 从 `herdr workspace create` 的输出里取新窗格号（形如 w3:p1）
+pub fn pane_from_create(out: &str) -> Option<String> {
+    for line in out.lines() {
+        let t = line.trim();
+        if !t.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+            continue;
+        };
+        if let Some(id) = v
+            .get("result")
+            .and_then(|r| r.get("root_pane"))
+            .and_then(|p| p.get("pane_id"))
+            .and_then(|x| x.as_str())
+        {
+            if !id.trim().is_empty() {
+                return Some(id.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// 窗格 id 只允许 `[A-Za-z0-9:_-]`：它会被拼进单引号的 shell 片段，
@@ -442,5 +559,71 @@ mod tests {
         assert_eq!(got.0, "0.9.1");
         assert_eq!(got.1, 22);
         assert!(got.1 >= MIN_PROTOCOL && got.1 == TESTED_PROTOCOL);
+    }
+
+    #[test]
+    fn control_command_is_single_line_and_can_take_over() {
+        let c = control_command("w2:p1", 120, 40, false);
+        assert!(c.contains("terminal session control 'w2:p1' --cols 120 --rows 40"));
+        assert!(!c.contains("--takeover"));
+        assert!(!c.contains('\n'), "远端命令必须单行");
+        let t = control_command("w2:p1", 80, 24, true);
+        assert!(t.contains("terminal session control 'w2:p1' --takeover --cols 80 --rows 24"));
+        // 窗格号照样要消毒，别被拼进 shell
+        let bad = control_command("w2:p1'; rm -rf / #", 80, 24, true);
+        assert!(!bad.contains("rm -rf"));
+    }
+
+    #[test]
+    fn stdin_lines_match_the_wire_format_we_measured() {
+        // 回车要用 \r（实测能提交），并且整行必须是合法 JSON、单行
+        let l = input_line(b"echo hi\r");
+        assert_eq!(l, "{\"type\":\"terminal.input\",\"bytes\":\"ZWNobyBoaQ0=\"}");
+        assert!(!l.contains('\n'));
+        assert_eq!(resize_line(100, 30), "{\"type\":\"terminal.resize\",\"cols\":100,\"rows\":30}");
+        assert_eq!(release_line(), "{\"type\":\"terminal.release\"}");
+        // 方向键这种控制字节也要能原样塞进 base64
+        let up = input_line(b"\x1b[A");
+        assert_eq!(up, "{\"type\":\"terminal.input\",\"bytes\":\"G1tB\"}");
+    }
+
+    #[test]
+    fn stream_lines_are_classified_not_printed_raw() {
+        // 数据帧 → 原始字节
+        let frame = format!(
+            "{{\"bytes\":\"{}\"}}",
+            {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(b"\x1b[31mhi")
+            }
+        );
+        assert_eq!(
+            classify_line(&frame),
+            StreamLine::Data(b"\x1b[31mhi".to_vec())
+        );
+        // 关流记录不能原样打进终端（否则屏幕上冒出一行 JSON），要翻成人话
+        let closed = classify_line("{\"type\":\"terminal.closed\",\"reason\":\"detached\"}");
+        match closed {
+            StreamLine::Closed(msg) => assert!(msg.contains("接管")),
+            other => panic!("terminal.closed 应该被认出来，实际：{other:?}"),
+        }
+        // 不是 JSON 的东西原样透传
+        assert_eq!(
+            classify_line("herdr: boom\n"),
+            StreamLine::Other(b"herdr: boom\n".to_vec())
+        );
+        // 合法 JSON 但没有 bytes 字段 → 也算"不认识"，透传
+        assert_eq!(
+            classify_line("{\"other\":1}"),
+            StreamLine::Other(b"{\"other\":1}".to_vec())
+        );
+    }
+
+    #[test]
+    fn pane_id_comes_out_of_workspace_create() {
+        let out = r#"{"id":"cli:workspace:create","result":{"root_pane":{"pane_id":"w5:p1","cwd":"/home/lz"},"tab":{"tab_id":"w5:t1"},"workspace":{"workspace_id":"w5"}}}"#;
+        assert_eq!(pane_from_create(out).unwrap(), "w5:p1");
+        assert!(pane_from_create("no json here").is_none());
+        assert!(pane_from_create("{\"result\":{\"root_pane\":{\"pane_id\":\"\"}}}").is_none());
     }
 }

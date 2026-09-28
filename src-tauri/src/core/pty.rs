@@ -20,8 +20,9 @@ pub enum Filter {
     /// 原样转发
     #[default]
     Raw,
-    /// herdr observe：JSON 行 → base64 解成原始字节
-    HerdrObserve,
+    /// herdr 的终端流（观察窗 `terminal session observe` 和可写的 `terminal session control`
+    /// **帧格式完全一样**）：JSON 行 → base64 解成原始字节；`terminal.closed` 翻成人话送去告警。
+    HerdrStream,
 }
 
 /// 起进程时的两个开关
@@ -125,12 +126,24 @@ pub fn spawn(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if opts.filter == Filter::HerdrObserve {
-                        // 一次 read 可能切在半行上：push 只吐"完整行解出来的东西"，
+                    if opts.filter == Filter::HerdrStream {
+                        // 一次 read 可能切在半行上：push 只吐"完整行的解码结果"，
                         // 剩下的半截留在 pending 里等下一片（分片边界必须处理，
                         // 否则 JSON 会被腰斩 → 解不出来 → 画面断片）。
-                        for chunk in push_observe_bytes(&mut pending, &buf[..n]) {
-                            if !flush(&chunk, &ch, &logs) {
+                        for rec in push_herdr_bytes(&mut pending, &buf[..n]) {
+                            // 服务端关流（比如被别的客户端接管）→ 进状态栏，不打进终端
+                            if let super::herdr::StreamLine::Closed(msg) = &rec {
+                                let _ = ch.send(SessionEvent::Error {
+                                    message: msg.clone(),
+                                });
+                                continue;
+                            }
+                            let bytes = match rec {
+                                super::herdr::StreamLine::Data(d) => d,
+                                super::herdr::StreamLine::Other(d) => d,
+                                super::herdr::StreamLine::Closed(_) => continue,
+                            };
+                            if !flush(&bytes, &ch, &logs) {
                                 return;
                             }
                         }
@@ -147,9 +160,9 @@ pub fn spawn(
             }
         }
         // 收尾：observe 流最后可能还剩半行（正常情况不会有），解出来别丢
-        if opts.filter == Filter::HerdrObserve && !pending.is_empty() {
+        if opts.filter == Filter::HerdrStream && !pending.is_empty() {
             let text = String::from_utf8_lossy(&pending).to_string();
-            if let Ok(bytes) = decode_observe_line(&text) {
+            if let super::herdr::StreamLine::Data(bytes) = super::herdr::classify_line(&text) {
                 let _ = flush(&bytes, &ch, &logs);
             }
         }
@@ -172,54 +185,40 @@ pub fn spawn(
     })
 }
 
-/// 解一行 herdr observe 的输出：`{"bytes":"<base64>"}` → 原始字节。
-///
-/// 返回 `Err(())` 表示"这行不是 observe 的数据帧"（调用方会原样转发）。
-/// 把新收到的一片字节喂进行缓冲，返回**可以立刻转发**的若干段：
-/// 每条完整的行要么解成原始字节（数据帧），要么原样带过（不是 JSON 的错误文本）。
+/// 把新收到的一片字节喂进行缓冲，返回**已经能处理的完整记录**。
 ///
 /// 为什么单独抽出来：herdr 的流是**按行**的 JSON，而 socket 读到的分片**不保证**落在
 /// 行边界上 —— 一条 JSON 可能被切成两片（甚至跨三片）。这种"粘包/半包"必须自己缓冲，
 /// 否则会出现"偶尔花屏/断片"，而且多半在网速慢的时候才复现（最难查的那一类 bug）。
-pub fn push_observe_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<Vec<u8>> {
+///
+/// 解码规则本身在 [`super::herdr::classify_line`] 里（那是 herdr 的协议知识，和被谁调用无关），
+/// 这里只负责"按行切分 + 缓冲半截"。
+pub fn push_herdr_bytes(
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Vec<super::herdr::StreamLine> {
     pending.extend_from_slice(chunk);
-    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut out = Vec::new();
     while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
         let line: Vec<u8> = pending.drain(..=pos).collect();
         let text = String::from_utf8_lossy(&line).to_string();
-        match decode_observe_line(&text) {
-            Ok(bytes) => {
-                if !bytes.is_empty() {
-                    out.push(bytes);
-                }
+        let rec = super::herdr::classify_line(&text);
+        // 空的数据帧没必要转发（省一次 IPC）
+        if let super::herdr::StreamLine::Data(d) = &rec {
+            if d.is_empty() {
+                continue;
             }
-            // 不是 JSON 行（远端自己打了句错误、或者 herdr 直接写非 JSON 的东西）：
-            // **原样放过去**，让用户看得见，总比"什么都不显示"强。
-            Err(()) => out.push(line),
         }
+        out.push(rec);
     }
     out
-}
-
-fn decode_observe_line(line: &str) -> Result<Vec<u8>, ()> {
-    let t = line.trim();
-    if !t.starts_with('{') {
-        return Err(());
-    }
-    let v: serde_json::Value = serde_json::from_str(t).map_err(|_| ())?;
-    let b = v.get("bytes").and_then(|x| x.as_str()).ok_or(())?;
-    if b.is_empty() {
-        return Ok(Vec::new());
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(b.as_bytes())
-        .map_err(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use crate::core::herdr::StreamLine;
 
     #[test]
     fn observe_line_decodes_base64_payload() {
@@ -228,13 +227,22 @@ mod tests {
             "{{\"bytes\":\"{}\"}}",
             base64::engine::general_purpose::STANDARD.encode(raw)
         );
-        assert_eq!(decode_observe_line(&json).unwrap(), raw);
+        assert_eq!(
+            crate::core::herdr::classify_line(&json),
+            StreamLine::Data(raw.to_vec())
+        );
     }
 
     #[test]
     fn observe_line_passes_through_non_json() {
-        assert!(decode_observe_line("herdr: something went wrong").is_err());
-        assert!(decode_observe_line("{\"other\":1}").is_err());
+        assert!(matches!(
+            crate::core::herdr::classify_line("herdr: something went wrong"),
+            StreamLine::Other(_)
+        ));
+        assert!(matches!(
+            crate::core::herdr::classify_line("{\"other\":1}"),
+            StreamLine::Other(_)
+        ));
     }
 
     #[test]
@@ -246,10 +254,10 @@ mod tests {
         );
         let bytes = frame.as_bytes();
         let mut pending = Vec::new();
-        assert!(push_observe_bytes(&mut pending, &bytes[..5]).is_empty());
-        assert!(push_observe_bytes(&mut pending, &bytes[5..11]).is_empty());
-        let got = push_observe_bytes(&mut pending, &bytes[11..]);
-        assert_eq!(got, vec![b"HELLO\r\n".to_vec()]);
+        assert!(push_herdr_bytes(&mut pending, &bytes[..5]).is_empty());
+        assert!(push_herdr_bytes(&mut pending, &bytes[5..11]).is_empty());
+        let got = push_herdr_bytes(&mut pending, &bytes[11..]);
+        assert_eq!(got, vec![StreamLine::Data(b"HELLO\r\n".to_vec())]);
         assert!(pending.is_empty(), "完整行解完之后不该留东西");
 
         // 一片里塞两行半：前两行要立刻出来，剩下的半行留着
@@ -259,14 +267,38 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(b"BB")
         );
         let mut p2 = Vec::new();
-        let got2 = push_observe_bytes(&mut p2, two.as_bytes());
-        assert_eq!(got2, vec![b"AA".to_vec(), b"BB".to_vec()]);
+        let got2 = push_herdr_bytes(&mut p2, two.as_bytes());
+        assert_eq!(
+            got2,
+            vec![
+                StreamLine::Data(b"AA".to_vec()),
+                StreamLine::Data(b"BB".to_vec())
+            ]
+        );
         assert!(!p2.is_empty(), "半截行必须留在缓冲里");
         // 非 JSON 的错误文本要原样带出去（否则用户什么都看不到）
         let mut p3 = Vec::new();
         assert_eq!(
-            push_observe_bytes(&mut p3, b"herdr: boom\n"),
-            vec![b"herdr: boom\n".to_vec()]
+            push_herdr_bytes(&mut p3, b"herdr: boom\n"),
+            vec![StreamLine::Other(b"herdr: boom\n".to_vec())]
+        );
+        // 关流记录要被认出来（不能打成一行 JSON 丢到终端里）
+        let mut p4 = Vec::new();
+        assert!(matches!(
+            push_herdr_bytes(&mut p4, b"{\"type\":\"terminal.closed\",\"reason\":\"detached\"}\n")[0],
+            StreamLine::Closed(_)
+        ));
+        // 空数据帧直接丢掉，不浪费一次 IPC
+        let mut p5 = Vec::new();
+        assert!(push_herdr_bytes(&mut p5, b"{\"bytes\":\"\"}\n").is_empty());
+        // 半截 JSON 留在缓冲里，不能当成"其它内容"打到屏幕上
+        let mut p6 = Vec::new();
+        assert!(push_herdr_bytes(&mut p6, b"{\"bytes\":\"YWJ").is_empty());
+        assert_eq!(p6, b"{\"bytes\":\"YWJ".to_vec());
+        assert_eq!(
+            push_herdr_bytes(&mut p6, b"j\"}\n"),
+            // "YWJj" → "abc"（半截 + 剩下的拼起来才是一个完整帧）
+            vec![StreamLine::Data(b"abc".to_vec())]
         );
     }
 }

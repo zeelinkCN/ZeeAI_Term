@@ -73,10 +73,11 @@ export async function openSsh(
   /**
    * 会话后端：
    * - `tmux`（默认）/ `herdr`：跑一个真终端；
-   * - `herdr-pane`：**只读观察窗** —— 用 herdr 的 observe 通道看某个窗格，
-   *   不跑 herdr 自己的 TUI（那条路会花屏、还会跟别的客户端抢尺寸）。
+   * - `herdr-pane`：**只读观察窗** —— 用 herdr 的 observe 通道看某个窗格；
+   * - `herdr-control`：**可读可写** —— 用 herdr 的 control 通道直接进她的环境里干活。
+   * 后两条都不跑 herdr 自己的 TUI（那条路会花屏、还会跟别的客户端抢尺寸）。
    */
-  backend?: "tmux" | "herdr" | "herdr-pane" | null,
+  backend?: "tmux" | "herdr" | "herdr-pane" | "herdr-control" | null,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -689,6 +690,27 @@ export async function herdrPaneType(id: string, text: string): Promise<void> {
 /** 往观察窗里送一个逻辑按键（enter / esc / ctrl+c / up …） */
 export async function herdrPaneKey(id: string, key: string): Promise<void> {
   return invoke("herdr_pane_key", { id, key });
+}
+
+/**
+ * 往**可写**的 herdr 窗格（herdr-control）里送原始字节。
+ *
+ * 和上面两个的区别：观察窗的输入得另开一条 ssh 去敲（`pane send-text`），
+ * 而 control 流的 stdin 就是它的输入口，直接把 JSON 指令写进这条会话即可。
+ */
+export async function herdrPaneInput(id: string, dataB64: string): Promise<void> {
+  return invoke("herdr_pane_input", { id, dataB64 });
+}
+
+/** 在服务器上新建一个 herdr 工作区，返回新窗格号（形如 w5:p1） */
+export async function herdrWorkspaceCreate(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("herdr_workspace_create", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
 }
 
 /** 一键安装 herdr：Windows 侧下载 → 校验 sha256 → scp 到 ~/.local/bin */

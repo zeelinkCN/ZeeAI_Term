@@ -21,10 +21,10 @@ pub fn run() {
         use tauri::menu::{Menu, MenuItem};
         use tauri::tray::TrayIconBuilder;
         let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-        let quit = MenuItem::with_id(app, "quit", "退出 ZeeAI Terminal", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "退出 ZEEAI TERM", true, None::<&str>)?;
         let menu = Menu::with_items(app, &[&show, &quit])?;
         let mut builder = TrayIconBuilder::with_id("main-tray")
-          .tooltip("ZeeAI Terminal")
+          .tooltip("ZEEAI TERM")
           .menu(&menu)
           .show_menu_on_left_click(false)
           .on_menu_event(|app, event| match event.id.as_ref() {
@@ -469,6 +469,8 @@ pub fn run() {
       commands::ai_timeline_clear,
       commands::ai_source_probe,
       commands::herdr_agents,
+      commands::herdr_workspace_create,
+      commands::herdr_pane_input,
       commands::herdr_pane_resize,
       commands::herdr_pane_input_start,
       commands::herdr_pane_type,

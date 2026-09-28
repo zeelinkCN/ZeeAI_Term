@@ -22,6 +22,12 @@ pub struct SshConfig {
     pub jump: Option<String>,
     #[serde(default = "default_true")]
     pub tmux_enabled: bool,
+    /// 这台服务器的新会话**默认用 herdr 打开**（和 tmux_enabled 一个性质，只是换成工具）。
+    ///
+    /// 为什么放在服务器配置里而不是全局设置：有的机器装了 herdr、有的没装；
+    /// 用户的要求是"我在这个服务器上勾了默认用 herdr，就别每次再问我"。
+    #[serde(default)]
+    pub herdr_enabled: bool,
     #[serde(default = "default_tmux_template")]
     pub tmux_template: String,
     #[serde(default)]
@@ -275,6 +281,18 @@ pub struct Settings {
     pub ai_notify_taskbar: bool,
     /// 是否在左侧活动栏的 AI 星号上显示红点/数字
     pub ai_notify_badge: bool,
+    /// 通知策略：**每一轮跑完**就提醒一次。
+    ///
+    /// 默认**关**：用户的原话是"我跑的小任务太多，每跑一个都弹一条，很烦"。
+    /// 真正要人接手的那种（等你批准 / 问你选择题）由下面两项负责，不会漏。
+    pub ai_notify_complete: bool,
+    /// 通知策略：这一轮**产出了文档**（HTML / Markdown）才提醒 —— 默认开。
+    /// "我离开电脑，AI 写完一份文档我得知道去哪儿看"就是这个场景。
+    pub ai_notify_docs: bool,
+    /// 通知策略：AI **在等你**（批准 / 回话 / 选择题）时提醒 —— 默认开，这条不能关掉才好用
+    pub ai_notify_needs_you: bool,
+    /// 产物范围：true = 任何新文件都算"有产物"；false = 只算 HTML / Markdown 文档（默认）
+    pub ai_notify_all_artifacts: bool,
 }
 
 impl Default for Settings {
@@ -309,6 +327,15 @@ impl Default for Settings {
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
             ai_notify_badge: true,
+            // 通知的默认口径（用户明确要求"别每跑一个小任务都弹"）：
+            //   - 跑完就提醒：关（小任务太多）
+            //   - 产出了 HTML/MD 文档：开（这是要你去看的成果）
+            //   - 在等你批准/回话/做选择题：开（这条漏了就白等了）
+            //   - 产物范围：只看文档（想连其它文件一起算，自己在设置里开）
+            ai_notify_complete: false,
+            ai_notify_docs: true,
+            ai_notify_needs_you: true,
+            ai_notify_all_artifacts: false,
         }
     }
 }

@@ -59,6 +59,8 @@ pub struct HerdrPaneMeta {
     pub profile_id: String,
     pub user: Option<String>,
     pub pane_id: String,
+    /// "observe"（只读观察窗）/ "control"（可读可写，就是"进到她的环境里"那条）
+    pub mode: String,
     pub cols: u16,
     pub rows: u16,
     pub channel: tauri::ipc::Channel<SessionEvent>,

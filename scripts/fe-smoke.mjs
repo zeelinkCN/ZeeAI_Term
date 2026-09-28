@@ -38,6 +38,10 @@ const readJson = (name, fallback) => {
 };
 
 const profiles = readJson("profiles.json", []);
+// 为了验证"服务器配置里勾了默认用 herdr"这条链路：把 lz 那台的 herdrEnabled 打开
+for (const p of profiles) {
+  if (p.ssh) p.ssh.herdrEnabled = true;
+}
 const settings = readJson("settings.json", {});
 const history = readJson("history.json", []);
 // 诊断开关：把假后端换成"全空"，用来判断崩溃是"数据形状不对"还是"代码本身"
@@ -117,7 +121,9 @@ const resolveCmd = (cmd) => {
     case "ai_source_probe": return S.herdr;
     case "herdr_agents": return S.herdrAgents;
     case "herdr_pane_input_start": case "herdr_pane_type": case "herdr_pane_key":
-    case "herdr_pane_resize": return null;
+    case "herdr_pane_resize": case "herdr_pane_input": return null;
+    case "herdr_workspace_create": return "w9:p1";
+    case "settings_set": return null;
     case "ai_tasks_remote": return S.tasks;
     case "ai_tasks_local": return [];
     case "ai_tasks_clear_finished": return null;
@@ -136,7 +142,12 @@ const resolveCmd = (cmd) => {
     case "secret_has": return false;
     case "open_ssh": return {
       id: "mock-1", profileId: (window.__ZEEAI_SESSION__.sessions[0] || {}).profileId || "",
-      title: "lz · codex", kind: "ssh", tmuxSession: null, user: "lz", host: "47.99.241.168",
+      // 跟真实后端一样：herdr 会话的标题里带上窗格号（用户要能一眼分清是哪个窗格）
+      title:
+        (args && (args.backend === "herdr-control" || args.backend === "herdr-pane") && args.tmuxName)
+          ? "lz · herdr " + args.tmuxName
+          : "lz · codex",
+      kind: "ssh", tmuxSession: null, user: "lz", host: "47.99.241.168",
     };
     case "open_local": return { id: "mock-1", profileId: "", title: "PowerShell", kind: "local", tmuxSession: null, user: null, host: null };
     case "session_write": case "session_resize": case "session_close": return null;
@@ -416,6 +427,18 @@ const shot3 = await shot("03-herdr-missing.png");
 check("没装 herdr 时给出「一键安装 herdr」", panel2.includes("一键安装 herdr"), panel2.split("\n").find((l) => l.includes("herdr")) ?? "");
 
 // 新建会话对话框：herdr 那行不该再有"代替 tmux"的勾
+// 先把场景切回"这台机器装了 herdr"（上面为了验证"没装时给安装入口"临时改成过没装），
+// 并点一次"状态来源"强制重探，让应用里那份按服务器缓存的结果也刷新过来。
+await evaluate(`(() => {
+  window.__ZEEAI_SCENARIO__.herdr = {
+    herdrVersion: "0.9.1", herdrPath: "/home/lz/.local/bin/herdr", agents: 1,
+    protocol: 22, schemaVersion: 1, schemaFingerprint: "226d4ecb", compat: "ok",
+  };
+  const src = document.querySelector(".ai-panel .ai-source-line");
+  if (src) src.click();
+  return true;
+})()`);
+await new Promise((r) => setTimeout(r, 1800));
 const dialog = await evaluate(`(() => {
   const btns = [...document.querySelectorAll("button")];
   const b = btns.find((x) => (x.innerText || "").trim() === "新建会话");
@@ -427,6 +450,147 @@ await new Promise((r) => setTimeout(r, 1500));
 const shot4 = await shot("04-new-session.png");
 const modalText = await evaluate("document.querySelector('.modal') ? document.querySelector('.modal').innerText : ''");
 check("新建会话里不再出现「用 herdr 代替 tmux」", !modalText.includes("代替 tmux"), modalText.split("\n").find((l) => l.toLowerCase().includes("herdr")) ?? "");
+
+// ---------- herdr 勾选框 / 默认值（服务器配置决定）/ 直接进她的环境 ----------
+const herdrBox = await evaluate(`(() => {
+  const labels = [...document.querySelectorAll(".modal .form-check")];
+  const row = labels.find((l) => (l.innerText || "").includes("用 herdr 打开"));
+  if (!row) return { found: false };
+  const cb = row.querySelector("input[type=checkbox]");
+  return { found: true, checked: !!cb && cb.checked, disabled: !!cb && cb.disabled, text: (row.innerText || "").trim() };
+})()`);
+check(
+  "herdr 是真勾选框，且按服务器配置默认打勾",
+  herdrBox.found && herdrBox.checked && !herdrBox.disabled,
+  `checked=${herdrBox.checked} disabled=${herdrBox.disabled} ${herdrBox.text}`,
+);
+const kinds = await evaluate(
+  `[...document.querySelectorAll(".modal .tmux-choice .form-check")].map((l) => (l.innerText || "").trim())`,
+);
+check(
+  "勾了 herdr 之后给「新建窗格 / 接管已有窗格」两个选择",
+  kinds.some((t) => t.includes("新建一个 herdr 窗格")) &&
+    kinds.some((t) => t.includes("接管已有窗格")),
+  kinds.join(" | "),
+);
+check("勾了 herdr 就不显示 tmux 那条", !modalText.includes("使用 tmux（断网后可回到同一个会话）"), "");
+const shot4b = await shot("04b-herdr-checked.png");
+
+// 点「连接」：应当先 herdr_workspace_create 新建窗格，再用 herdr-control 打开它
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal .modal-actions button")].find(
+    (x) => (x.innerText || "").trim() === "连接",
+  );
+  if (b) b.click();
+  return true;
+})()`);
+await new Promise((r) => setTimeout(r, 2500));
+const controlSession = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__;
+  const created = calls.filter((c) => c.cmd === "herdr_workspace_create").length;
+  const open = calls.filter((c) => c.cmd === "open_ssh").pop();
+  return {
+    created,
+    backend: open ? open.args.backend : null,
+    pane: open ? (open.args.tmuxName ?? null) : null,
+    tabs: [...document.querySelectorAll(".session-tab")].map((t) => (t.innerText || "").trim()),
+  };
+})()`);
+check(
+  "连接时先新建 herdr 窗格，再以可写方式打开",
+  controlSession.created >= 1 &&
+    controlSession.backend === "herdr-control" &&
+    controlSession.pane === "w9:p1",
+  `create=${controlSession.created} backend=${controlSession.backend} pane=${controlSession.pane}`,
+);
+check(
+  "标签栏出现这个可写 herdr 会话",
+  controlSession.tabs.some((t) => t.includes("w9:p1")),
+  controlSession.tabs.join(" / "),
+);
+
+// 在可写会话里打字：应当走 herdr_pane_input（原始字节），而不是观察窗那条 send-text
+await evaluate(`(() => {
+  const ta = document.querySelector(".xterm-helper-textarea");
+  if (ta) ta.focus();
+  return !!ta;
+})()`);
+// 观察窗那边刚才已经打过字（那走的是 herdr_pane_type），所以这里要**看增量**
+const typeCallsBefore = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_pane_type").length`,
+);
+await send("Input.dispatchKeyEvent", { type: "keyDown", text: "l", key: "l", unmodifiedText: "l" });
+await send("Input.dispatchKeyEvent", {
+  type: "keyDown",
+  key: "Enter",
+  code: "Enter",
+  windowsVirtualKeyCode: 13,
+  text: "\r",
+});
+await new Promise((r) => setTimeout(r, 1000));
+const typedInControl = await evaluate(`(() => {
+  const inp = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_pane_input");
+  const txt = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_pane_type");
+  return { inputBytes: inp.length, first: inp.length ? inp[0].args.dataB64 : null, typeCalls: txt.length };
+})()`);
+check(
+  "可写 herdr 会话里的按键走 herdr_pane_input（不是观察窗那条）",
+  typedInControl.inputBytes >= 2 && typedInControl.typeCalls === typeCallsBefore,
+  `input=${typedInControl.inputBytes} type 增量=${typedInControl.typeCalls - typeCallsBefore} 首个=${typedInControl.first}`,
+);
+
+// ---------- 通知策略可配 ----------
+const openedSettings = await evaluate(`(() => {
+  const gear = [...document.querySelectorAll("button")].find((b) => (b.title || "").includes("设置"));
+  if (gear) gear.click();
+  return !!gear;
+})()`);
+await new Promise((r) => setTimeout(r, 900));
+const clickedNav = await evaluate(`(() => {
+  const nav = [...document.querySelectorAll(".settings-nav-item")].find((n) =>
+    (n.innerText || "").includes("通知"),
+  );
+  if (nav) nav.click();
+  return !!nav;
+})()`);
+await new Promise((r) => setTimeout(r, 900));
+const notifyBoxes = await evaluate(`[...document.querySelectorAll(".modal input[type=checkbox]")]
+  .map((i) => ({ checked: i.checked, label: (i.closest("label")?.innerText || "").trim() }))
+  .filter((b) => b.label.includes("告诉我") || b.label.includes("产物"))`);
+const shot6 = await shot("06-settings-notify.png");
+const pick = (kw) => notifyBoxes.find((b) => b.label.includes(kw));
+check(
+  "设置里能配通知：默认「产出文档提醒 + 等你做选择题」开着",
+  !!pick("产出了文档")?.checked && !!pick("等我做选择题")?.checked,
+  notifyBoxes.map((b) => `${b.label.slice(0, 14)}=${b.checked}`).join(" | "),
+);
+check(
+  "「每一轮跑完都告诉我」默认关（小任务不再吵）",
+  pick("每一轮跑完")?.checked === false,
+  pick("每一轮跑完")?.label ?? "没找到这一项",
+);
+await evaluate(`(() => {
+  const boxes = [...document.querySelectorAll(".modal input[type=checkbox]")];
+  const t = boxes.find((i) => (i.closest("label")?.innerText || "").includes("每一轮跑完"));
+  if (t) { t.click(); return true; }
+  return false;
+})()`);
+await new Promise((r) => setTimeout(r, 900));
+const settingsWrite = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "settings_set");
+  const last = calls.length ? calls[calls.length - 1].args.settings : null;
+  return last ? { complete: last.aiNotifyComplete, docs: last.aiNotifyDocs, needs: last.aiNotifyNeedsYou } : null;
+})()`);
+check(
+  "改动立刻写回设置（aiNotifyComplete=true）",
+  !!settingsWrite && settingsWrite.complete === true,
+  JSON.stringify(settingsWrite),
+);
+const naming = await evaluate(`({
+  oldName: document.body.innerText.includes("ZeeAI Terminal"),
+  newName: document.body.innerText.includes("ZEEAI TERM"),
+})`);
+check("界面文案统一成 ZEEAI TERM（不再出现 ZeeAI Terminal）", !naming.oldName, `ZEEAI TERM=${naming.newName}`);
 
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
