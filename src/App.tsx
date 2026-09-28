@@ -710,6 +710,8 @@ export default function App() {
   const aiSourceCache = useRef<Map<string, AiSourceInfo>>(new Map());
   /** 各服务器有没有可用的 herdr（「新建会话」里据此决定 herdr 能不能勾） */
   const [herdrAvail, setHerdrAvail] = useState<Record<string, AiSourceInfo | null>>({});
+  /** 正在探的服务器（避免"打开对话框"和"切服务器"同时发起两次探测） */
+  const [probingHerdr, setProbingHerdr] = useState<Record<string, boolean>>({});
   const newDialogHerdr = newDialog ? herdrAvail[newDialog.profileId] : undefined;
   const newDialogCanHerdr =
     !!newDialogHerdr && !!newDialogHerdr.herdrVersion && newDialogHerdr.compat !== "too_old";
@@ -1117,12 +1119,16 @@ export default function App() {
       setHerdrAvail((m) => ({ ...m, [profileId]: cached }));
       return;
     }
+    if (probingHerdr[profileId]) return; // 已经在探了，别重复 ssh
+    setProbingHerdr((m) => ({ ...m, [profileId]: true }));
     try {
       const info = await aiSourceProbe(profileId, user ?? null);
       aiSourceCache.current.set(profileId, info);
       setHerdrAvail((m) => ({ ...m, [profileId]: info }));
     } catch {
       setHerdrAvail((m) => ({ ...m, [profileId]: null }));
+    } finally {
+      setProbingHerdr((m) => ({ ...m, [profileId]: false }));
     }
   }
 
@@ -1392,6 +1398,21 @@ export default function App() {
   useEffect(() => {
     if (aiPanelOpen) setAiUnread(0);
   }, [aiPanelOpen, activeId]);
+
+  /**
+   * 「新建会话」对话框里**只要选中了某台服务器**就探一下她那台机器有没有 herdr。
+   *
+   * 为什么用 effect 而不是只在"打开对话框"时探：用户会**在对话框里切服务器**，
+   * 而切换那条路以前没触发探测 —— 结果那一格永远停在"探测中"、复选框永远点不动（实测 bug）。
+   * 按 profileId 缓存，所以切来切去也只探一次。
+   */
+  useEffect(() => {
+    const pid = newDialog?.profileId;
+    if (!pid) return;
+    if (herdrAvail[pid] !== undefined) return; // 已经有结果了（null 也算结果）
+    void probeHerdrFor(pid, newDialog?.user);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newDialog?.profileId]);
 
   /**
    * 盯当前会话的日志 —— **面板关着也要盯**。
@@ -7761,11 +7782,19 @@ export default function App() {
               {/* herdr 后端：这台机器探测到有可用 herdr 才允许勾（不偷偷装、不猜） */}
               <label
                 className="form-check"
+                onClick={() => {
+                  // 还没探过（例如刚切过来）就先探；已经探过就不用管
+                  if (newDialogHerdr === undefined) {
+                    void probeHerdrFor(newDialog.profileId, newDialog.user);
+                  }
+                }}
                 title={
                   newDialogCanHerdr
                     ? `${newDialogHerdr?.herdrPath || ""}\n协议 ${newDialogHerdr?.protocol} · schema v${newDialogHerdr?.schemaVersion}\n当前她在管 ${newDialogHerdr?.agents} 个 agent`
                     : newDialogHerdr === undefined
-                      ? "正在探测这台机器有没有 herdr…"
+                      ? probingHerdr[newDialog.profileId]
+                        ? "正在探测这台机器有没有 herdr…"
+                        : "还没探测这台机器。点一下这行即可探测。"
                       : "这台机器上没有可用的 herdr。它只是「更准的一路信号」，没有也能正常用 tmux 或普通 shell。"
                 }
               >
@@ -7780,7 +7809,9 @@ export default function App() {
                   {newDialogCanHerdr
                     ? `（herdr ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
                     : newDialogHerdr === undefined
-                      ? "（探测中…）"
+                      ? probingHerdr[newDialog.profileId]
+                        ? "（探测中…）"
+                        : "（未探测 · 点这行探测）"
                       : "（这台机器没装）"}
                 </span>
               </label>
