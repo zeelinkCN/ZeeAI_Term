@@ -239,6 +239,19 @@ export interface AiTurnRecord {
   artifacts: string[];
 }
 
+/**
+ * 这台机器的「AI 状态来源」：装了 herdr 就用它的 agent 状态机（第一手），
+ * 没装就用我们自己的进程扫描 + 日志解析（第二手）。看板上要标出来，
+ * 否则用户没法判断状态准不准。
+ */
+export interface AiSourceInfo {
+  /** herdr 版本；空字符串 = 这台机器没有 herdr */
+  herdrVersion: string;
+  herdrPath: string;
+  /** 它当前认识的 agent 数量（0 也可能是 server 没在跑） */
+  agents: number;
+}
+
 export interface AppSettings {
   fontSize: number;
   defaultShell: "powershell" | "cmd" | "wsl";

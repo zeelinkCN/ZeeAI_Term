@@ -1144,6 +1144,13 @@ body {
 
 /* ---------- AI 任务时间线（落盘的历史，G-01） ---------- */
 
+.ai-source-line {
+  padding: 4px 12px 2px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
 .ai-timeline {
   display: flex;
   flex-direction: column;

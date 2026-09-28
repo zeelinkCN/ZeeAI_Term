@@ -2517,6 +2517,27 @@ pub fn ai_timeline_clear() {
     crate::core::ai_history::clear();
 }
 
+/// 探测"这台机器的 AI 状态是从哪来的"：装了 herdr 就用它的 agent 状态机，
+/// 没装就用我们自己的探测。只读，不启动、不安装、不改远程任何东西。
+#[tauri::command]
+pub async fn ai_source_probe(
+    profile_id: Option<String>,
+    user_override: Option<String>,
+) -> Result<crate::core::ai_sessions::AiSourceInfo, String> {
+    if let Some(pid) = profile_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        let cfg = ssh_config_for(pid, user_override)?;
+        let out = run_remote_capture(pid, &cfg, &ai_sessions::remote_source_script()).await?;
+        let info = ai_sessions::parse_source(&out);
+        log::info!(
+            "ipc: ai_source_probe(remote) -> herdr={:?} agents={}",
+            info.herdr_version,
+            info.agents
+        );
+        return Ok(info);
+    }
+    Ok(ai_sessions::local_source())
+}
+
 /// 读取上次的工作区快照（没有就返回 null）
 #[tauri::command]
 pub fn workspace_load() -> Option<String> {

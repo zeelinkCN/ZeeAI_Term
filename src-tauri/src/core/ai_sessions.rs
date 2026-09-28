@@ -477,6 +477,93 @@ tail -c {scan} \"$f\" | awk '{awk}' | sort -n | cut -d: -f2-; fi",
 /// 写成一行既躲开这个坑，也让整条远端命令更好读。
 const REMOTE_PICK_AWK: &str = r#"{n=NR;b=-1;if(index($0,"task_complete"))b=0;else if(index($0,"task_started"))b=1;else if(index($0,"token_count")||index($0,"token_usage_record"))b=2;else if(index($0,"function_call")||index($0,"custom_tool_call")||index($0,"local_shell_call")||index($0,"web_search_call")||index($0,"mcp_tool_call"))b=3;else if(index($0,"approval")||index($0,"request_user_input")||index($0,"elicitation"))b=4;else if(index($0,"agent_message")||index($0,"user_message")||index($0,"reasoning"))b=5;else if(index($0,"turn_context")||index($0,"session_meta"))b=6;else next;c[b]++;r[b,c[b]%3]=NR":"$0}END{for(b in c){for(i=0;i<3&&i<c[b];i++)print r[b,(c[b]-i)%3]}}"#;
 
+// ---------- herdr 可用性探测（方案②：只当数据源，不嵌它的 TUI） ----------
+
+/// 这台机器上"AI 状态是从哪来的"。
+///
+/// 为什么要显式告诉用户：同一张卡片上的状态可能来自两个完全不同的地方 ——
+/// 装了 herdr 时来自它的 agent 状态机（working / blocked / done，第一手）；
+/// 没装时来自我们自己的进程扫描 + rollout 解析（第二手、可能有偏差）。
+/// 不标清楚，用户没法判断"这个状态到底准不准"。
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSourceInfo {
+    /// herdr 版本（空 = 这台机器没有 herdr）
+    pub herdr_version: String,
+    /// herdr 可执行文件路径（PATH 里没有、但 ~/.local/bin 有的话也认）
+    pub herdr_path: String,
+    /// 它当前认识的 agent 数量（0 也可能是"server 没在跑"）
+    pub agents: u32,
+}
+
+impl AiSourceInfo {
+    pub fn has_herdr(&self) -> bool {
+        !self.herdr_version.trim().is_empty()
+    }
+}
+
+/// 远端探测脚本（**必须单行**：见 [`REMOTE_PICK_AWK`] 上面那条 CRLF 的教训）。
+///
+/// 查找顺序刻意和 herdr 官方安装脚本对齐：先 PATH，再 `~/.local/bin/herdr` ——
+/// 官方 `install.sh` 默认就装在后者，而且**可能不在 PATH 里**（它自己会 warn 一下）。
+/// 只做只读探测：跑 `--version` 和 `agent list`，不启动、不安装、不改任何东西。
+pub fn remote_source_script() -> String {
+    r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi; if [ -n "$H" ]; then printf 'HERDR|%s|%s|%s\n' "$("$H" --version 2>/dev/null | head -1 | tr -d '\r')" "$H" "$("$H" agent list 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' ')"; else printf 'HERDR|none||0\n'; fi"#
+        .to_string()
+}
+
+/// 解析探测脚本的输出
+pub fn parse_source(out: &str) -> AiSourceInfo {
+    let mut info = AiSourceInfo::default();
+    for line in out.lines() {
+        let Some(rest) = line.trim().strip_prefix("HERDR|") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(3, '|').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let ver = parts[0].trim();
+        if ver != "none" && !ver.is_empty() {
+            info.herdr_version = ver.to_string();
+        }
+        info.herdr_path = parts[1].trim().to_string();
+        info.agents = parts
+            .get(2)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+    }
+    info
+}
+
+/// 本机（Windows）探测：`where herdr` + `--version`
+pub fn local_source() -> AiSourceInfo {
+    let mut info = AiSourceInfo::default();
+    let out = std::process::Command::new("where")
+        .arg("herdr")
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(out) = out else {
+        return info;
+    };
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if first.is_empty() {
+        return info;
+    }
+    info.herdr_path = first.clone();
+    if let Ok(v) = std::process::Command::new(&first).arg("--version").output() {
+        let text = String::from_utf8_lossy(&v.stdout);
+        info.herdr_version = text.lines().next().unwrap_or("").trim().to_string();
+    }
+    info
+}
+
 /// 任务产物：某个文件是"这一轮跑完之后新出现/被改过"的
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

@@ -26,6 +26,7 @@ import {
   aiTimelineAdd,
   aiTimelineClear,
   aiTimelineList,
+  aiSourceProbe,
   isAdmin,
   openAdminShell,
   restartAsAdmin,
@@ -98,6 +99,7 @@ import type {
   AiSessionSnapshot,
   AiArtifact,
   AiTurnRecord,
+  AiSourceInfo,
   AiTask,
   AppSettings,
   ConnectionProfile,
@@ -692,6 +694,10 @@ export default function App() {
   const boardTasksRef = useRef<AiTask[]>([]);
   /** 各会话最近一次命令的退出码（G-02：只有注入过 shell 集成的会话才有） */
   const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
+  /** 这台机器的「AI 状态来源」：装了 herdr 就是它的 agent 状态机，否则是我们自己的探测 */
+  const [aiSource, setAiSource] = useState<AiSourceInfo | null>(null);
+  /** 上次探测 herdr 的时间（这东西不会天天变，没必要每次刷新面板都 ssh 一次） */
+  const lastSourceProbe = useRef(0);
   const boardBusy = useRef(false);
   /** 上次扫本机进程表的时刻（本机扫描比远端探针贵得多，单独限流） */
   const lastLocalScan = useRef(0);
@@ -1044,6 +1050,29 @@ export default function App() {
   }
 
   /**
+   * 探测这台机器的「AI 状态来源」——装了 herdr 就用它的 agent 状态机（working / blocked / done，
+   * 第一手），没装就用我们自己的进程扫描 + 日志解析（第二手）。
+   *
+   * 只读探测（跑 `herdr --version` / `agent list`），**不启动、不安装、不改远程任何东西**。
+   * 装没装这种事不会天天变，所以 5 分钟最多探一次。
+   */
+  async function refreshAiSource(force = false) {
+    const cur = sessionsRef.current.find((s) => s.id === activeId);
+    if (!cur) {
+      setAiSource(null);
+      return;
+    }
+    if (!force && Date.now() - lastSourceProbe.current < 5 * 60 * 1000) return;
+    lastSourceProbe.current = Date.now();
+    try {
+      setAiSource(await aiSourceProbe(cur.profileId ?? null, cur.user ?? null));
+    } catch {
+      // 探不到就当"没有 herdr"处理：看板会显示来源不明确，但功能照旧
+      setAiSource(null);
+    }
+  }
+
+  /**
    * 拉着看当前会话的 Codex 日志，决定"要不要提醒你"。
    *
    * 这是通知的主判据（比"进程还在不在"准得多）：
@@ -1286,6 +1315,7 @@ export default function App() {
   useEffect(() => {
     if (!aiPanelOpen) return;
     void refreshAi();
+    void refreshAiSource(true);
     void refreshBoard();
     void loadTimeline();
     // 会话日志是通知的主判据，跟着面板一起刷
@@ -5520,6 +5550,22 @@ export default function App() {
             </div>
 
             {/* ---------- AI 任务看板：多环境汇总 ---------- */}
+            {/* 状态是从哪来的：装了 herdr 就是它的 agent 状态机（第一手），
+                没装就是我们自己的进程扫描 + 日志解析（第二手）。不标清楚用户没法判断准不准。 */}
+            {aiSource ? (
+              <div
+                className="ai-source-line"
+                title={
+                  aiSource.herdrVersion
+                    ? `${aiSource.herdrPath}（herdr 当前认识 ${aiSource.agents} 个 agent）`
+                    : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。"
+                }
+              >
+                {aiSource.herdrVersion
+                  ? `状态来源：herdr ${aiSource.herdrVersion}（第一手）`
+                  : "状态来源：本机探测（这台机器没装 herdr）"}
+              </div>
+            ) : null}
             <div className="ai-section">
               AI 任务看板
               <button

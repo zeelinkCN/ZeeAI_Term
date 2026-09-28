@@ -12,6 +12,7 @@ import type {
   SerialPortInfo,
   GitStatus,
   AiTurnRecord,
+  AiSourceInfo,
   GitCommit,
   GitBranch,
   AdbFile,
@@ -629,4 +630,15 @@ export async function aiTimelineAdd(entry: AiTurnRecord): Promise<boolean> {
 /** 清空时间线 */
 export async function aiTimelineClear(): Promise<void> {
   return invoke("ai_timeline_clear");
+}
+
+/** 探测这台机器的 AI 状态来源（有没有 herdr）。只读，不装任何东西。 */
+export async function aiSourceProbe(
+  profileId?: string | null,
+  userOverride?: string | null,
+): Promise<AiSourceInfo> {
+  return invoke<AiSourceInfo>("ai_source_probe", {
+    profileId: profileId ?? null,
+    userOverride: userOverride ?? null,
+  });
 }
