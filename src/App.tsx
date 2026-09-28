@@ -641,6 +641,8 @@ export default function App() {
   const [newDialog, setNewDialog] = useState<{
     profileId: string;
     useTmux: boolean;
+    /** 用 herdr 代替 tmux（只在探测到这台机器有可用 herdr 时才可勾） */
+    useHerdr: boolean;
     tmuxKind: "new" | "attach";
     tmuxName: string;
     attachTarget: string;
@@ -696,6 +698,8 @@ export default function App() {
   const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
   /** 这台机器的「AI 状态来源」：装了 herdr 就是它的 agent 状态机，否则是我们自己的探测 */
   const [aiSource, setAiSource] = useState<AiSourceInfo | null>(null);
+  /** 正在探测（点那行来源时要给反馈，否则"没变化"会被当成"没生效"） */
+  const [aiSourceProbing, setAiSourceProbing] = useState(false);
   /**
    * 每台机器探测一次就记住（key = profileId / 本地终端类型）。
    *
@@ -704,6 +708,11 @@ export default function App() {
    * 换会话、重开面板都不会再 ssh 一次；想刷新就点那行来源。
    */
   const aiSourceCache = useRef<Map<string, AiSourceInfo>>(new Map());
+  /** 各服务器有没有可用的 herdr（「新建会话」里据此决定 herdr 能不能勾） */
+  const [herdrAvail, setHerdrAvail] = useState<Record<string, AiSourceInfo | null>>({});
+  const newDialogHerdr = newDialog ? herdrAvail[newDialog.profileId] : undefined;
+  const newDialogCanHerdr =
+    !!newDialogHerdr && !!newDialogHerdr.herdrVersion && newDialogHerdr.compat !== "too_old";
   const boardBusy = useRef(false);
   /** 上次扫本机进程表的时刻（本机扫描比远端探针贵得多，单独限流） */
   const lastLocalScan = useRef(0);
@@ -1074,13 +1083,46 @@ export default function App() {
       setAiSource(cached);
       return;
     }
+    setAiSourceProbing(true);
     try {
       const info = await aiSourceProbe(cur.profileId ?? null, cur.user ?? null);
       aiSourceCache.current.set(key, info);
       setAiSource(info);
+      // 强制重探时给一句回执 —— 否则结果和上次一样，用户会以为"点了没反应"（实测反馈）
+      if (force) {
+        notify(
+          info.herdrVersion
+            ? `重新探测完成：herdr ${info.herdrVersion}（协议 ${info.protocol}，agent ${info.agents}）`
+            : "重新探测完成：这台机器上没有 herdr",
+        );
+      }
     } catch {
       // 探不到就当"没有 herdr"处理：看板会显示来源不明确，但功能照旧
       setAiSource(null);
+      if (force) notify("探测 herdr 失败，已按「没有 herdr」处理");
+    } finally {
+      setAiSourceProbing(false);
+    }
+  }
+
+  /**
+   * 为「新建会话」对话框探一下目标服务器有没有可用的 herdr。
+   *
+   * 注意要按**对话框里选的那台服务器**探（不是当前会话那台）—— 用户可能在对话框里切服务器。
+   * 命中缓存就不重复 ssh；结果存进 herdrAvail，供那个复选框决定能不能勾。
+   */
+  async function probeHerdrFor(profileId: string, user?: string | null) {
+    const cached = aiSourceCache.current.get(profileId);
+    if (cached) {
+      setHerdrAvail((m) => ({ ...m, [profileId]: cached }));
+      return;
+    }
+    try {
+      const info = await aiSourceProbe(profileId, user ?? null);
+      aiSourceCache.current.set(profileId, info);
+      setHerdrAvail((m) => ({ ...m, [profileId]: info }));
+    } catch {
+      setHerdrAvail((m) => ({ ...m, [profileId]: null }));
     }
   }
 
@@ -2072,6 +2114,8 @@ export default function App() {
     titleOverride?: string | null,
     /** 这次会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
     highlightSetId?: string | null,
+    /** 会话后端：tmux（默认）/ herdr */
+    backend?: "tmux" | "herdr",
   ): Promise<string> {
     const id = uid();
     const explicitName = tmuxMode === "name" && tmuxName ? tmuxName : null;
@@ -2146,6 +2190,7 @@ export default function App() {
         undefined,
         undefined,
         userOverride ?? null,
+        backend ?? "tmux",
       );
       setSessions((prev) =>
         prev.map((s) =>
@@ -2594,6 +2639,7 @@ export default function App() {
     setNewDialog({
       profileId: target.id,
       useTmux,
+      useHerdr: false,
       tmuxKind: "new",
       tmuxName: defaultTmuxName(target),
       attachTarget: "",
@@ -2602,6 +2648,8 @@ export default function App() {
       title: "",
     });
     if (useTmux) void loadDialogTmux(target.id, target.ssh?.user);
+    // 顺便看看这台机器有没有 herdr（决定新会话里 herdr 能不能勾）
+    void probeHerdrFor(target.id, target.ssh?.user);
   }
 
   async function confirmNewSession() {
@@ -2643,6 +2691,7 @@ export default function App() {
           userOverride,
           wantedTitle || null,
           newDialog.highlightSetId,
+          newDialog.useHerdr ? "herdr" : "tmux",
         );
       } else {
         await openSshSession(
@@ -5576,7 +5625,9 @@ export default function App() {
                     : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。点击重新探测。"
                 }
               >
-                {aiSource.herdrVersion
+                {aiSourceProbing
+                  ? "正在重新探测…"
+                  : aiSource.herdrVersion
                   ? aiSource.compat === "too_old"
                     ? `herdr ${aiSource.herdrVersion} 太旧（协议 ${aiSource.protocol} < 20）→ 已回退到本机探测`
                     : aiSource.compat === "untested"
@@ -7705,6 +7756,33 @@ export default function App() {
                   }}
                 />
                 <span>使用 tmux（断网后可回到同一个会话）</span>
+              </label>
+
+              {/* herdr 后端：这台机器探测到有可用 herdr 才允许勾（不偷偷装、不猜） */}
+              <label
+                className="form-check"
+                title={
+                  newDialogCanHerdr
+                    ? `${newDialogHerdr?.herdrPath || ""}\n协议 ${newDialogHerdr?.protocol} · schema v${newDialogHerdr?.schemaVersion}\n当前她在管 ${newDialogHerdr?.agents} 个 agent`
+                    : newDialogHerdr === undefined
+                      ? "正在探测这台机器有没有 herdr…"
+                      : "这台机器上没有可用的 herdr。它只是「更准的一路信号」，没有也能正常用 tmux 或普通 shell。"
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={newDialog.useHerdr}
+                  disabled={!newDialogCanHerdr}
+                  onChange={(e) => setNewDialog({ ...newDialog, useHerdr: e.target.checked })}
+                />
+                <span>
+                  用 herdr 代替 tmux
+                  {newDialogCanHerdr
+                    ? `（herdr ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
+                    : newDialogHerdr === undefined
+                      ? "（探测中…）"
+                      : "（这台机器没装）"}
+                </span>
               </label>
 
               {newDialog.useTmux && (

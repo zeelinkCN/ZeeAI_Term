@@ -173,6 +173,34 @@ exec \"${{SHELL:-/bin/bash}}\"; fi"
     )
 }
 
+/// herdr 后端的连接命令（试用版）。
+///
+/// 这一版先把 herdr **自己的界面**跑在这个标签页里 —— 目的是让「会话后端」这个位置先落地可用，
+/// 用户马上能拿到 herdr 的 agent 列表 / 状态 / 断线恢复（这些我们自己都还没有）。
+/// 下一步（方案②的原生集成）会把这里换成"我们自己的界面 + herdr 的 observe/control 通道"，
+/// **位置和开关不变**，只是启动方式换掉。
+///
+/// 为什么不像 tmux 那样先 set-option：herdr 的配置由它自己管（`~/.config/herdr/config.toml`），
+/// 我们不去改用户的配置；它的默认前缀键就是 `ctrl+b`（和 tmux 一样），用户已知悉。
+///
+/// 找不到 herdr 时**原样退化成普通 shell**并打印一行英文提示（远端 locale 不保证是 UTF-8，
+/// 所以远端提示统一用 ASCII，和 tmux 那条的做法一致）。
+pub fn herdr_command(session_name: &str) -> String {
+    let cleaned = session_name.trim().replace('\'', "");
+    let name = if cleaned.is_empty() {
+        "main".to_string()
+    } else {
+        cleaned
+    };
+    format!(
+        "if command -v herdr >/dev/null 2>&1; then exec herdr --session '{name}'; \
+elif [ -x \"$HOME/.local/bin/herdr\" ]; then exec \"$HOME/.local/bin/herdr\" --session '{name}'; \
+else printf '\\n[ZeeAI] herdr not found on this server - falling back to a plain shell.\\n\
+[ZeeAI] The herdr option is only available when herdr is installed on this machine.\\n\\n'; \
+exec \"${{SHELL:-/bin/bash}}\"; fi"
+    )
+}
+
 /// 普通 shell（不用 tmux）时用的远端命令：
 /// 先让 bash 每次显示提示符时用 OSC 7 上报当前目录，再 exec 真 shell。
 /// 这样「文件面板同步终端目录」在非 tmux 会话里也能用——

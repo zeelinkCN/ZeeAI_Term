@@ -68,6 +68,8 @@ export async function openSsh(
   cols?: number,
   rows?: number,
   userOverride?: string | null,
+  /** 会话后端：tmux（默认）/ herdr */
+  backend?: "tmux" | "herdr" | null,
 ): Promise<SessionInfo> {
   const ch = new Channel<SessionEvent>();
   ch.onmessage = onEvent;
@@ -76,6 +78,7 @@ export async function openSsh(
     profileId,
     tmuxMode,
     tmuxName: tmuxName ?? null,
+    backend: backend ?? "tmux",
     userOverride: userOverride ?? null,
     cols: cols ?? null,
     rows: rows ?? null,

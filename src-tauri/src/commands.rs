@@ -121,6 +121,8 @@ pub fn open_ssh(
     profile_id: String,
     tmux_mode: Option<String>,
     tmux_name: Option<String>,
+    // 会话后端：None/"tmux" = 用 tmux（默认，兼容所有老服务器）；"herdr" = 用 herdr
+    backend: Option<String>,
     user_override: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
@@ -153,6 +155,7 @@ pub fn open_ssh(
     // "none" = 明确不用 tmux（直接给普通 shell）；"name" = 指定会话名；
     // 其他 = 按配置里的默认策略（开了就用模板名，没开就普通 shell）。
     let mode = tmux_mode.unwrap_or_else(|| "default".into());
+    let use_herdr = backend.as_deref() == Some("herdr");
     let mut resolved_tmux: Option<String> = None;
     let remote_cmd = match mode.as_str() {
         // 不用 tmux：给普通 shell 注入「上报当前目录」，文件面板才能跟着 cd 走
@@ -162,12 +165,20 @@ pub fn open_ssh(
             if name.trim().is_empty() {
                 Some(ssh::shell_with_cwd_report())
             } else {
-                resolved_tmux = Some(name.clone());
-                Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
+                if use_herdr {
+                    // herdr 的会话名不用记进"tmux 会话"字段（那是给 tmux 面板用的）
+                    Some(ssh::herdr_command(&name))
+                } else {
+                    resolved_tmux = Some(name.clone());
+                    Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
+                }
             }
         }
         _ => {
-            if cfg.tmux_enabled {
+            if use_herdr {
+                let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &effective_user);
+                Some(ssh::herdr_command(&name))
+            } else if cfg.tmux_enabled {
                 let name = ssh::tmux_session_name(&cfg.tmux_template, &cfg.host, &effective_user);
                 resolved_tmux = Some(name.clone());
                 Some(ssh::tmux_command(&name, cfg.start_dir.as_deref()))
