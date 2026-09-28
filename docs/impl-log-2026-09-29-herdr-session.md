@@ -326,6 +326,45 @@ herdr_install: ... 这台机器上已经有 herdr 0.9.1（协议 22），不覆�
 | `cargo run --example herdr_matrix`（真机） | **15 通过 / 0 失败** |
 | `npm run fe:smoke`（无头前端） | **37 通过 / 0 失败** |
 
+### 第五轮：又抓到一个**会让功能整体失效**的问题 —— herdr 服务器没在跑
+
+给矩阵补"服务器刚重启"这个场景时发现：**herdr 的 API 命令都要求服务器已在运行**。
+服务器没跑时 `workspace create` 返回：
+
+```json
+{"error":{"code":"server_not_running","message":"no herdr server is running at …; run `herdr session attach X` to start or attach it"}}
+```
+
+而我们的应用**刻意不跑她的 TUI**，也从不启动服务器 —— 也就是说：**用户服务器重启一次，
+我们的 herdr 功能就整体失效**，除非他自己去终端敲一次 `herdr`。这是今晚最有价值的发现。
+
+修法：给**每一条** herdr 远端命令前面加上"确保服务器在跑"（`ENSURE_SERVER`）：
+
+```sh
+if [ -n "$H" ] && ! "$H" status server 2>/dev/null | grep -q '^status: running'; then
+  printf '[ZeeAI] herdr 服务没在跑，已帮你启动。\n' >&2
+  if command -v setsid >/dev/null 2>&1; then setsid "$H" server </dev/null >/dev/null 2>&1 &
+  else nohup "$H" server </dev/null >/dev/null 2>&1 & fi
+  sleep 2
+fi
+```
+
+（`setsid`/`nohup` + 重定向 + 后台 = 服务器**不会**挂在我们这条 ssh 上，ssh 断开它照样活着；
+启动时会在 stderr 打一行中文提示，观察窗/控制流会把它显示到状态栏。）
+
+顺手加了单测：**每一条** API 命令都必须包含这段、且必须是单行。
+
+验证（矩阵里新增三条，用的是**独立 session**，不动用户默认 session 的服务器）：
+
+```
+PASS  能判断「服务器在不在跑」（我们是按 status: running 这一行判的）      status: running
+PASS  没有服务器时，herdr 会明确报 server_not_running
+PASS  自己把服务器起起来之后，新建工作区就成功了（重启后我们也能自愈）
+PASS  临时 herdr session 已清理
+```
+
+矩阵总数从 15 条增加到 **20 条，全绿**。
+
 ### 仍然**没有**验证的（如实列出）
 
 1. 真机上的**像素观感与打字手感**（延迟、中文输入、宽高比例）—— 数据链路已逐条验证，

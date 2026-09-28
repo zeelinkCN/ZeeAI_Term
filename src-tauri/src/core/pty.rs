@@ -195,7 +195,6 @@ pub fn push_herdr_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use crate::core::herdr::StreamLine;
 
     #[test]

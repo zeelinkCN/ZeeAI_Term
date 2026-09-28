@@ -246,10 +246,25 @@ pub fn state_label(status: &str) -> &'static str {
 /// 所有要跑 herdr 的远端命令都以它开头，避免各处各写一份、改一处漏一处。
 pub const CLI_PREFIX: &str = r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi"#;
 
+/// **确保 herdr 服务器在跑**：没跑就以"脱离终端"的方式起一个。
+///
+/// 为什么必须有这一段（真机上量出来的）：
+/// herdr 的 API 命令（`workspace` / `pane` / `agent` / `session`…）都要求**服务器已在运行**，
+/// 否则直接返回 `{"error":{"code":"server_not_running"}}`。而我们的应用**刻意不跑她的 TUI**，
+/// 所以一旦用户服务器重启（或他自己 `herdr server stop` 过），我们的 herdr 功能会全部失效 ——
+/// 除非用户手动去终端敲一次 `herdr`。这里显式补上这一步，效果和用户敲 `herdr` 一样。
+///
+/// 注意两点：
+/// - 用 `setsid`（没有就用 `nohup`）+ 重定向 + 放后台：**不能**让它挂在我们这条 ssh 上，
+///   否则 ssh 一断服务器就跟着没了；
+/// - 判断用 `^status: running` 而不是 `running`：`herdr status server` 在没有服务器时
+///   也会打印 "not running" 之类的字样，用整行匹配才不会误判。
+pub const ENSURE_SERVER: &str = r#"if [ -n "$H" ] && ! "$H" status server 2>/dev/null | grep -q '^status: running'; then printf '[ZeeAI] herdr 服务没在跑，已帮你启动。\n' >&2; if command -v setsid >/dev/null 2>&1; then setsid "$H" server </dev/null >/dev/null 2>&1 & else nohup "$H" server </dev/null >/dev/null 2>&1 & fi; sleep 2; fi"#;
+
 /// 读这台机器上 herdr 认得的 agent（一行 JSON，解析在 Rust 里做）。
 pub fn agents_command() -> String {
     format!(
-        "{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" agent list 2>/dev/null; else printf 'HERDR_NONE\\n'; fi"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -n \"$H\" ]; then \"$H\" agent list 2>/dev/null; else printf 'HERDR_NONE\\n'; fi"
     )
 }
 
@@ -275,7 +290,7 @@ pub struct HerdrPane {
 /// 读这台机器上的所有窗格
 pub fn panes_command() -> String {
     format!(
-        "{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" pane list 2>/dev/null; else printf 'HERDR_NONE\\n'; fi"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -n \"$H\" ]; then \"$H\" pane list 2>/dev/null; else printf 'HERDR_NONE\\n'; fi"
     )
 }
 
@@ -351,7 +366,7 @@ fn collect_panes(v: &serde_json::Value, out: &mut Vec<HerdrPane>) {
 /// 用户勾了"用 herdr 打开新会话"时走这条：新会话在 herdr 里就是一条新工作区，
 /// 断线/关标签之后它还在服务器上（和 tmux 新建会话一个感觉）。
 pub fn create_workspace_command() -> String {
-    format!("{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" workspace create 2>/dev/null; else printf 'HERDR_NONE\\n'; fi")
+    format!("{CLI_PREFIX}; {ENSURE_SERVER}; if [ -n \"$H\" ]; then \"$H\" workspace create 2>/dev/null; else printf 'HERDR_NONE\\n'; fi")
 }
 
 /// 打开一个**只读观察窗**：把窗格的终端字节流引出来。
@@ -361,7 +376,7 @@ pub fn create_workspace_command() -> String {
 pub fn observe_command(pane_id: &str, cols: u16, rows: u16) -> String {
     let pane = sanitize_pane(pane_id);
     format!(
-        "{CLI_PREFIX}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane view.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session observe '{pane}' --cols {cols} --rows {rows}"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane view.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session observe '{pane}' --cols {cols} --rows {rows}"
     )
 }
 
@@ -375,7 +390,7 @@ pub fn observe_command(pane_id: &str, cols: u16, rows: u16) -> String {
 pub fn input_pump_command(pane_id: &str) -> String {
     let pane = sanitize_pane(pane_id);
     format!(
-        "{CLI_PREFIX}; if [ -z \"$H\" ]; then exit 0; fi; P='{pane}'; \
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then exit 0; fi; P='{pane}'; \
 while IFS= read -r l; do case \"$l\" in \
 T*) v=${{l#T}}; [ -n \"$v\" ] && \"$H\" pane send-text \"$P\" \"$(printf '%s' \"$v\" | base64 -d 2>/dev/null)\" >/dev/null 2>&1 ;; \
 K*) v=${{l#K}}; [ -n \"$v\" ] && \"$H\" pane send-keys \"$P\" \"$v\" >/dev/null 2>&1 ;; \
@@ -397,7 +412,7 @@ pub fn control_command(pane_id: &str, cols: u16, rows: u16, takeover: bool) -> S
     let pane = sanitize_pane(pane_id);
     let tk = if takeover { " --takeover" } else { "" };
     format!(
-        "{CLI_PREFIX}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session control '{pane}'{tk} --cols {cols} --rows {rows}"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session control '{pane}'{tk} --cols {cols} --rows {rows}"
     )
 }
 
@@ -665,6 +680,26 @@ mod tests {
         // 窗格号照样要消毒，别被拼进 shell
         let bad = control_command("w2:p1'; rm -rf / #", 80, 24, true);
         assert!(!bad.contains("rm -rf"));
+    }
+
+    #[test]
+    fn every_api_command_ensures_the_server_is_running() {
+        // herdr 的 API 命令都要求服务器在跑，否则返回 server_not_running ——
+        // 用户服务器重启后功能就全废。所以每条命令前都要有 ENSURE_SERVER。
+        for cmd in [
+            agents_command(),
+            panes_command(),
+            create_workspace_command(),
+            observe_command("w1:p1", 80, 24),
+            control_command("w1:p1", 80, 24, true),
+            input_pump_command("w1:p1"),
+        ] {
+            assert!(
+                cmd.contains("status server") && cmd.contains("server </dev/null"),
+                "少了「确保服务器在跑」那一段：{cmd}"
+            );
+            assert!(!cmd.contains('\n'), "远端命令必须单行（CRLF 会把 shell 语法搞坏）");
+        }
     }
 
     #[test]

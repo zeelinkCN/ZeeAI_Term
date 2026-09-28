@@ -386,6 +386,121 @@ fn main() {
         );
     }
 
+    // ---------- 9c) 观察流"重开"（窗口改尺寸时我们就是这么做的）----------
+    {
+        let rec_a = Arc::new(Mutex::new(Recorder::default()));
+        let args_a = ssh::ssh_args_no_tty(
+            &host,
+            22,
+            &user,
+            None,
+            &herdr::observe_command(&pane, 100, 28),
+            None,
+        );
+        let _a = herdr_stream::spawn(
+            "matrix-re-open-1",
+            "matrix",
+            &ssh::ssh_exe(),
+            &args_a,
+            collector(rec_a.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // 换一个尺寸重开一条（真实场景：用户拖窗口宽度 → 前端 debounce 后重开观察流）
+        let rec_b = Arc::new(Mutex::new(Recorder::default()));
+        let args_b = ssh::ssh_args_no_tty(
+            &host,
+            22,
+            &user,
+            None,
+            &herdr::observe_command(&pane, 80, 20),
+            None,
+        );
+        let _b = herdr_stream::spawn(
+            "matrix-re-open-2",
+            "matrix",
+            &ssh::ssh_exe(),
+            &args_b,
+            collector(rec_b.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let (ba, bb) = {
+            let a = rec_a.lock().unwrap();
+            let b = rec_b.lock().unwrap();
+            (a.bytes, b.bytes)
+        };
+        check!(
+            "观察流按新尺寸重开时两条都能拿到画面（模拟拖动窗口）",
+            ba > 0 && bb > 0,
+            format!("100x28 → {ba} 字节；80x20 → {bb} 字节")
+        );
+    }
+
+    // ---------- 9d) 冷启动：herdr 服务器没在跑时（服务器刚重启那种） ----------
+    //
+    // 为什么用"另一个 session 名"来测：默认 session 的服务器**正是用户在用的**，
+    // 停掉它会把用户的工作区一起关掉（我不做这种有副作用的验证）。
+    // 命名 session 是完全独立的运行空间，可以安全地"先确认没服务器、再起一个、再建工作区"。
+    {
+        // 1) 默认 session 的状态检测（我们那条 ENSURE_SERVER 就是靠它判断的）
+        let st = ssh_run(&host, &user, "herdr status server 2>&1 | head -1");
+        check!(
+            "能判断「服务器在不在跑」（我们是按 status: running 这一行判的）",
+            st.contains("status:"),
+            st.trim().to_string()
+        );
+
+        let sname = format!("zeeai-mat-{}", std::process::id());
+        // 2) 这个 session 还没有服务器 → 应当明确报 server_not_running（而不是静默）
+        let before = ssh_run(
+            &host,
+            &user,
+            &format!("herdr --session '{sname}' workspace create 2>&1 | head -c 200"),
+        );
+        check!(
+            "没有服务器时，herdr 会明确报 server_not_running",
+            before.contains("server_not_running") || before.contains("\"error\""),
+            before.trim().chars().take(120).collect::<String>()
+        );
+        // 3) 用和应用同一套办法起服务器（setsid + 后台 + 重定向）→ 之后建工作区应当成功
+        let _ = ssh_run(
+            &host,
+            &user,
+            &format!(
+                "if command -v setsid >/dev/null 2>&1; then setsid herdr --session '{sname}' server </dev/null >/dev/null 2>&1 & else nohup herdr --session '{sname}' server </dev/null >/dev/null 2>&1 & fi; sleep 2; printf ok"
+            ),
+        );
+        let after = ssh_run(
+            &host,
+            &user,
+            &format!("herdr --session '{sname}' workspace create 2>&1 | head -c 200"),
+        );
+        check!(
+            "自己把服务器起起来之后，新建工作区就成功了（重启后我们也能自愈）",
+            after.contains("\"pane_id\""),
+            after.trim().chars().take(120).collect::<String>()
+        );
+        // 4) 收尾：关工作区 + 停服务器 + 删 session
+        let _ = ssh_run(
+            &host,
+            &user,
+            &format!(
+                "W=$(herdr --session '{sname}' pane list 2>/dev/null | tr ',' '\\n' | sed -n 's/.*\"pane_id\":\"\\([^\"]*\\)\".*/\\1/p' | head -1); \
+[ -n \"$W\" ] && herdr --session '{sname}' workspace close \"$(printf '%s' \"$W\" | cut -d: -f1)\" >/dev/null 2>&1; \
+herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sname}' >/dev/null 2>&1; printf 'cleaned\\n'"
+            ),
+        );
+        let left = ssh_run(&host, &user, &format!("herdr session list 2>&1 | grep -c '{sname}'"));
+        check!(
+            "临时 herdr session 已清理",
+            left.trim().ends_with('0'),
+            format!("剩余匹配={}", left.trim())
+        );
+    }
+
     // ---------- 10) 窗格不存在时：必须报错（而不是静默黑屏） ----------
     {
         let rec4 = Arc::new(Mutex::new(Recorder::default()));
