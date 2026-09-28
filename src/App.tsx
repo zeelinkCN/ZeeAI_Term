@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
@@ -191,6 +191,12 @@ interface SavedSession {
   user?: string;
   tmuxName?: string;
   tmuxMode?: "default" | "none" | "name";
+  /**
+   * herdr 窗格会话：恢复时必须带上这两项，否则重启后会被当成 tmux/普通 shell 打开
+   * （实测踩过：恢复了才发现"根本不在 herdr 里面"，服务器上还多出一个假 tmux 会话）。
+   */
+  herdrPane?: string;
+  herdrMode?: "observe" | "control";
   cwd?: string;
 }
 
@@ -1863,7 +1869,7 @@ export default function App() {
       { label: "Git：新建仓库（git init）", group: "Git", run: () => setGitInitDialog({ path: "" }) },
       { label: "关闭全部本地终端", group: "终端", run: () => void closeSessions(localTerminals, "本地终端") },
       { label: "关闭全部会话", group: "终端", run: () => void closeSessions(sessions, "会话") },
-      { label: "关于 ZEEAI TERM", group: "帮助", run: () => setShowAbout(true) },
+      { label: "关于 ZeeAI Term", group: "帮助", run: () => setShowAbout(true) },
       {
         label: "检查更新",
         group: "帮助",
@@ -1944,14 +1950,32 @@ export default function App() {
           if (s.kind === "remote" && s.profileId) {
             const p = list.find((x) => x.id === s.profileId);
             if (!p) continue;
-            const id = await openSshSession(
-              p,
-              s.tmuxMode ?? "default",
-              s.tmuxName ?? null,
-              s.user ?? null,
-              s.title ?? null,
-            );
+            // herdr 窗格会话：**必须原样恢复成 herdr**（同一个窗格、同一种方式）。
+            // 不这么做的话它会走 tmux/普通 shell 那条路 —— 用户看到的是一个"裸 shell"，
+            // 现象就是"重启之后根本不在 herdr 里面"（实测踩过）。
+            const id = s.herdrPane
+              ? await openSshSession(
+                  p,
+                  "name",
+                  s.herdrPane,
+                  s.user ?? null,
+                  s.title ?? null,
+                  null,
+                  s.herdrMode === "control" ? "herdr-control" : "herdr-pane",
+                  s.herdrPane,
+                  s.herdrMode ?? "observe",
+                )
+              : await openSshSession(
+                  p,
+                  s.tmuxMode ?? "default",
+                  s.tmuxName ?? null,
+                  s.user ?? null,
+                  s.title ?? null,
+                );
             ids.push(id);
+            if (s.herdrPane && s.herdrMode !== "control") {
+              await ensureHerdrInput(id, p.id, s.user ?? null, s.herdrPane);
+            }
           } else if (s.kind === "powershell" || s.kind === "cmd" || s.kind === "wsl") {
             const id = await openLocalSession(s.kind, undefined, s.cwd, s.title);
             ids.push(id);
@@ -1999,6 +2023,8 @@ export default function App() {
         user: s.user,
         tmuxName: s.tmuxName,
         tmuxMode: s.tmuxMode,
+        herdrPane: s.herdrPane,
+        herdrMode: s.herdrMode,
         cwd: s.cwd,
       })),
     };
@@ -2419,21 +2445,33 @@ export default function App() {
   }, [statusMsg]);
 
   async function openLocalSession(
-    shell: "powershell" | "cmd" | "wsl",
+    /** "pwsh" = PowerShell 7（pwsh.exe）；"powershell" = 系统自带的 Windows PowerShell 5.1 */
+    shell: "powershell" | "pwsh" | "cmd" | "wsl",
     distro?: string,
     cwd?: string,
     titleOverride?: string,
   ): Promise<string> {
     const id = uid();
+    // pwsh 归到「PowerShell」这个面板下（kind 还是 powershell），这样侧栏只多一个按钮、
+    // 不多一个模块；但标题/编号按各自的口味分开算，不会出现两个都叫"PowerShell 2"。
+    const kind: OpenSession["kind"] = shell === "pwsh" ? "powershell" : shell;
     const base =
-      shell === "wsl" ? "WSL" + (distro ? " · " + distro : "") : shell === "cmd" ? "命令提示符" : "PowerShell";
+      shell === "wsl"
+        ? "WSL" + (distro ? " · " + distro : "")
+        : shell === "cmd"
+          ? "命令提示符"
+          : shell === "pwsh"
+            ? "PowerShell 7"
+            : "PowerShell";
     // 同一个模块开多个时编号，方便在侧栏/标签里区分（PowerShell、PowerShell 2、…）
-    const sameKind = sessionsRef.current.filter((s) => s.kind === shell).length + 1;
+    const sameKind =
+      sessionsRef.current.filter((s) => s.kind === kind && (s.title ?? "").startsWith(base))
+        .length + 1;
     const title = titleOverride?.trim() || (sameKind > 1 ? `${base} ${sameKind}` : base);
     addSession({
       id,
       title,
-      kind: shell,
+      kind,
       cwd,
       state: "connecting",
       openFiles: [],
@@ -2443,7 +2481,11 @@ export default function App() {
     try {
       const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
       setSessions((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, title: titleOverride?.trim() ? title : info.title || title } : s)),
+        // 本地终端保留我们算好的名字（带编号）：后端只会给一个笼统的"PowerShell"，
+        // 拿它覆盖会把编号吃掉 → 侧栏里几个 PowerShell 又分不清了。
+        prev.map((s) =>
+          s.id === id ? { ...s, title: s.title || info.title || title } : s,
+        ),
       );
     } catch (e) {
       notify("打开本地终端失败：" + String(e));
@@ -2529,7 +2571,10 @@ export default function App() {
       profileId: profile.id,
       user: userOverride ?? profile.ssh?.user,
       // 观察窗的"名字"是 herdr 窗格号，不记进 tmuxName（那个字段是给 tmux 面板用的）
-      tmuxName: backend === "herdr-pane" ? undefined : explicitName ?? undefined,
+      tmuxName:
+        backend === "herdr-pane" || backend === "herdr-control"
+          ? undefined
+          : explicitName ?? undefined,
       herdrPane:
         backend === "herdr-pane" || backend === "herdr-control" ? herdrPane : undefined,
       herdrMode:
@@ -2558,6 +2603,14 @@ export default function App() {
         userOverride ?? null,
         backend ?? "tmux",
       );
+      // 最终显示名算一次、两处都用：标签上显示什么，历史里就存什么。
+      // （以前历史存的是 setSessions 之前的 title，于是 herdr 会话出现了两条记录：
+      //   标签/后端叫 "lz · herdr w9:p1"，历史里却躺着 "lz · w9:p1" —— 用户实测踩到。）
+      const finalTitle = titleOverride?.trim()
+        ? title
+        : tmuxMode === "none"
+          ? title
+          : info.title || title;
       setSessions((prev) =>
         prev.map((s) =>
           s.id === id
@@ -2567,15 +2620,8 @@ export default function App() {
                 // 于是标签显示成"lz · 47.99.241.168"，和历史里的"普通 shell 2"对不上）：
                 // 1) 用户手填的名字 → 用用户的；
                 // 2) 普通 shell（没 tmux）→ 用我们算好的自动编号名字；
-                // 3) tmux → 用后端回来的真实会话名（initial default 模式事先拿不到名字）。
-                title:
-                  // 嵌套三元，不要写成 `a || b ? x : y` —— 后者在 JS 里等价于 `(a || b) ? x : y`，
-                  // 手填了名字时会连 `info.title` 那一支一起短路，和上下文的意图不是一回事。
-                  titleOverride?.trim()
-                    ? title
-                    : tmuxMode === "none"
-                      ? title
-                      : info.title || title,
+                // 3) tmux / herdr → 用后端回来的真实名字（herdr 那条带着窗格号）。
+                title: finalTitle,
                 tmuxName: info.tmuxSession ?? undefined,
                 user: info.user ?? s.user,
               }
@@ -2592,10 +2638,10 @@ export default function App() {
               profileName: profile.name,
               host: profile.ssh?.host ?? "",
               tmuxSession: info.tmuxSession ?? null,
-              // 存"最终显示名"（自动编号的「普通 shell N」也要存下来）。
+              // 存"最终显示名"（自动编号的「普通 shell N」也要存下来；herdr 会话要带 herdr+窗格号）。
               // 之前这里写的是 titleOverride（只存用户手填的名字），自动编号的名字被丢成 null，
               // 于是所有普通 shell 的去重键都变成同一个空值 → 又互相覆盖 → 永远不增数。
-              title: title || null,
+              title: finalTitle || null,
               lastUsed: 0,
             }),
           );
@@ -3084,17 +3130,21 @@ export default function App() {
           notify("正在 herdr 里新建一个窗格…");
           pane = await herdrWorkspaceCreate(profile.id, userOverride);
         }
+        // 名字一定要带上"herdr"和窗格号：
+        // 光看 "lz · w9:p1" 谁也认不出这是 herdr 的窗格（用户实测就是被这个坑到的）。
+        const herdrTitle = wantedTitle || `${profile.name} · herdr ${pane}`;
         await openSshSession(
           profile,
           "name",
           pane,
           userOverride,
-          wantedTitle || null,
+          herdrTitle,
           newDialog.highlightSetId,
           "herdr-control",
           pane,
           "control",
         );
+        notify(`已进入 herdr 的窗格 ${pane}（它是 herdr 管的那个终端，留在服务器上、随时能回来）`);
       } else if (!newDialog.useTmux) {
         await openSshSession(
           profile,
@@ -4205,6 +4255,11 @@ export default function App() {
             action: () => void openLocalSession(settings.defaultShell),
           },
           { sep: false, label: "新建 PowerShell", action: () => void openLocalSession("powershell") },
+          {
+            sep: false,
+            label: "新建 PowerShell 7（pwsh）",
+            action: () => void openLocalSession("pwsh"),
+          },
           { sep: false, label: "新建 CMD", action: () => void openLocalSession("cmd") },
           { sep: false, label: "新建 WSL", action: () => void openLocalSession("wsl") },
           { sep: true },
@@ -4248,7 +4303,7 @@ export default function App() {
       {
         key: "help",
         label: "帮助",
-        items: [{ sep: false, label: "关于 ZEEAI TERM", action: () => setShowAbout(true) }],
+        items: [{ sep: false, label: "关于 ZeeAI Term", action: () => setShowAbout(true) }],
       },
     ];
   }
@@ -4726,7 +4781,7 @@ export default function App() {
           ))}
         </div>
         <div className="title">
-          ZEEAI TERM{activeSession ? " — " + activeSession.title : ""}
+          ZeeAI Term{activeSession ? " — " + activeSession.title : ""}
         </div>
         <div className="win-controls" aria-hidden="true">
           <span className="wbtn" />
@@ -5255,6 +5310,13 @@ export default function App() {
                 sessions={sessions.filter((s) => s.kind === "powershell")}
                 activeId={activeId}
                 onOpen={() => void openLocalSession("powershell")}
+                // 并排两个按钮：左边长的 = 系统自带的 Windows PowerShell 5.1，
+                // 右边短的 = PowerShell 7（pwsh.exe）。两者语法/编码不一样，让用户自己挑。
+                secondary={{
+                  label: "PowerShell 7",
+                  title: "用 PowerShell 7（pwsh.exe）新建——本机要先装 PowerShell 7",
+                  onClick: () => void openLocalSession("pwsh"),
+                }}
                 onActivate={setActiveId}
                 onClose={(id) => void closeSession(id)}
               />
@@ -5998,7 +6060,7 @@ export default function App() {
 
             {paneLayout === "single" && sessions.length === 0 ? (
               <div className="empty">
-                <div className="empty-title">ZEEAI TERM</div>
+                <div className="empty-title">ZeeAI Term</div>
                 <div className="empty-sub">
                   左侧「远程」里选一台服务器，或用 PowerShell / CMD / WSL 打开本地终端。
                 </div>
@@ -8170,13 +8232,13 @@ export default function App() {
       {showAbout && (
         <div className="modal-backdrop" onClick={() => setShowAbout(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">关于 ZEEAI TERM</div>
+            <div className="modal-head">关于 ZeeAI Term</div>
             <div className="modal-body">
               <div className="about-row">
                 <IconLogoRadio size={56} />
               </div>
               <div className="hint">
-                <b>ZeeAI Terminal</b> {APP_VERSION}
+                <b>ZeeAI Term</b> {APP_VERSION}
                 <br />
                 Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
                 <br />
@@ -8594,6 +8656,7 @@ function LocalModule({
   sessions,
   activeId,
   onOpen,
+  secondary,
   onActivate,
   onClose,
 }: {
@@ -8601,15 +8664,27 @@ function LocalModule({
   sessions: OpenSession[];
   activeId: string | null;
   onOpen: () => void;
+  /** 并排的第二个"新建"按钮（目前只有 PowerShell 7 用得上） */
+  secondary?: { label: string; title?: string; onClick: () => void };
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
 }) {
   return (
     <div className="local-module">
       <div className="side-actions">
-        <button type="button" className="btn primary" onClick={onOpen}>
+        <button type="button" className="btn primary grow" onClick={onOpen}>
           <IconPlus size={14} /> 新建 {label}
         </button>
+        {secondary && (
+          <button
+            type="button"
+            className="btn"
+            title={secondary.title}
+            onClick={secondary.onClick}
+          >
+            {secondary.label}
+          </button>
+        )}
       </div>
       <div className="tree-group">已打开的 {label}（{sessions.length}）</div>
       {sessions.length === 0 && <div className="hint">还没有打开</div>}

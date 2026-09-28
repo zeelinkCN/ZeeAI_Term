@@ -503,6 +503,11 @@ body {
 
 .side-actions {
   padding: 4px 8px 8px;
+  /* 并排两个"新建"按钮时（PowerShell / PowerShell 7）要横向排开、留一点缝 */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .btn {

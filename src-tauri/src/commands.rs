@@ -1,4 +1,4 @@
-﻿use base64::Engine as _;
+use base64::Engine as _;
 use portable_pty::PtySize;
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -71,6 +71,22 @@ pub fn open_local(
     );
     let (program, args, title) = match shell.as_str() {
         "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
+        // PowerShell 7（pwsh.exe）和系统自带的 Windows PowerShell 5.1（powershell.exe）
+        // 是两个不同的程序，语法/编码都不一样，所以让用户自己挑（面板上是两个并排按钮）。
+        "pwsh" => {
+            if !program_on_path("pwsh.exe") {
+                return Err(
+                    "本机没找到 pwsh.exe（PowerShell 7）——先装 PowerShell 7 再用这个按钮；\
+                     想用系统自带的那个请点「新建 PowerShell」"
+                        .into(),
+                );
+            }
+            (
+                "pwsh.exe".to_string(),
+                vec!["-NoLogo".to_string()],
+                "PowerShell 7".to_string(),
+            )
+        }
         "wsl" => {
             let mut args: Vec<String> = vec![];
             if let Some(d) = distro.as_ref().filter(|d| !d.trim().is_empty()) {
@@ -315,7 +331,7 @@ pub fn open_ssh(
 }
 
 #[tauri::command]
-pub fn session_write(
+pub async fn session_write(
     id: String,
     data_b64: String,
     registry: State<'_, SessionRegistry>,
@@ -323,12 +339,12 @@ pub fn session_write(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| format!("解码输入失败: {e}"))?;
-    // ★ 只在这把全局锁里**取出 Arc**，拿到就放锁，再做阻塞写。
-    //
-    // 以前是"持着 sessions 锁 → 锁 writer → write_all + flush"一路到底：只要有一个会话
-    // 的远端不再读（回显停了、管道缓冲写满），write_all 就会一直阻塞，而全局锁被它握着，
-    // 于是**所有**会话操作（连 session_close 想关掉这个卡住的会话）全部排队 —— 整个应用
-    // 看起来像死了，只能杀进程。Arc 本来就是共享所有权，克隆出来不需要改数据结构。
+    // ★ 两道保险（都是实测踩出来的）：
+    // 1) 只在这把全局锁里**取出 Arc**，拿到就放锁 —— 否则一个"远端不再读"的会话会把
+    //    所有会话操作一起拖住；
+    // 2) 真正阻塞的 write 放到**阻塞线程**去做 —— Tauri 的**同步命令跑在主线程**上，
+    //    一旦这个写卡住（管道满 / conhost 不作声），整个界面就"未响应"
+    //    （Windows 事件日志里那条 AppHangXProcB1、等着 conhost.exe，就是这么来的）。
     let writer = {
         let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
         sessions
@@ -337,19 +353,23 @@ pub fn session_write(
             .writer
             .clone()
     };
-    let mut writer = writer.lock().map_err(|e| e.to_string())?;
-    writer.write_all(&bytes).map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        let mut writer = writer.lock().map_err(|e| e.to_string())?;
+        writer.write_all(&bytes).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("写入线程失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn session_resize(
+pub async fn session_resize(
     id: String,
     cols: u16,
     rows: u16,
     registry: State<'_, SessionRegistry>,
 ) -> Result<(), String> {
-    // 同 session_write：先把 Arc 拿出来、放掉全局锁，再做可能阻塞的 resize
+    // 同 session_write：先拿 Arc、放掉全局锁，再把可能阻塞的 resize 丢给阻塞线程
     let master = {
         let sessions = registry.sessions.lock().map_err(|e| e.to_string())?;
         sessions
@@ -359,19 +379,23 @@ pub fn session_resize(
             .clone()
             .ok_or_else(|| "该会话不支持调整尺寸（例如串口）".to_string())?
     };
-    let master = master.lock().map_err(|e| e.to_string())?;
-    master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        let master = master.lock().map_err(|e| e.to_string())?;
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("resize 线程失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn session_close(
+pub async fn session_close(
     id: String,
     registry: State<'_, SessionRegistry>,
     panes: State<'_, HerdrPaneRegistry>,
@@ -401,18 +425,22 @@ pub fn session_close(
             .ok()
             .and_then(|m| m.get(&id).map(|x| x.mode == "control"))
             .unwrap_or(false);
-        if is_control {
-            use std::io::Write as _;
-            if let Ok(mut w) = handle.writer.lock() {
-                let _ = w.write_all(format!("{}\n", herdr::release_line()).as_bytes());
-                let _ = w.flush();
+        // 交还控制权 / 杀进程都是阻塞动作 → 丢到阻塞线程，别占主线程
+        let _ = tokio::task::spawn_blocking(move || {
+            if is_control {
+                use std::io::Write as _;
+                if let Ok(mut w) = handle.writer.lock() {
+                    let _ = w.write_all(format!("{}\n", herdr::release_line()).as_bytes());
+                    let _ = w.flush();
+                }
             }
-        }
-        if let Some(child) = handle.child.as_ref() {
-            if let Ok(mut child) = child.lock() {
-                let _ = child.kill();
+            if let Some(child) = handle.child.as_ref() {
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.kill();
+                }
             }
-        }
+        })
+        .await;
     }
     Ok(())
 }
@@ -2181,6 +2209,24 @@ fn reg_value(key: &str, name: &str) -> Option<String> {
     None
 }
 
+/// 这个程序在不在 PATH 上（用系统自带的 `where`，不引任何库）。
+///
+/// 用它的场景：用户点了「PowerShell 7」但我们本机没装 `pwsh.exe` —— 那种情况下
+/// ConPTY 只会甩一句 "spawn failed"，不如提前说清"你没装 PowerShell 7"。
+fn program_on_path(name: &str) -> bool {
+    let mut cmd = std::process::Command::new("where");
+    cmd.arg(name);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
 /// 找系统的 curl.exe：先看 System32，再看 PATH。
 fn find_curl() -> Option<std::path::PathBuf> {
     if let Ok(sys) = std::env::var("SystemRoot") {
@@ -2688,7 +2734,7 @@ pub async fn herdr_agents(
 /// herdr 的观察者是在开流时声明自己行列数的（不会去改窗格本身的尺寸 —— 这正是我们
 /// 想要的）。所以"窗口变大"对我们是"重开一条更大观察者"，而不是去 resize 别人的窗格。
 #[tauri::command]
-pub fn herdr_pane_resize(
+pub async fn herdr_pane_resize(
     id: String,
     cols: u16,
     rows: u16,
@@ -2734,12 +2780,16 @@ pub fn herdr_pane_resize(
                 sessions.get(&id).map(|h| h.writer.clone())
             };
             if let Some(writer) = writer {
-                use std::io::Write as _;
-                if let Ok(mut w) = writer.lock() {
-                    let _ = w.write_all(herdr::resize_line(cols, rows).as_bytes());
-                    let _ = w.write_all(b"\n");
-                    let _ = w.flush();
-                }
+                // 阻塞写 → 丢给阻塞线程（见 session_write 上面的说明）
+                let line = format!("{}\n", herdr::resize_line(cols, rows));
+                let _ = tokio::task::spawn_blocking(move || {
+                    use std::io::Write as _;
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = w.write_all(line.as_bytes());
+                        let _ = w.flush();
+                    }
+                })
+                .await;
                 if let Ok(mut m) = panes.panes.lock() {
                     if let Some(x) = m.get_mut(&id) {
                         x.cols = cols;
@@ -2765,11 +2815,14 @@ pub fn herdr_pane_resize(
         sessions.remove(&id)
     };
     if let Some(h) = old {
-        if let Some(child) = h.child.as_ref() {
-            if let Ok(mut c) = child.lock() {
-                let _ = c.kill();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(child) = h.child.as_ref() {
+                if let Ok(mut c) = child.lock() {
+                    let _ = c.kill();
+                }
             }
-        }
+        })
+        .await;
     }
 
     // 2) 擦掉旧画面再铺新的：新流是按**新的宽度**渲染的，不擦会和上面的残影叠在一起
@@ -2789,22 +2842,32 @@ pub fn herdr_pane_resize(
     );
     let title = format!("herdr {}", herdr::sanitize_pane(&pane_id));
     let new_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = pty::spawn(
-        &id,
-        "ssh",
-        &title,
-        &ssh::ssh_exe(),
-        &args,
-        None,
-        cols,
-        rows,
-        channel.clone(),
-        logs.inner().clone(),
-        pty::SpawnOpts {
-        filter: pty::Filter::HerdrStream,
-        close_flag: new_flag.clone(),
-        },
-    )?;
+    // 开一个 PTY = 让 conhost 起来，这一步也可能慢 —— 同样挪到阻塞线程
+    let spawn_id = id.clone();
+    let spawn_program = ssh::ssh_exe();
+    let spawn_channel = channel.clone();
+    let spawn_logs = logs.inner().clone();
+    let spawn_flag = new_flag.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        pty::spawn(
+            &spawn_id,
+            "ssh",
+            &title,
+            &spawn_program,
+            &args,
+            None,
+            cols,
+            rows,
+            spawn_channel,
+            spawn_logs,
+            pty::SpawnOpts {
+                filter: pty::Filter::HerdrStream,
+                close_flag: spawn_flag,
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("重建观察流失败: {e}"))??;
     registry
         .sessions
         .lock()
@@ -2881,7 +2944,10 @@ pub fn herdr_pane_input_start(
         .inputs
         .lock()
         .map_err(|e| e.to_string())?
-        .insert(id.clone(), stdin);
+        .insert(
+            id.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(stdin)),
+        );
     // Child 句柄本身不留在注册表里：我们只关心它的 stdin（它在表里，管道就不会断）。
     // 远端那条循环是 `while read`，stdin 一关（会话结束）它自己就退出了。
     drop(child);
@@ -2896,7 +2962,7 @@ pub fn herdr_pane_input_start(
 /// JSON 长什么样（`bytes` = base64）由 `core::herdr::input_line` 负责 —— 那是实测出来的
 /// 唯一可用字段名，放在 Rust 里也便于单测。
 #[tauri::command]
-pub fn herdr_pane_input(
+pub async fn herdr_pane_input(
     id: String,
     data_b64: String,
     registry: State<'_, SessionRegistry>,
@@ -2917,12 +2983,17 @@ pub fn herdr_pane_input(
             .writer
             .clone()
     };
-    use std::io::Write as _;
-    let mut writer = writer.lock().map_err(|e| e.to_string())?;
-    writer
-        .write_all(line.as_bytes())
-        .map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())
+    // 和 session_write 同样的道理：阻塞的写不能占着主线程
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut writer = writer.lock().map_err(|e| e.to_string())?;
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("写入线程失败: {e}"))?
 }
 
 /// 在 herdr 里**新开一个窗格**，返回它的窗格号（形如 w5:p1）。
@@ -2944,7 +3015,7 @@ pub async fn herdr_workspace_create(
 
 /// 往观察窗里**按字面**送一段文本（等价于在窗格里敲键盘）
 #[tauri::command]
-pub fn herdr_pane_type(
+pub async fn herdr_pane_type(
     id: String,
     text: String,
     panes: State<'_, HerdrPaneRegistry>,
@@ -2953,14 +3024,19 @@ pub fn herdr_pane_type(
         return Ok(());
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    herdr_write_input(&panes, &id, &format!("T{b64}\n"))
+    let line = format!("T{b64}\n");
+    let stdin = {
+        let m = panes.inputs.lock().map_err(|e| e.to_string())?;
+        m.get(&id).cloned().ok_or_else(|| "输入通道还没建立".to_string())?
+    };
+    herdr_write_input(stdin, line).await
 }
 
 /// 往观察窗里送一个**逻辑按键**（enter / esc / ctrl+c / up …）
 ///
 /// 白名单校验：这个值会被拼进远端命令行，所以只允许 `[a-z0-9+-]`，且不超过 16 个字符。
 #[tauri::command]
-pub fn herdr_pane_key(
+pub async fn herdr_pane_key(
     id: String,
     key: String,
     panes: State<'_, HerdrPaneRegistry>,
@@ -2973,37 +3049,32 @@ pub fn herdr_pane_key(
     if !ok {
         return Err(format!("不认这个按键名：{key}"));
     }
-    herdr_write_input(&panes, &id, &format!("K{k}\n"))
+    let line = format!("K{k}\n");
+    let stdin = {
+        let m = panes.inputs.lock().map_err(|e| e.to_string())?;
+        m.get(&id).cloned().ok_or_else(|| "输入通道还没建立".to_string())?
+    };
+    herdr_write_input(stdin, line).await
 }
 
 /// 往输入泵写一行指令（写失败时把这条通道从表里摘掉，下次输入会自动重开）
-fn herdr_write_input(
-    panes: &State<'_, HerdrPaneRegistry>,
-    id: &str,
-    line: &str,
+async fn herdr_write_input(
+    stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
+    line: String,
 ) -> Result<(), String> {
-    use std::io::Write as _;
-    // 写的是内存管道、一行就几十字节，正常永远写得进去；真写满了也只会短暂阻塞这一下。
-    let mut dead = false;
-    let res = {
-        let mut m = panes.inputs.lock().map_err(|e| e.to_string())?;
-        match m.get_mut(id) {
-            None => Err("输入通道还没建立".to_string()),
-            Some(s) => match s.write_all(line.as_bytes()) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    dead = true;
-                    Err(format!("输入通道断了（下次输入会自动重连）: {e}"))
-                }
-            },
+    // 写的是内存管道、一行就几十字节；但"可能阻塞"的东西一律交给阻塞线程，
+    // 免得某次远端不读就把界面顶住（AppHang）。
+    tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        use std::io::Write as _;
+        let mut s = stdin.lock().map_err(|e| e.to_string())?;
+        match s.write_all(line.as_bytes()) {
+            Ok(()) => Ok(true),
+            Err(e) => Err(format!("输入通道断了（下次输入会自动重连）: {e}")),
         }
-    };
-    if dead {
-        if let Ok(mut m) = panes.inputs.lock() {
-            m.remove(id);
-        }
-    }
-    res
+    })
+    .await
+    .map_err(|e| format!("写入线程失败: {e}"))?
+    .map(|_| ())
 }
 
 /// 一键安装 herdr 的结果（前端拿去显示"装了什么版本、来自哪、校验对不对"）

@@ -122,3 +122,55 @@
 `adb.exe` 守护进程**还活着，它从 `src-tauri/target/debug/resources/platform-tools/` 启动、
 占住了 `AdbWinApi.dll`，于是 Tauri 的构建脚本没法更新资源目录。杀掉那个 adb 就好了。
 以后跑完自检记得顺手 `adb kill-server`。
+
+## 6. 用户实测反馈后的修复（同日第三轮）
+
+用户跑了便携版，报了两件事：「herdr 会话看着不像在 herdr 里面」和「软件崩了」。
+查下来是**三个真问题**，都修了：
+
+### 6.1 恢复工作区时 herdr 会话被打回原形（"不在 herdr 里面"的根因）
+
+- `SavedSession`（工作区快照）**没记** `herdrPane` / `herdrMode`，重启后那条会话就按
+  `tmuxMode/tmuxName` 走普通路径 → 你看到的是一个**裸 shell**，当然"不在 herdr 里"；
+- 更糟的是 `openSshSession` 里"窗格号不写进 tmuxName"那句话**只排除了只读观察窗**
+  （`herdr-pane`），可写那条（`herdr-control`）漏了 → 窗格号被当成 tmux 会话名存下来，
+  于是会去 `tmux new-session -A -s w9:p1`，在服务器上凭空造一个假 tmux 会话。
+
+修法：快照带上 herdr 两项、恢复时按 herdr 重开；`tmuxName` 对**两种** herdr 会话都不写；
+标题统一成 `lz · herdr w9:p1`（以前标签叫这个、历史里却存着 `lz · w9:p1`，一份会话两条记录）。
+**已经帮你清掉**：历史里那条重复的 `lz · w9:p1`、以及指向坏会话的 `workspace.json`。
+
+### 6.2 "崩了"其实是**卡死**（Windows 事件日志 AppHangXProcB1，等着 conhost.exe）
+
+根因：**Tauri 的同步命令跑在主线程上**，而我们在这些命令里做**阻塞的 PTY 操作**
+（写管道、`master.resize()`、`child.kill()`、开新 PTY）。只要远端不读、或 conhost 一时不作声，
+主线程就被顶住 → 整个界面"未响应" → Windows 报 AppHang 并关掉它。
+
+修法：`session_write` / `session_resize` / `session_close` /
+`herdr_pane_input` / `herdr_pane_type` / `herdr_pane_key` / `herdr_pane_resize`
+全部改成 **async + `spawn_blocking`**：先从注册表里**只取 Arc**（拿完就放锁），
+再把真正的阻塞动作丢给阻塞线程。输入泵的 `ChildStdin` 因此改存 `Arc<Mutex<..>>`（不能克隆）。
+
+### 6.3 产品名
+
+用户纠正：应该是原来的大小写 **ZeeAI Term**（他的语音输入法给打成了全大写，我照抄了）。
+窗口标题 / 标题栏 / 空状态 / 托盘 / 关于 全部统一成 `ZeeAI Term`。
+（`productName`、`mainBinaryName`、仓库地址、配置目录仍是标识符，保持不变。）
+
+### 6.4 另外
+
+进 herdr 窗格时会在底部状态栏说一句"已进入 herdr 的窗格 wN:pN（它留在服务器上、随时能回来）"，
+免得再出现"这到底是不是在 herdr 里"的疑惑 —— 顺带说明：**herdr 的窗格本身就是一个普通终端**，
+她的整体界面（侧栏/agent 列表）只在 herdr 自己的客户端上显示，我们这边显示的是那个窗格的画面。
+
+### 6.5 PowerShell 5.1 / 7 两个按钮（用户当轮追加）
+
+用户本机装了 PowerShell 7，但面板里默认开的还是系统自带的 Windows PowerShell 5.1，
+有些脚本不兼容。做法：
+
+- PowerShell 面板的"新建"变成**并排两个按钮**：左边长的 `新建 PowerShell`（5.1）、
+  右边短的 `PowerShell 7`（`pwsh.exe`）；「终端」菜单里也加了一条"新建 PowerShell 7（pwsh）"。
+- 后端 `open_local` 新增 `shell = "pwsh"`：先 `where pwsh.exe` 探一下，**没装就给一句人话**
+  （"先装 PowerShell 7 再用这个按钮"），而不是甩一句 `spawn failed`。
+- pwsh 会话在侧栏里**归到 PowerShell 面板**（kind 仍是 powershell），
+  但标题/编号按各自的口味分开算（"PowerShell 7"、"PowerShell 7 2"），不会互相串号。

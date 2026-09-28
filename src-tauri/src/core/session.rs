@@ -74,5 +74,8 @@ pub struct HerdrPaneRegistry {
     pub panes: Mutex<HashMap<String, HerdrPaneMeta>>,
     /// 每个 herdr 观察窗配一个常驻的「输入泵」（一条 ssh，stdin 就是指令通道）。
     /// 会话关掉时把它从表里移除 = 关掉 stdin = 远端 `read` 拿到 EOF 自己退出。
-    pub inputs: Mutex<HashMap<String, std::process::ChildStdin>>,
+    ///
+    /// 为什么再套一层 `Arc<Mutex<..>>`：`ChildStdin` 不能克隆，而写入是**阻塞**操作，
+    /// 必须能把它挪到阻塞线程里去写（不能占着主线程，也不能占着这张表）。
+    pub inputs: Mutex<HashMap<String, Arc<Mutex<std::process::ChildStdin>>>>,
 }

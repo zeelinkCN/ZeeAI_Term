@@ -539,6 +539,40 @@ check(
   `input=${typedInControl.inputBytes} type 增量=${typedInControl.typeCalls - typeCallsBefore} 首个=${typedInControl.first}`,
 );
 
+// ---------- PowerShell 面板：并排两个"新建"按钮（5.1 / 7）----------
+await evaluate(`(() => {
+  const nav = [...document.querySelectorAll("button")].find((b) => (b.title || "").includes("PowerShell"));
+  if (nav) nav.click();
+  return true;
+})()`);
+await new Promise((r) => setTimeout(r, 900));
+const pwshBar = await evaluate(`[...document.querySelectorAll(".local-module .side-actions button")]
+  .map((b) => ({ text: (b.innerText || "").trim(), title: b.title || "" }))`);
+check(
+  "PowerShell 面板有两个并排的新建按钮（5.1 / 7）",
+  pwshBar.some((b) => b.text.includes("新建 PowerShell")) &&
+    pwshBar.some((b) => b.text.trim() === "PowerShell 7"),
+  pwshBar.map((b) => b.text).join(" | "),
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".local-module .side-actions button")]
+    .find((x) => (x.innerText || "").trim() === "PowerShell 7");
+  if (b) b.click();
+  return !!b;
+})()`);
+await new Promise((r) => setTimeout(r, 1200));
+const pwshCall = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "open_local");
+  const last = calls.length ? calls[calls.length - 1].args : null;
+  return last ? { shell: last.shell } : null;
+})()`);
+check(
+  "点「PowerShell 7」时后端收到 shell=pwsh",
+  !!pwshCall && pwshCall.shell === "pwsh",
+  JSON.stringify(pwshCall),
+);
+const shot7 = await shot("07-powershell-7.png");
+
 // ---------- 通知策略可配 ----------
 const openedSettings = await evaluate(`(() => {
   const gear = [...document.querySelectorAll("button")].find((b) => (b.title || "").includes("设置"));
@@ -587,10 +621,14 @@ check(
   JSON.stringify(settingsWrite),
 );
 const naming = await evaluate(`({
-  oldName: document.body.innerText.includes("ZeeAI Terminal"),
-  newName: document.body.innerText.includes("ZEEAI TERM"),
+  oldName: document.body.innerText.includes("ZeeAI Terminal") || document.body.innerText.includes("ZEEAI TERM"),
+  newName: document.body.innerText.includes("ZeeAI Term"),
 })`);
-check("界面文案统一成 ZEEAI TERM（不再出现 ZeeAI Terminal）", !naming.oldName, `ZEEAI TERM=${naming.newName}`);
+check(
+  "产品名统一成 ZeeAI Term（不再出现全大写或 Terminal 全称）",
+  !naming.oldName && naming.newName,
+  `出现 ZeeAI Term=${naming.newName}`,
+);
 
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
