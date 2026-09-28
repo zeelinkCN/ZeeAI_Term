@@ -60,7 +60,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage 'resources') | Out-N
 
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZeeAI_Term.exe') -Force
 Copy-Item -LiteralPath $readme -Destination (Join-Path $stage 'README-portable.txt') -Force
-Copy-Item -LiteralPath $resDir -Destination (Join-Path $stage 'resources/platform-tools') -Recurse -Force
+# 复制**目录内容**而不是目录本身：目标是已存在的目录时，Copy-Item 会把源目录
+# "塞进去"变成 platform-tools/platform-tools（我踩过，多出一份 8MB 的 adb）。
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'resources/platform-tools') | Out-Null
+Copy-Item -Path (Join-Path $resDir '*') -Destination (Join-Path $stage 'resources/platform-tools') -Recurse -Force
 
 Write-Host '== 压缩 =='
 if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
@@ -85,7 +88,8 @@ try {
   New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources') | Out-Null
   Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
   Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
-  Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
+  New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources/platform-tools') | Out-Null
+  Copy-Item -Path (Join-Path $resDir '*') -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
   Write-Host "   已刷新（解压即用的目录也是这一版了）"
   if (Test-Path $stale) {
     Write-Host "   旧目录留了个备份：$stale（里面那个 exe 可能还被正在运行的窗口占着，关掉后删掉它即可）"
@@ -96,9 +100,19 @@ try {
   # 而不是像以前那样"删了一半、只剩一个 .old 文件"（真踩过，把用户的目录掏空了）。
   Write-Host '   整目录重建失败，改成就地覆盖…'
   try {
-    Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
+    # exe 正被运行中的窗口占着时，直接覆盖会失败 —— 那就先把它改名让位（改名不受锁影响），
+    # 再把新的复制过去。用户下次打开就是新版，旧的那个留着关掉窗口后删。
+    try {
+      Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
+    } catch {
+      $staleExe = Join-Path $outDir ("ZeeAI_Term.exe.old-" + (Get-Date -Format 'HHmmss'))
+      Move-Item -LiteralPath (Join-Path $outDir 'ZeeAI_Term.exe') -Destination $staleExe -Force
+      Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
+      Write-Host "   exe 正在运行，旧的那份改名成：$(Split-Path $staleExe -Leaf)（关掉窗口后删掉它）"
+    }
     Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
-    Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
+    New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources/platform-tools') | Out-Null
+    Copy-Item -Path (Join-Path $resDir '*') -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
     # 顺手清掉能删的旧备份（删不掉的说明还被占着，留着就行）
     Get-ChildItem -LiteralPath $outDir -Filter 'ZeeAI_Term.exe.old-*' -File -ErrorAction SilentlyContinue |
       ForEach-Object { try { $_.Delete() } catch { } }

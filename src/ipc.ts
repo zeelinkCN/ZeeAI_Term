@@ -22,6 +22,7 @@ import type {
   AiArtifact,
   HighlightRule,
   HerdrAgent,
+  HerdrPane,
   HerdrInstallReport,
 } from "./types";
 
@@ -662,6 +663,17 @@ export async function herdrAgents(
   userOverride?: string | null,
 ): Promise<HerdrAgent[]> {
   return invoke<HerdrAgent[]>("herdr_agents", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 读这台服务器上 herdr 的**所有窗格**（含没有 agent 的空壳窗格）—— 接管列表用 */
+export async function herdrPanes(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<HerdrPane[]> {
+  return invoke<HerdrPane[]>("herdr_panes", {
     profileId,
     userOverride: userOverride ?? null,
   });

@@ -245,7 +245,7 @@ pub fn open_ssh(
                 close_flag,
             },
         );
-        log::info!("ipc: open_ssh(herdr-pane) pane={pane} {c}x{r} -> {id}");
+        log::info!("ipc: open_ssh(herdr-{mode}) pane={pane} {c}x{r} -> {id}");
         return Ok(SessionInfo {
             id,
             profile_id,
@@ -2729,6 +2729,21 @@ pub async fn herdr_agents(
     Ok(agents)
 }
 
+/// 读这台服务器上 herdr 的**所有窗格**（不只 agent 的，只读）。
+///
+/// 用途：「接管已有窗格」的列表 —— 空壳窗格（AI 已退出 / 刚开的）也得能选。
+#[tauri::command]
+pub async fn herdr_panes(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<Vec<herdr::HerdrPane>, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::panes_command()).await?;
+    let panes = herdr::parse_panes(&out);
+    log::info!("ipc: herdr_panes -> {} 个窗格", panes.len());
+    Ok(panes)
+}
+
 /// 观察窗的尺寸变了：把 observe 流**重开**一次。
 ///
 /// herdr 的观察者是在开流时声明自己行列数的（不会去改窗格本身的尺寸 —— 这正是我们
@@ -3375,13 +3390,18 @@ pub fn history_list() -> Vec<HistoryEntry> {
 pub fn history_save(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
     if entry.id.trim().is_empty() {
         // 普通 shell 的 id 也要带名字，否则同一台机器的多个普通 shell 会撞成同一个 id
-        let tail = entry
-            .tmux_session
-            .clone()
-            .map(|t| format!("tmux-{t}"))
-            .unwrap_or_else(|| {
-                format!("plain-{}", entry.title.clone().unwrap_or_else(|| "shell".into()))
-            });
+        // herdr 会话按**窗格号**分条（同一个窗格只有一条记录，不同窗格互不覆盖）。
+        let tail = if let Some(pane) = entry.herdr_pane.clone().filter(|p| !p.trim().is_empty()) {
+            format!("herdr-{pane}")
+        } else {
+            entry
+                .tmux_session
+                .clone()
+                .map(|t| format!("tmux-{t}"))
+                .unwrap_or_else(|| {
+                    format!("plain-{}", entry.title.clone().unwrap_or_else(|| "shell".into()))
+                })
+        };
         entry.id = format!("h-{}-{}", entry.profile_id, tail);
     }
     log::info!(

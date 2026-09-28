@@ -58,7 +58,18 @@ pub fn run() {
         let handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {
           let profiles = crate::store::load().unwrap_or_default();
-          match profiles.iter().find(|p| p.ssh.is_some()) {
+          // 默认拿第一台 SSH 服务器；设了 ZEEAI_SELFTEST_PROFILE=<名字> 就按名字挑
+          //（排查"只有某台机器出问题"时很有用，比如 lz 走的是密码认证那条路）
+          let want = std::env::var("ZEEAI_SELFTEST_PROFILE").unwrap_or_default();
+          let picked = if want.trim().is_empty() {
+            profiles.iter().find(|p| p.ssh.is_some())
+          } else {
+            profiles
+              .iter()
+              .find(|p| p.ssh.is_some() && p.name.eq_ignore_ascii_case(want.trim()))
+              .or_else(|| profiles.iter().find(|p| p.ssh.is_some()))
+          };
+          match picked {
             Some(profile) => {
               log::info!("SELFTEST: using profile {}", profile.name);
               match crate::commands::tmux_list(profile.id.clone(), None).await {
@@ -341,17 +352,58 @@ pub fn run() {
               if std::env::var("ZEEAI_SELFTEST_HERDR").is_ok() {
                 // 先对**每一台** SSH 服务器只读探一遍 agent 列表（这是看板的 herdr 数据源）
                 for p in profiles.iter().filter(|p| p.ssh.is_some()) {
-                  match crate::commands::herdr_agents(p.id.clone(), None).await {
+                  // 顺手量一下耗时：这一步走的是"远端采集"（密钥走 ssh.exe、密码走 russh），
+                  // 用户报的"新建 herdr 窗口一直转"如果卡在这里，日志里就能直接看出来。
+                  let t0 = std::time::Instant::now();
+                  let r = crate::commands::herdr_agents(p.id.clone(), None).await;
+                  let ms = t0.elapsed().as_millis();
+                  match r {
                     Ok(list) => log::info!(
-                      "SELFTEST: herdr_agents({}) -> {} 个：{}",
+                      "SELFTEST: herdr_agents({}) -> {} 个（{} ms）：{}",
                       p.name,
                       list.len(),
+                      ms,
                       list.iter()
                         .map(|a| format!("{}@{}={}", a.kind, a.pane_id, a.status))
                         .collect::<Vec<_>>()
                         .join(", ")
                     ),
-                    Err(e) => log::error!("SELFTEST: herdr_agents({}) failed -> {e}", p.name),
+                    Err(e) => log::error!(
+                      "SELFTEST: herdr_agents({}) failed（{} ms）-> {e}",
+                      p.name,
+                      ms
+                    ),
+                  }
+                }
+                // 再量一遍"新建窗格"那条路（用户点「新建 herdr 窗格」时走的就是它）
+                {
+                  let t0 = std::time::Instant::now();
+                  match crate::commands::herdr_workspace_create(profile.id.clone(), None).await {
+                    Ok(pane) => {
+                      log::info!(
+                        "SELFTEST: herdr_workspace_create -> {pane}（{} ms）",
+                        t0.elapsed().as_millis()
+                      );
+                      // 建完就关掉，别在服务器上留垃圾
+                      let host = profile.ssh.as_ref().map(|s| s.host.clone()).unwrap_or_default();
+                      let user = profile.ssh.as_ref().map(|s| s.user.clone()).unwrap_or_default();
+                      let ws = pane.split(':').next().unwrap_or("").to_string();
+                      let args = crate::core::ssh::ssh_exec_args(
+                        &host,
+                        22,
+                        &user,
+                        None,
+                        &format!("herdr workspace close '{ws}'"),
+                        None,
+                      );
+                      let _ = std::process::Command::new(crate::core::ssh::ssh_exe())
+                        .args(&args)
+                        .output();
+                    }
+                    Err(e) => log::error!(
+                      "SELFTEST: herdr_workspace_create failed（{} ms）-> {e}",
+                      t0.elapsed().as_millis()
+                    ),
                   }
                 }
                 match crate::commands::herdr_install_inner(
@@ -469,6 +521,7 @@ pub fn run() {
       commands::ai_timeline_clear,
       commands::ai_source_probe,
       commands::herdr_agents,
+      commands::herdr_panes,
       commands::herdr_workspace_create,
       commands::herdr_pane_input,
       commands::herdr_pane_resize,

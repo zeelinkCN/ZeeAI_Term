@@ -22,10 +22,19 @@ import { tmpdir } from "node:os";
 
 // 仓库根目录 = 本文件的上一级（这样从任何目录调用都能跑）
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const OUT = join(tmpdir(), "zeeai-fe-test");
+// 临时目录：优先用固定的 zeeai-fe-test；如果上一轮的 Edge 还占着（清理失败），
+// 就换一个带时间戳的目录 —— 宁可换目录，也不要因为清理失败整轮跑不起来。
+let OUT = join(tmpdir(), "zeeai-fe-test");
+try {
+  rmSync(OUT, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+} catch {
+  OUT = join(tmpdir(), `zeeai-fe-test-${Date.now()}`);
+}
 const SITE = join(OUT, "site");
 const PORT = 8791;
-const CDP_PORT = 9333;
+// CDP 端口随机 + 每次一个新的 Edge profile 目录：
+// 上一轮万一留下 Edge 进程（或用户自己在开 Edge），都不会和我们抢端口/抢 profile。
+const CDP_PORT = 9300 + Math.floor(Math.random() * 650);
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 
 const appData = join(process.env.APPDATA ?? "", "ZeeAI-Terminal");
@@ -100,15 +109,49 @@ window.__ZEEAI_SESSION__ = ${JSON.stringify({
 })};
 
 const noop = () => {};
-const resolveCmd = (cmd) => {
+const resolveCmd = (cmd, args) => {
   const M = window.__ZEEAI_MOCK__;
   const S = window.__ZEEAI_SCENARIO__;
   switch (cmd) {
     case "list_profiles": return M.profiles;
     case "settings_get": return M.settings;
-    case "history_list": return M.history;
-    case "history_save": case "history_remove": return M.history;
-    case "workspace_load": return JSON.stringify(window.__ZEEAI_SESSION__);
+    // 历史列表：herdrHistory = 带一条 herdr 会话（验证"从侧栏点开也进 herdr"）。
+    // 注意三个入口（list/save/remove）都要走同一份 —— 应用启动时恢复会话会调 history_save，
+    // 如果那里返回真实列表，就会把场景数据覆盖掉（我自己踩过）。
+    case "history_list": case "history_save": case "history_remove":
+      return window.__ZEEAI_SCENARIO__.herdrHistory ? [{
+        id: "h-herdr-wD",
+        profileId: (M.profiles.find((p) => p.ssh && p.ssh.herdrEnabled) || {}).id,
+        profileName: "lz",
+        host: "47.99.241.168",
+        tmuxSession: null,
+        herdrPane: "wD:p1",
+        herdrMode: "control",
+        title: "lz · herdr wD:p1",
+        lastUsed: 0,
+      }] : M.history;
+    // restoreHerdr = 让快照里带一条 herdr 会话（验证"重启后仍以 herdr 方式恢复"）
+    case "workspace_load":
+      return JSON.stringify(
+        window.__ZEEAI_SCENARIO__.restoreHerdr
+          ? {
+              version: 1,
+              savedAt: Date.now(),
+              activeIndex: 0,
+              sessions: [
+                {
+                  kind: "remote",
+                  title: "lz · herdr wD:p1",
+                  profileId: (window.__ZEEAI_MOCK__.profiles.find((p) => p.ssh && p.ssh.herdrEnabled) || {}).id,
+                  user: "lz",
+                  tmuxMode: "name",
+                  herdrPane: "wD:p1",
+                  herdrMode: "control",
+                },
+              ],
+            }
+          : window.__ZEEAI_SESSION__,
+      );
     case "workspace_save": return null;
     case "update_install_kind": return "portable";
     case "update_take_result": return null;
@@ -118,11 +161,35 @@ const resolveCmd = (cmd) => {
     case "session_log_stop": case "session_log_status": return null;
     case "ai_timeline_list": return [];
     case "ai_timeline_add": return false;
-    case "ai_source_probe": return S.herdr;
+    // herdrProbePending = "探测一直不返回"（用来验证勾选框不会被禁用）
+    case "ai_source_probe":
+      if (S.herdrProbePending) return new Promise(() => {});
+      // herdrProbeFail = "这一下没连上"（探测抛错 → 界面应显示可重试，而不是"没装"）
+      if (S.herdrProbeFail) return Promise.reject(new Error("mock 探测失败"));
+      // herdrNotInstalled = "探到了、但这台机器没装"（用来验证安装入口）
+      if (S.herdrNotInstalled) {
+        return { herdrVersion: "", herdrPath: "", agents: 0, protocol: 0, schemaVersion: 0, schemaFingerprint: "", compat: "unknown" };
+      }
+      return S.herdr;
     case "herdr_agents": return S.herdrAgents;
+    // 接管列表用的是**所有窗格**（含没有 agent 的空壳窗格）
+    case "herdr_panes":
+      return S.herdrPanes || [
+        { paneId: "w2:p1", title: "lz", cwd: "/home/lz", agent: "codex", status: "idle", focused: true },
+        { paneId: "w9:p1", title: "lz", cwd: "/home/lz", agent: "", status: "unknown", focused: false },
+      ];
     case "herdr_pane_input_start": case "herdr_pane_type": case "herdr_pane_key":
     case "herdr_pane_resize": case "herdr_pane_input": return null;
-    case "herdr_workspace_create": return "w9:p1";
+    case "herdr_workspace_create":
+      if (window.__ZEEAI_SCENARIO__.createFails) {
+        return Promise.reject(new Error("mock：建窗格失败"));
+      }
+      return "w9:p1";
+    case "herdr_install":
+      return {
+        version: "0.9.1", protocol: 22, platform: "linux-x86_64",
+        source: "官方·直连", sha256: "2a02fed1", bytes: 26207464, path: "$HOME/.local/bin/herdr",
+      };
     case "settings_set": return null;
     case "ai_tasks_remote": return S.tasks;
     case "ai_tasks_local": return [];
@@ -173,7 +240,11 @@ window.__TAURI_INTERNALS__ = {
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: noop };
 `;
 
-rmSync(OUT, { recursive: true, force: true });
+try {
+  rmSync(OUT, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+} catch {
+  /* 上一轮的残留占着也无所谓：下面 copyDir 会覆盖 */
+}
 copyDir(join(ROOT, "dist"), SITE);
 // 用 CDP 的 addScriptToEvaluateOnNewDocument 注入（比改 HTML 更稳，dev server 也能用）
 
@@ -189,7 +260,7 @@ const server = createServer((req, res) => {
 await new Promise((r) => server.listen(PORT, r));
 
 // ---------- 3) 无头 Edge + CDP ----------
-const profileDir = join(OUT, "edge-profile");
+const profileDir = join(OUT, "edge-profile-" + Date.now());
 const edge = spawn(
   EDGE,
   [
@@ -317,6 +388,34 @@ const shot = async (name) => {
   const p = join(OUT, name);
   writeFileSync(p, Buffer.from(r.data, "base64"));
   return p;
+};
+// 通用小工具（后面的多轮场景都会用）
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** 重新加载页面：每一条新场景都从"刚启动"的干净状态开始 */
+const reload = async () => {
+  await send("Page.navigate", { url: targetUrl });
+  await sleep(2600);
+};
+/**
+ * 给"下一页"设一组场景开关。
+ *
+ * 关键点：注入的脚本是**累积**的（每次 navigate 都会按顺序跑一遍），所以每个场景都必须
+ * 把**所有**开关显式写一遍 —— 否则上一个场景留下的开关会污染下一个场景
+ *（我刚踩过：安装场景的 herdrNotInstalled 漏到接管场景，导致 herdr 勾选框变灰）。
+ */
+const setScenario = async (flags) => {
+  const all = {
+    herdrProbePending: false,
+    herdrProbeFail: false,
+    herdrNotInstalled: false,
+    createFails: false,
+    restoreHerdr: false,
+    herdrHistory: false,
+    ...flags,
+  };
+  await send("Page.addScriptToEvaluateOnNewDocument", {
+    source: `if (window.__ZEEAI_SCENARIO__) Object.assign(window.__ZEEAI_SCENARIO__, ${JSON.stringify(all)});`,
+  });
 };
 
 // ---------- 4) 断言 ----------
@@ -551,12 +650,12 @@ const pwshBar = await evaluate(`[...document.querySelectorAll(".local-module .si
 check(
   "PowerShell 面板有两个并排的新建按钮（5.1 / 7）",
   pwshBar.some((b) => b.text.includes("新建 PowerShell")) &&
-    pwshBar.some((b) => b.text.trim() === "PowerShell 7"),
+    pwshBar.some((b) => b.text.includes("PowerShell 7")),
   pwshBar.map((b) => b.text).join(" | "),
 );
 await evaluate(`(() => {
   const b = [...document.querySelectorAll(".local-module .side-actions button")]
-    .find((x) => (x.innerText || "").trim() === "PowerShell 7");
+    .find((x) => (x.innerText || "").includes("PowerShell 7"));
   if (b) b.click();
   return !!b;
 })()`);
@@ -572,6 +671,31 @@ check(
   JSON.stringify(pwshCall),
 );
 const shot7 = await shot("07-powershell-7.png");
+
+// ---------- (A4) 一键安装按钮：点了要真的调 herdr_install ----------
+await setScenario({ herdrNotInstalled: true });
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2000);
+const installBtn = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal button")].find((x) => (x.innerText || "").includes("一键安装 herdr"));
+  if (!b) return { found: false, text: (document.querySelector(".modal")?.innerText || "").slice(0, 200) };
+  b.click();
+  return { found: true };
+})()`);
+await sleep(1500);
+const installCalled = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_install").length`,
+);
+check(
+  "没装时点「一键安装 herdr」会真的发起安装",
+  installBtn.found && installCalled >= 1,
+  `按钮=${installBtn.found} 调用=${installCalled}`,
+);
 
 // ---------- 通知策略可配 ----------
 const openedSettings = await evaluate(`(() => {
@@ -630,12 +754,245 @@ check(
   `出现 ZeeAI Term=${naming.newName}`,
 );
 
+// ---------- 回归：探测还没返回时，herdr 勾选框**必须能点** ----------
+// （这正是用户"新建 herdr 窗口一直建不开"的根因：以前探测没回来就禁用，
+//   用户点不动那个勾，点连接就悄悄开了个普通 shell。）
+await setScenario({ herdrProbePending: true });
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+  if (b) b.click();
+  return true;
+})()`);
+await new Promise((r) => setTimeout(r, 1500));
+const pendingBox = await evaluate(`(() => {
+  const labels = [...document.querySelectorAll(".modal .form-check")];
+  const row = labels.find((l) => (l.innerText || "").includes("用 herdr 打开"));
+  if (!row) return { found: false };
+  const cb = row.querySelector("input[type=checkbox]");
+  return { found: true, disabled: !!cb && cb.disabled, text: (row.innerText || "").trim() };
+})()`);
+check(
+  "探测未返回时 herdr 勾选框仍可点（不再禁用）",
+  pendingBox.found && pendingBox.disabled === false && pendingBox.text.includes("探测"),
+  `disabled=${pendingBox.disabled} ${pendingBox.text}`,
+);
+const shot8 = await shot("08-herdr-probing.png");
+
+// ================= 第二轮：把 herdr 剩下的 UI 路径全铺一遍 =================
+// ---------- (A) 接管已有窗格：不能新建、要拿列表、要带 --takeover ----------
+await setScenario({});
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(1600);
+await evaluate(`(() => {
+  const radios = [...document.querySelectorAll(".modal .tmux-choice .form-check")];
+  const r = radios.find((x) => (x.innerText || "").includes("接管已有窗格"));
+  if (r) r.click();
+  return !!r;
+})()`);
+await sleep(1200);
+const takeoverList = await evaluate(`(() => {
+  const items = [...document.querySelectorAll(".modal .attach-list .form-check")]
+    .map((l) => (l.innerText || "").trim());
+  const panes = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_panes").length;
+  return { items, panes };
+})()`);
+check(
+  "选「接管已有窗格」会列出**所有窗格**（含没有 agent 的空壳窗格）",
+  takeoverList.panes >= 1 &&
+    takeoverList.items.some((t) => t.includes("w2:p1")) &&
+    takeoverList.items.some((t) => t.includes("w9:p1")),
+  `pane 调用 ${takeoverList.panes} 次；列表=${takeoverList.items.join(" | ")}`,
+);
+await evaluate(`(() => {
+  const items = [...document.querySelectorAll(".modal .attach-list .form-check")];
+  const t = items.find((l) => (l.innerText || "").includes("w2:p1"));
+  if (t) t.querySelector("input").click();
+  return !!t;
+})()`);
+await sleep(400);
+const beforeCreate = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "herdr_workspace_create").length`,
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal .modal-actions button")].find((x) => (x.innerText || "").trim() === "连接");
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2500);
+const takeoverOpen = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__;
+  const open = calls.filter((c) => c.cmd === "open_ssh").pop();
+  return {
+    backend: open ? open.args.backend : null,
+    pane: open ? open.args.tmuxName : null,
+    created: calls.filter((c) => c.cmd === "herdr_workspace_create").length,
+  };
+})()`);
+check(
+  "接管已有窗格：不新建，直接以 herdr-control 打开那个窗格",
+  takeoverOpen.backend === "herdr-control" &&
+    takeoverOpen.pane === "w2:p1" &&
+    takeoverOpen.created === beforeCreate,
+  JSON.stringify(takeoverOpen),
+);
+const shot9 = await shot("09-herdr-takeover.png");
+
+// ---------- (A2) 从左侧会话列表点开 herdr 会话：也要进 herdr（不是普通 shell） ----------
+await setScenario({ herdrHistory: true });
+await reload();
+await sleep(1200);
+const historyRow = await evaluate(`(() => {
+  const scen = "herdrHistory=" + window.__ZEEAI_SCENARIO__.herdrHistory;
+  const rows = [...document.querySelectorAll(".tree-item")];
+  const r = rows.find((x) => (x.innerText || "").includes("herdr wD:p1"));
+  if (!r) return { found: false, scen, hist: JSON.stringify(window.__ZEEAI_MOCK__.history).slice(0, 120), all: rows.map((x) => (x.innerText || "").trim()).slice(0, 12) };
+  r.click();
+  return { found: true };
+})()`);
+await sleep(2500);
+const fromHistory = await evaluate(`(() => {
+  const open = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "open_ssh").pop();
+  return open ? { backend: open.args.backend, pane: open.args.tmuxName } : null;
+})()`);
+check(
+  "从侧栏历史点开 herdr 会话 → 仍以 herdr 打开",
+  historyRow.found && !!fromHistory && fromHistory.backend === "herdr-control" && fromHistory.pane === "wD:p1",
+  `找到行=${historyRow.found} 结果=${JSON.stringify(fromHistory)} 场景=${historyRow.scen} 行文本=${JSON.stringify(historyRow.all)}`,
+);
+
+// ---------- (A3) 新建窗格失败必须有可见报错（不能"卡着不动"） ----------
+await setScenario({ createFails: true });
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(1600);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal .modal-actions button")].find((x) => (x.innerText || "").trim() === "连接");
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2500);
+const failNotice = await evaluate(`(() => {
+  const bar = document.querySelector(".statusbar .status-notice");
+  return { text: bar ? (bar.innerText || "").trim() : "", kind: bar ? bar.className : "", modalOpen: !!document.querySelector(".modal") };
+})()`);
+check(
+  "新建窗格失败时状态栏给出报错（对话框不再无声卡住）",
+  failNotice.text.includes("新建会话失败") && failNotice.kind.includes("error"),
+  JSON.stringify(failNotice),
+);
+const shot11 = await shot("11-create-fail.png");
+
+// ---------- (B) 看板卡片上的「接管」 ----------
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2600);
+const cardButtons = await evaluate(`[...document.querySelectorAll(".ai-panel .ai-task-actions button")].map((b) => (b.innerText || "").trim())`);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel .ai-task-actions button")].find((x) => (x.innerText || "").trim() === "接管");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2200);
+const cardTakeover = await evaluate(`(() => {
+  const open = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "open_ssh").pop();
+  return open ? { backend: open.args.backend, pane: open.args.tmuxName } : null;
+})()`);
+check(
+  "看板卡片「接管」→ herdr-control + 那个窗格",
+  !!cardTakeover && cardTakeover.backend === "herdr-control" && cardTakeover.pane === "w2:p1",
+  `按钮=${cardButtons.join(",")} 结果=${JSON.stringify(cardTakeover)}`,
+);
+
+// ---------- (C) 重启恢复：快照里的 herdr 会话要以 herdr 方式打开 ----------
+await setScenario({ restoreHerdr: true });
+await reload();
+await sleep(2000);
+const restored = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__;
+  const opens = calls.filter((c) => c.cmd === "open_ssh");
+  const last = opens.length ? opens[opens.length - 1] : null;
+  return {
+    count: opens.length,
+    backend: last ? last.args.backend : null,
+    pane: last ? last.args.tmuxName : null,
+    tabs: [...document.querySelectorAll(".session-tab")].map((t) => (t.innerText || "").trim()),
+  };
+})()`);
+check(
+  "重启后 herdr 会话仍以 herdr 打开（不会被当成 tmux/普通 shell）",
+  restored.backend === "herdr-control" && restored.pane === "wD:p1",
+  JSON.stringify(restored),
+);
+const shot10 = await shot("10-restore-herdr.png");
+
+// ---------- (D) 探测失败（null）：可以勾、点连接会强制重探 ----------
+await setScenario({ herdrProbeFail: true });
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2200);
+const failedProbeBox = await evaluate(`(() => {
+  const row = [...document.querySelectorAll(".modal .form-check")].find((l) => (l.innerText || "").includes("用 herdr 打开"));
+  if (!row) return { found: false };
+  const cb = row.querySelector("input[type=checkbox]");
+  return { found: true, disabled: !!cb && cb.disabled, text: (row.innerText || "").trim() };
+})()`);
+check(
+  "探测失败时勾选框仍可点，并说明会重试",
+  failedProbeBox.found && failedProbeBox.disabled === false && failedProbeBox.text.includes("探测失败"),
+  `disabled=${failedProbeBox.disabled} ${failedProbeBox.text}`,
+);
+const probeCallsBefore = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_source_probe").length`,
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal .modal-actions button")].find((x) => (x.innerText || "").trim() === "连接");
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2500);
+const retry = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__;
+  const open = calls.filter((c) => c.cmd === "open_ssh").pop();
+  return {
+    probes: calls.filter((c) => c.cmd === "ai_source_probe").length,
+    backend: open ? open.args.backend : null,
+  };
+})()`);
+check(
+  "点了连接会**强制重探**一次（不再被一次失败挡住）",
+  retry.probes > probeCallsBefore,
+  `ai_source_probe ${probeCallsBefore} → ${retry.probes}，open backend=${retry.backend}`,
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}`);
 
 ws.close();
-edge.kill();
+// 结束整棵 Edge 进程树（只 kill 父进程会留下子进程占着 profile 目录和工作目录）
+try {
+  spawn("taskkill", ["/PID", String(edge.pid), "/T", "/F"], { stdio: "ignore" });
+} catch {
+  edge.kill();
+}
 server.close();
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n结果：${results.length - failed}/${results.length} 通过`);

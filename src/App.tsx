@@ -29,6 +29,7 @@ import {
   aiSourceProbe,
   herdrAgents,
   herdrInstall,
+  herdrPanes,
   herdrWorkspaceCreate,
   herdrPaneInputStart,
   herdrPaneKey,
@@ -106,6 +107,7 @@ import type {
   AiArtifact,
   AiTask,
   HerdrAgent,
+  HerdrPane,
   AiTurnRecord,
   AiSourceInfo,
   AppSettings,
@@ -751,8 +753,8 @@ export default function App() {
   } | null>(null);
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
-  /** 「接管已有 herdr 窗格」时列出来的 agent / 窗格（点一下那个，按需加载） */
-  const [dialogHerdr, setDialogHerdr] = useState<HerdrAgent[]>([]);
+  /** 「接管已有 herdr 窗格」时列出来的窗格（按需加载；含没有 agent 的空壳窗格） */
+  const [dialogHerdr, setDialogHerdr] = useState<HerdrPane[]>([]);
 
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -1300,21 +1302,35 @@ export default function App() {
    * 注意要按**对话框里选的那台服务器**探（不是当前会话那台）—— 用户可能在对话框里切服务器。
    * 命中缓存就不重复 ssh；结果存进 herdrAvail，供那个复选框决定能不能勾。
    */
-  async function probeHerdrFor(profileId: string, user?: string | null) {
-    const cached = aiSourceCache.current.get(profileId);
-    if (cached) {
-      rememberHerdrAvail(profileId, cached);
-      return;
+  async function probeHerdrFor(
+    profileId: string,
+    user?: string | null,
+    /** true = 绕开成功缓存、**强制重探一次**（用户明确要用 herdr 时走这条） */
+    force = false,
+  ): Promise<AiSourceInfo | null | undefined> {
+    if (!force) {
+      const cached = aiSourceCache.current.get(profileId);
+      if (cached) {
+        rememberHerdrAvail(profileId, cached);
+        return cached;
+      }
     }
-    if (probingHerdrRef.current[profileId]) return; // 已经在探了，别重复 ssh
+    if (probingHerdrRef.current[profileId]) {
+      // 已经在探了，别重复 ssh；把当前已知的结果先给调用方
+      return herdrAvailRef.current[profileId];
+    }
     probingHerdrRef.current = { ...probingHerdrRef.current, [profileId]: true };
     setProbingHerdr((m) => ({ ...m, [profileId]: true }));
     try {
       const info = await aiSourceProbe(profileId, user ?? null);
       aiSourceCache.current.set(profileId, info);
       rememberHerdrAvail(profileId, info);
+      return info;
     } catch {
+      // **失败不写进成功缓存**（一次网络抖动不该让这台机器整场都"没装 herdr"）；
+      // 只记一条"探测失败"，界面据此提示可以重试。
       rememberHerdrAvail(profileId, null);
+      return null;
     } finally {
       probingHerdrRef.current = { ...probingHerdrRef.current, [profileId]: false };
       setProbingHerdr((m) => ({ ...m, [profileId]: false }));
@@ -2638,6 +2654,11 @@ export default function App() {
               profileName: profile.name,
               host: profile.ssh?.host ?? "",
               tmuxSession: info.tmuxSession ?? null,
+              // herdr 会话要把窗格号也记下来 —— 否则从侧栏列表点开它会开出普通 shell
+              herdrPane: herdrPane && (backend === "herdr-pane" || backend === "herdr-control")
+                ? herdrPane
+                : null,
+              herdrMode: backend === "herdr-control" ? "control" : backend === "herdr-pane" ? "observe" : null,
               // 存"最终显示名"（自动编号的「普通 shell N」也要存下来；herdr 会话要带 herdr+窗格号）。
               // 之前这里写的是 titleOverride（只存用户手填的名字），自动编号的名字被丢成 null，
               // 于是所有普通 shell 的去重键都变成同一个空值 → 又互相覆盖 → 永远不增数。
@@ -3073,11 +3094,13 @@ export default function App() {
     void probeHerdrFor(target.id, target.ssh?.user);
   }
 
-  /** 读一下这台机器上 herdr 认得的 agent / 窗格（「接管已有窗格」用，按需加载） */
+  /** 读一下这台机器上 herdr 的**所有窗格**（「接管已有窗格」用，按需加载） */
   async function loadDialogHerdr(profileId: string, user?: string) {
     setDialogBusy(true);
     try {
-      setDialogHerdr(await herdrAgents(profileId, user ?? null));
+      // 用 pane list 而不是 agent list：空壳窗格（AI 已退出/刚开的）也得能选，
+      // 否则用户会看到"没东西可接管"（实测反馈）。
+      setDialogHerdr(await herdrPanes(profileId, user ?? null));
     } catch (e) {
       notify("读取 herdr 窗格失败：" + String(e));
       setDialogHerdr([]);
@@ -3100,17 +3123,20 @@ export default function App() {
     }
     setDialogBusy(true);
     try {
-      // 「用 herdr 打开」但还没探过这台机器 → 先探一下再决定（别让用户点了连接才发现没装）。
-      // 探完结果是"没有 herdr"就**明确降级**到 tmux / 普通 shell，并在状态栏说清楚，
-      // 而不是让 herdr 那条远端命令自己打印一句英文提示了事。
-      if (newDialog.useHerdr && herdrAvailRef.current[newDialog.profileId] === undefined) {
-        await probeHerdrFor(newDialog.profileId, newDialog.user);
+      // 勾了「用 herdr 打开」就一定要拿到**可信的**结论再决定：
+      //   - 没探过 → 探一次；
+      //   - 上次探失败（null）→ **强制重探**（以前这里直接认为"没有 herdr"，
+      //     一次网络抖动就把用户挡在门外，日志里就是这么发生的）；
+      //   - 探到确实没装 → 明确降级到 tmux / 普通 shell，并在状态栏说清楚。
+      let srcNow: AiSourceInfo | null | undefined =
+        herdrAvailRef.current[newDialog.profileId];
+      if (newDialog.useHerdr && (!srcNow || !srcNow.herdrVersion)) {
+        srcNow = await probeHerdrFor(newDialog.profileId, newDialog.user, true);
       }
-      const srcNow = herdrAvailRef.current[newDialog.profileId];
       const canHerdrNow = !!srcNow && !!srcNow.herdrVersion && srcNow.compat !== "too_old";
       const useHerdr = newDialog.useHerdr && canHerdrNow;
       if (newDialog.useHerdr && !canHerdrNow) {
-        notify("这台机器上没探到可用的 herdr，这次改用 tmux / 普通 shell 打开");
+        notify("没探到可用的 herdr（这台机器没装或这一下没连上），这次改用 tmux / 普通 shell 打开");
       }
       const wantedUser = newDialog.user.trim();
       // 这里**不再写回服务器配置**：以前那个"把用户名保存到配置里"的勾选，
@@ -3175,6 +3201,10 @@ export default function App() {
         );
       }
       setNewDialog(null);
+    } catch (e) {
+      // 以前这里没有 catch：`herdr workspace create` 之类一旦抛错，异常就被吞掉，
+      // 对话框一动不动、也不报错 —— 用户看到的就是"一直建不开"（实测反馈）。
+      notify("新建会话失败：" + String(e));
     } finally {
       setDialogBusy(false);
     }
@@ -3191,19 +3221,35 @@ export default function App() {
     // - 普通 shell：一台机器开一排一模一样的"普通 shell"纯属重复，切过去就够了
     //   （真要再开一个，用「新建会话」按钮或服务器右键）。
     const opened = sessions.find((s) =>
-      h.tmuxSession
-        ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
-        : s.profileId === h.profileId &&
-          !s.tmuxName &&
-          (s.title ?? "").trim() === (h.title ?? "").trim(),
+      // herdr 会话按"同一个窗格 + 同一种方式"判重（和 openSshSession 里那套一致）
+      h.herdrPane
+        ? s.profileId === h.profileId &&
+          s.herdrPane === h.herdrPane &&
+          (s.herdrMode ?? "observe") === (h.herdrMode ?? "control")
+        : h.tmuxSession
+          ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
+          : s.profileId === h.profileId &&
+            !s.tmuxName &&
+            (s.title ?? "").trim() === (h.title ?? "").trim(),
     );
     if (opened) {
       setActiveId(opened.id);
-      notify(`「${h.title?.trim() || h.tmuxSession || "普通 shell"}」已经开着了，已帮你切过去`);
+      notify(
+        `「${h.title?.trim() || h.herdrPane || h.tmuxSession || "普通 shell"}」已经开着了，已帮你切过去`,
+      );
       return;
     }
     const custom = h.title?.trim() || undefined;
-    if (h.tmuxSession) {
+    if (h.herdrPane) {
+      // herdr 会话：按原来的方式重开那个窗格（以前这里会开出**普通 shell**，是个 bug）
+      await openHerdrPane(
+        h.profileId,
+        h.herdrPane,
+        custom?.replace(/^.*·\s*/, "").replace(/\s*w\d+:p\d+.*$/, "") || undefined,
+        null,
+        h.herdrMode === "observe" ? "observe" : "control",
+      );
+    } else if (h.tmuxSession) {
       await openSshSession(profile, "name", h.tmuxSession, null, custom);
     } else {
       // 普通 shell：带上这条历史的名字重开 —— 名字一样，历史记录还是同一条（不会又长出新的编号）
@@ -8455,7 +8501,13 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={newDialog.useHerdr}
-                  disabled={!newDialogCanHerdr}
+                  // **只有"确实探到没装"才禁**（`!!newDialogHerdr` 就是这道闸）：
+                  //   - undefined = 还没探 → 允许勾
+                  //   - null      = 探测失败（可以重试）→ 允许勾
+                  //   - {} 无版本 = 探到了、这台机器没装 → 才禁用
+                  // 以前是"探测没返回就禁用"，用户想勾也点不动，点连接就悄悄开了个普通 shell
+                  //（实测反馈"herdr 一直建不开"）。勾上之后点连接会强制再确认一次。
+                  disabled={!!newDialogHerdr && !newDialogCanHerdr}
                   onChange={(e) => {
                     setNewDialog({ ...newDialog, useHerdr: e.target.checked });
                     // 只有"接管已有窗格"才需要列表；新建窗格不用拉
@@ -8470,15 +8522,20 @@ export default function App() {
                     ? `（已装 ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
                     : newDialogHerdr === undefined
                       ? probingHerdr[newDialog.profileId]
-                        ? "（探测中…）"
+                        ? "（正在探测…可以先勾上）"
                         : "（未探测 · 点这行探测）"
+                      // 探到"没装"和"探测失败"要分开说：前者是结论，后者是可以重试的
+                      : newDialogHerdr === null
+                        ? "（探测失败，可以先勾上，连接时会重试）"
                       : "（这台机器没装）"}
                 </span>
               </label>
 
               {/* 探测结果是"没有 herdr"时，顺手给一个一键安装入口。
                   安装过程由 Windows 侧下载 + 校验 sha256 后 scp 上去，不跑远端脚本、不要 root。 */}
-              {newDialogHerdr !== undefined && !newDialogCanHerdr ? (
+              {/* 安装入口只在"**确认**这台机器没装 herdr"时出现；
+                  探测失败（null）不给 —— 那多半是网络一时不通，装什么装。 */}
+              {!!newDialogHerdr && !newDialogCanHerdr ? (
                 <div className="modal-inline-action" style={{ paddingLeft: 14 }}>
                   {herdrInstalling[newDialog.profileId] ? (
                     <span className="hint">
@@ -8539,7 +8596,7 @@ export default function App() {
                             }
                           />
                           <span>
-                            {a.kind || "agent"} · {a.paneId} · {herdrStateLabel(a.status)}
+                            {a.agent || "shell"} · {a.paneId} · {herdrStateLabel(a.status)}
                           </span>
                         </label>
                       ))}
@@ -8671,7 +8728,8 @@ function LocalModule({
 }) {
   return (
     <div className="local-module">
-      <div className="side-actions">
+      {/* 有第二个按钮时改成竖排：两个按钮同宽同高、各占一行（并排会挤到折行，很难看） */}
+      <div className={"side-actions" + (secondary ? " stack" : "")}>
         <button type="button" className="btn primary grow" onClick={onOpen}>
           <IconPlus size={14} /> 新建 {label}
         </button>
@@ -8682,7 +8740,7 @@ function LocalModule({
             title={secondary.title}
             onClick={secondary.onClick}
           >
-            {secondary.label}
+            <IconPlus size={14} /> 新建 {secondary.label}
           </button>
         )}
       </div>

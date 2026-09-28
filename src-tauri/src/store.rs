@@ -399,6 +399,15 @@ pub struct HistoryEntry {
     /// 用户给这个会话起的名字（为空则界面按 tmux 会话名/普通 shell 显示）
     #[serde(default)]
     pub title: Option<String>,
+    /// herdr 会话：恢复时要打开的窗格号（形如 w1:p1）。空 = 不是 herdr 会话。
+    ///
+    /// 为什么必须记：不记的话，从侧栏会话列表点开一个 herdr 会话会开出**普通 shell**
+    ///（同一类 bug 在工作区恢复那里也踩过一次）。
+    #[serde(default)]
+    pub herdr_pane: Option<String>,
+    /// herdr 会话的打开方式：observe（只读）/ control（可写）
+    #[serde(default)]
+    pub herdr_mode: Option<String>,
     #[serde(default)]
     pub last_used: u64,
 }

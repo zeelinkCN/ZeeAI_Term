@@ -253,6 +253,99 @@ pub fn agents_command() -> String {
     )
 }
 
+/// herdr 里的**一个窗格**（不管里面有没有 agent）
+///
+/// 为什么除了 agent 还要有它：`agent list` 只给"正在跑 agent"的窗格。
+/// 用户想接管一个刚开的、或者 AI 已经退出的空壳窗格时，那个列表是**空的** ——
+/// "接管已有窗格"就会变成没东西可选（实测发现）。`pane list` 是所有窗格。
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrPane {
+    pub pane_id: String,
+    /// 窗格标题（herdr 里显示的名字，通常是 cwd）
+    pub title: String,
+    pub cwd: String,
+    /// 里面跑着什么 agent（没有就是空串）
+    pub agent: String,
+    /// 该 agent 的状态：working / blocked / done / idle / unknown
+    pub status: String,
+    pub focused: bool,
+}
+
+/// 读这台机器上的所有窗格
+pub fn panes_command() -> String {
+    format!(
+        "{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" pane list 2>/dev/null; else printf 'HERDR_NONE\\n'; fi"
+    )
+}
+
+/// 解析 `herdr pane list` 的输出（一行 JSON：`{"result":{"panes":[…]}}`）
+pub fn parse_panes(text: &str) -> Vec<HerdrPane> {
+    let mut out: Vec<HerdrPane> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            collect_panes(&v, &mut out);
+        }
+    }
+    // 兜底：万一哪天 herdr 改成"整份 JSON 跨多行"，也还能读出来（和 parse_agents 一致）
+    if out.is_empty() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+            collect_panes(&v, &mut out);
+        }
+    }
+    out
+}
+
+/// 从一条 herdr JSON 里取窗格数组（形状与 [`collect_agents`] 一致，只是取的是 panes）
+fn collect_panes(v: &serde_json::Value, out: &mut Vec<HerdrPane>) {
+    let Some(list) = v
+        .get("result")
+        .and_then(|r| r.get("panes"))
+        .and_then(|p| p.as_array())
+    else {
+        return;
+    };
+    for p in list {
+        let s = |k: &str| -> String {
+            p.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let pane_id = s("pane_id");
+        if pane_id.is_empty() {
+            continue;
+        }
+        out.push(HerdrPane {
+            pane_id,
+            title: {
+                let t = s("terminal_title_stripped");
+                if t.is_empty() {
+                    s("terminal_title")
+                } else {
+                    t
+                }
+            },
+            cwd: {
+                let c = s("cwd");
+                if c.is_empty() {
+                    s("foreground_cwd")
+                } else {
+                    c
+                }
+            },
+            agent: s("agent"),
+            status: s("agent_status"),
+            focused: p.get("focused").and_then(|x| x.as_bool()).unwrap_or(false),
+        });
+    }
+}
+
 /// 在服务器上**新建一个 herdr workspace**（她的一个工作区，自带一个 shell 窗格）。
 ///
 /// 用户勾了"用 herdr 打开新会话"时走这条：新会话在 herdr 里就是一条新工作区，
@@ -625,5 +718,20 @@ mod tests {
         assert_eq!(pane_from_create(out).unwrap(), "w5:p1");
         assert!(pane_from_create("no json here").is_none());
         assert!(pane_from_create("{\"result\":{\"root_pane\":{\"pane_id\":\"\"}}}").is_none());
+    }
+
+    #[test]
+    fn panes_include_shells_without_agents() {
+        // 真实输出（lz 上抓的）：一个跑着 codex 的窗格 + 一个空壳窗格
+        let line = r#"{"id":"cli:pane:list","result":{"panes":[
+          {"agent":"codex","agent_status":"idle","cwd":"/home/lz","focused":true,"pane_id":"w2:p1","terminal_title_stripped":"lz"},
+          {"agent_status":"unknown","cwd":"/home/lz","focused":false,"pane_id":"w9:p1","terminal_title_stripped":"lz"}
+        ]},"type":"pane_list"}"#;
+        let got = parse_panes(line);
+        assert_eq!(got.len(), 2, "空壳窗格也要列出来（否则没东西可接管）");
+        assert_eq!(got[0].agent, "codex");
+        assert_eq!(got[0].status, "idle");
+        assert!(got[1].agent.is_empty());
+        assert_eq!(got[1].pane_id, "w9:p1");
     }
 }

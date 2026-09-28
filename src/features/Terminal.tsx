@@ -254,6 +254,13 @@ export default function TerminalView({
   herdrPaneRef.current = herdrPane;
   const needHerdrInputRef = useRef<Props["onHerdrInputNeeded"]>(onHerdrInputNeeded);
   needHerdrInputRef.current = onHerdrInputNeeded;
+  /**
+   * 可写 herdr 流的输入通道是否已经断了。
+   *
+   * 为什么要有它：通道断了之后**每一次按键都会失败**，如果每次都弹一条状态栏提示，
+   * 用户随便敲几下就被刷屏了。所以第一次失败提示一次，之后就不再发、也不再报。
+   */
+  const herdrInputDeadRef = useRef(false);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -370,8 +377,12 @@ export default function TerminalView({
         // 可写那条（control）：这条会话的 stdin 就是 herdr 的输入口，
         // 直接把原始字节交上去（回车之类都由 herdr 那边按终端语义处理）
         if (pane.mode === "control") {
+          if (herdrInputDeadRef.current) return; // 通道已断：不再逐键重试/报错
           void herdrPaneInput(sessionId, bytesToB64(new TextEncoder().encode(data))).catch(
-            () => onNotice?.("这个窗格的输入没送出去（可能已被别的客户端接管）"),
+            () => {
+              herdrInputDeadRef.current = true;
+              onNotice?.("这个窗格的输入送不出去了（可能已被别的客户端接管，或窗格已关闭）");
+            },
           );
           return;
         }

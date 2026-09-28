@@ -109,6 +109,10 @@ export interface HistoryEntry {
   profileName: string;
   host: string;
   tmuxSession?: string | null;
+  /** herdr 会话：要打开的窗格号（形如 w1:p1）；空 = 不是 herdr 会话 */
+  herdrPane?: string | null;
+  /** herdr 会话的打开方式：observe（只读）/ control（可写） */
+  herdrMode?: "observe" | "control" | null;
   /** 用户给这个会话起的名字 */
   title?: string | null;
   lastUsed: number;
@@ -207,6 +211,23 @@ export interface HerdrAgent {
   focused: boolean;
   /** 在等我们做事（= blocked） */
   attention: boolean;
+}
+
+/**
+ * herdr 里的一个窗格（**不管里面有没有 agent**）。
+ *
+ * 「接管已有窗格」的列表用它：光有 `agent list` 的话，AI 已退出/刚开的空壳窗格
+ * 是不出现的 —— 用户就会觉得"没东西可接管"（实测发现）。
+ */
+export interface HerdrPane {
+  paneId: string;
+  title: string;
+  cwd: string;
+  /** 里面跑着什么 agent；空串 = 普通 shell */
+  agent: string;
+  /** working / blocked / done / idle / unknown */
+  status: string;
+  focused: boolean;
 }
 
 /** 一键安装 herdr 的结果 */

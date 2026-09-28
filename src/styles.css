@@ -503,11 +503,25 @@ body {
 
 .side-actions {
   padding: 4px 8px 8px;
-  /* 并排两个"新建"按钮时（PowerShell / PowerShell 7）要横向排开、留一点缝 */
+  /* 两个按钮排开时留一点缝；不让它换行（换行会让两个按钮一高一矮，很乱） */
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+
+/* 竖着排：两个"新建"按钮**同宽同高、各占一行**。
+   为什么不用并排：侧栏就那么宽，"＋ 新建 PowerShell" + "PowerShell 7" 一行放不下，
+   按钮里的文字会折成两行，看起来一高一矮（用户截图反馈过）。 */
+.side-actions.stack {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.side-actions .btn {
+  /* 文字永远一行；居中，两个按钮观感一致 */
+  white-space: nowrap;
+  justify-content: center;
 }
 
 .btn {

@@ -1,0 +1,455 @@
+//! herdr 功能**全矩阵**真机测试（用应用自己的代码路径，不假后端）。
+//!
+//! 覆盖：探测 / 新建窗格 / 可写流（读+写+改尺寸+交还）/ 只读观察 / 输入泵 /
+//!        抢控制权(--takeover) / 窗格不存在时的报错 / 关流告警 / 清理。
+//!
+//! 用法（需要真机）：
+//! ```text
+//! ZEEAI_PROBE_USER=lz cargo run --example herdr_matrix
+//! ```
+//! 退出码 0 = 全过；非 0 = 有失败（失败项会打出来）。
+
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use zeeai_terminal_lib::core::{
+    herdr, herdr_stream, session_log::LogRegistry, ssh, SessionEvent,
+};
+
+/// 收集一条流的输出（解码后的原始字节 → 去掉 ANSI 的文本）
+#[derive(Default)]
+struct Recorder {
+    bytes: usize,
+    text: String,
+    states: Vec<String>,
+    errors: Vec<String>,
+    closed: bool,
+}
+
+fn collector(r: Arc<Mutex<Recorder>>) -> impl Fn(SessionEvent) + Send + Sync + 'static {
+    move |ev| match ev {
+        SessionEvent::Data { data } => {
+            use base64::Engine as _;
+            let b = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .unwrap_or_default();
+            let mut g = r.lock().unwrap();
+            g.bytes += b.len();
+            g.text.push_str(&strip_ansi(&String::from_utf8_lossy(&b)));
+        }
+        SessionEvent::Error { message } => r.lock().unwrap().errors.push(message),
+        SessionEvent::State { state } => {
+            let mut g = r.lock().unwrap();
+            if state == "closed" {
+                g.closed = true;
+            }
+            g.states.push(state);
+        }
+        SessionEvent::Title { .. } => {}
+    }
+}
+
+/// 粗略去掉 ANSI 转义（只为断言里找关键词）
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            match it.peek() {
+                Some('[') => {
+                    it.next();
+                    while let Some(&n) = it.peek() {
+                        it.next();
+                        if n.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    it.next();
+                    // OSC 的结束符有**两种**：BEL(\x07) 或 ST(ESC \)。
+                    // herdr 用的是 ST（`ESC]8;;ESC\`，OSC 8 超链接），只认 BEL 的话
+                    // 会把后面整屏文字一起吃掉 —— 这个坑我自己的测试脚本先踩了。
+                    while let Some(n) = it.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && it.peek() == Some(&'\\') {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn ssh_run(host: &str, user: &str, cmd: &str) -> String {
+    let args = ssh::ssh_exec_args(host, 22, user, None, cmd, None);
+    match std::process::Command::new(ssh::ssh_exe()).args(&args).output() {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        }
+        Err(e) => format!("ssh 执行失败：{e}"),
+    }
+}
+
+fn main() {
+    let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "47.99.241.168".into());
+    let user = std::env::var("ZEEAI_PROBE_USER").unwrap_or_else(|_| "lz".into());
+    println!("== herdr 全矩阵测试 → {user}@{host} ==");
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    macro_rules! check {
+        ($name:expr, $cond:expr, $extra:expr) => {{
+            if $cond {
+                pass += 1;
+                println!("PASS  {}\t{}", $name, $extra);
+            } else {
+                fail += 1;
+                println!("FAIL  {}\t{}", $name, $extra);
+            }
+        }};
+    }
+
+    // ---------- 1) 探测：herdr 在不在、协议号 ----------
+    let probe = ssh_run(&host, &user, &herdr::agents_command());
+    let agents = herdr::parse_agents(&probe);
+    check!(
+        "探测 herdr 可用",
+        !probe.contains("HERDR_NONE"),
+        format!("agents={}", agents.len())
+    );
+
+    // ---------- 2) 新建窗格（应用里「新建一个 herdr 窗格」走的就是这条） ----------
+    let create = ssh_run(&host, &user, &herdr::create_workspace_command());
+    let pane = herdr::pane_from_create(&create).unwrap_or_default();
+    check!(
+        "新建 herdr 窗格并解析出窗格号",
+        pane.starts_with('w') && pane.contains(':'),
+        format!("pane={pane}")
+    );
+    if pane.is_empty() {
+        println!("\n拿不到窗格号，后面的用例没法跑。原始输出：{create}");
+        std::process::exit(2);
+    }
+    let ws = pane.split(':').next().unwrap_or("").to_string();
+
+    // ---------- 3) 可写控制流：能收到帧 ----------
+    let rec = Arc::new(Mutex::new(Recorder::default()));
+    let ctl_cmd = herdr::control_command(&pane, 100, 28, true);
+    let ctl_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &ctl_cmd, None);
+    let ctl = herdr_stream::spawn(
+        "matrix-ctl",
+        "matrix",
+        &ssh::ssh_exe(),
+        &ctl_args,
+        collector(rec.clone()),
+        Arc::new(LogRegistry::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let (bytes, text) = {
+        let g = rec.lock().unwrap();
+        (g.bytes, g.text.clone())
+    };
+    check!(
+        "可写流收到画面（说明管道传输通了）",
+        bytes > 0,
+        format!("{bytes} 字节，开头：{:?}", text.trim().chars().take(40).collect::<String>())
+    );
+
+    // ---------- 4) 往流里写命令 → 真的执行了吗 ----------
+    if let Ok(h) = &ctl {
+        let marker = format!("ZEEAI_MATRIX_{}", std::process::id());
+        let line = format!("{}\n", herdr::input_line(format!("echo {marker}\r").as_bytes()));
+        let write_res = {
+            let mut w = h.writer.lock().unwrap();
+            let r = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+            r
+        };
+        println!("   [诊断] 写入 {} 字节 → {:?}", line.len(), write_res);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // 直接看窗格自己的画面：到底有没有收到我们敲的字
+        let pane_after = ssh_run(
+            &host,
+            &user,
+            &format!("herdr pane read '{pane}' --source recent --format text --lines 10"),
+        );
+        println!(
+            "   [诊断] 窗格画面里有没有 marker：{}；片段：{:?}",
+            pane_after.contains(&marker),
+            pane_after.trim().chars().take(120).collect::<String>()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let (got, count, tail) = {
+            let g = rec.lock().unwrap();
+            let n = g.text.matches(&marker).count();
+            let tail: String = g
+                .text
+                .chars()
+                .rev()
+                .take(160)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            (n >= 2, n, tail.replace('\n', "⏎"))
+        };
+        check!(
+            "写入命令后被真的执行（画面里出现回显+输出）",
+            got,
+            format!("marker={marker} 出现 {count} 次；尾部：{tail}")
+        );
+
+        // ---------- 5) 改尺寸不报错、且画面重绘 ----------
+        let before = rec.lock().unwrap().bytes;
+        let rl = format!("{}\n", herdr::resize_line(80, 20));
+        {
+            let mut w = h.writer.lock().unwrap();
+            let _ = w.write_all(rl.as_bytes());
+            let _ = w.flush();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let after = rec.lock().unwrap().bytes;
+        let errs = rec.lock().unwrap().errors.clone();
+        check!(
+            "terminal.resize 生效（画面重绘、无报错）",
+            after > before && errs.is_empty(),
+            format!("字节 {before} → {after}，errors={errs:?}")
+        );
+
+        // ---------- 6) 抢控制权：再来一个 --takeover，原控制端应该收到告警 ----------
+        let rec2 = Arc::new(Mutex::new(Recorder::default()));
+        let ctl2_cmd = herdr::control_command(&pane, 100, 28, true);
+        let ctl2_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &ctl2_cmd, None);
+        let ctl2 = herdr_stream::spawn(
+            "matrix-ctl2",
+            "matrix",
+            &ssh::ssh_exe(),
+            &ctl2_args,
+            collector(rec2.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let b2 = rec2.lock().unwrap().bytes;
+        check!("--takeover 能抢到控制权（新控制端拿到画面）", b2 > 0, format!("{b2} 字节"));
+        let old_errors = rec.lock().unwrap().errors.clone();
+        check!(
+            "原控制端收到「被接管」告警（翻成中文进状态栏）",
+            old_errors.iter().any(|e| e.contains("接管") || e.contains("关掉")),
+            format!("errors={old_errors:?}")
+        );
+        if let Ok(h2) = &ctl2 {
+            let _ = h2
+                .writer
+                .lock()
+                .map(|mut w| {
+                    let _ = w.write_all(format!("{}\n", herdr::release_line()).as_bytes());
+                    let _ = w.flush();
+                });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // ---------- 7) 交还控制权后，窗格还在（tmux 那种"能回来"） ----------
+        let still = ssh_run(&host, &user, &format!("herdr pane get '{pane}' 2>&1 | head -c 600"));
+        check!(
+            "交还控制权后窗格仍在服务器上",
+            still.contains("\"pane_id\"") && still.contains(&pane),
+            format!("含 pane_id={}", still.contains(&pane))
+        );
+    }
+
+    // ---------- 8) 只读观察窗 ----------
+    {
+        let rec3 = Arc::new(Mutex::new(Recorder::default()));
+        let obs_cmd = herdr::observe_command(&pane, 100, 28);
+        let obs_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &obs_cmd, None);
+        let _obs = herdr_stream::spawn(
+            "matrix-obs",
+            "matrix",
+            &ssh::ssh_exe(),
+            &obs_args,
+            collector(rec3.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let b = rec3.lock().unwrap().bytes;
+        check!("只读观察窗拿到画面", b > 0, format!("{b} 字节"));
+    }
+
+    // ---------- 9) 输入泵（观察窗打字用的那条） ----------
+    {
+        let marker = format!("ZEEAI_PUMP_{}", std::process::id());
+        let mut cmd = std::process::Command::new(ssh::ssh_exe());
+        cmd.args(ssh::ssh_args_no_tty(
+            &host,
+            22,
+            &user,
+            None,
+            &herdr::input_pump_command(&pane),
+            None,
+        ));
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                {
+                    use base64::Engine as _;
+                    let text = base64::engine::general_purpose::STANDARD
+                        .encode(format!("echo {marker}").as_bytes());
+                    if let Some(si) = child.stdin.as_mut() {
+                        let _ = si.write_all(format!("T{text}\n").as_bytes());
+                        let _ = si.write_all(b"Kenter\n");
+                        let _ = si.flush();
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let out = ssh_run(
+                    &host,
+                    &user,
+                    &format!("herdr pane read '{pane}' --source recent --format text --lines 20"),
+                );
+                check!(
+                    "输入泵能把命令敲进窗格（send-text + enter）",
+                    out.contains(&marker) && out.matches(&marker).count() >= 2,
+                    format!("marker={marker}")
+                );
+                let _ = child.kill();
+            }
+            Err(e) => check!("输入泵能起来", false, format!("{e}")),
+        }
+    }
+
+    // ---------- 9b) 观察者 + 控制端**同时**挂在一个窗格上（不打架） ----------
+    {
+        let rec_obs = Arc::new(Mutex::new(Recorder::default()));
+        let rec_ctl = Arc::new(Mutex::new(Recorder::default()));
+        let obs_cmd = herdr::observe_command(&pane, 100, 28);
+        let obs_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &obs_cmd, None);
+        let ctl_cmd = herdr::control_command(&pane, 100, 28, true);
+        let ctl_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &ctl_cmd, None);
+        let _o = herdr_stream::spawn(
+            "matrix-both-obs",
+            "matrix",
+            &ssh::ssh_exe(),
+            &obs_args,
+            collector(rec_obs.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let c = herdr_stream::spawn(
+            "matrix-both-ctl",
+            "matrix",
+            &ssh::ssh_exe(),
+            &ctl_args,
+            collector(rec_ctl.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        // 让控制端敲一句，观察端**应该也能看到**（同一块屏幕的两个视角）
+        if let Ok(h) = &c {
+            let m = format!("ZEEAI_BOTH_{}", std::process::id());
+            let line = format!("{}\n", herdr::input_line(format!("echo {m}\r").as_bytes()));
+            let _ = h.writer.lock().map(|mut w| {
+                let _ = w.write_all(line.as_bytes());
+                let _ = w.flush();
+            });
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let obs_text = rec_obs.lock().unwrap().text.clone();
+            let ctl_text = rec_ctl.lock().unwrap().text.clone();
+            check!(
+                "观察者与控制端可同时工作，且看到同一画面变化",
+                obs_text.contains(&m) && ctl_text.contains(&m),
+                format!("观察端看到={} 控制端看到={}", obs_text.contains(&m), ctl_text.contains(&m))
+            );
+        }
+        let o = rec_obs.lock().unwrap().bytes;
+        let cc = rec_ctl.lock().unwrap().bytes;
+        check!(
+            "两边都能持续收到帧（互不踢掉）",
+            o > 0 && cc > 0,
+            format!("观察 {o} 字节 / 控制 {cc} 字节")
+        );
+    }
+
+    // ---------- 10) 窗格不存在时：必须报错（而不是静默黑屏） ----------
+    {
+        let rec4 = Arc::new(Mutex::new(Recorder::default()));
+        let bad_cmd = herdr::control_command("w9999:p1", 80, 20, true);
+        let bad_args = ssh::ssh_args_no_tty(&host, 22, &user, None, &bad_cmd, None);
+        let _bad = herdr_stream::spawn(
+            "matrix-bad",
+            "matrix",
+            &ssh::ssh_exe(),
+            &bad_args,
+            collector(rec4.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let g = rec4.lock().unwrap();
+        let all = format!("{}{}", g.text, g.errors.join(" "));
+        check!(
+            "窗格不存在时给出报错（不会静默黑屏）",
+            all.to_lowercase().contains("error")
+                || all.contains("not found")
+                || all.contains("不存在")
+                || all.contains("no such")
+                || !g.errors.is_empty(),
+            format!("文本={:?} 告警={:?}", g.text.trim().chars().take(60).collect::<String>(), g.errors)
+        );
+    }
+
+    // ---------- 11) 关掉窗格 → 流应当结束（前端会收到"已关闭"） ----------
+    {
+        let rec5 = Arc::new(Mutex::new(Recorder::default()));
+        let cmd2 = herdr::control_command(&pane, 90, 24, true);
+        let args2 = ssh::ssh_args_no_tty(&host, 22, &user, None, &cmd2, None);
+        let _c5 = herdr_stream::spawn(
+            "matrix-close",
+            "matrix",
+            &ssh::ssh_exe(),
+            &args2,
+            collector(rec5.clone()),
+            Arc::new(LogRegistry::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = ssh_run(&host, &user, &format!("herdr workspace close '{ws}'"));
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let g = rec5.lock().unwrap();
+        check!(
+            "窗格被关掉后，流结束（或给出告警）",
+            g.closed || !g.errors.is_empty(),
+            format!("closed={} errors={:?}", g.closed, g.errors)
+        );
+    }
+
+    // ---------- 收尾：确保临时工作区都关掉 ----------
+    let _ = ssh_run(&host, &user, &format!("herdr workspace close '{ws}'"));
+    let left = ssh_run(&host, &user, "herdr pane list");
+    check!(
+        "临时窗格已清理干净",
+        !left.contains(&pane),
+        format!("剩余 pane 数={}", left.matches("\"pane_id\"").count())
+    );
+
+    println!("\n== 结果：{pass} 通过 / {fail} 失败 ==");
+    let _ = Ordering::Relaxed;
+    let _ = AtomicUsize::new(0);
+    std::process::exit(if fail > 0 { 1 } else { 0 });
+}
