@@ -74,16 +74,41 @@ if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
 Write-Host '== 同步到解压即用的目录 =='
 $locked = $false
 try {
-  if (Test-Path $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction Stop }
+  # 先把旧目录**改名让位**，而不是递归删除。
+  #
+  # 为什么不能用 Remove-Item -Recurse：目录里有**正在运行的 exe** 时，它会
+  # **先删掉其它文件、再在锁住的那个文件上失败** —— 等于把用户的解压目录掏空
+  # （实测踩过：新 exe / resources / README 全被删掉，只剩一个 .old 文件）。
+  # 改名不受文件锁影响，之后再建一个干净目录就行。
+  $stale = "$outDir.old-" + (Get-Date -Format 'HHmmss')
+  if (Test-Path $outDir) { Move-Item -LiteralPath $outDir -Destination $stale -Force }
   New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources') | Out-Null
   Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
   Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
   Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
-  Write-Host '   已刷新（解压即用的目录也是这一版了）'
+  Write-Host "   已刷新（解压即用的目录也是这一版了）"
+  if (Test-Path $stale) {
+    Write-Host "   旧目录留了个备份：$stale（里面那个 exe 可能还被正在运行的窗口占着，关掉后删掉它即可）"
+  }
 } catch {
-  $locked = $true
-  Write-Warning "同步失败：$outDir 里的文件正被占用（多半是便携版还在运行）。zip 已经正常产出，不受影响；"
-  Write-Warning "想刷新那个目录，请先关掉正在跑的 ZeeAI_Term，再重跑一次本脚本。"
+  # 退路：整目录重建失败（多半是那个目录被某个进程占着，或者里面的 exe 正在运行）。
+  # 这种情况**就地覆盖**通常还是可以的 —— 至少让用户拿到的目录是新版，
+  # 而不是像以前那样"删了一半、只剩一个 .old 文件"（真踩过，把用户的目录掏空了）。
+  Write-Host '   整目录重建失败，改成就地覆盖…'
+  try {
+    Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
+    Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
+    Copy-Item -LiteralPath $resDir -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
+    # 顺手清掉能删的旧备份（删不掉的说明还被占着，留着就行）
+    Get-ChildItem -LiteralPath $outDir -Filter 'ZeeAI_Term.exe.old-*' -File -ErrorAction SilentlyContinue |
+      ForEach-Object { try { $_.Delete() } catch { } }
+    Write-Host '   已就地覆盖刷新（目录本身没能重建，但里面的文件都是这一版了）'
+    $locked = $false
+  } catch {
+    $locked = $true
+    Write-Warning "同步失败：$outDir 里的文件正被占用（多半是便携版还在运行）。zip 已经正常产出，不受影响；"
+    Write-Warning "想刷新那个目录，请先关掉正在跑的 ZeeAI_Term，再重跑一次本脚本。"
+  }
 }
 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 
