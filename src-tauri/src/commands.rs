@@ -2865,6 +2865,27 @@ pub async fn herdr_workspace_close(
     Ok(out.trim().to_string())
 }
 
+/// 「herdr 快捷操作」面板上的一个动作。
+///
+/// 和 tmux 那条一个道理：前端只传**动作名**（白名单见 core/herdr.rs::action_command），
+/// 后端拼好命令、另开一条 ssh 去跑 herdr 的 socket API —— 不往用户的终端里塞按键，
+/// 所以不抢任何快捷键，也不受"窗格里正在跑程序"的影响。
+#[tauri::command]
+pub async fn herdr_pane_action(
+    profile_id: String,
+    pane: String,
+    action: String,
+    arg: Option<String>,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cmd = herdr::action_command(&pane, &action, arg.as_deref())
+        .ok_or_else(|| format!("不支持的动作，或缺少参数：{action}"))?;
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &cmd).await?;
+    log::info!("ipc: herdr_pane_action {action} pane={pane} -> {}", out.trim());
+    Ok(out.trim().to_string())
+}
+
 /// 观察窗的尺寸变了：把 observe 流**重开**一次。
 ///
 /// herdr 的观察者是在开流时声明自己行列数的（不会去改窗格本身的尺寸 —— 这正是我们

@@ -34,6 +34,7 @@ import {
   herdrServerStart,
   herdrServerStatus,
   herdrServerStop,
+  herdrPaneAction,
   herdrWorkspaceClose,
   herdrWorkspaceScan,
   herdrWorkspaceCreate,
@@ -615,6 +616,28 @@ const TMUX_ACTIONS: { key: string; label: string; title: string }[] = [
   { key: "detach", label: "脱离会话", title: "等价于 Ctrl+B d：断开但会话继续在服务器上跑" },
 ];
 
+/**
+ * 「herdr 快捷操作」面板上的按钮。
+ *
+ * 和上面 tmux 那份是同一个思路：**不模拟按键**，而是另开一条 ssh 去跑 herdr 自己的
+ * socket API（白名单见后端 core/herdr.rs::action_command）。所以它不会碰任何快捷键，
+ * 也不管窗格里此刻在跑什么。herdr 没有"上一个/下一个工作区"这种指令，就没有这两项；
+ * 它的滚动是观察端自己做的（我们用 xterm 的滚动条），所以也没有复制模式那两项。
+ */
+const HERDR_ACTIONS: { key: string; label: string; title: string }[] = [
+  { key: "new-workspace", label: "新建工作区", title: "在服务器上新开一个工作区（窗格会留在服务器上，随时能回来）" },
+  { key: "split-right", label: "右分屏", title: "把当前窗格左右分成两块" },
+  { key: "split-down", label: "下分屏", title: "把当前窗格上下分成两块" },
+  { key: "zoom", label: "放大/还原", title: "当前窗格占满（再点还原）" },
+  { key: "pane-left", label: "窗格 ←", title: "把焦点移到左边那个窗格" },
+  { key: "pane-up", label: "窗格 ↑", title: "把焦点移到上边那个窗格" },
+  { key: "pane-down", label: "窗格 ↓", title: "把焦点移到下边那个窗格" },
+  { key: "pane-right", label: "窗格 →", title: "把焦点移到右边那个窗格" },
+  { key: "rename-pane", label: "重命名窗格", title: "给这个窗格起个名字（herdr 里显示的名字）" },
+  { key: "close-pane", label: "关闭窗格", title: "关掉当前窗格（会问一次）" },
+  { key: "close-workspace", label: "关闭工作区", title: "关掉整个工作区，连同里面的窗格（会问一次）" },
+];
+
 const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
   defaultShell: "powershell",
@@ -1056,6 +1079,13 @@ export default function App() {
   const [tmuxBusy, setTmuxBusy] = useState(false);
   // 正在重命名窗口时的临时输入（用自绘输入框，不弹浏览器 prompt）
   const [tmuxRename, setTmuxRename] = useState<string | null>(null);
+  // herdr 快捷操作面板（只在当前会话是 herdr 窗格时出现）——和上面那份 tnux 的对位关系一模一样
+  const [herdrDockOpen, setHerdrDockOpen] = useState(true);
+  const [herdrBusy, setHerdrBusy] = useState(false);
+  /** 正在重命名窗格时的临时输入（自绘，不弹浏览器 prompt） */
+  const [herdrRename, setHerdrRename] = useState<string | null>(null);
+  /** 会真的关掉东西的动作 → 二段确认（第一次点只是把按钮变成"确认…"） */
+  const [herdrArmed, setHerdrArmed] = useState<string | null>(null);
 
   const [adbList, setAdbList] = useState<AdbDevice[]>([]);
   const [adbVer, setAdbVer] = useState("");
@@ -4322,6 +4352,30 @@ export default function App() {
   }
 
   /**
+   * 执行一个 herdr 快捷操作。
+   *
+   * 和上面 tmux 那条完全同构：**另开一条 ssh 跑 herdr 的白名单动作**，
+   * 不往终端里塞按键 —— 既不抢快捷键，也不管窗格里此刻在跑什么。
+   */
+  async function runHerdrAction(action: string, arg?: string) {
+    const pane = activeSession?.herdrPane;
+    const pid = activeSession?.profileId;
+    if (!pane || !pid) return;
+    setHerdrArmed(null);
+    setHerdrBusy(true);
+    try {
+      const out = await herdrPaneAction(pid, pane, action, arg ?? null, activeSession?.user ?? null);
+      if (out.trim()) notify(out.trim());
+      // 分屏/新建工作区/关掉之后，服务那边的窗格数就变了 —— 顺手刷一下
+      void refreshHerdrServer(pid, activeSession?.user ?? null);
+    } catch (e) {
+      notify("herdr 操作失败：" + String(e));
+    } finally {
+      setHerdrBusy(false);
+    }
+  }
+
+  /**
    * 切到别的 tmux 会话、或者把面板展开时，读一次窗口列表；
    * 之后每 10 秒对一次表，这样你在终端里自己按 Ctrl+B 切了窗口，面板也能跟上。
    * （只在面板展开时才轮询，收起就完全不打扰服务器。）
@@ -6597,6 +6651,95 @@ export default function App() {
                         {w.panes > 1 && <span className="tag">{w.panes} 格</span>}
                       </button>
                     ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* herdr 快捷操作：和上面 tmux 那条同构 —— 只在当前会话是 herdr 窗格时出现，
+              按钮走的是 herdr 自己的 socket API（另开一条 ssh），不模拟按键。 */}
+          {module === "remote" && activeSession?.herdrPane && (
+            <div className="tmux-dock herdr-dock">
+              <button
+                type="button"
+                className="tmux-head"
+                title="不想记 herdr 的快捷键的话，点这里的按钮就行（herdr 自己的快捷键照旧可用）"
+                onClick={() => setHerdrDockOpen((v) => !v)}
+              >
+                {herdrDockOpen ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
+                <span className="grow">herdr 快捷操作</span>
+                <span className="tag herdr">{activeSession.herdrPane}</span>
+              </button>
+
+              {herdrDockOpen && (
+                <div className="tmux-body">
+                  <div className="tmux-grid">
+                    {HERDR_ACTIONS.map((a) => {
+                      const destructive = a.key === "close-pane" || a.key === "close-workspace";
+                      const armed = herdrArmed === a.key;
+                      return (
+                        <button
+                          key={a.key}
+                          type="button"
+                          className={"mini-btn tmux-btn" + (armed ? " danger" : "")}
+                          title={armed ? "再点一次就是真的关掉了" : a.title}
+                          disabled={herdrBusy}
+                          onClick={() => {
+                            if (a.key === "rename-pane") {
+                              setHerdrRename(activeSession.herdrPane ?? "");
+                              return;
+                            }
+                            // 会真的关掉东西的两个动作：第一次点只是"上膛"，再点才执行
+                            if (destructive && !armed) {
+                              setHerdrArmed(a.key);
+                              return;
+                            }
+                            void runHerdrAction(a.key);
+                          }}
+                        >
+                          {armed ? "确认？" : a.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {herdrRename !== null && (
+                    <div className="tmux-rename">
+                      <input
+                        autoFocus
+                        value={herdrRename}
+                        placeholder="窗格名字（留空 = 清掉）"
+                        onChange={(e) => setHerdrRename(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            void runHerdrAction("rename-pane", herdrRename);
+                            setHerdrRename(null);
+                          } else if (e.key === "Escape") {
+                            setHerdrRename(null);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => {
+                          void runHerdrAction("rename-pane", herdrRename);
+                          setHerdrRename(null);
+                        }}
+                      >
+                        确定
+                      </button>
+                      <button type="button" className="mini-btn" onClick={() => setHerdrRename(null)}>
+                        取消
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="tmux-sub">
+                    <span className="grow hint">
+                      这些按钮是让服务器上的 herdr 去做（另开一条 ssh），不碰你的键盘
+                    </span>
                   </div>
                 </div>
               )}

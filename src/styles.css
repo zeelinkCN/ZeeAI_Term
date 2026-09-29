@@ -2457,7 +2457,11 @@ body {
   margin-bottom: 6px;
 }
 
-.tmux-head {
+/* 只作用于「管理 tmux 会话」那个面板的表头。
+   以前这里是裸的 `.tmux-head`，它排在文件后面，把左下角「快捷操作」那条栏的表头也一起
+   套上了 `text-transform: uppercase` —— 于是栏上显示成 "HERDR 快捷操作 / W9:P1"（全大写）。
+   产品名/pane 号都该保持原有大小写（用户提过两次）。 */
+.tmux-panel .tmux-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2465,7 +2469,6 @@ body {
   padding: 4px 10px;
   font-size: 11px;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--muted);
 }
 

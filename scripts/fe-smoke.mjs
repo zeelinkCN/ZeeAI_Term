@@ -201,6 +201,8 @@ const resolveCmd = (cmd, args) => {
     }
     case "herdr_pane_input_start": case "herdr_pane_type": case "herdr_pane_key":
     case "herdr_pane_resize": case "herdr_pane_input": return null;
+    // herdr 快捷操作（白名单动作）
+    case "herdr_pane_action": return "ok " + (args && args.action);
     case "herdr_workspace_create":
       if (window.__ZEEAI_SCENARIO__.createFails) {
         return Promise.reject(new Error("mock：建窗格失败"));
@@ -761,6 +763,96 @@ check(
   "可写 herdr 会话里的按键走 herdr_pane_input（不是观察窗那条）",
   typedInControl.inputBytes >= 2 && typedInControl.typeCalls === typeCallsBefore,
   `input=${typedInControl.inputBytes} type 增量=${typedInControl.typeCalls - typeCallsBefore} 首个=${typedInControl.first}`,
+);
+
+// ---------- herdr 快捷操作栏（和 tmux 那条同构）----------
+const herdrDock = await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  if (!dock) return { found: false };
+  return {
+    found: true,
+    head: (dock.querySelector(".tmux-head") || {}).innerText || "",
+    btns: [...dock.querySelectorAll(".tmux-btn")].map((b) => (b.innerText || "").trim()),
+    note: (dock.querySelector(".tmux-sub") || {}).innerText || "",
+  };
+})()`);
+check(
+  "当前会话是 herdr 时，左下角出现可折叠的「herdr 快捷操作」栏",
+  herdrDock.found &&
+    herdrDock.head.includes("herdr 快捷操作") &&
+    herdrDock.head.includes("w9:p1") &&
+    herdrDock.btns.includes("新建工作区") &&
+    herdrDock.btns.includes("右分屏") &&
+    herdrDock.btns.includes("关闭窗格"),
+  JSON.stringify(herdrDock).slice(0, 280),
+);
+// 点「右分屏」→ 走 herdr_pane_action(split-right)，而且是那个窗格
+await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  const b = dock && [...dock.querySelectorAll(".tmux-btn")].find((x) => (x.innerText || "").trim() === "右分屏");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(700);
+const actionCall = await evaluate(`(() => {
+  const c = (window.__ZEEAI_CALLARGS__ || []).filter((x) => x.cmd === "herdr_pane_action").pop();
+  return c ? { action: c.args.action, pane: c.args.pane, profileId: c.args.profileId } : null;
+})()`);
+check(
+  "点「右分屏」→ 后端收到 herdr_pane_action(split-right) + 当前窗格",
+  !!actionCall && actionCall.action === "split-right" && actionCall.pane === "w9:p1",
+  JSON.stringify(actionCall),
+);
+// 会关东西的动作要二段确认：第一次点只是"上膛"
+await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  const b = dock && [...dock.querySelectorAll(".tmux-btn")].find((x) => (x.innerText || "").trim() === "关闭窗格");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(300);
+const armedDock = await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  return {
+    btns: dock ? [...dock.querySelectorAll(".tmux-btn")].map((b) => (b.innerText || "").trim()) : [],
+    calls: (window.__ZEEAI_CALLARGS__ || []).filter((x) => x.cmd === "herdr_pane_action").length,
+  };
+})()`);
+check(
+  "「关闭窗格」要二段确认（第一次点不会真的关）",
+  armedDock.btns.includes("确认？") && armedDock.calls === 1,
+  JSON.stringify(armedDock).slice(0, 200),
+);
+// 取消上膛，别把后面的用例带进去
+await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  const b = dock && [...dock.querySelectorAll(".tmux-btn")].find((x) => (x.innerText || "").trim() === "确认？");
+  if (b) b.click();
+})()`);
+await sleep(500);
+const afterConfirm = await evaluate(
+  `(window.__ZEEAI_CALLARGS__ || []).filter((x) => x.cmd === "herdr_pane_action").map((x) => x.args.action)`,
+);
+check(
+  "再点一次「确认？」才真的执行关闭窗格",
+  Array.isArray(afterConfirm) && afterConfirm.includes("close-pane"),
+  JSON.stringify(afterConfirm),
+);
+// 重命名走自绘输入框，不弹浏览器 prompt
+await evaluate(`(() => {
+  const dock = document.querySelector(".herdr-dock");
+  const b = dock && [...dock.querySelectorAll(".tmux-btn")].find((x) => (x.innerText || "").trim() === "重命名窗格");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(300);
+const renameBox = await evaluate(
+  `(() => { const i = document.querySelector(".herdr-dock .tmux-rename input"); return i ? { found: true, value: i.value } : { found: false }; })()`,
+);
+check(
+  "「重命名窗格」用自绘输入框（不弹浏览器 prompt）",
+  renameBox.found,
+  JSON.stringify(renameBox),
 );
 
 // ---------- PowerShell 面板：并排两个"新建"按钮（5.1 / 7）----------

@@ -441,6 +441,50 @@ pub fn close_workspace_command(workspace_id: &str) -> String {
     )
 }
 
+/// 把一段文本包进**单引号**（里面的单引号按 shell 的写法断开再拼）。
+/// 只有"重命名窗格"这一个动作会用到用户输入的文本。
+fn quote_text(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 「herdr 快捷操作」面板上的按钮 → 具体要跑的 herdr 命令。
+///
+/// 和 tmux 那份一个道理（见 core/tmux.rs::action_command）：
+/// **只认下面这些固定动作**，前端传的是动作名而不是命令，所以这个接口
+/// 不会变成"在前端拼任意远端命令"的口子；而且它是**另开一条 ssh 跑 herdr 的
+/// socket API**，不往你的终端里塞按键 —— 不抢任何快捷键，也不受"窗格里正在跑程序"的影响。
+///
+/// `pane` 是当前会话那个窗格（形如 `w1T:p1`）；要工作区号的动作自己从它切出来。
+pub fn action_command(pane: &str, action: &str, arg: Option<&str>) -> Option<String> {
+    let p = sanitize_pane(pane);
+    let ws = p.split(':').next().unwrap_or("").to_string();
+    let text = arg.unwrap_or("").trim().to_string();
+    let inner = match action {
+        // 工作区（= 一条独立的工作，和 tmux 的"窗口/会话"对位）
+        "new-workspace" => "\"$H\" workspace create".to_string(),
+        "close-workspace" => format!("\"$H\" workspace close '{ws}'"),
+        // 窗格
+        "split-right" => format!("\"$H\" pane split --pane '{p}' --direction right"),
+        "split-down" => format!("\"$H\" pane split --pane '{p}' --direction down"),
+        "zoom" => format!("\"$H\" pane zoom --pane '{p}' --toggle"),
+        "pane-left" => format!("\"$H\" pane focus --pane '{p}' --direction left"),
+        "pane-right" => format!("\"$H\" pane focus --pane '{p}' --direction right"),
+        "pane-up" => format!("\"$H\" pane focus --pane '{p}' --direction up"),
+        "pane-down" => format!("\"$H\" pane focus --pane '{p}' --direction down"),
+        "rename-pane" => {
+            if text.is_empty() {
+                return None;
+            }
+            format!("\"$H\" pane rename --pane '{p}' {}", quote_text(&text))
+        }
+        "close-pane" => format!("\"$H\" pane close '{p}'"),
+        _ => return None,
+    };
+    Some(format!(
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf 'HERDR_NONE\\n'; else {inner} 2>&1 | head -3; fi"
+    ))
+}
+
 /// 工作区号只允许 `[A-Za-z0-9_-]`（形如 `w9`）。它会被拼进单引号的 shell 片段里，
 /// 直接拒绝其它字符比"转义"踏实。**空串返回 `None`**：调用方必须当成非法输入。
 pub fn sanitize_workspace(workspace_id: &str) -> Option<String> {
@@ -924,6 +968,38 @@ mod tests {
         assert!(!c.contains('\n'));
         let bad = close_workspace_command("w9'; touch /tmp/x; #");
         assert!(!bad.contains("touch /tmp/x"), "工作区号没消毒：{bad}");
+    }
+
+    #[test]
+    fn shortcut_actions_are_whitelisted_and_single_line() {
+        // 只认白名单：前端传动作名，不能借这个口子拼任意命令
+        assert!(action_command("w1T:p1", "rm -rf /", None).is_none());
+        assert!(action_command("w1T:p1", "unknown", None).is_none());
+        // 重命名必须给文本
+        assert!(action_command("w1T:p1", "rename-pane", None).is_none());
+        assert!(action_command("w1T:p1", "rename-pane", Some("  ")).is_none());
+
+        for (action, arg, want) in [
+            ("new-workspace", None, "workspace create"),
+            ("split-right", None, "pane split --pane 'w1T:p1' --direction right"),
+            ("split-down", None, "pane split --pane 'w1T:p1' --direction down"),
+            ("zoom", None, "pane zoom --pane 'w1T:p1' --toggle"),
+            ("pane-left", None, "pane focus --pane 'w1T:p1' --direction left"),
+            ("close-pane", None, "pane close 'w1T:p1'"),
+            ("close-workspace", None, "workspace close 'w1T'"),
+            ("rename-pane", Some("我的窗格"), "pane rename --pane 'w1T:p1' '我的窗格'"),
+        ] {
+            let cmd = action_command("w1T:p1", action, arg).unwrap_or_default();
+            assert!(cmd.contains(want), "{action} 生成的不对：{cmd}");
+            // 每条都得先确保服务在跑，而且必须是单行
+            assert!(cmd.contains("status server") && cmd.contains("server </dev/null"));
+            assert!(!cmd.contains('\n'), "远端命令必须单行：{cmd}");
+        }
+        // 带引号的窗格号/文本不能把命令拼坏
+        let evil = action_command("w1T:p1'; touch /tmp/x; #", "rename-pane", Some("a'; rm -rf / #"))
+            .unwrap_or_default();
+        assert!(!evil.contains("touch /tmp/x"), "窗格号没消毒：{evil}");
+        assert!(evil.contains(r"'a'\''; rm -rf / #'"), "文本没按 shell 规则转义：{evil}");
     }
 
     #[test]

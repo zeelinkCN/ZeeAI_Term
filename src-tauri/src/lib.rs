@@ -573,6 +573,7 @@ pub fn run() {
       commands::herdr_server_stop,
       commands::herdr_workspace_scan,
       commands::herdr_workspace_close,
+      commands::herdr_pane_action,
       commands::herdr_workspace_create,
       commands::herdr_pane_input,
       commands::herdr_pane_resize,

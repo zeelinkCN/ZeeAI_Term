@@ -738,6 +738,29 @@ export async function herdrWorkspaceClose(
   });
 }
 
+/**
+ * 「herdr 快捷操作」面板上的一个动作。
+ *
+ * 只传**动作名**（后端白名单），不传命令 —— 和 tmux 那条一样，这个接口不能变成
+ * "在前端拼任意远端命令"的口子。后端是另开一条 ssh 跑 herdr 的 socket API，
+ * 不往终端里塞按键（所以不抢快捷键、也不受"窗格里正在跑程序"的影响）。
+ */
+export async function herdrPaneAction(
+  profileId: string,
+  pane: string,
+  action: string,
+  arg?: string | null,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("herdr_pane_action", {
+    profileId,
+    pane,
+    action,
+    arg: arg ?? null,
+    userOverride: userOverride ?? null,
+  });
+}
+
 /** 观察窗尺寸变了：让后端把 observe 流按新尺寸重开一次 */
 export async function herdrPaneResize(id: string, cols: number, rows: number): Promise<void> {
   return invoke("herdr_pane_resize", { id, cols, rows });
