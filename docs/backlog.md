@@ -54,3 +54,77 @@
 - 深色主题不回归。
 - 在 `scripts/fe-smoke.mjs` 里加一条断言：切到浅色主题后，设置面板里所有
   `.btn` / `input[type=range]` 的计算样式（背景与文字）对比度达标 —— 让这类问题以后能被自动拦住。
+
+---
+
+## [ ] AI 看板把「桌面版 Codex 自己的后端进程」当成用户任务报出来
+
+**报的日期**：2026-09-29
+**用户原话**：*"我的 AI 任务看板探测到 PowerShell 里面有 Codex 在运行。但其实运行的是桌面版的
+Codex，并不是我现在正在使用的 PowerShell 里面有任何 Codex 进程，现在却被识别到了。
+我觉得这个应该做一下次级提示，或者掩盖一下，不要给我弹提示。因为这属于你能看到别人正在工作的
+内容，你也切不过去。它只是在后台跑一些 PowerShell 的指令，或者客户端利用终端的一些东西。
+这种信息到底要不要展示在 AI 任务列表里面？是变成可选，还是干脆过滤掉这种噪音，
+或者变成不起眼的提示？"*
+**当时的处理**：只记录，**没有改任何源码**。
+
+### 只读排查（2026-09-29，未改动代码）
+
+在本机跑了一遍应用自己那条 WMI 扫描（`ai_tasks.rs::windows_script` 同样的过滤条件），
+当时的进程表里只有**一个** codex 进程，就是桌面版 Codex 的后端：
+
+```
+pid=22496  C:\Users\<user>\AppData\Local\OpenAI\Codex\bin\<hash>\codex.exe
+           -c features.code_mode_host=true app-server --analytics-default-enabled
+           -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true
+```
+
+它拉起来的子进程树是：`codex.exe` → `cmd.exe /c call ./scripts/launch_codex_app_tools_mcp.cmd
+./server.mjs` → `node .../cua_node/.../node.exe ./server.mjs`。
+
+代码里**已经有**一道"后台服务"过滤（`ai_tasks.rs:331 is_background_service`，
+标记 `app-server` / `app_server` / `--analytics-default-enabled` / `code_mode_host` /
+`mcp-server` / `mcp_server`），上面这条命令行**三个标记全中**，按理应该被挡掉
+（这道过滤是 2026-09-26 的 `597585c` 加的，0.1.9 里已经带着）。
+
+所以用户看到的那张卡可能来自下面几种情况之一，**下次开工前需要先确认是哪一种**
+（最快的方式：让用户把那张卡截个图，鼠标悬停在卡片上看它显示的命令行）：
+
+1. 那一刻存在**别的** codex 进程 —— 桌面版在真正干活时会 fork 出子进程
+   （`codex.exe ... exec ...`、或工具调用用的 `pwsh.exe`），它们的命令行里不一定带上面那些标记；
+2. 卡片其实来自**「AI 命令行工具」那一段的"运行中"**，而不是任务看板（那段走的是 `ai_probe`）；
+3. 本机扫描的进程名白名单里放了 `cmd.exe` / `powershell.exe` / `pwsh.exe` / `wsl.exe`
+   （为了让"cmd 里跑的 codex.cmd"能被认出来），这条口径把"PowerShell 命令行里出现 codex"
+   也纳入了候选 —— 与用户早先定的规矩"**按可执行文件/参数匹配，别拿输出文本子串匹配**"存在张力。
+
+### 判据（定这件事的原则）
+
+**看板只该报"用户自己开的、并且能切过去的"任务。**
+- 能切过去 = 要么对应一个**已打开的本应用会话**（能定位到标签），
+  要么对应**服务器上的一个窗格**（能开观察窗）；
+- 两样都不是 → 它是噪音，不该占卡片位、更不该进通知。
+
+桌面版 Codex 自己的后端属于"**别人正在工作**"（用户原话），而且切不过去 ——
+按上面这条判据就该被过滤掉。
+
+### 建议做法（下次做，按推荐顺序）
+
+1. **过滤（首选）**：不只是按命令行关键词挡 `app-server`，而是把
+   **"桌面版 Codex 的进程子树"**整棵排除 —— 认父进程链：只要某个祖先的命令行带
+   `app-server` / `code_mode_host` / `launch_codex_app_tools_mcp.cmd` / `cua_node` / `server.mjs`
+   这一组特征，它下面的子进程（`cmd.exe` / `node.exe` / `pwsh.exe`）一律不算任务。
+   顺带把本机扫描的白名单收紧：`cmd/powershell/pwsh` 只在**命令行第一个 token 就是 AI 工具或
+   启动器**时才认（现在已经基本如此，实现时补一条回归用例钉住）。
+2. **降级显示（如果确实想"知道但不打扰"）**：不在卡片区显示，改成看板底部**一行折叠的小字**
+   ——「另有 N 个本机 AI 进程不在你打开的终端里」，默认收起、不进通知、不占卡片位。
+3. **不要加一堆开关**（用户明确不喜欢选项膨胀）。最多一个全局开关
+   「看板只显示我能切过去的任务」，**默认开**。
+
+### 验收标准
+
+- 开着桌面版 Codex 干活时，看板里**不出现**指向它的卡片（含"本地"环境标签的那些）；
+- 用户自己开一个 PowerShell 跑 `codex`，看板**照旧**能报出来（不能误杀真任务）；
+- 回归用例：把桌面版那棵进程树（`codex.exe -c features.code_mode_host=true app-server …`
+  → `cmd.exe /c call …launch_codex_app_tools_mcp.cmd` → `node … ./server.mjs`）
+  作为测试数据喂给 `classify()`，断言输出里**一条都没有**；
+  同时喂一条"用户在 PowerShell 里敲的真实 `codex`"，断言**必须有一条**。
