@@ -1261,6 +1261,28 @@ check(
   armedRow.join(" | ").slice(0, 160),
 );
 
+// ---------- (F) 尺寸闸门：整个跑测过程中不许出现"小得离谱"的 resize ----------
+//
+// 用户截图里那几个"折叠"的提示符，就是某一次按很窄的宽度排版留下的。
+// 这里把跑测期间发给后端的所有尺寸都翻一遍。
+const sizeCalls = await evaluate(`(() => {
+  const bad = [];
+  const all = [];
+  for (const c of (window.__ZEEAI_CALLARGS__ || [])) {
+    if (c.cmd !== "session_resize" && c.cmd !== "herdr_pane_resize") continue;
+    const cols = c.args && (c.args.cols !== undefined ? c.args.cols : c.args[1]);
+    const rows = c.args && (c.args.rows !== undefined ? c.args.rows : c.args[2]);
+    all.push([c.cmd, cols, rows]);
+    if (typeof cols === "number" && (cols < 40 || rows < 12)) bad.push([c.cmd, cols, rows]);
+  }
+  return { bad, n: all.length, sample: all.slice(0, 5) };
+})()`);
+check(
+  "发给后端的尺寸没有小得离谱的（<40 列 / <12 行一律不发）",
+  sizeCalls.bad.length === 0,
+  `共 ${sizeCalls.n} 次，异常 ${JSON.stringify(sizeCalls.bad)} 抽样 ${JSON.stringify(sizeCalls.sample)}`,
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}`);

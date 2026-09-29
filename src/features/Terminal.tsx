@@ -112,8 +112,20 @@ const LIGHT_THEME = {
 
 // 小于这个尺寸的 resize 一律不发：界面首次布局时容器可能是 0 尺寸，
 // 一旦把 12x4 这种尺寸发给 tmux，窗口会被压变形（表现为满屏花点）。
-const MIN_COLS = 20;
-const MIN_ROWS = 5;
+//
+// 门槛从 20x5 提到 40x12：20 列这种"能过闸但明显不合理"的值照样有害 ——
+// 本地会按 20 列换行、远端会真的按 20 列重排，用户看到的就是
+// "启动时几个提示符折叠在一起"（而且远端那一份会永久留在滚动区里）。
+const MIN_COLS = 40;
+const MIN_ROWS = 12;
+
+// 容器小到这个像素尺寸就认为"还没布局好"，这一轮干脆不 fit。
+//
+// 为什么不能只靠上面的列数闸门：容器在首帧可能是几十像素宽，fit() 照样能算出
+// 一个"通过闸门但离谱"的列数（实测能到 10~20 列），然后被写进终端。
+// 一次都不发，比发一个错的值好得多 —— 后面还有 80/300/900/1800ms 几次补 fit。
+const MIN_FIT_W = 160;
+const MIN_FIT_H = 80;
 
 /**
  * 连续 resize 的合并窗口。
@@ -352,6 +364,12 @@ export default function TerminalView({
 
     const doFit = () => {
       if (disposed) return;
+      // 元素还没布局好（首帧常常是 0 宽或几十像素）时不要 fit：
+      // 这时候算出来的列数会非常离谱，一旦按它去 resize，远端会真的按那个宽度重排、
+      // 本地也会按那个宽度换行 —— 用户看到的就是"启动时几个提示符折叠在一起"
+      //（用户截图里那段 `[lz@iZbp13 / lx01nj91v3 / 7nkv2uZ ~]` 就是这么来的）。
+      const box = hostRef.current;
+      if (!box || box.clientWidth < MIN_FIT_W || box.clientHeight < MIN_FIT_H) return;
       try {
         fit.fit();
       } catch {

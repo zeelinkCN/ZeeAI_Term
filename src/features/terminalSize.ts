@@ -19,12 +19,27 @@ let last: { cols: number; rows: number } | null = null;
 /** 存到 localStorage 的键：这样**重启应用后**的第一条会话也是对的尺寸 */
 const KEY = "zeeai.lastTerminalSize";
 
+/**
+ * 认这个尺寸是"像个正常终端"的最低门槛。
+ *
+ * 比 Terminal.tsx 里那对闸门还严一点：那份是我自己算出来的、当场就要用；
+ * 这份是**跨重启存下来的**，可能来自很老的版本或某个瞬间的坏布局 ——
+ * 宁可退回"不知道"（让后端用自己的默认值），也不要拿一个 20 列的值去开新会话。
+ */
+const MIN_SAVED_COLS = 40;
+const MIN_SAVED_ROWS = 12;
+
 // 启动时先读一次上次存的（还没量过任何终端的时候就用它）
 try {
   const raw = localStorage.getItem(KEY);
   if (raw) {
     const v = JSON.parse(raw) as { cols?: number; rows?: number };
-    if (typeof v.cols === "number" && typeof v.rows === "number") {
+    if (
+      typeof v.cols === "number" &&
+      typeof v.rows === "number" &&
+      v.cols >= MIN_SAVED_COLS &&
+      v.rows >= MIN_SAVED_ROWS
+    ) {
       last = { cols: v.cols, rows: v.rows };
     }
   }
@@ -35,7 +50,7 @@ try {
 /** 记下刚量到的尺寸（只有像样的值才记：避免把"还没布局好"的 0 记进来） */
 export function rememberTerminalSize(cols: number, rows: number): void {
   if (!Number.isFinite(cols) || !Number.isFinite(rows)) return;
-  if (cols < 20 || rows < 5) return;
+  if (cols < MIN_SAVED_COLS || rows < MIN_SAVED_ROWS) return;
   if (last && last.cols === cols && last.rows === rows) return;
   last = { cols, rows };
   try {
