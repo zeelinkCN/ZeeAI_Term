@@ -6963,7 +6963,7 @@ export default function App() {
               <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
                 <span className="hint">
                   {herdrServer?.running
-                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格（看板的 AI 状态就是从它这来的）`
+                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格`
                     : herdrServer
                       ? "herdr 服务：没在跑（用到时会自动启动）"
                       : "herdr 服务：状态未知"}
