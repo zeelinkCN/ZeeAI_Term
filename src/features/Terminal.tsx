@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
 import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
 import { bytesToB64 } from "../util";
+import { rememberTerminalSize } from "./terminalSize";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
 import type { TermPalette } from "../termThemes";
@@ -320,6 +321,9 @@ export default function TerminalView({
         const cols = term.cols;
         const rows = term.rows;
         if (cols < MIN_COLS || rows < MIN_ROWS) return;
+        // 顺手记下来：下一次开新会话时用它当**初始尺寸**，省掉"先 110 列排版再 resize"
+        // 那一次（那正是"头几个提示符折叠"和"一条竖条宽度不对"的来源）
+        rememberTerminalSize(cols, rows);
         if (cols === lastSent.cols && rows === lastSent.rows) return;
         lastSent = { cols, rows };
         if (herdrPaneRef.current) {

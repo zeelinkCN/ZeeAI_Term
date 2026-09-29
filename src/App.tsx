@@ -5,6 +5,7 @@ import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import TerminalView from "./features/Terminal";
+import { lastTerminalSize } from "./features/terminalSize";
 import TermThemeDialog from "./features/TermThemeDialog";
 import HighlightDialog from "./features/HighlightDialog";
 import { SessionBus } from "./sessionBus";
@@ -260,6 +261,45 @@ function aiToolLabel(name: string): string {
   return AI_TOOL_LABEL[name] ?? name;
 }
 
+/**
+ * 一组"这就是个壳"的 shell 名字。
+ *
+ * 用来判断一个 herdr 窗格**是不是空壳**（前台进程就停在提示符上、没跑任何活）。
+ * herdr 的 `pane process-info` 给的是前台进程名（`bash` / `codex` / …），
+ * 拿它跟这张表比就行 —— 也是"清理工作区"唯一敢自动碰的情况。
+ */
+const SHELL_NAMES = new Set([
+  "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu", "busybox",
+]);
+
+/**
+ * 从窗格号取工作区号：`w9:p1` → `w9`。
+ *
+ * herdr 是 workspace > tab > pane 三层，而**会在服务器上攒着的是工作区** ——
+ * 回收的时候要按工作区来，所以这个转换到处都在用。
+ */
+function paneWorkspace(paneId?: string | null): string {
+  return paneId ? paneId.split(":")[0] : "";
+}
+
+/**
+ * 从"存下来的会话名"里摘出给标签用的短名。
+ *
+ * 存下来的形如 `lz · codex w1P:p1`，而标签里还会再拼一次服务器名和窗格号，
+ * 所以两段都要摘掉。**注意 herdr 的工作区号是带字母的**（`w1P` / `wD` / `wE`）——
+ * 以前这里写成 `w\d+`，字母那种摘不掉，于是标签变成
+ * `lz · codex w1P:p1 w1P:p1`（用户截图里那个重复的标签就是它）。
+ */
+function herdrShortLabel(title?: string | null): string | undefined {
+  const t = (title ?? "").trim();
+  if (!t) return undefined;
+  const stripped = t
+    .replace(/^.*·\s*/, "")
+    .replace(/\s*w[0-9A-Za-z]+:p\d+.*$/, "")
+    .trim();
+  return stripped || undefined;
+}
+
 /** 环境徽标：本地 / 远端 / WSL */
 function aiEnvLabel(env: string): string {
   if (env === "remote") return "远端";
@@ -293,6 +333,51 @@ function srcRank(src: string): number {
   if (src === "herdr") return 2;
   if (src === "tmux") return 1;
   return 0;
+}
+
+/**
+ * 这张卡"在哪个窗格"——herdr 的窗格号 / tmux 的窗格号，都没有就是空串。
+ *
+ * 看板合并的两趟都靠它：带窗格的卡不能被只看到进程的那些抹掉，
+ * 而**两个不同的窗格是两张卡**（这正是用户要的"两个 codex 要显示两个"）。
+ */
+function paneIdOf(t: AiTask): string {
+  return t.herdrPane ?? t.pane ?? "";
+}
+
+/** 合并用的"同一组"：环境 + 服务器 + 工具 + 目录（不含窗格） */
+function groupKeyOf(t: AiTask): string {
+  return `${t.env}|${t.server}|${t.tool}|${t.cwd || ""}`;
+}
+
+/** 合并用的完整键 = 同组 + 窗格。同组但不同窗格**不合并**。 */
+function taskKeyOf(t: AiTask): string {
+  return `${groupKeyOf(t)}|${paneIdOf(t)}`;
+}
+
+/**
+ * 两张卡说的是同一个 agent 时，谁的信息更该留。
+ * 源越准越优先（App > herdr > tmux > ps）；同源则保留带窗格的、耗时更短的。
+ */
+function betterTask(a: AiTask, b: AiTask): boolean {
+  return (
+    srcRank(a.source) > srcRank(b.source) ||
+    (srcRank(a.source) === srcRank(b.source) &&
+      ((!b.pane && !!a.pane) || b.durationMs < a.durationMs))
+  );
+}
+
+/**
+ * 把 `src` 的信息并进 `dst`（**只在 src 更准的时候调用**），
+ * 但"看得见窗格"的那几个字段不能被抹掉 —— 它们是"点这张卡就能跳到那个终端"的
+ * 唯一凭据，而 App 记录和 ps 扫描这两种来源都没有它们。
+ */
+function absorbTask(dst: AiTask, src: AiTask): void {
+  const keep = { herdrPane: dst.herdrPane, herdrProfileId: dst.herdrProfileId, pane: dst.pane };
+  Object.assign(dst, src);
+  dst.herdrPane = dst.herdrPane ?? keep.herdrPane;
+  dst.herdrProfileId = dst.herdrProfileId ?? keep.herdrProfileId;
+  dst.pane = dst.pane ?? keep.pane;
 }
 
 /** 把 herdr 的一个 agent 映射成看板卡片（时长/pid 拿不到，就留空 —— 不编） */
@@ -725,6 +810,14 @@ export default function App() {
     profile: ConnectionProfile;
     x: number;
     y: number;
+    /**
+     * 这条菜单是**对着某一条会话记录**（侧栏服务器下面那一行）打开的时候带上它。
+     *
+     * 为什么要区分：服务器那一栏的菜单是"管理这台机器"，而 herdr 的窗格是**会攒的**
+     * （每开一次新会话就多一个），用户需要能"就在这一行上"把它回收掉，而不是先记住
+     * 窗格号再跑去别的地方找。
+     */
+    herdrRow?: HistoryEntry;
   } | null>(null);
   const [editDialog, setEditDialog] = useState<{
     draft: ConnectionProfile;
@@ -734,6 +827,19 @@ export default function App() {
   const [tmuxTarget, setTmuxTarget] = useState<ConnectionProfile | null>(null);
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
   const [tmuxLoading, setTmuxLoading] = useState(false);
+  /** 「管理 herdr 工作区」面板对着的那台服务器（和上面的 tmuxTarget 一个道理） */
+  const [herdrTarget, setHerdrTarget] = useState<ConnectionProfile | null>(null);
+  /** 那台机器上的工作区 + 每个窗格的前台进程 + 服务状态（三样一起刷） */
+  const [herdrMgr, setHerdrMgr] = useState<{
+    scan: HerdrWorkspaceScan;
+    panes: HerdrPane[];
+    server: HerdrServerStatus;
+  } | null>(null);
+  const [herdrMgrLoading, setHerdrMgrLoading] = useState(false);
+  /** 正在等"再点一次确认"的工作区号（关掉工作区会连带关掉里面的窗格） */
+  const [herdrMgrArmed, setHerdrMgrArmed] = useState<string | null>(null);
+  /** 会话行右键菜单里"确认在服务器上关掉"的那一下（和上面那个二段确认一个道理） */
+  const [herdrRowArmed, setHerdrRowArmed] = useState<string | null>(null);
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   /** 供异步流程读最新历史（自动编号要数"这台机器已有几个普通 shell"） */
@@ -1201,25 +1307,43 @@ export default function App() {
         return;
       }
       const lists = await Promise.all(jobs);
-      // 同一台机器上同一种工具可能被探测成多条（node 壳 + 内部二进制，或 App 记录的那条），
-      // 按「环境+服务器+工具+目录」合并成一张：优先保留有 tmux 窗格的 / 来自 App 的
       const flat = lists.flat();
+      // 同一台机器上同一种工具可能被探测成多条（node 壳 + 内部二进制，或 App 记录的那条），
+      // 所以要合并。但**合并的粒度必须带上"哪个窗格"**：以前只按「环境+服务器+工具+目录」
+      // 合并，于是"同一台机器、同一个目录里开了两个 codex"在看板上只剩一张卡
+      // （用户实测：明明有两个终端在跑，看板只显示一个）。
       const merged: AiTask[] = [];
-      const keyOf = (t: AiTask) => `${t.env}|${t.server}|${t.tool}|${t.cwd || ""}`;
       for (const t of flat) {
-        const hit = merged.find((m) => keyOf(m) === keyOf(t));
+        const hit = merged.find((m) => taskKeyOf(m) === taskKeyOf(t));
         if (!hit) {
           merged.push({ ...t });
           continue;
         }
-        const better =
-          srcRank(t.source) > srcRank(hit.source) ||
-          (srcRank(t.source) === srcRank(hit.source) &&
-            ((!hit.pane && !!t.pane) || hit.durationMs < t.durationMs));
-        if (better) Object.assign(hit, t);
+        if (betterTask(t, hit)) absorbTask(hit, t);
       }
-      setBoardTasks(merged);
-      boardTasksRef.current = merged;
+      // 第二趟：把"说不出自己在哪个窗格"的卡片并进同组里带窗格的那张。
+      //
+      // 为什么需要：同一个 agent 会被两路同时看到 —— herdr 说得清窗格，ps 扫描只看到一个
+      // 进程（它不知道那是 herdr 的窗格）。不并的话一张卡会变成两张。
+      // 反过来，同组里**有多张**带窗格的卡（就是"两个 codex"那种）时，没窗格的那张并到
+      // 时间最近的那张上 —— 它本来就认不出是哪一个。
+      const paned = merged.filter((t) => paneIdOf(t));
+      const out: AiTask[] = [];
+      for (const t of merged) {
+        if (paneIdOf(t)) {
+          out.push(t);
+          continue;
+        }
+        const kin = paned.filter((m) => groupKeyOf(m) === groupKeyOf(t));
+        if (!kin.length) {
+          out.push(t);
+          continue;
+        }
+        const host = kin.reduce((a, b) => (betterTask(b, a) ? b : a));
+        if (betterTask(t, host)) absorbTask(host, t);
+      }
+      setBoardTasks(out);
+      boardTasksRef.current = out;
       // herdr 说"有人在等你"：这是最值钱的一路信号（我们自己的进程扫描永远拿不到）。
       // 同一张卡"进入 blocked"只提醒一次；它离开 blocked 之后再进会重新提醒。
       const waiting = new Set<string>();
@@ -1374,12 +1498,22 @@ export default function App() {
       setHerdrScan(null);
       return;
     }
+    // 只有"当前会话那台机器"的结果才配写进面板/状态条的状态里。
+    // 「管理 herdr 工作区」面板管的是**右键选中的那台**，它不一定是当前打开着会话的那台；
+    // 那种情况下面板自己有 herdrMgr 那份状态，别把别人的数字糊到状态条上。
+    const forActive = pid === activeSession?.profileId;
     try {
-      setHerdrServer(await herdrServerStatus(pid, user ?? null));
       // 「装了」≠「服务在跑」≠「有工作区」≠「我们开着的会话」——这四件事分开说，
       // 顺手把工作区 + 前台进程也拿回来，好跟我们会话列表对比出"没在用且是空壳"的那些。
-      setHerdrScan(await herdrWorkspaceScan(pid, user ?? null));
+      const [status, scan] = await Promise.all([
+        herdrServerStatus(pid, user ?? null),
+        herdrWorkspaceScan(pid, user ?? null),
+      ]);
+      if (!forActive) return;
+      setHerdrServer(status);
+      setHerdrScan(scan);
     } catch {
+      if (!forActive) return;
       // 探不到就当"不知道"，界面不显示这两行（不影响别的功能）
       setHerdrServer(null);
       setHerdrScan(null);
@@ -1429,16 +1563,13 @@ export default function App() {
    */
   function herdrCleanable(): string[] {
     if (!herdrScan) return [];
-    const SHELLS = new Set([
-      "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu", "busybox",
-    ]);
     const busy = new Set<string>();
     const seen = new Set<string>();
     for (const p of herdrScan.panes) {
       const w = p.paneId.split(":")[0];
       if (!w) continue;
       seen.add(w);
-      if (!SHELLS.has((p.procName || "").trim().toLowerCase())) busy.add(w);
+      if (!SHELL_NAMES.has((p.procName || "").trim().toLowerCase())) busy.add(w);
     }
     return herdrOrphans().filter((w) => seen.has(w) && !busy.has(w));
   }
@@ -1472,34 +1603,87 @@ export default function App() {
     void refreshHerdrServer();
   }
 
-  /** 启动 herdr 服务（后台起来，不挂在我们这条 ssh 上） */
-  async function startHerdrServer() {
-    const pid = activeSession?.profileId;
-    if (!pid) return;
+  /**
+   * 读一台服务器上的 herdr 现状（给「管理 herdr 工作区」面板用）。
+   *
+   * 三样一起拿：有哪些工作区 + 每个窗格上跑着什么（前台进程）、窗格本身的标题/目录/agent
+   * 状态（`herdr pane list` 那份）、以及服务在不在跑。少了任何一样，用户就没法判断
+   * "哪个是我要的、哪个是可以关掉的"。
+   */
+  async function refreshHerdrMgr(profile: ConnectionProfile) {
+    const user = profile.ssh?.user ?? null;
+    setHerdrMgrLoading(true);
     try {
-      const out = await herdrServerStart(pid, activeSession?.user ?? null);
+      const [scan, panes, server] = await Promise.all([
+        herdrWorkspaceScan(profile.id, user),
+        herdrPanes(profile.id, user),
+        herdrServerStatus(profile.id, user),
+      ]);
+      setHerdrMgr({ scan, panes, server });
+    } catch (e) {
+      notify("读取 herdr 工作区失败：" + String(e));
+      setHerdrMgr(null);
+    } finally {
+      setHerdrMgrLoading(false);
+    }
+  }
+
+  /**
+   * 在服务器上**关掉一个 herdr 工作区**（连带里面的窗格）。
+   *
+   * 这是"会在远端真的动手"的动作，所以在界面上必须二段确认：第一次点只是把按钮
+   * 变成确认态（并把窗格号写出来），再点一次才真关。
+   */
+  async function closeHerdrWorkspace(profile: ConnectionProfile, ws: string) {
+    const user = profile.ssh?.user ?? null;
+    setHerdrMgrArmed(null);
+    try {
+      await herdrWorkspaceClose(profile.id, ws, user);
+      notify(`已在服务器上关掉 herdr 工作区 ${ws}`);
+    } catch (e) {
+      notify(`关掉 herdr 工作区 ${ws} 失败：` + String(e));
+    }
+    // 关掉之后本地那几条指向它的会话/历史就没意义了；但**不删记录**（用户可能还想留个痕），
+    // 只是把"服务器上还在"这个前提去掉了 —— 打开它会走我们新加的那条"窗格没了"的人话路径。
+    if (herdrTarget?.id === profile.id) void refreshHerdrMgr(profile);
+    void refreshHerdrServer(profile.id, user);
+  }
+
+  /**
+   * 启动 herdr 服务（后台起来，不挂在我们这条 ssh 上）。
+   *
+   * 不传参数 = 针对**当前会话**那台机器；传了就是"管理面板"里选中的那台
+   * （面板管理的服务器不一定是当前打开着会话的那台）。
+   */
+  async function startHerdrServer(pidOverride?: string, userOverride?: string | null) {
+    const pid = pidOverride ?? activeSession?.profileId;
+    if (!pid) return;
+    const user = userOverride ?? (pidOverride ? null : activeSession?.user ?? null);
+    try {
+      const out = await herdrServerStart(pid, user);
       notify(`herdr 服务已启动（${out || "ok"}）`);
     } catch (e) {
       notify("启动 herdr 服务失败：" + String(e));
     }
-    void refreshHerdrServer();
+    void refreshHerdrServer(pid, user);
   }
 
   /**
    * 停止 herdr 服务。**会关掉它管着的所有窗格**（包括别的客户端正在用的），
    * 所以走"二段确认"：第一次点只是把按钮变成确认态，再点一次才真停。
    */
-  async function stopHerdrServer() {
-    const pid = activeSession?.profileId;
+  async function stopHerdrServer(pidOverride?: string, userOverride?: string | null) {
+    const pid = pidOverride ?? activeSession?.profileId;
     if (!pid) return;
+    const user = userOverride ?? (pidOverride ? null : activeSession?.user ?? null);
     try {
-      const out = await herdrServerStop(pid, activeSession?.user ?? null);
+      const out = await herdrServerStop(pid, user);
       notify(`已停止 herdr 服务（${out || "ok"}）—— 它管着的窗格都关掉了`);
     } catch (e) {
       notify("停止 herdr 服务失败：" + String(e));
     }
     setHerdrStopArmed(false);
-    void refreshHerdrServer();
+    void refreshHerdrServer(pid, user);
   }
 
   async function ensureHerdrInput(
@@ -2655,7 +2839,17 @@ export default function App() {
     });
     maybeAutoLog({ id, title });
     try {
-      const info = await openLocal(id, shell, (e) => handleEvent(id, e), distro, undefined, undefined, cwd);
+      // 初始尺寸同上：用上一次量到的，省掉"先按默认列数画一遍再 resize"（本地端一样会
+      // 把提示符按错宽度画出来再重排）
+      const info = await openLocal(
+        id,
+        shell,
+        (e) => handleEvent(id, e),
+        distro,
+        lastTerminalSize()?.cols,
+        lastTerminalSize()?.rows,
+        cwd,
+      );
       setSessions((prev) =>
         // 本地终端保留我们算好的名字（带编号）：后端只会给一个笼统的"PowerShell"，
         // 拿它覆盖会把编号吃掉 → 侧栏里几个 PowerShell 又分不清了。
@@ -2774,8 +2968,12 @@ export default function App() {
         backend === "herdr-pane" || backend === "herdr-control"
           ? herdrPane ?? null
           : tmuxName ?? null,
-        undefined,
-        undefined,
+        // 初始尺寸用"上一次量到的"（同一台机器同一个窗口，尺寸几乎一定一样）。
+        // 不传的话后端会用一个写死的 110x30 起流，等前端量完再 resize —— 远端会先把
+        // 提示符按 110 列画一遍再重排，看起来就是"头几个提示符折叠在一起"；
+        // herdr 的可写流还会真的把那个窗格撑成 110 再收回来，屏幕上留一条宽度不对的竖条。
+        lastTerminalSize()?.cols,
+        lastTerminalSize()?.rows,
         userOverride ?? null,
         backend ?? "tmux",
       );
@@ -3409,7 +3607,7 @@ export default function App() {
       await openHerdrPane(
         h.profileId,
         h.herdrPane,
-        custom?.replace(/^.*·\s*/, "").replace(/\s*w\d+:p\d+.*$/, "") || undefined,
+        herdrShortLabel(custom),
         null,
         h.herdrMode === "observe" ? "observe" : "control",
       );
@@ -4953,6 +5151,80 @@ export default function App() {
   const herdrOrphanList = herdrOrphans();
   const herdrCleanList = herdrCleanable();
 
+  /**
+   * 把「管理 herdr 工作区」面板的两份数据合起来：**每个工作区一行**。
+   *
+   * 为什么要合：`workspace scan` 给的是"有哪些工作区 + 每个窗格的前台进程"，
+   * `pane list` 给的是"每个窗格的标题 / cwd / agent 状态"。少了前者分不出空壳，
+   * 少了后者你认不出哪个窗格是哪个 —— 用户的原话就是"创建了无数个 herdr 都忘了"。
+   */
+  function herdrMgrRows(profile: ConnectionProfile, mgr: NonNullable<typeof herdrMgr>) {
+    const wsOf = (p?: string | null) => (p ? p.split(":")[0] : "");
+    const used = new Set<string>();
+    for (const s of sessions) {
+      if (s.profileId !== profile.id) continue;
+      const w = wsOf(s.herdrPane);
+      if (w) used.add(w);
+    }
+    for (const h of history) {
+      if (h.profileId !== profile.id) continue;
+      const w = wsOf(h.herdrPane);
+      if (w) used.add(w);
+    }
+    for (const t of boardTasks) {
+      if (t.herdrProfileId !== profile.id) continue;
+      const w = wsOf(t.herdrPane);
+      if (w) used.add(w);
+    }
+    const procOf = new Map(
+      mgr.scan.panes.map((p) => [p.paneId, (p.procName || "").trim().toLowerCase()] as const),
+    );
+    const isShell = (id: string) => SHELL_NAMES.has(procOf.get(id) ?? "");
+    return mgr.scan.workspaces.map((ws) => {
+      const known = mgr.panes.filter((p) => wsOf(p.paneId) === ws);
+      const ids = (known.length ? known.map((p) => p.paneId) : mgr.scan.panes.filter((p) => wsOf(p.paneId) === ws).map((p) => p.paneId));
+      const first = known[0];
+      const pane = ids[0] ?? `${ws}:p1`;
+      // "空壳"的条件：① 每个窗格的前台进程都是 shell（取不到进程名的不算）② 不在这台机器
+      // 任何已打开/历史/AI 看板的引用里。两条都满足才敢让人一键回收。
+      const allShell = ids.length > 0 && ids.every(isShell);
+      const running = ids.filter((id) => !isShell(id));
+      const status =
+        first?.status === "blocked"
+          ? "等你处理"
+          : first?.status === "idle"
+            ? "空闲"
+            : first?.agent
+              ? aiToolLabel(first.agent)
+              : "";
+      const proc = [...new Set(ids.map((id) => procOf.get(id) || "?"))].join(" + ");
+      return {
+        ws,
+        pane,
+        label: (first?.title ?? "").trim() || first?.agent || "herdr",
+        inUse: used.has(ws),
+        idle: !used.has(ws) && allShell,
+        summary: [proc, status].filter(Boolean).join(" · "),
+        detail: [
+          `工作区 ${ws}`,
+          ...known.map(
+            (p) =>
+              `　窗格 ${p.paneId}｜前台 ${procOf.get(p.paneId) || "?"}` +
+              `${p.agent ? `｜agent ${aiToolLabel(p.agent)}（${p.status}）` : ""}` +
+              `${p.cwd ? `｜${p.cwd}` : ""}`,
+          ),
+          `在用：${used.has(ws) ? "是（有会话/历史/看板卡片指着它）" : "否"}`,
+          running.length ? `还有东西在跑：${running.join("、")}` : "空壳（只停着 shell）",
+        ].join("\n"),
+      };
+    });
+  }
+
+  /** 管理面板里"能直接回收"的工作区个数（空壳）；按钮上要写这个数 */
+  function herdrMgrIdleCount(profile: ConnectionProfile, mgr: NonNullable<typeof herdrMgr>) {
+    return herdrMgrRows(profile, mgr).filter((r) => r.idle).length;
+  }
+
   // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
   // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
   // 同一台机器来回切标签不会反复 ssh。
@@ -5207,6 +5479,14 @@ export default function App() {
                                   key={h.id}
                                   className={"tree-item child" + (opened ? " opened" : "")}
                                   onClick={() => void connectFromHistory(h)}
+                                  onContextMenu={(e) => {
+                                    // herdr 的行才给菜单：它对着的是"服务器上那个工作区"，
+                                    // 能就地决定留着还是回收（别的行没有服务器侧的东西要管）。
+                                    if (!h.herdrPane) return;
+                                    e.preventDefault();
+                                    setHerdrRowArmed(null);
+                                    setCtxMenu({ profile: p, x: e.clientX, y: e.clientY, herdrRow: h });
+                                  }}
                                   title={
                                     (h.tmuxSession ?? "普通 shell") +
                                     `　${relTime(h.lastUsed)}` +
@@ -5379,6 +5659,182 @@ export default function App() {
                         </button>
                       </div>
                     ))}
+                  </div>
+                )}
+
+                {/* ---------- 管理 herdr 工作区（服务器右键打开） ----------
+                    herdr 的工作区天生持久，关标签页不会回收 —— 所以必须有一个"就在服务器上
+                    看一遍、决定留哪个"的地方。 */}
+                {herdrTarget && (
+                  <div className="tmux-panel herdr-panel">
+                    <div className="tmux-head">
+                      <span>herdr · {herdrTarget.name}</span>
+                      <span className="tmux-actions">
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => void refreshHerdrMgr(herdrTarget)}
+                        >
+                          刷新
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => {
+                            setHerdrTarget(null);
+                            setHerdrMgr(null);
+                            setHerdrMgrArmed(null);
+                          }}
+                        >
+                          关闭
+                        </button>
+                      </span>
+                    </div>
+                    {herdrMgrLoading && <div className="hint">正在读取…</div>}
+                    {!herdrMgrLoading && !herdrMgr && (
+                      <div className="hint">读不到 herdr 状态（这台机器可能没装，或没连上）</div>
+                    )}
+                    {!herdrMgrLoading && herdrMgr && (
+                      <>
+                        <div className="herdr-svc-row">
+                          <span className="grow">
+                            {herdrMgr.server.running
+                              ? `服务运行中 · ${herdrMgr.scan.panes.length} 个窗格`
+                              : "服务没在跑"}
+                          </span>
+                          {herdrMgr.server.running ? (
+                            herdrStopArmed ? (
+                              <>
+                                <button
+                                  type="button"
+                                  className="mini-btn danger"
+                                  title="停止 herdr 服务 —— 它管着的所有窗格都会关掉"
+                                  onClick={() =>
+                                    void stopHerdrServer(
+                                      herdrTarget.id,
+                                      herdrTarget.ssh?.user ?? null,
+                                    )
+                                  }
+                                >
+                                  确认停止
+                                </button>
+                                <button
+                                  type="button"
+                                  className="mini-btn"
+                                  onClick={() => setHerdrStopArmed(false)}
+                                >
+                                  取消
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                className="mini-btn"
+                                onClick={() => setHerdrStopArmed(true)}
+                              >
+                                停止服务…
+                              </button>
+                            )
+                          ) : (
+                            <button
+                              type="button"
+                              className="mini-btn"
+                              onClick={() =>
+                                void startHerdrServer(
+                                  herdrTarget.id,
+                                  herdrTarget.ssh?.user ?? null,
+                                )
+                              }
+                            >
+                              启动服务
+                            </button>
+                          )}
+                        </div>
+                        {herdrMgr.scan.workspaces.length === 0 && (
+                          <div className="hint">服务器上没有 herdr 工作区</div>
+                        )}
+                        {herdrTarget &&
+                          herdrMgrRows(herdrTarget, herdrMgr).map((w) => (
+                            <div key={w.ws} className="tmux-row herdr-ws-row">
+                              <span className="herdr-mark">H</span>
+                              <span className="grow ellipsis" title={w.detail}>
+                                {w.ws}
+                                <span className="dim"> · {w.summary}</span>
+                              </span>
+                              {w.inUse && <span className="tag">在用</span>}
+                              {w.idle && <span className="tag">空壳</span>}
+                              <button
+                                type="button"
+                                className="mini-btn"
+                                title={`以可写方式接管 ${w.pane}`}
+                                onClick={() =>
+                                  void openHerdrPane(
+                                    herdrTarget.id,
+                                    w.pane,
+                                    w.label,
+                                    herdrTarget.ssh?.user ?? null,
+                                    "control",
+                                  )
+                                }
+                              >
+                                接管
+                              </button>
+                              <button
+                                type="button"
+                                className="mini-btn"
+                                title={`只读观察 ${w.pane}`}
+                                onClick={() =>
+                                  void openHerdrPane(
+                                    herdrTarget.id,
+                                    w.pane,
+                                    w.label,
+                                    herdrTarget.ssh?.user ?? null,
+                                    "observe",
+                                  )
+                                }
+                              >
+                                观察
+                              </button>
+                              {herdrMgrArmed === w.ws ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="mini-btn danger"
+                                    title={`真的关掉 ${w.ws}（含里面的窗格）`}
+                                    onClick={() => void closeHerdrWorkspace(herdrTarget, w.ws)}
+                                  >
+                                    确认关掉 {w.ws}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="mini-btn"
+                                    onClick={() => setHerdrMgrArmed(null)}
+                                  >
+                                    取消
+                                  </button>
+                                </>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="mini-btn"
+                                  title={`关掉工作区 ${w.ws}（里面的窗格也会一起没）`}
+                                  onClick={() => setHerdrMgrArmed(w.ws)}
+                                >
+                                  关掉
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        {herdrTarget && herdrMgrIdleCount(herdrTarget, herdrMgr) > 0 && (
+                          <div className="herdr-svc-row">
+                            <span className="grow hint">
+                              其中 {herdrMgrIdleCount(herdrTarget, herdrMgr)} 个是空壳（只停着
+                              shell，且不在任何已打开/历史会话里）
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -6604,6 +7060,19 @@ export default function App() {
                   // "等你处理"要显眼：红点 + 卡片红边（她的 blocked = 在等人批准/回话）
                   const attention = !!t.attention || state === "needs-approval";
                   const project = dirBase(t.cwd || snap?.cwd || "");
+                  // 这张卡对着的**终端标签**（看板 ↔ 标签栏的对应关系）。
+                  // 分开两个概念：
+                  // - `linkedControl`：这个窗格已经**可写**地开着 → 按钮变成"切到标签"，
+                  //   点了就走过去，而不是再开一条（再开一条会跟它抢输入和尺寸）；
+                  // - `linkedAny`：只读观察窗也算"已经开在标签里"，用来告诉用户卡和标签的对应。
+                  const same = (s: OpenSession) =>
+                    s.profileId === t.herdrProfileId && s.herdrPane === t.herdrPane;
+                  const linkedControl = t.herdrPane
+                    ? sessions.find((s) => same(s) && s.herdrMode === "control")
+                    : undefined;
+                  const linkedAny = t.herdrPane
+                    ? linkedControl ?? sessions.find(same)
+                    : undefined;
                   const usage = snap?.usage;
                   const pct =
                     usage && usage.contextWindow > 0
@@ -6628,7 +7097,10 @@ export default function App() {
                       <div className="ai-task-meta ellipsis">
                         {t.server}
                         {project ? ` · ${project}` : ""}
-                        {t.pane ? ` · ${t.pane}` : ""}
+                        {t.herdrPane ? ` · ${t.herdrPane}` : t.pane ? ` · ${t.pane}` : ""}
+                        {linkedAny
+                          ? ` · 已开在「${linkedAny.title}」${linkedControl ? "" : "（只读）"}`
+                          : ""}
                       </div>
                       {snap && usage ? (
                         <div className="ai-task-meta">
@@ -6685,17 +7157,25 @@ export default function App() {
                             type="button"
                             className="mini-btn"
                             onClick={() =>
-                              void openHerdrPane(
-                                t.herdrProfileId ?? "",
-                                t.herdrPane ?? "",
-                                t.tool,
-                                null,
-                                "control",
-                              )
+                              linkedControl
+                                ? // 这个窗格已经作为标签开着了：**切过去**，
+                                  // 而不是再开一个（再开一个会跟它抢输入/尺寸）
+                                  setActiveId(linkedControl.id)
+                                : void openHerdrPane(
+                                    t.herdrProfileId ?? "",
+                                    t.herdrPane ?? "",
+                                    t.tool,
+                                    null,
+                                    "control",
+                                  )
                             }
-                            title="接管这个窗格：可读可写，能直接回答它的选择题（会抢过输入；关掉标签就交还，窗格留在服务器上）"
+                            title={
+                              linkedControl
+                                ? `这张卡对应的终端标签已经开着了：「${linkedControl.title}」`
+                                : "接管这个窗格：可读可写，能直接回答它的选择题（会抢过输入；关掉标签就交还，窗格留在服务器上）"
+                            }
                           >
-                            接管
+                            {linkedControl ? "切到标签" : "接管"}
                           </button>
                         </div>
                       ) : null}
@@ -7811,6 +8291,74 @@ export default function App() {
             }}
             onClick={(e) => e.stopPropagation()}
           >
+            {/* 对着**一条 herdr 会话**右键时，菜单是"这一条"的：herdr 的窗格会在服务器上攒着，
+                用户需要能就在这一行上决定"留着 / 回收"（菜单里不弹窗，第二次点才是确认）。 */}
+            {ctxMenu.herdrRow ? (
+              <>
+                <div className="menu-title">{ctxMenu.herdrRow.herdrPane}</div>
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    const h = ctxMenu.herdrRow!;
+                    setCtxMenu(null);
+                    void connectFromHistory(h);
+                  }}
+                >
+                  打开这个会话
+                </button>
+                <button
+                  type="button"
+                  className="menu-item"
+                  onClick={() => {
+                    const h = ctxMenu.herdrRow!;
+                    setCtxMenu(null);
+                    void removeHistoryEntry(h.id);
+                  }}
+                >
+                  只从列表移除（服务器上留着）
+                </button>
+                <div className="menu-sep" />
+                {herdrRowArmed === ctxMenu.herdrRow.herdrPane ? (
+                  <>
+                    <button
+                      type="button"
+                      className="menu-item danger"
+                      onClick={() => {
+                        const h = ctxMenu.herdrRow!;
+                        setCtxMenu(null);
+                        setHerdrRowArmed(null);
+                        void closeHerdrWorkspace(
+                          ctxMenu.profile,
+                          paneWorkspace(h.herdrPane),
+                        );
+                      }}
+                    >
+                      确认在服务器上关掉 {paneWorkspace(ctxMenu.herdrRow.herdrPane)}
+                    </button>
+                    <button
+                      type="button"
+                      className="menu-item"
+                      onClick={() => {
+                        setHerdrRowArmed(null);
+                        setCtxMenu(null);
+                      }}
+                    >
+                      取消
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="menu-item"
+                    onClick={() => setHerdrRowArmed(ctxMenu.herdrRow!.herdrPane ?? null)}
+                  >
+                    在服务器上关掉这个工作区…
+                  </button>
+                )}
+              </>
+            ) : (
+              <>
             <button
               type="button"
               className="menu-item"
@@ -7856,6 +8404,19 @@ export default function App() {
             >
               管理 tmux 会话
             </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                const p = ctxMenu.profile;
+                setCtxMenu(null);
+                setHerdrTarget(p);
+                setHerdrMgrArmed(null);
+                void refreshHerdrMgr(p);
+              }}
+            >
+              管理 herdr 工作区
+            </button>
             <div className="menu-sep" />
             <button
               type="button"
@@ -7868,6 +8429,8 @@ export default function App() {
             >
               删除服务器
             </button>
+              </>
+            )}
           </div>
         </div>
       )}

@@ -1100,6 +1100,123 @@ check(
   `ai_source_probe ${probeCallsBefore} → ${retry.probes}，open backend=${retry.backend}`,
 );
 
+// ---------- (D) 看板 ↔ 标签栏的映射：同一台机器上两个窗格 = 两张卡 ----------
+//
+// 用户实测：明明开了两个 codex（两个终端），看板上只有一个 —— 因为以前合并的粒度是
+// 「环境+服务器+工具+目录」，同一个目录下的两个 codex 被并成了一张。
+// setScenario 只对"下一次加载"生效，所以这里必须 reload 一次。
+await setScenario({
+  herdrAgents: [
+    {
+      kind: "codex", status: "blocked", cwd: "/home/lz", paneId: "w1P:p1",
+      tabId: "w1P:t1", workspaceId: "w1P", title: "lz", focused: true, attention: true,
+    },
+    {
+      kind: "codex", status: "working", cwd: "/home/lz", paneId: "w1R:p1",
+      tabId: "w1R:t1", workspaceId: "w1R", title: "lz", focused: false, attention: false,
+    },
+  ],
+});
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2600);
+const twoCards = await evaluate(
+  `[...document.querySelectorAll(".ai-panel .ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / "))`,
+);
+check(
+  "同一台机器、同一个目录里的两个 codex 显示成两张卡（不再并成一张）",
+  twoCards.some((c) => c.includes("w1P:p1")) && twoCards.some((c) => c.includes("w1R:p1")),
+  JSON.stringify(twoCards).slice(0, 240),
+);
+// 在 w1P:p1 那张卡上点「接管」→ 这个窗格作为标签开起来
+await evaluate(`(() => {
+  const c = [...document.querySelectorAll(".ai-panel .ai-task")].find((x) => (x.innerText || "").includes("w1P:p1"));
+  const b = c && [...c.querySelectorAll("button")].find((x) => (x.innerText || "").trim() === "接管");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2400);
+const mapped = await evaluate(`(() => {
+  const c = [...document.querySelectorAll(".ai-panel .ai-task")].find((x) => (x.innerText || "").includes("w1P:p1"));
+  const tabs = [...document.querySelectorAll(".session-tab")].map((t) => (t.innerText || "").trim());
+  return { card: c ? (c.innerText || "").replace(/\\n/g, " / ") : "", tabs: tabs.slice(0, 4) };
+})()`);
+check(
+  "卡片写清它对着哪个终端标签，并把按钮换成「切到标签」",
+  mapped.card.includes("已开在「") && mapped.card.includes("切到标签"),
+  JSON.stringify(mapped).slice(0, 260),
+);
+// 打开过的窗格标签名里**不该出现两次窗格号**（以前 `w\\d+` 的坑：herdr 的号里有字母）
+check(
+  "标签名里窗格号不重复（`w1P:p1` 只出现一次）",
+  mapped.tabs.some((t) => (t.match(/w1P:p1/g) || []).length === 1) &&
+    !mapped.tabs.some((t) => (t.match(/w1P:p1/g) || []).length > 1),
+  JSON.stringify(mapped.tabs),
+);
+
+// ---------- (E) 服务器右键 → 管理 herdr 工作区 ----------
+await setScenario({});
+await reload();
+const mgrOpened = await evaluate(`(() => {
+  const srv = document.querySelector(".tree-item.srv-node");
+  if (!srv) return { found: false };
+  srv.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 }));
+  return { found: true };
+})()`);
+await sleep(400);
+const menuText = await evaluate(
+  `[...document.querySelectorAll(".ctx-menu .menu-item")].map((b) => (b.innerText || "").trim())`,
+);
+check(
+  "服务器右键菜单里有「管理 herdr 工作区」（和「管理 tmux 会话」并排）",
+  mgrOpened.found && menuText.some((t) => t.includes("管理 herdr 工作区")) && menuText.some((t) => t.includes("管理 tmux 会话")),
+  menuText.join(" | ").slice(0, 200),
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ctx-menu .menu-item")].find((x) => (x.innerText || "").includes("管理 herdr 工作区"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1600);
+const mgr = await evaluate(`(() => {
+  const p = document.querySelector(".herdr-panel");
+  if (!p) return { found: false };
+  return {
+    found: true,
+    rows: [...p.querySelectorAll(".herdr-ws-row")].map((r) => (r.innerText || "").replace(/\\n/g, " / ")),
+    svc: (p.querySelector(".herdr-svc-row") || {}).innerText || "",
+  };
+})()`);
+check(
+  "「管理 herdr 工作区」列出这台机器上的每个工作区 + 服务状态",
+  mgr.found &&
+    mgr.rows.length === 3 &&
+    mgr.rows.some((r) => r.includes("wD")) &&
+    mgr.rows.some((r) => r.includes("claude")) &&
+    mgr.svc.includes("服务运行中"),
+  JSON.stringify(mgr).slice(0, 320),
+);
+// 「关掉」要二段确认（会连带关掉里面的窗格），并且把工作区号写在按钮上
+await evaluate(`(() => {
+  const r = [...document.querySelectorAll(".herdr-panel .herdr-ws-row")].find((x) => (x.innerText || "").includes("w9"));
+  const b = r && [...r.querySelectorAll("button")].find((x) => (x.innerText || "").trim() === "关掉");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(400);
+const armedRow = await evaluate(
+  `[...document.querySelectorAll(".herdr-panel .herdr-ws-row button")].map((b) => (b.innerText || "").trim())`,
+);
+check(
+  "管理面板里「关掉工作区」要二段确认，且按钮上写出要关的工作区号",
+  armedRow.some((t) => t.includes("确认关掉 w9")),
+  armedRow.join(" | ").slice(0, 160),
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}`);
