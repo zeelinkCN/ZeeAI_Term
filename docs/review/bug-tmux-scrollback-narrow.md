@@ -108,7 +108,7 @@ onClick={() => void openSshSession(tmuxTarget, "name", s.name)}   // 没有"已�
   const name = newDialog.tmuxName.trim() || defaultTmuxName(profile);   // 同一台服务器永远是同一个名字
 ```
 
-`defaultTmuxName()` 按模板 `{host}-{user}` 生成，对 `lz@47.99.241.168` 永远是
+`defaultTmuxName()` 按模板 `{host}-{user}` 生成，对 `lz@192.0.2.45` 永远是
 `47-99-241-168-lz`。所以"新建会话"点两次 = 同一个 tmux 会话挂两个客户端。
 
 ### 3.3 前端的最小尺寸下限太小（次要成因）

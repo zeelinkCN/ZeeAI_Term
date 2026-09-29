@@ -8,7 +8,7 @@
 //! ```text
 //! ZEEAI_PROBE_USER=lz cargo run --example herdr_probe
 //! ```
-//! 可选：`ZEEAI_PROBE_HOST`（默认 47.99.241.168）、`ZEEAI_PROBE_SECS`（默认 5）、
+//! 可选：`ZEEAI_PROBE_HOST`（默认 192.0.2.45）、`ZEEAI_PROBE_SECS`（默认 5）、
 //! `ZEEAI_PROBE_NOTTY=1`（对照：不加 -tt）。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,7 +19,7 @@ use zeeai_terminal_lib::core::{
 };
 
 fn main() {
-    let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "47.99.241.168".into());
+    let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "192.0.2.45".into());
     let user = std::env::var("ZEEAI_PROBE_USER").unwrap_or_else(|_| "lz".into());
     let secs: u64 = std::env::var("ZEEAI_PROBE_SECS")
         .ok()

@@ -177,7 +177,7 @@ fn wait_any(rec: &Arc<Mutex<Recorder>>, timeout_ms: u64) -> (usize, usize) {
 }
 
 fn main() {
-    let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "47.99.241.168".into());
+    let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "192.0.2.45".into());
     let user = std::env::var("ZEEAI_PROBE_USER").unwrap_or_else(|_| "lz".into());
     println!("== herdr 全矩阵测试 → {user}@{host} ==");
     // 记下"开跑前就有哪些 ssh"，收尾时只杀我们自己新起的（见 kill_new_ssh）

@@ -123,7 +123,7 @@ const resolveCmd = (cmd, args) => {
         id: "h-herdr-wD",
         profileId: (M.profiles.find((p) => p.ssh && p.ssh.herdrEnabled) || {}).id,
         profileName: "lz",
-        host: "47.99.241.168",
+        host: "192.0.2.45",
         tmuxSession: null,
         herdrPane: "wD:p1",
         herdrMode: "control",
@@ -248,7 +248,7 @@ const resolveCmd = (cmd, args) => {
         (args && (args.backend === "herdr-control" || args.backend === "herdr-pane") && args.tmuxName)
           ? "lz · herdr " + args.tmuxName
           : "lz · codex",
-      kind: "ssh", tmuxSession: null, user: "lz", host: "47.99.241.168",
+      kind: "ssh", tmuxSession: null, user: "lz", host: "192.0.2.45",
     };
     case "open_local": return { id: "mock-1", profileId: "", title: "PowerShell", kind: "local", tmuxSession: null, user: null, host: null };
     case "session_write": case "session_resize": case "session_close": return null;
