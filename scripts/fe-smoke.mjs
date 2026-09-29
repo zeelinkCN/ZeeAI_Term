@@ -217,7 +217,18 @@ const resolveCmd = (cmd, args) => {
     case "ai_tasks_clear_finished": return null;
     case "ai_session_snapshot": return null;
     case "ai_task_artifacts": return [];
-    case "ai_probe": return { tools: [], npm: false, running: [] };
+    // 和真后端一样摆四个：两个默认（Codex / Claude）+ 两个"没听过"的（Aider / Gemini），
+    // 用来验证"没装的、又不在默认名单里的不显示"
+    case "ai_probe": return {
+      npm: "10.0.0",
+      running: [],
+      tools: [
+        { name: "codex", label: "OpenAI Codex CLI", installed: true, version: "0.9.1", installCmd: "npm i -g @openai/codex", runCmd: "codex" },
+        { name: "claude", label: "Claude Code", installed: false, version: "", installCmd: "npm i -g @anthropic-ai/claude-code", runCmd: "claude" },
+        { name: "aider", label: "Aider", installed: false, version: "", installCmd: "pip install aider-chat", runCmd: "aider" },
+        { name: "gemini", label: "Gemini CLI", installed: false, version: "", installCmd: "npm i -g @google/gemini-cli", runCmd: "gemini" },
+      ],
+    };
     case "tmux_list": return [];
     case "tmux_windows": return [];
     case "serial_list": return [];
@@ -1161,6 +1172,39 @@ check(
 // ---------- (E) 服务器右键 → 管理 herdr 工作区 ----------
 await setScenario({});
 await reload();
+// 先打开 AI 面板（工具坞挂在它上面）
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2200);
+// 「AI 命令行工具」现在收在右下角：默认只剩一个小按钮，点开才展开
+const dockClosed = await evaluate(`(() => {
+  const b = document.querySelector(".tool-dock-btn");
+  return { found: !!b, open: !!document.querySelector(".tool-dock-body"), text: b ? (b.innerText || "").trim() : "" };
+})()`);
+check(
+  "「AI 命令行工具」默认收成右下角一个小按钮（不占看板空间）",
+  dockClosed.found && !dockClosed.open,
+  JSON.stringify(dockClosed),
+);
+await evaluate(`(() => {
+  const b = document.querySelector(".tool-dock-btn");
+  if (b) b.click();
+})()`);
+await sleep(400);
+const dockOpen = await evaluate(`(() => {
+  const body = document.querySelector(".tool-dock-body");
+  if (!body) return { open: false, tools: [] };
+  return { open: true, tools: [...body.querySelectorAll(".ai-tool-line .grow")].map((x) => (x.innerText || "").trim()) };
+})()`);
+check(
+  "点开后列出工具，且没装的 Aider / Gemini 不再摆出来",
+  dockOpen.open && !dockOpen.tools.some((t) => t.includes("Aider") || t.includes("Gemini")),
+  JSON.stringify(dockOpen),
+);
+
 const mgrOpened = await evaluate(`(() => {
   const srv = document.querySelector(".tree-item.srv-node");
   if (!srv) return { found: false };

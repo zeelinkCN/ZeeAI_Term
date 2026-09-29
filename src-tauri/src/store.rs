@@ -427,7 +427,9 @@ pub fn load_history() -> Vec<HistoryEntry> {
     if text.trim().is_empty() {
         return Vec::new();
     }
-    serde_json::from_str::<Vec<HistoryEntry>>(&text).unwrap_or_default()
+    let all = serde_json::from_str::<Vec<HistoryEntry>>(&text).unwrap_or_default();
+    // 读的时候就顺手把重复行收掉（老用户的历史文件里已经有一串了）
+    dedupe_history(all)
 }
 
 pub fn save_history(entries: &[HistoryEntry]) -> Result<(), String> {
@@ -437,11 +439,28 @@ pub fn save_history(entries: &[HistoryEntry]) -> Result<(), String> {
     fs::write(history_file(), text).map_err(|e| format!("写入历史失败: {e}"))
 }
 
-/// 同一个「配置 + tmux 会话」只保留一条，按最近使用排序。
-/// 历史记录的去重键：tmux 会话按「服务器 + tmux 名」；
-/// **普通 shell 按「服务器 + 会话名」** —— 以前不看名字，同一台机器的所有普通 shell
-/// 都被算成同一条互相覆盖，用户开了好几个却只看到一行（数量永远不涨）。
-pub fn history_key(profile_id: &str, tmux_session: &Option<String>, title: &str) -> String {
+/// 历史记录的去重键。
+///
+/// - **herdr：按「服务器 + 窗格」**。这是这次的修复重点：以前只看 tmux 名和标题，
+///   而 herdr 会话没有 tmux 名，标题又会随打开方式变（`… w1P:p1` /
+///   `… w1P:p1 （接管）` / 从看板点开时带的是 agent 标题），于是**同一个窗格在侧栏里
+///   长出一排重复行**（用户截图里那一串绿色 H 就是它）。
+/// - tmux：按「服务器 + tmux 名」；
+/// - 普通 shell：按「服务器 + 会话名」—— 以前不看名字，同一台机器的所有普通 shell
+///   都被算成同一条互相覆盖，用户开了好几个却只看到一行（数量永远不涨）。
+pub fn history_key_for(
+    profile_id: &str,
+    tmux_session: &Option<String>,
+    title: &str,
+    herdr_pane: &Option<String>,
+) -> String {
+    if let Some(pane) = herdr_pane
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        return format!("{profile_id}|herdr:{pane}");
+    }
     match tmux_session
         .as_deref()
         .map(str::trim)
@@ -454,16 +473,33 @@ pub fn history_key(profile_id: &str, tmux_session: &Option<String>, title: &str)
 
 pub fn upsert_history(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
     let mut all = load_history();
-    let new_key = history_key(
+    // herdr 的标题里"（接管）"是随打开方式变的：同一个窗格一会儿叫
+    // `lz · codex w1P:p1`、一会儿叫 `lz · codex w1P:p1 （接管）`。
+    // 既然是同一个窗格，标题就统一成不带这个尾巴的那个，免得侧栏那一行名字来回跳。
+    if entry
+        .herdr_pane
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|p| !p.is_empty())
+    {
+        if let Some(t) = entry.title.clone() {
+            let cleaned = t.replace(" （接管）", "").replace("（接管）", "");
+            let cleaned = cleaned.trim().to_string();
+            entry.title = if cleaned.is_empty() { None } else { Some(cleaned) };
+        }
+    }
+    let new_key = history_key_for(
         &entry.profile_id,
         &entry.tmux_session,
         entry.title.as_deref().unwrap_or(""),
+        &entry.herdr_pane,
     );
     all.retain(|e| {
-        history_key(
+        history_key_for(
             &e.profile_id,
             &e.tmux_session,
             e.title.as_deref().unwrap_or(""),
+            &e.herdr_pane,
         ) != new_key
     });
     entry.last_used = now_secs();
@@ -471,6 +507,31 @@ pub fn upsert_history(mut entry: HistoryEntry) -> Result<Vec<HistoryEntry>, Stri
     all.truncate(50);
     save_history(&all)?;
     Ok(all)
+}
+
+/// 把已经有的一堆重复行收拾干净：同一个「服务器 + herdr 窗格」只留最近用过的那条。
+///
+/// 为什么要在**读**的时候就做：去重键是这次才补上的，老用户的历史文件里已经躺着
+/// 一串重复行（用户截图里就是），光改写入侧的话它们会一直留在那儿。
+fn dedupe_history(all: Vec<HistoryEntry>) -> Vec<HistoryEntry> {
+    let mut out: Vec<HistoryEntry> = Vec::with_capacity(all.len());
+    for e in all {
+        // last_used 大的在前（load 出来已经是倒序，这里再稳一手）
+        let dup = out
+            .iter()
+            .position(|k| history_key_for(&k.profile_id, &k.tmux_session, k.title.as_deref().unwrap_or(""), &k.herdr_pane)
+                == history_key_for(&e.profile_id, &e.tmux_session, e.title.as_deref().unwrap_or(""), &e.herdr_pane));
+        match dup {
+            // 同一条：保留已有的（它更近），但如果新的标题更"干净"就把名字换过来
+            Some(i) => {
+                if out[i].title.is_none() && e.title.is_some() {
+                    out[i].title = e.title.clone();
+                }
+            }
+            None => out.push(e),
+        }
+    }
+    out
 }
 
 pub fn remove_history(id: &str) -> Result<Vec<HistoryEntry>, String> {
@@ -592,7 +653,7 @@ pub fn save(profiles: &[ConnectionProfile]) -> Result<(), String> {
 
 #[cfg(test)]
 mod history_tests {
-    use super::{history_key, write_atomic};
+    use super::{dedupe_history, history_key_for, write_atomic, HistoryEntry};
 
     #[test]
     fn atomic_write_replaces_content_and_leaves_no_tmp() {
@@ -613,25 +674,70 @@ mod history_tests {
 
     #[test]
     fn tmux_sessions_dedupe_by_name() {
-        let a = history_key("p1", &Some("my-sess".into()), "随便什么名字");
-        let b = history_key("p1", &Some("my-sess".into()), "另一个名字");
+        let k = |tmux: Option<&str>, title: &str| {
+            history_key_for("p1", &tmux.map(str::to_string), title, &None)
+        };
+        let a = k(Some("my-sess"), "随便什么名字");
+        let b = k(Some("my-sess"), "另一个名字");
         assert_eq!(a, b, "tmux 会话按会话名去重");
-        let c = history_key("p1", &Some("other".into()), "随便什么名字");
+        let c = k(Some("other"), "随便什么名字");
         assert_ne!(a, c);
-        let other_profile = history_key("p2", &Some("my-sess".into()), "");
+        let other_profile = history_key_for("p2", &Some("my-sess".into()), "", &None);
         assert_ne!(a, other_profile, "不同服务器不能撞");
     }
 
     #[test]
     fn plain_shells_are_separate_per_name() {
         // 这就是用户报的问题：同一台机器开了好几个普通 shell，只看到一行
-        let s1 = history_key("p1", &None, "服务器 · 普通 shell 1");
-        let s2 = history_key("p1", &None, "服务器 · 普通 shell 2");
+        let k = |title: &str| history_key_for("p1", &None, title, &None);
+        let s1 = k("服务器 · 普通 shell 1");
+        let s2 = k("服务器 · 普通 shell 2");
         assert_ne!(s1, s2, "普通 shell 要按名字分成不同记录");
         // 同名（自动命名重复的情况）仍然算同一条，不会无限堆积
-        let s1b = history_key("p1", &None, "服务器 · 普通 shell 1");
-        assert_eq!(s1, s1b);
+        assert_eq!(s1, k("服务器 · 普通 shell 1"));
         // 空 tmux 名也要走 plain 分支（不能和 tmux: 撞）
-        assert_eq!(history_key("p1", &Some("  ".into()), "x"), history_key("p1", &None, "x"));
+        assert_eq!(
+            history_key_for("p1", &Some("  ".into()), "x", &None),
+            k("x")
+        );
+    }
+
+    #[test]
+    fn herdr_sessions_dedupe_by_pane_not_title() {
+        // 用户截图里那一串重复的 H 行：同一个窗格被存了好几条，因为标题随打开方式变
+        let a = history_key_for("p1", &None, "lz · codex w1P:p1", &Some("w1P:p1".into()));
+        let b = history_key_for("p1", &None, "lz · 测试1 w1P:p1 （接管）", &Some("w1P:p1".into()));
+        let c = history_key_for("p1", &None, "lz · 查看机器网页的显示内容 | lz w1Q:p1", &Some("w1Q:p1".into()));
+        assert_eq!(a, b, "同一个窗格无论怎么打开都算一条");
+        assert_ne!(a, c, "不同窗格是不同记录");
+        // 不能跟同名的 tmux / 普通 shell 撞
+        assert_ne!(a, history_key_for("p1", &Some("w1P:p1".into()), "x", &None));
+    }
+
+    #[test]
+    fn dedupe_history_collapses_existing_duplicates() {
+        // 老版本写下的历史文件里已经有一串重复行，读进来就要收拾干净
+        let mk = |id: &str, pane: Option<&str>, title: &str, used: u64| HistoryEntry {
+            id: id.into(),
+            profile_id: "p1".into(),
+            profile_name: "lz".into(),
+            host: "h".into(),
+            tmux_session: None,
+            title: Some(title.into()),
+            herdr_pane: pane.map(str::to_string),
+            herdr_mode: None,
+            last_used: used,
+        };
+        let all = vec![
+            mk("1", Some("w1P:p1"), "lz · codex w1P:p1", 100),
+            mk("2", Some("w1P:p1"), "lz · codex w1P:p1 （接管）", 90),
+            mk("3", Some("w1Q:p1"), "lz · w1Q:p1", 80),
+            mk("4", None, "lz · 普通 shell 1", 70),
+        ];
+        let out = dedupe_history(all);
+        assert_eq!(out.len(), 3, "同一个窗格只留一条");
+        assert_eq!(out[0].id, "1");
+        assert_eq!(out[1].id, "3");
+        assert_eq!(out[2].id, "4");
     }
 }

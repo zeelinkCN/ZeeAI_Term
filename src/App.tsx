@@ -109,6 +109,7 @@ import type {
   AdbDevice,
   AdbFile,
   AiProbe,
+  AiTool,
   AiSessionSnapshot,
   AiArtifact,
   AiTask,
@@ -257,6 +258,15 @@ const AI_TOOL_LABEL: Record<string, string> = {
   gemini: "Gemini CLI",
 };
 
+/**
+ * 默认就摆出来的两个 AI 命令行工具。
+ *
+ * 用户反馈：面板上默认列了四种，后两种（Aider / Gemini CLI）他压根没听过，看着像噪音。
+ * 所以**没装的、又不在这个名单里的就不显示**；真装了才出现 —— 那时候它代表
+ * "你这台机器上确实有这个东西"，是有用的信息，不是噪音。
+ */
+const DEFAULT_AI_TOOLS = new Set(["codex", "claude"]);
+
 function aiToolLabel(name: string): string {
   return AI_TOOL_LABEL[name] ?? name;
 }
@@ -298,6 +308,22 @@ function herdrShortLabel(title?: string | null): string | undefined {
     .replace(/\s*w[0-9A-Za-z]+:p\d+.*$/, "")
     .trim();
   return stripped || undefined;
+}
+
+/**
+ * 把标题里**重复出现的窗格号**收成一个：`codex w1P:p1 w1P:p1` → `codex w1P:p1`。
+ *
+ * 这是老版本留下的脏数据：当时摘窗格号的正则写成 `w\d+`，而 herdr 的工作区号带字母
+ * （`w1P`/`wD`/`wE`），摘不掉就又拼了一遍。历史记录里那些名字现在还是脏的，
+ * 重新打开一次才会写干净，所以显示的时候顺手收一下。
+ */
+function dedupPaneId(text: string, paneId?: string | null): string {
+  const p = (paneId ?? "").trim();
+  if (!p) return text;
+  let out = text.split(`${p} ${p}`).join(p);
+  // 极端情况：连着拼了三次
+  while (out.includes(`${p} ${p}`)) out = out.split(`${p} ${p}`).join(p);
+  return out.trim();
 }
 
 /** 环境徽标：本地 / 远端 / WSL */
@@ -1002,6 +1028,8 @@ export default function App() {
   const [aiArtifacts, setAiArtifacts] = useState<AiArtifact[]>([]);
   /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
   const [toolListOpen, setToolListOpen] = useState(false);
+  /// 「最近任务」默认只露 3 条，想看全部点一下展开（不在那小框里上下拖）
+  const [timelineAll, setTimelineAll] = useState(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
@@ -5225,6 +5253,15 @@ export default function App() {
     return herdrMgrRows(profile, mgr).filter((r) => r.idle).length;
   }
 
+  /**
+   * 「AI 命令行工具」里要列哪些。
+   *
+   * 只默认摆 Codex CLI / Claude Code，别的**装了才显示**（见 DEFAULT_AI_TOOLS 的说明）。
+   */
+  function aiToolsVisible(tools: AiTool[]): AiTool[] {
+    return tools.filter((t) => t.installed || DEFAULT_AI_TOOLS.has(t.name));
+  }
+
   // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
   // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
   // 同一台机器来回切标签不会反复 ssh。
@@ -5463,17 +5500,28 @@ export default function App() {
                               // 已打开的判定：tmux 按 tmux 会话名比；普通 shell 按"这台机器 + 没有 tmux 名"比
                               // 普通 shell 还必须**比名字** —— 否则同一台机器上随便开一个普通 shell，
                               // 它所有普通 shell 的历史行都会显示"已打开"（实测就是这个 bug）
+                              // herdr：按**窗格号**比（和上面两个都不是一回事；
+                              // 以前漏了这一支，于是 herdr 行会拿标题去比普通 shell，判得一塌糊涂）
                               const opened = sessions.find((s) =>
-                                h.tmuxSession
+                                h.herdrPane
+                                  ? s.profileId === h.profileId && s.herdrPane === h.herdrPane
+                                  : h.tmuxSession
                                   ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
                                   : s.profileId === h.profileId &&
                                     !s.tmuxName &&
                                     (s.title ?? "").trim() === (h.title ?? "").trim(),
                               );
-                              const rowLabel =
-                                h.title?.trim() ||
-                                h.tmuxSession ||
-                                `${h.profileName || "服务器"} · 普通 shell`;
+                              const rawTitle = h.title?.trim() || "";
+                              const rowLabel = h.herdrPane
+                                ? // herdr 行：去掉"服务器名 · "前缀（服务器就在上一级树里），
+                                  // 窗格号由左边的 H 标和悬停提示给出，行里不用再挤一遍
+                                  // 再把老版本拼重复的窗格号收掉（那时候正则漏了带字母的工作区号，
+                                  // 标题会变成 "… w1P:p1 w1P:p1"）
+                                  dedupPaneId(rawTitle.replace(/^[^·]*·\s*/, ""), h.herdrPane) ||
+                                  h.herdrPane
+                                : rawTitle ||
+                                  h.tmuxSession ||
+                                  `${h.profileName || "服务器"} · 普通 shell`;
                               return (
                                 <div
                                   key={h.id}
@@ -5488,9 +5536,14 @@ export default function App() {
                                     setCtxMenu({ profile: p, x: e.clientX, y: e.clientY, herdrRow: h });
                                   }}
                                   title={
-                                    (h.tmuxSession ?? "普通 shell") +
+                                    (h.herdrPane
+                                      ? `herdr 窗格 ${h.herdrPane}`
+                                      : h.tmuxSession ?? "普通 shell") +
                                     `　${relTime(h.lastUsed)}` +
-                                    (opened ? "\n已经开着了 —— 点一下切到那个标签" : "")
+                                    (opened ? "\n已经开着了 —— 点一下切到那个标签" : "") +
+                                    (h.herdrPane
+                                      ? "\n右键：只移除记录 / 在服务器上关掉这个工作区"
+                                      : "")
                                   }
                                 >
                                   <span
@@ -6910,7 +6963,7 @@ export default function App() {
               <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
                 <span className="hint">
                   {herdrServer?.running
-                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格`
+                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格（看板的 AI 状态就是从它这来的）`
                     : herdrServer
                       ? "herdr 服务：没在跑（用到时会自动启动）"
                       : "herdr 服务：状态未知"}
@@ -6921,7 +6974,11 @@ export default function App() {
                       <button
                         type="button"
                         className="mini-btn danger"
-                        title="停止 herdr 服务 —— 它管着的所有窗格（含别的客户端在用的）都会关掉"
+                        title={
+                          "停止 herdr 服务 —— 它管着的所有窗格都会关掉，" +
+                          "里面正在跑的 AI 也会一起没；看板上这些窗格的卡片会跟着变准不了。\n" +
+                          "（只想腾地方的话，用「管理 herdr 工作区」一个个关更稳）"
+                        }
                         onClick={() => void stopHerdrServer()}
                       >
                         确认停止（会关掉所有 herdr 窗格）
@@ -7246,8 +7303,11 @@ export default function App() {
                 还没有记录。AI 跑完一轮会记在这里（重启应用也还在）。
               </div>
             ) : (
-              <div className="ai-timeline">
-                {timeline.slice(0, 40).map((r) => {
+              // 不在这么小的框里让人上下拖：默认只露 3 条，下面给一个"展开全部"，
+              // 展开后整块跟着面板滚（而不是在那个 260px 的小窗里拖）
+              <>
+              <div className={"ai-timeline" + (timelineAll ? " all" : "")}>
+                {(timelineAll ? timeline.slice(0, 60) : timeline.slice(0, 3)).map((r) => {
                   // 能不能"切过去"：找标题相同的已打开会话
                   const target = sessions.find(
                     (s) => (s.title ?? "").trim() === (r.sessionTitle ?? "").trim(),
@@ -7300,6 +7360,18 @@ export default function App() {
                   );
                 })}
               </div>
+              {(timeline.length > 3 || timelineAll) && (
+                <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    onClick={() => setTimelineAll((v) => !v)}
+                  >
+                    {timelineAll ? "收起" : `展开全部（${timeline.length}）`}
+                  </button>
+                </div>
+              )}
+              </>
             )}
 
             {aiNotices.length > 0 && (
@@ -7333,22 +7405,23 @@ export default function App() {
               </div>
             )}
 
-            {activeSession?.profileId && (
-              <>
-                {/* 已安装/未安装这类"工具清单"放上面太占地方，折叠起来（看板才是主角） */}
-                <button
-                  type="button"
-                  className="ai-section ai-section-toggle"
-                  onClick={() => setToolListOpen((v) => !v)}
-                  title="展开/收起工具清单（安装与在终端启动）"
-                >
-                  <span className="grow">{toolListOpen ? "▾" : "▸"} AI 命令行工具</span>
-                  <span className="dim">
-                    {(aiState?.tools ?? []).filter((t) => t.installed).length} 个已安装
-                  </span>
-                </button>
-                {toolListOpen &&
-                  (aiState?.tools ?? []).map((t) => {
+          </aside>
+        )}
+      </div>
+
+      {/* 「AI 命令行工具」不再占着整块空间：收成右下角一个小按钮，点了才展开。
+          展开的面板贴着右下角（不挡中间），再点一次或点空白就收起。 */}
+      {aiPanelOpen && activeSession?.profileId && (
+        <div className={"tool-dock" + (toolListOpen ? " open" : "")}>
+          {toolListOpen && (
+            <div className="tool-dock-body">
+              <div className="tool-dock-head">
+                <span className="grow">AI 命令行工具</span>
+                <span className="dim">
+                  {(aiState?.tools ?? []).filter((t) => t.installed).length} 个已安装
+                </span>
+              </div>
+              {aiToolsVisible(aiState?.tools ?? []).map((t) => {
                     const running = aiState?.running.includes(t.name) ?? false;
                     return (
                       <div className="ai-tool" key={t.name}>
@@ -7385,16 +7458,22 @@ export default function App() {
                       </div>
                     );
                   })}
-                {!aiState && (
-                  <div className="hint" style={{ padding: "8px 12px" }}>
-                    正在探测这台服务器…
-                  </div>
-                )}
-              </>
-            )}
-          </aside>
-        )}
-      </div>
+              {!aiState && <div className="hint">正在探测这台服务器…</div>}
+            </div>
+          )}
+          <button
+            type="button"
+            className="tool-dock-btn"
+            title="AI 命令行工具（安装与在终端启动）"
+            onClick={() => setToolListOpen((v) => !v)}
+          >
+            {toolListOpen ? "▾" : "▴"} AI 工具
+            <span className="dim">
+              {(aiState?.tools ?? []).filter((t) => t.installed).length}
+            </span>
+          </button>
+        </div>
+      )}
 
       <div className="statusbar">
         <span className="stat">
