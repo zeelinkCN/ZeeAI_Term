@@ -1170,6 +1170,11 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* 探测失败：用告警色，和"确实没装"区分开（用户报过被这两个状态误导） */
+.ai-source-line.warn {
+  color: var(--yellow);
+}
+
 .ai-timeline {
   display: flex;
   flex-direction: column;

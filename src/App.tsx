@@ -6213,7 +6213,7 @@ export default function App() {
                 title={
                   aiSource.herdrVersion
                     ? `${aiSource.herdrPath}\n协议 ${aiSource.protocol} · schema v${aiSource.schemaVersion} · 指纹 ${aiSource.schemaFingerprint || "—"}\nherdr 当前认识 ${aiSource.agents} 个 agent\n点击重新探测`
-                    : "这台机器上没有 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。点击重新探测。"
+                    : `这台机器上没探到 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。\n远端原话：${(aiSource.raw || "（空）").slice(0, 200)}\n点击重新探测。`
                 }
               >
                 {aiSourceProbing
@@ -6226,7 +6226,20 @@ export default function App() {
                       : `状态来源：herdr ${aiSource.herdrVersion}（协议 ${aiSource.protocol} · 已实测）`
                   : "状态来源：本机探测（这台机器没装 herdr）"}
               </div>
-            ) : null}
+            ) : (
+              // 探测**失败**（连不上/超时）和"确实没装"是两回事：以前失败时这里什么都不显示，
+              // 用户只看到别处的"没装"，就会以为服务器上没装（实际是这次没连上）。
+              aiSourceProbing ? null : (
+                <div
+                  className="ai-source-line warn"
+                  role="button"
+                  title="探测这台服务器时没连上（可能是网络/sshd 一时拥塞）。点击重试。"
+                  onClick={() => void refreshAiSource(true)}
+                >
+                  状态来源：探测失败（没连上，不代表没装）· 点一下重试
+                </div>
+              )
+            )}
             {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
                 scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
             {aiSource && !aiSource.herdrVersion && activeSession?.profileId ? (

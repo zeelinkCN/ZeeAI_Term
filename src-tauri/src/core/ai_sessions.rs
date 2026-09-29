@@ -502,6 +502,12 @@ pub struct AiSourceInfo {
     pub schema_fingerprint: String,
     /// ok / untested / too_old / unknown（见 [`compat_of`]）
     pub compat: String,
+    /// 探测时**原始输出**的前若干字符（只用于界面上的诊断提示）。
+    ///
+    /// 为什么留着：用户报过"服务器明明装了 herdr，应用却显示探测不到"——
+    /// 那种情况十有八九是**这次探测没连上/超时**，而不是真的没装。
+    /// 把远端原话带到悬停提示里，下一次就能当场分辨是哪种。
+    pub raw: String,
 }
 
 impl AiSourceInfo {
@@ -550,6 +556,8 @@ pub fn remote_source_script() -> String {
 /// 解析探测脚本的输出
 pub fn parse_source(out: &str) -> AiSourceInfo {
     let mut info = AiSourceInfo::default();
+    // 原始输出留一小段，给界面做诊断（见 AiSourceInfo::raw 的说明）
+    info.raw = out.trim().chars().take(300).collect();
     for line in out.lines() {
         let Some(rest) = line.trim().strip_prefix("HERDR|") else {
             continue;

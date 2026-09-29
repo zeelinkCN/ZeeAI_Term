@@ -161,6 +161,21 @@ fn wait_bytes(rec: &Arc<Mutex<Recorder>>, timeout_ms: u64) -> usize {
     }
 }
 
+/// 等"有数据**或**有告警"（有些用例的预期结果就是一条报错，不是画面）
+fn wait_any(rec: &Arc<Mutex<Recorder>>, timeout_ms: u64) -> (usize, usize) {
+    let step = 250u64;
+    let mut waited = 0u64;
+    loop {
+        let g = rec.lock().unwrap();
+        if (g.bytes > 0 || !g.errors.is_empty()) || waited >= timeout_ms {
+            return (g.bytes, g.errors.len());
+        }
+        drop(g);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+    }
+}
+
 fn main() {
     let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "47.99.241.168".into());
     let user = std::env::var("ZEEAI_PROBE_USER").unwrap_or_else(|_| "lz".into());
@@ -577,7 +592,7 @@ herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sn
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = wait_any(&rec4, 8000);
         let g = rec4.lock().unwrap();
         let all = format!("{}{}", g.text, g.errors.join(" "));
         check!(
@@ -605,9 +620,18 @@ herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sn
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = wait_bytes(&rec5, 8000);
         let _ = ssh_run(&host, &user, &format!("herdr workspace close '{ws}'"));
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // 关掉之后要等"流结束/收到告警"，同样是轮询而不是固定睡
+        let step = 250u64;
+        let mut waited = 0u64;
+        while waited < 8000 {
+            if rec5.lock().unwrap().closed || !rec5.lock().unwrap().errors.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(step));
+            waited += step;
+        }
         let g = rec5.lock().unwrap();
         check!(
             "窗格被关掉后，流结束（或给出告警）",

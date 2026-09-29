@@ -327,6 +327,8 @@ export interface AiSourceInfo {
   schemaFingerprint: string;
   /** ok / untested / too_old / unknown */
   compat: string;
+  /** 探测时的远端原始输出（前 300 字符）—— 用来分辨"没装"和"没连上" */
+  raw?: string;
 }
 
 export interface AppSettings {
