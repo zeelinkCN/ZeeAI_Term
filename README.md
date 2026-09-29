@@ -8,6 +8,7 @@
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4?style=flat-square)](#下载)
 [![release](https://img.shields.io/github/v/release/zeelinkCN/ZeeAI_Term?style=flat-square&label=release&color=2ea043)](https://github.com/zeelinkCN/ZeeAI_Term/releases/latest)
 [![build](https://img.shields.io/badge/build-tauri%202%20%2B%20react%20%2B%20rust-555?style=flat-square)](#技术栈)
+[![license](https://img.shields.io/badge/license-GPL--3.0-2ea043?style=flat-square)](#许可证)
 
 ![工作台](docs/images/workbench.png)
 
@@ -85,9 +86,21 @@ npm run fe:smoke                     # 界面功能测试：无头 Edge 真点�
 
 ## 许可证
 
-**本仓库目前尚未选定开源许可证。** 没有许可证意味着默认「保留所有权利」—— 别人不能合法地使用、
-修改或再分发这份代码。选定之后会补上 `LICENSE` 文件（`MIT` / `Apache-2.0` / `GPL-3.0` 都可以，
-取决于希望它被怎样使用）。
+**GNU General Public License v3.0 或更新版本**（`GPL-3.0-or-later`），全文见 [LICENSE](LICENSE)。
+
+```
+ZeeAI_Term · Windows 多协议终端工作台
+Copyright (C) 2026 zeelinkCN
+
+本程序是自由软件：你可以按自由软件基金会发布的 GNU 通用公共许可证
+（第 3 版或你选择的任何更新版本）的条款重新分发和/或修改它。
+
+本程序的分发是希望它有用，但不提供任何担保，甚至不包含适销性或
+特定用途适用性的默示担保。详见 GNU 通用公共许可证。
+```
+
+这意味着：可以自由使用、修改、分发，但**分发修改版时必须一起提供源代码**，
+且不能附加额外限制。想要闭源再分发的场景请先联系作者。
 
 随包分发、但不属于本项目的第三方组件各自跟随其原始许可：ADB platform-tools（Android SDK 条款）、
 herdr（其官方许可），以及 Rust / npm 依赖树里的各个 crate 与包。

@@ -4,6 +4,7 @@
   "version": "0.1.9",
   "type": "module",
   "description": "Windows multi-protocol terminal workbench",
+  "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
