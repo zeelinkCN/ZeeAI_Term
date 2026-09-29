@@ -23,6 +23,8 @@ import type {
   HighlightRule,
   HerdrAgent,
   HerdrPane,
+  HerdrServerStatus,
+  HerdrWorkspaceScan,
   HerdrInstallReport,
 } from "./types";
 
@@ -675,6 +677,63 @@ export async function herdrPanes(
 ): Promise<HerdrPane[]> {
   return invoke<HerdrPane[]>("herdr_panes", {
     profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** herdr 服务状态（只读；不会顺手启动它） */
+export async function herdrServerStatus(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<HerdrServerStatus> {
+  return invoke<HerdrServerStatus>("herdr_server_status", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 启动 herdr 服务（后台起来，不挂在这条 ssh 上） */
+export async function herdrServerStart(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("herdr_server_start", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 停止 herdr 服务 —— **会关掉它管着的所有窗格**，调用前必须让用户确认 */
+export async function herdrServerStop(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("herdr_server_stop", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 扫一遍服务器上的 herdr 工作区 + 每个窗格的前台进程（只读）—— 用来挑出"空壳"的那些 */
+export async function herdrWorkspaceScan(
+  profileId: string,
+  userOverride?: string | null,
+): Promise<HerdrWorkspaceScan> {
+  return invoke<HerdrWorkspaceScan>("herdr_workspace_scan", {
+    profileId,
+    userOverride: userOverride ?? null,
+  });
+}
+
+/** 关掉一个 herdr 工作区（连带它的窗格）—— **必须让用户确认后**再调用 */
+export async function herdrWorkspaceClose(
+  profileId: string,
+  workspaceId: string,
+  userOverride?: string | null,
+): Promise<string> {
+  return invoke<string>("herdr_workspace_close", {
+    profileId,
+    workspaceId,
     userOverride: userOverride ?? null,
   });
 }

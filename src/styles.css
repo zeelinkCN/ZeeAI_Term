@@ -1340,6 +1340,39 @@ body {
   font-weight: 700;
 }
 
+/* herdr 会话的小标记（和上面的 T 同款，换个颜色区分两种多路复用器） */
+.herdr-mark {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  line-height: 15px;
+  text-align: center;
+  border-radius: 3px;
+  background: rgba(35, 209, 139, 0.16);
+  color: var(--green);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+/* herdr 会话终端上方的状态条：像 tmux 的状态栏一样，一眼能看出"进了 herdr" */
+.herdr-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 10px;
+  font-size: 11px;
+  color: var(--fg);
+  background: rgba(35, 209, 139, 0.10);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.tag.herdr {
+  background: rgba(35, 209, 139, 0.18);
+  color: var(--green);
+  font-weight: 700;
+}
+
 .session-tab {
   cursor: grab;
 }

@@ -30,6 +30,11 @@ import {
   herdrAgents,
   herdrInstall,
   herdrPanes,
+  herdrServerStart,
+  herdrServerStatus,
+  herdrServerStop,
+  herdrWorkspaceClose,
+  herdrWorkspaceScan,
   herdrWorkspaceCreate,
   herdrPaneInputStart,
   herdrPaneKey,
@@ -108,6 +113,8 @@ import type {
   AiTask,
   HerdrAgent,
   HerdrPane,
+  HerdrServerStatus,
+  HerdrWorkspaceScan,
   AiTurnRecord,
   AiSourceInfo,
   AppSettings,
@@ -845,6 +852,16 @@ export default function App() {
   const herdrInputs = useRef<Set<string>>(new Set());
   /** 已经为哪些"herdr 在等人"的窗格提醒过（离开 blocked 之后再进会重新提醒） */
   const herdrNotified = useRef<Set<string>>(new Set());
+  /** 「停止 herdr 服务」是个会关掉所有 herdr 窗格的动作 → 二段确认（不弹窗、不打断） */
+  const [herdrStopArmed, setHerdrStopArmed] = useState(false);
+  /** herdr 服务状态（只读探测；面板打开时刷新） */
+  const [herdrServer, setHerdrServer] = useState<HerdrServerStatus | null>(null);
+  /** 服务器上**真实存在**的 herdr 工作区 + 每个窗格的前台进程（只读探测） */
+  const [herdrScan, setHerdrScan] = useState<HerdrWorkspaceScan | null>(null);
+  /** 「清理没在用的工作区」会关掉服务器上的东西 → 也是二段确认 */
+  const [herdrCleanArmed, setHerdrCleanArmed] = useState(false);
+  /** 已经探过服务状态的服务器：换服务器时才再探一次，同一台机器来回切标签不重复 ssh */
+  const herdrProbedFor = useRef<string | null>(null);
   /** 「探到 herdr 之后要不要再刷一次看板」的排队标记（见 refreshBoard 的 finally） */
   const boardRefreshQueued = useRef(false);
   /** 正在安装 herdr 的服务器（防重复点击；同时给界面显示"进行到哪一步"） */
@@ -1344,6 +1361,147 @@ export default function App() {
    * 按键得由 herdr 自己去敲（`pane send-text` / `pane send-keys`），所以后端常驻一条
    * ssh 专门收指令（见 commands.rs::herdr_pane_input_start）。
    */
+  /**
+   * 刷新 herdr **服务**状态（只读）。
+   *
+   * 「装了 herdr」和「herdr 服务在跑」是两件事：服务没在跑时窗格/工作区都取不到。
+   * 界面必须把这两种状态分开说，并且让用户能显式启动/停止。
+   */
+  async function refreshHerdrServer(profileId?: string | null, user?: string | null) {
+    const pid = profileId ?? activeSession?.profileId;
+    if (!pid) {
+      setHerdrServer(null);
+      setHerdrScan(null);
+      return;
+    }
+    try {
+      setHerdrServer(await herdrServerStatus(pid, user ?? null));
+      // 「装了」≠「服务在跑」≠「有工作区」≠「我们开着的会话」——这四件事分开说，
+      // 顺手把工作区 + 前台进程也拿回来，好跟我们会话列表对比出"没在用且是空壳"的那些。
+      setHerdrScan(await herdrWorkspaceScan(pid, user ?? null));
+    } catch {
+      // 探不到就当"不知道"，界面不显示这两行（不影响别的功能）
+      setHerdrServer(null);
+      setHerdrScan(null);
+    }
+  }
+
+  /**
+   * 服务器上**没在用**的 herdr 工作区。
+   *
+   * herdr 的工作区天生是持久的（这正是它比 tmux 强的地方），但每开一次 herdr 会话就多一个，
+   * **关掉标签页并不会回收它们** —— 攒久了服务器上会留一串空工作区（用户撞见过十几条，还
+   * 因此以为"一台机器上只能有一个 herdr"）。这里把"服务器上真实存在的"减去"我们这边引用到的"
+   * （开着的标签 + 历史记录 + AI 看板里的任务）才叫没在用；清理动作**只碰这些**。
+   */
+  function herdrOrphans(): string[] {
+    const pid = activeSession?.profileId;
+    if (!herdrScan || !pid) return [];
+    const used = new Set<string>();
+    const ws = (p?: string | null) => (p ? p.split(":")[0] : "");
+    for (const s of sessions) {
+      if (s.profileId !== pid) continue;
+      const w = ws(s.herdrPane);
+      if (w) used.add(w);
+    }
+    for (const h of history) {
+      if (h.profileId !== pid) continue;
+      const w = ws(h.herdrPane);
+      if (w) used.add(w);
+    }
+    for (const t of boardTasks) {
+      if (t.herdrProfileId !== pid) continue;
+      const w = ws(t.herdrPane);
+      if (w) used.add(w);
+    }
+    return herdrScan.workspaces.filter((w) => !used.has(w));
+  }
+
+  /**
+   * 上面那些"没在用"的里面，哪些是**空壳**。
+   *
+   * 空壳 = 这个工作区里每个窗格的**前台进程都是 shell**（我扫回来的就是它 --
+   * `herdr pane process-info` 给的 foreground_processes[].name）。只要有一个窗格
+   * 里跑着别的东西（codex / vim / 编译 / 一个没退出的命令），这个工作区就**不算空壳**，
+   * 再没在用也不会被清理 —— 关掉它等于直接毁掉用户正在干的活，不干这种事。
+   *
+   * 取不到进程名（空串）当"不知道"，也按不安全处理。
+   */
+  function herdrCleanable(): string[] {
+    if (!herdrScan) return [];
+    const SHELLS = new Set([
+      "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu", "busybox",
+    ]);
+    const busy = new Set<string>();
+    const seen = new Set<string>();
+    for (const p of herdrScan.panes) {
+      const w = p.paneId.split(":")[0];
+      if (!w) continue;
+      seen.add(w);
+      if (!SHELLS.has((p.procName || "").trim().toLowerCase())) busy.add(w);
+    }
+    return herdrOrphans().filter((w) => seen.has(w) && !busy.has(w));
+  }
+
+  /** 清理**空壳** herdr 工作区（只有用户二段确认之后才会走到这里）。 */
+  async function cleanHerdrOrphans() {
+    const pid = activeSession?.profileId;
+    setHerdrCleanArmed(false);
+    if (!pid) return;
+    const doomed = herdrCleanable();
+    if (!doomed.length) {
+      notify("没有可以清理的空壳 herdr 工作区");
+      return;
+    }
+    const user = activeSession?.user ?? null;
+    const failed: string[] = [];
+    // 一个一个关：某一个关不掉（刚好有人在用）不影响其它
+    for (const w of doomed) {
+      try {
+        await herdrWorkspaceClose(pid, w, user);
+      } catch {
+        failed.push(w);
+      }
+    }
+    const ok = doomed.length - failed.length;
+    notify(
+      failed.length
+        ? `已清理 ${ok} 个空壳 herdr 工作区；${failed.join("、")} 没关掉（可能正被别的客户端用着）`
+        : `已清理 ${ok} 个空壳 herdr 工作区`,
+    );
+    void refreshHerdrServer();
+  }
+
+  /** 启动 herdr 服务（后台起来，不挂在我们这条 ssh 上） */
+  async function startHerdrServer() {
+    const pid = activeSession?.profileId;
+    if (!pid) return;
+    try {
+      const out = await herdrServerStart(pid, activeSession?.user ?? null);
+      notify(`herdr 服务已启动（${out || "ok"}）`);
+    } catch (e) {
+      notify("启动 herdr 服务失败：" + String(e));
+    }
+    void refreshHerdrServer();
+  }
+
+  /**
+   * 停止 herdr 服务。**会关掉它管着的所有窗格**（包括别的客户端正在用的），
+   * 所以走"二段确认"：第一次点只是把按钮变成确认态，再点一次才真停。
+   */
+  async function stopHerdrServer() {
+    const pid = activeSession?.profileId;
+    if (!pid) return;
+    try {
+      const out = await herdrServerStop(pid, activeSession?.user ?? null);
+      notify(`已停止 herdr 服务（${out || "ok"}）—— 它管着的窗格都关掉了`);
+    } catch (e) {
+      notify("停止 herdr 服务失败：" + String(e));
+    }
+    setHerdrStopArmed(false);
+    void refreshHerdrServer();
+  }
+
   async function ensureHerdrInput(
     id: string,
     profileId: string,
@@ -1723,6 +1881,8 @@ export default function App() {
     void refreshAi();
     // 不带 force：命中缓存就不再 ssh（同一台机器一个进程里只探一次）
     void refreshAiSource();
+    // herdr 服务状态（装了 ≠ 在跑），面板打开时一起刷
+    void refreshHerdrServer();
     void refreshBoard();
     void loadTimeline();
     // 会话日志是通知的主判据，跟着面板一起刷
@@ -3171,6 +3331,10 @@ export default function App() {
           "control",
         );
         notify(`已进入 herdr 的窗格 ${pane}（它是 herdr 管的那个终端，留在服务器上、随时能回来）`);
+        // 刚多了一个工作区，顺手把服务状态/工作区清单刷新一下（状态条和面板上那句
+        // 「N 个窗格 / N 个工作区」要跟着变，不然用户会以为没生效）
+        herdrProbedFor.current = profile.id;
+        void refreshHerdrServer(profile.id, userOverride);
       } else if (!newDialog.useTmux) {
         await openSshSession(
           profile,
@@ -4785,6 +4949,21 @@ export default function App() {
     return out;
   }, [gitState]);
 
+  /** 面板上要显示的"没在用"和"可清理"（只读计算，不产生任何副作用） */
+  const herdrOrphanList = herdrOrphans();
+  const herdrCleanList = herdrCleanable();
+
+  // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
+  // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
+  // 同一台机器来回切标签不会反复 ssh。
+  useEffect(() => {
+    const s = sessions.find((x) => x.id === activeId) ?? null;
+    const pid = s?.herdrPane ? s.profileId : null;
+    if (!pid || herdrProbedFor.current === pid) return;
+    herdrProbedFor.current = pid;
+    void refreshHerdrServer(pid, s?.user ?? null);
+  }, [activeId, sessions]);
+
   return (
     <div
       className={
@@ -5042,6 +5221,16 @@ export default function App() {
                                   {h.tmuxSession && (
                                     <span className="tmux-mark" title="tmux 会话（服务器上会一直活着）">
                                       T
+                                    </span>
+                                  )}
+                                  {/* herdr 会话用一个小 H 标出来 —— 和上面那个 T 一个道理，
+                                      侧栏一眼就能看出这条是 herdr 管的窗格 */}
+                                  {h.herdrPane && (
+                                    <span
+                                      className="herdr-mark"
+                                      title={`herdr 窗格（服务器上的工作区/窗格：${h.herdrPane}）`}
+                                    >
+                                      H
                                     </span>
                                   )}
                                   <IconTerminal size={13} />
@@ -6121,6 +6310,23 @@ export default function App() {
                       s.id === activeId && s.activeTab === "terminal" ? "block" : "none",
                   }}
                 >
+                  {/* herdr 会话：终端上方挂一条**一眼可见**的状态条（像 tmux 的状态栏那样），
+                      避免"到底进没进 herdr"这种疑惑。 */}
+                  {s.herdrPane && (
+                    <div className="herdr-bar" title={`${s.title}\nherdr 工作区/窗格：${s.herdrPane}`}>
+                      <span className="tag herdr">herdr</span>
+                      <span>{s.herdrMode === "control" ? "接管中（可写）" : "只读观察"}</span>
+                      <span className="dim">{s.herdrPane}</span>
+                      <span className="grow" />
+                      <span className="dim">
+                        {herdrServer
+                          ? herdrServer.running
+                            ? `服务运行中 · ${herdrServer.panes} 个窗格`
+                            : "服务没在跑"
+                          : ""}
+                      </span>
+                    </div>
+                  )}
                   <TerminalView
                     sessionId={s.id}
                     bus={bus}
@@ -6242,6 +6448,101 @@ export default function App() {
             )}
             {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
                 scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
+            {/* herdr **服务**的生命周期做成可见 + 可控：
+                "装了"和"在跑"是两件事；停止会关掉它管着的所有窗格 —— 所以二段确认，不弹窗。 */}
+            {aiSource?.herdrVersion && activeSession?.profileId ? (
+              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
+                <span className="hint">
+                  {herdrServer?.running
+                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格`
+                    : herdrServer
+                      ? "herdr 服务：没在跑（用到时会自动启动）"
+                      : "herdr 服务：状态未知"}
+                </span>
+                {herdrServer?.running ? (
+                  herdrStopArmed ? (
+                    <>
+                      <button
+                        type="button"
+                        className="mini-btn danger"
+                        title="停止 herdr 服务 —— 它管着的所有窗格（含别的客户端在用的）都会关掉"
+                        onClick={() => void stopHerdrServer()}
+                      >
+                        确认停止（会关掉所有 herdr 窗格）
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => setHerdrStopArmed(false)}
+                      >
+                        取消
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => setHerdrStopArmed(true)}
+                    >
+                      停止服务…
+                    </button>
+                  )
+                ) : (
+                  <button type="button" className="mini-btn" onClick={() => void startHerdrServer()}>
+                    启动服务
+                  </button>
+                )}
+              </div>
+            ) : null}
+            {/* herdr **工作区**的生命周期：我们是"每开一个会话就建一个工作区"，
+                但关掉标签页不会回收它 —— 把没在用的一次列出来，让用户自己决定清不清。 */}
+            {aiSource?.herdrVersion && activeSession?.profileId && herdrScan ? (
+              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
+                <span
+                  className="hint"
+                  title={
+                    `服务器上的工作区：${herdrScan.workspaces.join("、") || "（没有）"}\n` +
+                    `没在用（不在任何已打开/历史会话里）：${herdrOrphanList.join("、") || "（没有）"}\n` +
+                    `其中是空壳（只停在提示符上，可以安全清理）：${herdrCleanList.join("、") || "（没有）"}`
+                  }
+                >
+                  herdr 工作区：{herdrScan.workspaces.length} 个
+                  {herdrOrphanList.length
+                    ? `（${herdrOrphanList.length} 个没在用）`
+                    : "（都在用）"}
+                </span>
+                {herdrCleanList.length ? (
+                  herdrCleanArmed ? (
+                    <>
+                      <button
+                        type="button"
+                        className="mini-btn danger"
+                        title={`会关掉：${herdrCleanList.join("、")}\n（都是停在提示符上的空壳工作区；里面正跑着东西的一个都不会碰）`}
+                        onClick={() => void cleanHerdrOrphans()}
+                      >
+                        确认清理（{herdrCleanList.join("、")}）
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        onClick={() => setHerdrCleanArmed(false)}
+                      >
+                        取消
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      title="只关掉「不属于任何已打开/历史会话」而且「里面只停着 shell」的工作区"
+                      onClick={() => setHerdrCleanArmed(true)}
+                    >
+                      清理空壳（{herdrCleanList.length}）…
+                    </button>
+                  )
+                ) : null}
+              </div>
+            ) : null}
             {aiSource && !aiSource.herdrVersion && activeSession?.profileId ? (
               <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
                 {herdrInstalling[activeSession.profileId] ? (

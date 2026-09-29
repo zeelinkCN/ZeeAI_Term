@@ -294,6 +294,168 @@ pub fn panes_command() -> String {
     )
 }
 
+/// 这台机器上 herdr 服务的状态（**只读**，不带 ENSURE_SERVER —— 探测不该有副作用）。
+///
+/// 输出格式（两行）：
+/// ```text
+/// SRV|<herdr status server 的第一行，例如 status: running>
+/// <窗格数量>
+/// ```
+pub fn server_status_command() -> String {
+    format!(
+        "{CLI_PREFIX}; if [ -n \"$H\" ]; then S=$(\"$H\" status server 2>/dev/null | head -1 | tr -d '\\r'); printf 'SRV|%s\\n' \"$S\"; \"$H\" pane list 2>/dev/null | tr ',' '\\n' | grep -c '\"pane_id\"'; else printf 'SRV|\\n0\\n'; fi"
+    )
+}
+
+/// herdr 服务的状态
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerStatus {
+    /// 服务在不在跑（`herdr status server` 打的是 `status: running`）
+    pub running: bool,
+    /// 原始那一行，界面上可以悬停看
+    pub raw: String,
+    /// 这套服务里现在有多少个窗格
+    pub panes: u32,
+}
+
+pub fn parse_server_status(out: &str) -> ServerStatus {
+    let mut st = ServerStatus::default();
+    let mut saw_srv = false;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("SRV|") {
+            // 注意：**即使 SRV| 后面是空的也要认下来** —— 那表示"问到了，但服务没在跑"；
+            // 只有整段里压根没有 SRV 行，才叫"没问出来"（老版本 herdr 没这一列）。
+            saw_srv = true;
+            st.raw = rest.trim().to_string();
+            st.running = st.raw.contains("status: running");
+            continue;
+        }
+        if let Ok(n) = line.parse::<u32>() {
+            st.panes = n;
+            continue;
+        }
+        if !saw_srv && !line.is_empty() {
+            // 没有 SRV 行时的兜底：整段里出现 "status: running" 也算在跑
+            st.raw = line.to_string();
+            st.running = line.contains("status: running");
+        }
+    }
+    st
+}
+
+/// **启动** herdr 服务（用户显式点「启动」时用；后台起来，不挂在我们这条 ssh 上）
+pub fn server_start_command() -> String {
+    format!("{CLI_PREFIX}; {ENSURE_SERVER}; {CLI_PREFIX}; \"$H\" status server 2>/dev/null | head -1")
+}
+
+/// **停止** herdr 服务（会关掉它管着的所有窗格，所以只在用户明确点「停止」时执行）
+pub fn server_stop_command() -> String {
+    format!("{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" server stop 2>&1 | head -3; else printf 'no herdr\\n'; fi")
+}
+
+/// 扫一遍服务器上的**工作区 + 每个窗格的前台进程**（只读）。
+///
+/// 为什么要把"前台进程"一起拿回来：清理工作区时要能分清
+/// **"空壳"（停在提示符上的 shell）** 和 **"里面正跑着东西"**（codex / vim / 编译…）。
+/// 只有前者才允许被清理 —— 后者一旦关掉就是直接毁掉用户正在跑的活。
+///
+/// 输出形如：
+/// ```text
+/// WSL|w9
+/// WSP|w9:p1|bash
+/// ```
+pub fn workspace_scan_command() -> String {
+    format!(
+        "{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" workspace list 2>/dev/null | tr ',' '\\n' | sed -n 's/.*\"workspace_id\":\"\\([^\"]*\\)\".*/WSL|\\1/p' | sort -u; for p in $(\"$H\" pane list 2>/dev/null | tr ',' '\\n' | sed -n 's/.*\"pane_id\":\"\\([^\"]*\\)\".*/\\1/p'); do n=$(\"$H\" pane process-info --pane \"$p\" 2>/dev/null | sed -n 's/.*\"name\":\"\\([^\"]*\\)\".*/\\1/p' | head -1); printf 'WSP|%s|%s\\n' \"$p\" \"$n\"; done; fi"
+    )
+}
+
+/// 服务器上的一个窗格 + 它的前台进程名（`bash` / `codex` / …）
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneProc {
+    pub pane_id: String,
+    /// 前台进程名；取不到就是空串（当作"不知道"，按不安全处理）
+    pub proc_name: String,
+}
+
+/// 一次扫描的结果：有哪些工作区、每个窗格上跑着什么
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceScan {
+    pub workspaces: Vec<String>,
+    pub panes: Vec<PaneProc>,
+}
+
+pub fn parse_workspace_scan(out: &str) -> WorkspaceScan {
+    let mut scan = WorkspaceScan::default();
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("WSL|") {
+            let id = rest.trim().to_string();
+            if !id.is_empty()
+                && sanitize_workspace(&id).as_deref() == Some(id.as_str())
+                && !scan.workspaces.contains(&id)
+            {
+                scan.workspaces.push(id);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("WSP|") {
+            let (pane, proc_name) = match rest.split_once('|') {
+                Some((p, n)) => (p.trim(), n.trim()),
+                None => (rest.trim(), ""),
+            };
+            if !pane.is_empty() && sanitize_pane(pane) == pane {
+                scan.panes.push(PaneProc {
+                    pane_id: pane.to_string(),
+                    // 进程名只用来跟一组 shell 名字做比对（不进任何 shell 片段），
+                    // 但仍然只认"干净的一串"：有别的字符就当作"不知道"（空串）。
+                    proc_name: if proc_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+                    {
+                        proc_name.to_string()
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+        }
+    }
+    scan
+}
+
+/// 关掉一个工作区（连带它里面的窗格）。
+///
+/// 「生命周期管理」的最后一块：herdr 的工作区**天生是持久的**（这正是它的卖点），
+/// 但每开一次 herdr 会话就会多一个 —— 关标签页**不会**回收它们，攒久了服务器上
+/// 会留一堆没人用的空工作区（用户就撞见过十几条）。所以给用户一个**显式**的清理动作，
+/// 只关他自己点了确认的那些；没在用的工作区不会被他以外的人动。
+pub fn close_workspace_command(workspace_id: &str) -> String {
+    let ws = sanitize_workspace(workspace_id).unwrap_or_default();
+    format!(
+        "{CLI_PREFIX}; if [ -n \"$H\" ]; then \"$H\" workspace close '{ws}' 2>&1 | head -3; else printf 'no herdr\\n'; fi"
+    )
+}
+
+/// 工作区号只允许 `[A-Za-z0-9_-]`（形如 `w9`）。它会被拼进单引号的 shell 片段里，
+/// 直接拒绝其它字符比"转义"踏实。**空串返回 `None`**：调用方必须当成非法输入。
+pub fn sanitize_workspace(workspace_id: &str) -> Option<String> {
+    let cleaned: String = workspace_id
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 /// 解析 `herdr pane list` 的输出（一行 JSON：`{"result":{"panes":[…]}}`）
 pub fn parse_panes(text: &str) -> Vec<HerdrPane> {
     let mut out: Vec<HerdrPane> = Vec::new();
@@ -369,14 +531,26 @@ pub fn create_workspace_command() -> String {
     format!("{CLI_PREFIX}; {ENSURE_SERVER}; if [ -n \"$H\" ]; then \"$H\" workspace create 2>/dev/null; else printf 'HERDR_NONE\\n'; fi")
 }
 
+/// 打开窗格前的**存在性检查片段**（本身不是一条完整命令，由 [`format!`] 拼进去）。
+///
+/// 为什么必须有它：herdr 服务重启过、或者那个工作区被关掉之后，**老的窗格号就不存在了** ——
+/// 这时候 `terminal session observe/control` 会直接报错退出，界面上只剩一片黑。用户报过
+/// "重新打开之前的 herdr 会话是黑屏"，根因就在这里。
+///
+/// 先用 `pane get` 探一下：不在就把"现在还有哪些窗格"列出来，再退回普通 shell ——
+/// 用户看到的是一条人话，而不是盯着一块黑屏猜。
+const PANE_GUARD_BODY: &str = r#"printf '\n[ZeeAI] herdr 上已经没有窗格 %s 了（服务器重启过，或这个工作区被关掉了）。\n' "$P"; printf '[ZeeAI] 现在还在的窗格：\n'; "$H" pane list 2>/dev/null | tr ',' '\n' | sed -n 's/.*"pane_id":"\([^"]*\)".*/  - \1/p'; printf '\n[ZeeAI] 这里先退回普通 shell；要接着用 herdr，请在左侧列表里重新开一个 herdr 会话。\n\n'"#;
+
 /// 打开一个**只读观察窗**：把窗格的终端字节流引出来。
 ///
 /// `--cols/--rows` 是观察端自己声明要多大 —— herdr 支持多个观察者，而且**不会**因为这个
 /// 观察者去改窗格尺寸（这正是我们不再用 TUI attach 的原因：不会再跟手机端抢窗口）。
+///
+/// 打开之前先做 [`PANE_GUARD_BODY`] 的存在性检查：窗格没了就给人话 + 退回 shell，不留黑屏。
 pub fn observe_command(pane_id: &str, cols: u16, rows: u16) -> String {
     let pane = sanitize_pane(pane_id);
     format!(
-        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane view.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session observe '{pane}' --cols {cols} --rows {rows}"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane view.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; P='{pane}'; if ! \"$H\" pane get \"$P\" >/dev/null 2>&1; then {PANE_GUARD_BODY}; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session observe '{pane}' --cols {cols} --rows {rows}"
     )
 }
 
@@ -408,11 +582,13 @@ esac; done"
 ///
 /// 为什么不用 `herdr --session <名>` 那种整屏 TUI：那条路退出时会把终端留在花屏状态，
 /// 而且它自己会跟别的客户端抢窗格尺寸（用户截的两张图都是它）。
+///
+/// 同样要先过 [`PANE_GUARD_BODY`]：窗格没了就给人话 + 退回 shell（否则一片黑）。
 pub fn control_command(pane_id: &str, cols: u16, rows: u16, takeover: bool) -> String {
     let pane = sanitize_pane(pane_id);
     let tk = if takeover { " --takeover" } else { "" };
     format!(
-        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session control '{pane}'{tk} --cols {cols} --rows {rows}"
+        "{CLI_PREFIX}; {ENSURE_SERVER}; if [ -z \"$H\" ]; then printf '\\n[ZeeAI] herdr not found on this server - cannot open the pane.\\n\\n'; exec \"${{SHELL:-/bin/sh}}\"; fi; P='{pane}'; if ! \"$H\" pane get \"$P\" >/dev/null 2>&1; then {PANE_GUARD_BODY}; exec \"${{SHELL:-/bin/sh}}\"; fi; exec \"$H\" terminal session control '{pane}'{tk} --cols {cols} --rows {rows}"
     )
 }
 
@@ -700,6 +876,79 @@ mod tests {
             );
             assert!(!cmd.contains('\n'), "远端命令必须单行（CRLF 会把 shell 语法搞坏）");
         }
+    }
+
+    #[test]
+    fn pane_open_commands_guard_against_a_dead_pane() {
+        // 服务重启过之后老窗格号就没了：必须**先探一下**，而不是让 observe/control
+        // 直接报错退出 → 界面只剩一片黑（用户报过这个）。
+        for cmd in [observe_command("w1:p1", 80, 24), control_command("w1:p1", 80, 24, true)] {
+            assert!(cmd.contains(r#"pane get "$P" >/dev/null 2>&1"#), "少了窗格存在性检查：{cmd}");
+            assert!(cmd.contains("已经没有窗格"), "窗格没了要给人话：{cmd}");
+            assert!(cmd.contains(r#"exec "${SHELL:-/bin/sh}""#), "窗格没了要能退回 shell：{cmd}");
+            assert!(!cmd.contains('\n'), "远端命令必须单行");
+            // 消毒过的窗格号，不能被拼成别的命令
+            let bad = control_command("w1:p1'; touch /tmp/x; #", 80, 24, true);
+            assert!(!bad.contains("touch /tmp/x"), "窗格号没消毒：{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_server_status_in_both_shapes() {
+        let running = parse_server_status("SRV|status: running\n3\n");
+        assert!(running.running);
+        assert_eq!(running.panes, 3);
+        assert_eq!(running.raw, "status: running");
+
+        // 服务没在跑时那一行可能是空的 —— 只要 SRV 行在，就得算成"问到了、没在跑"，
+        // 而且**后面的窗格数不能被当成状态行吃掉**（这里就是曾经的坑）
+        let stopped = parse_server_status("SRV|\n0\n");
+        assert!(!stopped.running);
+        assert_eq!(stopped.panes, 0);
+
+        // 老版本 herdr 没有这一列：退回"整段里找 status: running"
+        let old = parse_server_status("server:\n  status: running\n");
+        assert!(old.running);
+        assert!(!parse_server_status("").running);
+    }
+
+    #[test]
+    fn workspace_commands_are_sanitized_and_single_line() {
+        assert_eq!(sanitize_workspace("w9").as_deref(), Some("w9"));
+        assert_eq!(sanitize_workspace(" w-9_A ").as_deref(), Some("w-9_A"));
+        assert!(sanitize_workspace("   ").is_none());
+        assert!(sanitize_workspace("; rm -rf /").is_some(), "非法字符是被**过滤掉**的");
+        assert_eq!(sanitize_workspace("; rm -rf /").as_deref(), Some("rm-rf"));
+        let c = close_workspace_command("w9");
+        assert!(c.contains("workspace close 'w9'"));
+        assert!(!c.contains('\n'));
+        let bad = close_workspace_command("w9'; touch /tmp/x; #");
+        assert!(!bad.contains("touch /tmp/x"), "工作区号没消毒：{bad}");
+    }
+
+    #[test]
+    fn scans_workspaces_and_their_foreground_process() {
+        // 真机上拿回来的形状（见库里那条 ssh 实测）
+        let out = "WSL|w9\nWSL|wD\nWSP|w9:p1|bash\nWSP|wD:p1|codex\n";
+        let scan = parse_workspace_scan(out);
+        assert_eq!(scan.workspaces, vec!["w9".to_string(), "wD".to_string()]);
+        assert_eq!(
+            scan.panes,
+            vec![
+                PaneProc { pane_id: "w9:p1".into(), proc_name: "bash".into() },
+                PaneProc { pane_id: "wD:p1".into(), proc_name: "codex".into() },
+            ]
+        );
+        // 脏数据要挡住（工作区号 / 窗格号会被拼进远端 shell；进程名只做比对，
+        // 但也只认干净的一串，带别的字符就当"不知道"）
+        let dirty = parse_workspace_scan("WSL|w9'; rm -rf /\nWSP|w9:p1|x\"; rm -rf /\nWSP||x\n");
+        assert!(dirty.workspaces.is_empty(), "{:?}", dirty.workspaces);
+        assert_eq!(
+            dirty.panes,
+            vec![PaneProc { pane_id: "w9:p1".into(), proc_name: String::new() }],
+            "窗格号合法就留着，但进程名必须被清成空串"
+        );
+        assert!(parse_workspace_scan("").workspaces.is_empty());
     }
 
     #[test]

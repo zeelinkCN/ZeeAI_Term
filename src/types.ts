@@ -230,6 +230,38 @@ export interface HerdrPane {
   focused: boolean;
 }
 
+/**
+ * herdr **服务**的状态。
+ *
+ * 为什么单独有它：「装了 herdr」和「herdr 服务在跑」是两件事 ——
+ * 服务没在跑时窗格/工作区都取不到，界面必须能让用户看见这个区别，
+ * 并且允许他显式启动/停止（停止会关掉所有 herdr 窗格）。
+ */
+export interface HerdrServerStatus {
+  running: boolean;
+  /** `herdr status server` 打的那一行，悬停可看 */
+  raw: string;
+  /** 这套服务里现在有多少个窗格 */
+  panes: number;
+}
+
+/** 服务器上一个 herdr 窗格 + 它的前台进程名（`bash` / `codex` / …） */
+export interface HerdrPaneProc {
+  paneId: string;
+  procName: string;
+}
+
+/**
+ * 一次 herdr 工作区扫描的结果。
+ *
+ * 为什么要带"前台进程"：清理工作区时必须分清**空壳**（停在提示符上的 shell）和
+ * **里面正跑着东西**（codex / vim / 编译…）—— 只有空壳才允许被一键清理。
+ */
+export interface HerdrWorkspaceScan {
+  workspaces: string[];
+  panes: HerdrPaneProc[];
+}
+
 /** 一键安装 herdr 的结果 */
 export interface HerdrInstallReport {
   version: string;
@@ -329,6 +361,8 @@ export interface AiSourceInfo {
   compat: string;
   /** 探测时的远端原始输出（前 300 字符）—— 用来分辨"没装"和"没连上" */
   raw?: string;
+  /** herdr 服务现在在不在跑（装了 ≠ 在跑） */
+  serverRunning?: boolean;
 }
 
 export interface AppSettings {

@@ -594,15 +594,77 @@ herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sn
         );
         let _ = wait_any(&rec4, 8000);
         let g = rec4.lock().unwrap();
-        let all = format!("{}{}", g.text, g.errors.join(" "));
         check!(
-            "窗格不存在时给出报错（不会静默黑屏）",
-            all.to_lowercase().contains("error")
-                || all.contains("not found")
-                || all.contains("不存在")
-                || all.contains("no such")
-                || !g.errors.is_empty(),
-            format!("文本={:?} 告警={:?}", g.text.trim().chars().take(60).collect::<String>(), g.errors)
+            "窗格不存在时给出人话 + 退回普通 shell（不会静默黑屏）",
+            g.text.contains("已经没有窗格")
+                && g.text.contains("现在还在的窗格")
+                && g.bytes > 0,
+            format!(
+                "{} 字节；文本={:?} 告警={:?}",
+                g.bytes,
+                g.text.trim().chars().take(90).collect::<String>(),
+                g.errors
+            )
+        );
+    }
+
+    // ---------- 10b) 工作区/窗格扫描：清理功能就是靠它判断"空壳"的 ----------
+    {
+        let raw = ssh_run(&host, &user, &herdr::workspace_scan_command());
+        let scan = herdr::parse_workspace_scan(&raw);
+        let mine = scan.panes.iter().find(|p| p.pane_id == pane);
+        check!(
+            "扫描能列出工作区（含我们刚建的这个）",
+            scan.workspaces.contains(&ws),
+            format!("工作区={:?}", scan.workspaces)
+        );
+        check!(
+            "扫描能拿到每个窗格的前台进程名（用来分辨空壳 / 正在跑）",
+            mine.is_some() && !mine.unwrap().proc_name.is_empty(),
+            format!("{:?}", mine)
+        );
+    }
+
+    // ---------- 10c) 清理：关掉空壳工作区，数量要回落（前端「清理空壳」走的就是它） ----------
+    {
+        let before = herdr::parse_workspace_scan(&ssh_run(
+            &host,
+            &user,
+            &herdr::workspace_scan_command(),
+        ))
+        .workspaces
+        .len();
+        // 再建一个临时工作区（就是"每开一次 herdr 会话会多出来的那个"）
+        let made = ssh_run(&host, &user, &herdr::create_workspace_command());
+        let made_pane = herdr::pane_from_create(&made).unwrap_or_default();
+        let made_ws = made_pane.split(':').next().unwrap_or("").to_string();
+        let mid = herdr::parse_workspace_scan(&ssh_run(
+            &host,
+            &user,
+            &herdr::workspace_scan_command(),
+        ))
+        .workspaces
+        .len();
+        // 关掉它（这一步就是界面上那句「确认清理」）
+        let closed = ssh_run(&host, &user, &herdr::close_workspace_command(&made_ws));
+        let after = herdr::parse_workspace_scan(&ssh_run(
+            &host,
+            &user,
+            &herdr::workspace_scan_command(),
+        ))
+        .workspaces
+        .len();
+        check!(
+            "新建会多一个工作区、清理之后再回落（生命周期闭环）",
+            mid == before + 1 && after == before,
+            format!("{before} → 建后 {mid} → 清理后 {after}（close 回显={:?}）", closed.trim())
+        );
+        check!(
+            "被清理的工作区真的从服务器上消失",
+            !herdr::parse_workspace_scan(&ssh_run(&host, &user, &herdr::workspace_scan_command()))
+                .workspaces
+                .contains(&made_ws),
+            format!("关掉的是 {made_ws}")
         );
     }
 

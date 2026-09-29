@@ -789,7 +789,7 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| format!("启动 scp 失败（本机需要 OpenSSH 客户端）: {e}"))?;
     if let Some(pid) = child.id() {
@@ -837,7 +837,7 @@ async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<Strin
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
     // 挂进 Job Object：App 退出/被强杀时不会留下孤儿 ssh
     if let Some(pid) = child.id() {
         crate::core::job::assign(pid);
@@ -869,7 +869,7 @@ async fn run_capture_checked(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
     if let Some(pid) = child.id() {
         crate::core::job::assign(pid);
     }
@@ -2783,6 +2783,86 @@ pub async fn herdr_panes(
     let panes = herdr::parse_panes(&out);
     log::info!("ipc: herdr_panes -> {} 个窗格", panes.len());
     Ok(panes)
+}
+
+/// herdr 服务现在是什么状态（**只读**，不会顺手把它起起来）
+#[tauri::command]
+pub async fn herdr_server_status(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<herdr::ServerStatus, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::server_status_command()).await?;
+    let st = herdr::parse_server_status(&out);
+    log::info!(
+        "ipc: herdr_server_status -> running={} panes={} raw={:?}",
+        st.running,
+        st.panes,
+        st.raw
+    );
+    Ok(st)
+}
+
+/// **启动** herdr 服务（用户明确点「启动服务」时）。返回启动后的状态行。
+#[tauri::command]
+pub async fn herdr_server_start(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::server_start_command()).await?;
+    log::info!("ipc: herdr_server_start -> {}", out.trim());
+    Ok(out.trim().to_string())
+}
+
+/// **停止** herdr 服务。**会关掉它管着的所有窗格**，所以只允许用户显式点（前端要确认）。
+#[tauri::command]
+pub async fn herdr_server_stop(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::server_stop_command()).await?;
+    log::info!("ipc: herdr_server_stop -> {}", out.trim());
+    Ok(out.trim().to_string())
+}
+
+/// 扫一遍这台服务器上的 herdr 工作区 + 每个窗格的前台进程（**只读**）。
+///
+/// 用来在界面上对比"我们开着的会话"和"服务器上真实存在的工作区"，把**空壳**那些挑出来
+/// 给用户一键清理（里面正跑着东西的不算，那是用户正在干的活）。
+#[tauri::command]
+pub async fn herdr_workspace_scan(
+    profile_id: String,
+    user_override: Option<String>,
+) -> Result<herdr::WorkspaceScan, String> {
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::workspace_scan_command()).await?;
+    let scan = herdr::parse_workspace_scan(&out);
+    log::info!(
+        "ipc: herdr_workspace_scan -> {} 个工作区 / {} 个窗格",
+        scan.workspaces.len(),
+        scan.panes.len()
+    );
+    Ok(scan)
+}
+
+/// 关掉一个 herdr 工作区（连带它里面的窗格）。
+///
+/// 这一步**会把用户在服务器上的东西关掉**，所以只有用户在前端点过「清理」再点「确认」
+/// 才会走到这里；工作区号在后端再消毒一遍（它会被拼进远端 shell 片段）。
+#[tauri::command]
+pub async fn herdr_workspace_close(
+    profile_id: String,
+    workspace_id: String,
+    user_override: Option<String>,
+) -> Result<String, String> {
+    let ws = herdr::sanitize_workspace(&workspace_id)
+        .ok_or_else(|| format!("工作区号不合法，已拒绝：{workspace_id:?}"))?;
+    let cfg = ssh_config_for(&profile_id, user_override)?;
+    let out = run_remote_capture(&profile_id, &cfg, &herdr::close_workspace_command(&ws)).await?;
+    log::info!("ipc: herdr_workspace_close {ws} -> {}", out.trim());
+    Ok(out.trim().to_string())
 }
 
 /// 观察窗的尺寸变了：把 observe 流**重开**一次。

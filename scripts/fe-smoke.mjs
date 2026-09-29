@@ -178,6 +178,27 @@ const resolveCmd = (cmd, args) => {
         { paneId: "w2:p1", title: "lz", cwd: "/home/lz", agent: "codex", status: "idle", focused: true },
         { paneId: "w9:p1", title: "lz", cwd: "/home/lz", agent: "", status: "unknown", focused: false },
       ];
+    // herdr 服务状态（"装了"和"在跑"是两件事）
+    case "herdr_server_status":
+      return S.herdrServer || { running: true, panes: 3, raw: "status: running" };
+    case "herdr_server_start": return "status: running";
+    case "herdr_server_stop": return "stopped";
+    // 服务器上的工作区 + 每个窗格的前台进程（"我们开着的会话"是另一回事；
+    // 差集里那些「只停着 shell」的才算空壳，才允许被清理）
+    case "herdr_workspace_scan":
+      return S.herdrScan || {
+        workspaces: ["w9", "wD", "wE"],
+        panes: [
+          { paneId: "w9:p1", procName: "bash" },
+          { paneId: "wD:p1", procName: "bash" },
+          { paneId: "wE:p1", procName: "claude" },
+        ],
+      };
+    case "herdr_workspace_close": {
+      const w = args?.workspaceId;
+      if (S.herdrScan) S.herdrScan.workspaces = S.herdrScan.workspaces.filter((x) => x !== w);
+      return "closed " + w;
+    }
     case "herdr_pane_input_start": case "herdr_pane_type": case "herdr_pane_key":
     case "herdr_pane_resize": case "herdr_pane_input": return null;
     case "herdr_workspace_create":
@@ -463,6 +484,83 @@ check("herdr 卡片带「查看窗格」入口", panel.includes("查看窗格"))
 check("卡片标了来源 = herdr 状态", panel.includes("herdr 状态"));
 check("装了 herdr 时不显示一键安装", !panel.includes("一键安装"));
 
+// ---------- herdr 服务生命周期：可见 + 可控（停止要二段确认） ----------
+check(
+  "AI 面板显示 herdr 服务状态（运行中 + 窗格数）",
+  panel.includes("herdr 服务：运行中"),
+  panel.split("\n").find((l) => l.includes("herdr 服务")) ?? "",
+);
+const stopArmed = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").includes("停止服务"));
+  if (!b) return { found: false };
+  b.click();
+  return { found: true };
+})()`);
+await new Promise((r) => setTimeout(r, 400));
+const armed = await evaluate(`[...document.querySelectorAll(".ai-panel button")].map((b) => (b.innerText || "").trim())`);
+check(
+  "「停止服务」要二段确认（会关掉所有 herdr 窗格）",
+  stopArmed.found && armed.some((t) => t.includes("确认停止")),
+  armed.filter((t) => t.includes("停止") || t.includes("取消")).join(" | "),
+);
+// 取消掉，别把后面的用例带进"确认态"
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").trim() === "取消");
+  if (b) b.click();
+})()`);
+
+// ---------- herdr 工作区生命周期：挑出"空壳" + 二段确认清理 ----------
+const wsLine = await evaluate(`(() => {
+  const el = [...document.querySelectorAll(".ai-panel .hint")].find((x) => (x.innerText || "").includes("herdr 工作区"));
+  return el ? (el.innerText || "").replace(/\\n/g, " / ") : "";
+})()`);
+check(
+  "面板列出 herdr 工作区总数 + 没在用的数量",
+  wsLine.includes("herdr 工作区：3 个") && wsLine.includes("3 个没在用"),
+  wsLine || "(找不到那一行)",
+);
+const cleanBtnText = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").includes("清理空壳"));
+  return b ? (b.innerText || "").trim() : "";
+})()`);
+check(
+  "3 个都没在用，但只有 2 个是空壳（wE 上跑着 claude，不许碰）",
+  cleanBtnText.includes("清理空壳（2）"),
+  cleanBtnText || "(没有清理按钮)",
+);
+const cleanArmed = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").includes("清理空壳"));
+  if (!b) return { found: false };
+  b.click();
+  return { found: true };
+})()`);
+await new Promise((r) => setTimeout(r, 400));
+const cleanBtns = await evaluate(`[...document.querySelectorAll(".ai-panel button")].map((b) => (b.innerText || "").trim())`);
+check(
+  "清理工作区也要二段确认，并且把要关的工作区号写出来",
+  cleanArmed.found && cleanBtns.some((t) => t.includes("确认清理") && t.includes("wD")),
+  cleanBtns.filter((t) => t.includes("清理") || t.includes("取消")).join(" | "),
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").includes("确认清理"));
+  if (b) b.click();
+})()`);
+await new Promise((r) => setTimeout(r, 500));
+const cleanResult = await evaluate(`(() => {
+  const closeCalls = (window.__ZEEAI_CALLARGS__ || []).filter((c) => c.cmd === "herdr_workspace_close");
+  return {
+    calls: closeCalls.map((c) => c.args && c.args.workspaceId),
+    status: (document.querySelector(".status-bar") || {}).innerText || "",
+    others: (window.__ZEEAI_CALLARGS__ || []).filter((c) => c.cmd === "herdr_server_stop").length,
+  };
+})()`);
+check(
+  "确认后只关那 2 个空壳（正在跑 claude 的 wE 一个字节都不碰）",
+  JSON.stringify(cleanResult.calls.slice().sort()) === JSON.stringify(["w9", "wD"]) &&
+    cleanResult.others === 0,
+  JSON.stringify(cleanResult),
+);
+
 // ---------- 点「查看窗格」：应当开一个 herdr-pane 观察窗，并建立输入通道 ----------
 const clickedPane = await evaluate(`(() => {
   const p = document.querySelector(".ai-panel");
@@ -606,6 +704,22 @@ check(
   "标签栏出现这个可写 herdr 会话",
   controlSession.tabs.some((t) => t.includes("w9:p1")),
   controlSession.tabs.join(" / "),
+);
+// herdr 会话终端上方要有一条"一眼可见"的状态条（像 tmux 的状态栏）。
+// 注意：标签栏是都渲染出来的，`.herdr-bar` 会有好几条（观察窗那条也有），
+// 所以要看"可写那条"的文字 —— 也就是含「接管中（可写）」的那一条。
+const herdrBar = await evaluate(`(() => {
+  const bars = [...document.querySelectorAll(".herdr-bar")].map((b) => (b.innerText || "").trim());
+  const ctrl = bars.find((t) => t.includes("接管中")) || "";
+  return { ctrl, all: bars };
+})()`);
+check(
+  "可写 herdr 会话上方有状态条（一眼看出进了 herdr、进的是哪个窗格）",
+  herdrBar.ctrl.includes("herdr") &&
+    herdrBar.ctrl.includes("w9:p1") &&
+    herdrBar.ctrl.includes("接管中（可写）") &&
+    herdrBar.ctrl.includes("服务运行中"),
+  JSON.stringify(herdrBar).replace(/\\n/g, " / ").slice(0, 300),
 );
 
 // 在可写会话里打字：应当走 herdr_pane_input（原始字节），而不是观察窗那条 send-text
@@ -865,6 +979,10 @@ check(
   historyRow.found && !!fromHistory && fromHistory.backend === "herdr-control" && fromHistory.pane === "wD:p1",
   `找到行=${historyRow.found} 结果=${JSON.stringify(fromHistory)} 场景=${historyRow.scen} 行文本=${JSON.stringify(historyRow.all)}`,
 );
+const hMark = await evaluate(
+  `(() => { const m = document.querySelector(".tree-item .herdr-mark"); return m ? (m.getAttribute("title") || "") : ""; })()`,
+);
+check("侧栏会话列表用 H 标记 herdr 会话（像 tmux 的 T）", hMark.includes("herdr"), hMark.slice(0, 60));
 
 // ---------- (A3) 新建窗格失败必须有可见报错（不能"卡着不动"） ----------
 await setScenario({ createFails: true });

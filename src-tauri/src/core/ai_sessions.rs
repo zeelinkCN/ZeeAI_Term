@@ -508,6 +508,12 @@ pub struct AiSourceInfo {
     /// 那种情况十有八九是**这次探测没连上/超时**，而不是真的没装。
     /// 把远端原话带到悬停提示里，下一次就能当场分辨是哪种。
     pub raw: String,
+    /// herdr 服务**现在在不在跑**。
+    ///
+    /// 为什么要单独告诉用户："装了 herdr"和"herdr 服务在跑"是两件事 ——
+    /// 服务没在跑时，窗格/工作区都取不到（我们会在真正要用时自动把它起起来，
+    /// 但这个状态得让用户看得见）。
+    pub server_running: bool,
 }
 
 impl AiSourceInfo {
@@ -545,11 +551,11 @@ pub fn compat_of(protocol: u32) -> String {
 /// 官方 `install.sh` 默认就装在后者，而且**可能不在 PATH 里**（它自己会 warn 一下）。
 /// 只做只读探测：跑 `--version` 和 `agent list`，不启动、不安装、不改任何东西。
 pub fn remote_source_script() -> String {
-    // 输出一行 7 段：HERDR|版本|路径|agent数|协议号|schema版本|schema指纹
+    // 输出一行 8 段：HERDR|版本|路径|agent数|协议号|schema版本|schema指纹|服务是否在跑(1/0)
     //
-    // 两处都只读：`--version`、`agent list`、`api schema`（后者是它自己二进制里带的元数据，
-    // 276KB 在服务器本地算个 sha256，不产生网络流量）。
-    r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi; if [ -n "$H" ]; then V=$("$H" --version 2>/dev/null | head -1 | tr -d '\r'); A=$("$H" agent list 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' '); S=$("$H" api schema 2>/dev/null | head -4 | tr -d '\r'); P=$(printf '%s\n' "$S" | sed -n 's/^protocol: *//p' | head -1); SV=$(printf '%s\n' "$S" | sed -n 's/^schema_version: *//p' | head -1); F=$("$H" api schema --json 2>/dev/null | sha256sum | cut -c1-8); printf 'HERDR|%s|%s|%s|%s|%s|%s\n' "$V" "$H" "$A" "${P:-0}" "${SV:-0}" "$F"; else printf 'HERDR|none||0|0|0|\n'; fi"#
+    // 全是只读：`--version`、`agent list`、`api schema`（它自己二进制里带的元数据，
+    // 本地算个 sha256，不产生网络流量）、`status server`（只查状态，**不会**启动服务）。
+    r#"H=""; if command -v herdr >/dev/null 2>&1; then H=$(command -v herdr); elif [ -x "$HOME/.local/bin/herdr" ]; then H="$HOME/.local/bin/herdr"; fi; if [ -n "$H" ]; then V=$("$H" --version 2>/dev/null | head -1 | tr -d '\r'); A=$("$H" agent list 2>/dev/null | grep -o '"name"' | wc -l | tr -d ' '); S=$("$H" api schema 2>/dev/null | head -4 | tr -d '\r'); P=$(printf '%s\n' "$S" | sed -n 's/^protocol: *//p' | head -1); SV=$(printf '%s\n' "$S" | sed -n 's/^schema_version: *//p' | head -1); F=$("$H" api schema --json 2>/dev/null | sha256sum | cut -c1-8); R=$("$H" status server 2>/dev/null | head -1 | grep -q '^status: running' && printf 1 || printf 0); printf 'HERDR|%s|%s|%s|%s|%s|%s|%s\n' "$V" "$H" "$A" "${P:-0}" "${SV:-0}" "$F" "$R"; else printf 'HERDR|none||0|0|0|0\n'; fi"#
         .to_string()
 }
 
@@ -562,7 +568,9 @@ pub fn parse_source(out: &str) -> AiSourceInfo {
         let Some(rest) = line.trim().strip_prefix("HERDR|") else {
             continue;
         };
-        let parts: Vec<&str> = rest.splitn(6, '|').collect();
+        // 7 段之后全归最后一段（`splitn` 的最后一个元素是剩下的全部），所以这里给 7
+        // 保证"服务是否在跑"那一列单独成段
+        let parts: Vec<&str> = rest.splitn(7, '|').collect();
         if parts.len() < 2 {
             continue;
         }
@@ -583,6 +591,13 @@ pub fn parse_source(out: &str) -> AiSourceInfo {
         info.protocol = num(3);
         info.schema_version = num(4);
         info.schema_fingerprint = parts.get(5).map(|s| s.trim().to_string()).unwrap_or_default();
+        // 第 7 段（索引 6）= 服务在不在跑（1/0）。拿不到就按"0.9.x 之前没这一列"处理。
+        if let Some(r) = parts.get(6) {
+            let r = r.trim();
+            if !r.is_empty() {
+                info.server_running = r.starts_with('1');
+            }
+        }
     }
     info.compat = compat_of(info.protocol);
     info
