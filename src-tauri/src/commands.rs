@@ -776,15 +776,23 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
     let exe = ssh::scp_exe();
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(args);
+    // 见 run_capture 上面的说明：一次性进程必须能"跟着未来一起被杀掉"
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = cmd
-        .output()
-        .await
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("启动 scp 失败（本机需要 OpenSSH 客户端）: {e}"))?;
+    if let Some(pid) = child.id() {
+        crate::core::job::assign(pid);
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("等待 scp 失败: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -800,19 +808,33 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
 
 /// 跑一个外部命令并拿到输出（隐藏控制台窗口）。
 /// 注意：命令失败时也会返回 Ok（把 stderr 拼在文本里），仅供「不关心成败」的场景用。
+///
+/// **一次性进程必须能跟着未来被杀掉**（`kill_on_drop(true)` + 挂 Job Object）：
+///
+/// 这些一次性 ssh 是在 `run_remote_capture` 的 20 秒超时里跑的；超时一到，tokio 只会
+/// **丢掉这个 future**，而 `Command::output()` 内部那个子进程**不会**被自动杀掉 ——
+/// 于是一次超时就漏一个 ssh 进程。实测在用户机器上攒了 **41 个**残留 ssh：
+/// 它们一直挂在服务器上占着连接，最后把 sshd 拖到"新连接被排队/丢弃"，
+/// 表现就是**点「新建 herdr 窗格」一直卡着**（用户截图那次）。
 async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
+    cmd.kill_on_drop(true);
     // 关键：一次性 ssh 命令不能弹出控制台窗口（否则界面上会闪一个黑框甚至挡住操作）
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = cmd
-        .output()
+    let mut child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
+    // 挂进 Job Object：App 退出/被强杀时不会留下孤儿 ssh
+    if let Some(pid) = child.id() {
+        crate::core::job::assign(pid);
+    }
+    let output = child
+        .wait_with_output()
         .await
-        .map_err(|e| format!("执行命令失败: {e}"))?;
+        .map_err(|e| format!("等待命令失败: {e}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -827,15 +849,20 @@ async fn run_capture_checked(
 ) -> Result<(bool, String), String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = cmd
-        .output()
+    let mut child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
+    if let Some(pid) = child.id() {
+        crate::core::job::assign(pid);
+    }
+    let output = child
+        .wait_with_output()
         .await
-        .map_err(|e| format!("执行命令失败: {e}"))?;
+        .map_err(|e| format!("等待命令失败: {e}"))?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         text.push_str(&String::from_utf8_lossy(&output.stderr));

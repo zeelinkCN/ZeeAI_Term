@@ -102,10 +102,71 @@ fn ssh_run(host: &str, user: &str, cmd: &str) -> String {
     }
 }
 
+/// 当前机器上所有 `ssh.exe` 的 pid。
+///
+/// 为什么要按 pid 差集收尾：这个例程会起好几条**长驻** ssh 流（观察/控制/输入泵），
+/// 它们的进程不会随 Rust 句柄释放而退出。上一次我忘了收，真机上攒了 41 个残留 ssh，
+/// 一直挂在服务器上，最终把 sshd 拖到"新连接被排队"——用户看到的就是
+/// **「新建 herdr 窗格」一直卡着**。所以跑完必须只把我们自己新起的那些收掉。
+fn ssh_pids() -> Vec<u32> {
+    let out = std::process::Command::new("tasklist")
+        .args([
+            "/FI",
+            "IMAGENAME eq ssh.exe",
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.split("\",\"");
+            let name = it.next()?.trim_start_matches('"').to_ascii_lowercase();
+            if name != "ssh.exe" {
+                return None;
+            }
+            it.next()?.trim_end_matches('"').trim().parse::<u32>().ok()
+        })
+        .collect()
+}
+
+/// 只杀"这次新起来"的 ssh（不碰用户自己的 ssh 会话）
+fn kill_new_ssh(before: &[u32]) {
+    for pid in ssh_pids() {
+        if !before.contains(&pid) {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output();
+        }
+    }
+}
+
+/// 等一条流**拿到第一帧**（最多 `timeout_ms`）。
+///
+/// 为什么不能固定 sleep 3 秒就断言：ssh 握手 + herdr 首帧在机器忙的时候会超过 3 秒
+/// （我第一次跑矩阵时就因为这样误报了 3 条 observe 失败）。这里轮询到有数据为止，
+/// 结论才稳定；同时这也说明**应用侧同样可能"先空白一会儿"**（流不会断，帧到了就画）。
+fn wait_bytes(rec: &Arc<Mutex<Recorder>>, timeout_ms: u64) -> usize {
+    let step = 250u64;
+    let mut waited = 0u64;
+    loop {
+        let n = rec.lock().unwrap().bytes;
+        if n > 0 || waited >= timeout_ms {
+            return n;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+    }
+}
+
 fn main() {
     let host = std::env::var("ZEEAI_PROBE_HOST").unwrap_or_else(|_| "47.99.241.168".into());
     let user = std::env::var("ZEEAI_PROBE_USER").unwrap_or_else(|_| "lz".into());
     println!("== herdr 全矩阵测试 → {user}@{host} ==");
+    // 记下"开跑前就有哪些 ssh"，收尾时只杀我们自己新起的（见 kill_new_ssh）
+    let ssh_before = ssh_pids();
 
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -241,7 +302,7 @@ fn main() {
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = wait_bytes(&rec2, 8000);
         let b2 = rec2.lock().unwrap().bytes;
         check!("--takeover 能抢到控制权（新控制端拿到画面）", b2 > 0, format!("{b2} 字节"));
         let old_errors = rec.lock().unwrap().errors.clone();
@@ -284,8 +345,7 @@ fn main() {
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let b = rec3.lock().unwrap().bytes;
+        let b = wait_bytes(&rec3, 8000);
         check!("只读观察窗拿到画面", b > 0, format!("{b} 字节"));
     }
 
@@ -359,7 +419,9 @@ fn main() {
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // 等到**两边都出画面**再往下走（握手慢的时候 3 秒不够，会误报）
+        let _ = wait_bytes(&rec_obs, 8000);
+        let _ = wait_bytes(&rec_ctl, 8000);
         // 让控制端敲一句，观察端**应该也能看到**（同一块屏幕的两个视角）
         if let Ok(h) = &c {
             let m = format!("ZEEAI_BOTH_{}", std::process::id());
@@ -406,7 +468,7 @@ fn main() {
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = wait_bytes(&rec_a, 8000);
         // 换一个尺寸重开一条（真实场景：用户拖窗口宽度 → 前端 debounce 后重开观察流）
         let rec_b = Arc::new(Mutex::new(Recorder::default()));
         let args_b = ssh::ssh_args_no_tty(
@@ -426,7 +488,7 @@ fn main() {
             Arc::new(LogRegistry::new()),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = wait_bytes(&rec_b, 8000);
         let (ba, bb) = {
             let a = rec_a.lock().unwrap();
             let b = rec_b.lock().unwrap();
@@ -564,6 +626,8 @@ herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sn
     );
 
     println!("\n== 结果：{pass} 通过 / {fail} 失败 ==");
+    // 收尾：把我们这次新起的 ssh 全收掉（不碰用户自己的）
+    kill_new_ssh(&ssh_before);
     let _ = Ordering::Relaxed;
     let _ = AtomicUsize::new(0);
     std::process::exit(if fail > 0 { 1 } else { 0 });

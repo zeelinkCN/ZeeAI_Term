@@ -429,6 +429,27 @@ pub fn run() {
             None => log::warn!("SELFTEST: no ssh profile found"),
           }
           log::info!("SELFTEST: done");
+          // 自检里调过 adb_devices，那会顺手起一个 adb 守护进程；它从
+          // `target/debug/resources/platform-tools/` 启动、会一直占着 AdbWinApi.dll，
+          // 于是**下一次 cargo build 会报"文件正在使用"**（实测踩过好几次）。
+          // 自检自己收尾：跑完就把它关掉。
+          {
+            let adb = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+              .join("resources")
+              .join("platform-tools")
+              .join("adb.exe");
+            if adb.exists() {
+              let mut c = std::process::Command::new(&adb);
+              c.arg("kill-server");
+              #[cfg(windows)]
+              {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x0800_0000);
+              }
+              let _ = c.output();
+              log::info!("SELFTEST: 已顺手关掉 adb 守护进程（免得占着构建要用的 DLL）");
+            }
+          }
           handle.exit(0);
         });
       }
