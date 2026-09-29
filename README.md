@@ -22,7 +22,7 @@ HTML 沙箱预览、图片/代码/文本查看；每个会话各自维护打开�
 
 ### 便携版
 
-`portable/ZeeAI_Term-0.1.8-portable.zip`（解压即用，内含内置 platform-tools，
+`portable/ZeeAI_Term-0.1.9-portable.zip`（解压即用，内含内置 platform-tools，
 ADB 无需另装；`resources` 目录必须与 exe 放在一起）。
 
 ### 功能现状
@@ -137,9 +137,9 @@ Git 面板**能写**（暂存/取消暂存/丢弃/提交/分支切换）。
 ### 产出物
 
 - 免安装版：`src-tauri/target/release/ZeeAI_Term.exe`
-- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.8_x64-setup.exe`
-- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.8_x64_en-US.msi`
-- 便携版：`portable/ZeeAI_Term-0.1.8-portable.zip`
+- 安装包（NSIS）：`src-tauri/target/release/bundle/nsis/ZeeAI_Term_0.1.9_x64-setup.exe`
+- 安装包（MSI）：`src-tauri/target/release/bundle/msi/ZeeAI_Term_0.1.9_x64_en-US.msi`
+- 便携版：`portable/ZeeAI_Term-0.1.9-portable.zip`
 
 应用名与可执行文件名统一为 **`ZeeAI_Term`**（`productName` / `mainBinaryName`），
 配置仍放在 `%APPDATA%\ZeeAI-Terminal\`（所以改名不会丢你的服务器、历史和日志）。

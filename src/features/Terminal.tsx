@@ -301,17 +301,44 @@ export default function TerminalView({
       // `Cannot read properties of undefined (reading 'dimensions')` —— 终端整块不动了。
       // （这是用无头浏览器跑功能测试时实测到的，不是猜的。）
       if (webgl2Available()) {
-        const webgl = new WebglAddon();
-        // WebGL 上下文丢失时退回 canvas 渲染，避免出现花屏
-        webgl.onContextLoss(() => {
+        // 上下文丢失时**重建**渲染器，而不是一丢了之。
+        //
+        // 以前这里只 dispose 就完事 —— 后果是这条终端**永久**退回慢的 DOM 渲染，
+        // 一直慢到重启应用/重启电脑（用户实测："重启电脑就好了"、"本地/远端全都慢"、
+        // "关掉高亮也还是慢"）。GPU 上下文会因为驱动重置、远程桌面切换、长时间运行、
+        // 显存压力等原因丢失，所以必须能自愈。
+        //
+        // 这条修复是从工作空间那条线（D:\AI\ZeeAI_term-beta，commit 87e0ceb）搬过来的。
+        let webglTries = 0;
+        const attachWebgl = () => {
           try {
-            webgl.dispose();
+            const webgl = new WebglAddon();
+            webgl.onContextLoss(() => {
+              try {
+                webgl.dispose();
+              } catch {
+                /* ignore */
+              }
+              webglRef.current = null;
+              // 200ms 后重建；最多试 5 次，避免真的没有 WebGL 时无限重试
+              if (webglTries < 5) {
+                webglTries += 1;
+                window.setTimeout(() => {
+                  try {
+                    attachWebgl();
+                  } catch {
+                    /* 重建失败：保持默认渲染 */
+                  }
+                }, 200);
+              }
+            });
+            term.loadAddon(webgl);
+            webglRef.current = webgl;
           } catch {
-            /* ignore */
+            /* WebGL 真的不可用：退回默认渲染 */
           }
-        });
-        term.loadAddon(webgl);
-        webglRef.current = webgl;
+        };
+        attachWebgl();
       }
     } catch {
       /* WebGL 不可用时自动回退到 canvas/dom 渲染 */
@@ -490,11 +517,40 @@ export default function TerminalView({
   }, [highlightEnabled, JSON.stringify(highlightRules ?? [])]);
 
   useEffect(() => {
-    if (active && termRef.current) {
-      // 走同一套"合并 + 变了才发"的逻辑，别在这里直接 session_resize
-      doFitRef.current?.();
-      termRef.current.focus();
-    }
+    const term = termRef.current;
+    if (!active || !term) return;
+    /**
+     * 这个标签**重新可见**了 —— 这一条 effect 是唯一能收到这个通知的地方。
+     *
+     * 为什么要无条件重画：终端被 `display:none` 藏起来时 WebGL 画布不再重绘，
+     * 字形图集也可能被浏览器丢掉；再显示出来时如果窗口尺寸没变，下面那套
+     * "只在尺寸真的变了才发/才刷" 的逻辑就**什么都不做**，画面停在半坏的状态 ——
+     * 用户看到的就是"切回 herdr 标签后字体花了（有的字没了、有的错位），
+     * 缩放一下/拉一下窗口才恢复"。所以这里固定做三件事：清图集 → 重新 fit → 整屏重画。
+     */
+    const repaint = () => {
+      try {
+        // 图集里可能留着按旧单元格尺寸栅格化的字形（换字号/换宽之后），先清掉
+        webglRef.current?.clearTextureAtlas();
+      } catch {
+        /* 没挂 WebGL（回退到 canvas/dom 渲染）时没有图集可清 */
+      }
+      try {
+        // 走同一套"合并 + 变了才发"的逻辑，别在这里直接 session_resize
+        doFitRef.current?.();
+      } catch {
+        /* ignore */
+      }
+      try {
+        term.refresh(0, term.rows - 1);
+      } catch {
+        /* ignore */
+      }
+      term.focus();
+    };
+    // 等一帧再画：刚切过来时容器可能还没拿到最终尺寸，立刻 fit 出来的列数会不准
+    const raf = window.requestAnimationFrame(repaint);
+    return () => window.cancelAnimationFrame(raf);
   }, [active, sessionId]);
 
   // 字体大小 / 主题变化时热更新（不重建终端，保留回滚缓冲与连接状态）

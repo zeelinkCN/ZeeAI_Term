@@ -1375,6 +1375,47 @@ check(
   `共 ${sizeCalls.n} 次，异常 ${JSON.stringify(sizeCalls.bad)} 抽样 ${JSON.stringify(sizeCalls.sample)}`,
 );
 
+// ---------- (G) 藏起来再切回来：终端必须自己重画，且不能崩 ----------
+//
+// 用户实测：开一个 WSL、关掉、切回 herdr 标签 → 字体花了（有的字没了、有的错位），
+// 缩放一下窗口才恢复。根因是"重新可见"这件事没人通知终端：尺寸没变时原来那套
+// "只在变了才刷"的逻辑什么都不做。现在切回来会无条件清图集 + 重画。
+// 注意：无头 Edge 里终端可能是 canvas/WebGL 渲染，`.xterm-rows` 的 innerText 本来就是空的，
+// 所以这里看"容器还在、尺寸正常、没有新报错"，而不是看文字（我第一版就测错了这一条）。
+const errsBeforeSwitch = pageErrors.length;
+const beforeSwitch = await evaluate(`(() => {
+  const el = document.querySelector(".xterm");
+  return { hasTerm: !!el, w: el ? el.clientWidth : 0 };
+})()`);
+// 切到别的模块（终端会被藏起来），再切回远程
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").trim() === "WSL");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(900);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").trim() === "远程");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1200);
+const afterSwitch = await evaluate(`(() => {
+  const el = document.querySelector(".xterm");
+  return { hasTerm: !!el, w: el ? el.clientWidth : 0, h: el ? el.clientHeight : 0 };
+})()`);
+check(
+  "切到别的模块再切回来：终端还在、尺寸正常、没有新报错（重新可见时自己重画）",
+  beforeSwitch.hasTerm &&
+    afterSwitch.hasTerm &&
+    afterSwitch.w > 200 &&
+    afterSwitch.h > 100 &&
+    pageErrors.length === errsBeforeSwitch,
+  `切前 w=${beforeSwitch.w} → 切后 ${JSON.stringify(afterSwitch)}；新报错 ${
+    pageErrors.length - errsBeforeSwitch
+  } 条`,
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}`);

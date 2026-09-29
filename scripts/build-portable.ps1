@@ -126,6 +126,15 @@ try {
 }
 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 
+# 便携版固定输出在 portable/ZeeAI_Term；上面"改名让位"那一步会留下 .old-* 目录，
+# 里面是上一版 exe —— 用户完全可能去点它（点错了就是"问题没修好"的那种误判）。
+# 所以这里统一清掉（能删的删，删不掉的说明还被占着，留着就行）。
+Get-ChildItem -LiteralPath (Split-Path $outDir -Parent) -Directory -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -like ((Split-Path $outDir -Leaf) + '.old-*') } |
+  ForEach-Object {
+    try { Remove-Item -LiteralPath $_.FullName -Recurse -Force } catch { }
+  }
+
 Write-Host '== 产物 =='
 $folderExe = Join-Path $outDir 'ZeeAI_Term.exe'
 foreach ($f in @($folderExe, $zip)) {
