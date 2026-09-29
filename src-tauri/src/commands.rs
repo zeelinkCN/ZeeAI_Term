@@ -778,6 +778,12 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
     cmd.args(args);
     // 见 run_capture 上面的说明：一次性进程必须能"跟着未来一起被杀掉"
     cmd.kill_on_drop(true);
+    // ★ 必须显式接管 stdout/stderr：`Command::output()` 会自己接管，但换成
+    //   `spawn()` + `wait_with_output()` 之后**默认是继承父进程的输出** ——
+    //   不写这一句，子进程的输出会直接漏到控制台，我们捕获到的是**空字符串**。
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -820,6 +826,11 @@ async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<Strin
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.kill_on_drop(true);
+    // ★ 见上：spawn + wait_with_output 不会自动接管，必须显式 pipe，
+    //   否则"远端明明回了内容，我们却收到空串"（这个回归我踩过：herdr 探测一直显示没装）。
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
     // 关键：一次性 ssh 命令不能弹出控制台窗口（否则界面上会闪一个黑框甚至挡住操作）
     #[cfg(windows)]
     {
@@ -850,6 +861,9 @@ async fn run_capture_checked(
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.kill_on_drop(true);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

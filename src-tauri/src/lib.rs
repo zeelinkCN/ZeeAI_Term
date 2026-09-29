@@ -350,7 +350,32 @@ pub fn run() {
               // 探测 → 读官方清单 → Windows 侧下载 → 校验 sha256 → scp → 安装 → 只读自检。
               // 不设变量时连探测都不跑 —— 免得默认打扰别人的服务器。
               if std::env::var("ZEEAI_SELFTEST_HERDR").is_ok() {
-                // 先对**每一台** SSH 服务器只读探一遍 agent 列表（这是看板的 herdr 数据源）
+                // 先对**每一台** SSH 服务器跑一遍"状态来源探测"（AI 面板/新建会话用的那个），
+                // 并且**把原始输出也打出来**：万一哪天远端采集又拿到空串（例如 API 改成
+                // spawn 之后忘了接管道 —— 我踩过，表现是"明明装了 herdr 却显示没装"），
+                // 日志里一眼就能看出来。
+                for p in profiles.iter().filter(|p| p.ssh.is_some()) {
+                    match crate::commands::ai_source_probe(Some(p.id.clone()), None).await {
+                        Ok(info) => {
+                            if info.raw.trim().is_empty() {
+                                log::error!(
+                                    "SELFTEST: ai_source_probe({}) **拿到空输出** —— 远端采集可能又没接管 stdout",
+                                    p.name
+                                );
+                            } else {
+                                log::info!(
+                                    "SELFTEST: ai_source_probe({}) -> herdr={:?} 协议 {} raw={:?}",
+                                    p.name,
+                                    info.herdr_version,
+                                    info.protocol,
+                                    info.raw
+                                );
+                            }
+                        }
+                        Err(e) => log::error!("SELFTEST: ai_source_probe({}) failed -> {e}", p.name),
+                    }
+                }
+                // 再对**每一台** SSH 服务器只读探一遍 agent 列表（这是看板的 herdr 数据源）
                 for p in profiles.iter().filter(|p| p.ssh.is_some()) {
                   // 顺手量一下耗时：这一步走的是"远端采集"（密钥走 ssh.exe、密码走 russh），
                   // 用户报的"新建 herdr 窗口一直转"如果卡在这里，日志里就能直接看出来。

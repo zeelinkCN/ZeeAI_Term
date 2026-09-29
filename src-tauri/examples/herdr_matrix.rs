@@ -652,6 +652,9 @@ herdr --session '{sname}' server stop >/dev/null 2>&1; herdr session delete '{sn
     println!("\n== 结果：{pass} 通过 / {fail} 失败 ==");
     // 收尾：把我们这次新起的 ssh 全收掉（不碰用户自己的）
     kill_new_ssh(&ssh_before);
+    // 再扫一次：有的 ssh 是"命令跑完了但进程还没退干净"，差一点就会被漏掉
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    kill_new_ssh(&ssh_before);
     let _ = Ordering::Relaxed;
     let _ = AtomicUsize::new(0);
     std::process::exit(if fail > 0 { 1 } else { 0 });
