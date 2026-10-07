@@ -1,6 +1,6 @@
 [package]
 name = "zeeai-terminal"
-version = "0.1.9"
+version = "0.1.10"
 description = "ZeeAI Terminal - Windows multi-protocol terminal workbench"
 authors = ["ZeeAI"]
 license = "GPL-3.0-or-later"
@@ -12,10 +12,26 @@ rust-version = "1.77.2"
 
 [lib]
 name = "zeeai_terminal_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 桌面版（Windows）只需要 rlib：bin 通过它静态链接。
+# staticlib / cdylib 是 Tauri 移动端模板的默认值，本仓库不构建移动端，
+# 留着它们等于每次 release 都多链接、多产出一份 136MB 的 .lib 和一份 .dll。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
+
+[features]
+# 无人值守自检 / 自动演示（`ZEEAI_SELFTEST` / `ZEEAI_AUTODEMO`）。
+#
+# **默认关闭，发布二进制里不含这段代码。** 为什么必须这样：
+# 那条路径会对**用户自己的服务器和手机**做真操作 —— 上传、改目录、删文件、
+# 往服务器装 herdr、`adb kill-server`。编译进发给用户的 exe 就等于"任何能设环境变量的
+# 本地程序都能动用户的机器"，上架/审计也会把它当成后门面。
+#
+# 开发时要跑自检（在 src-tauri 下）：
+#   cargo run --features selftest                # 直接跑
+#   npm run tauri dev -- -- --features selftest  # 走 Tauri CLI
+selftest = []
 
 [dependencies]
 serde_json = "1.0"
@@ -57,3 +73,24 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# 本地迭代专用 profile。
+#
+# 注意：dev / prod 的判定跟 profile 名字无关 —— tauri 的 build.rs 里是
+# `let dev = !has_feature("custom-protocol")`，Tauri CLI 会带上
+# `--features tauri/custom-protocol`，所以用这个 profile 构建出来的 exe
+# 同样是"生产"行为（前端已内嵌），不会去连 build.devUrl。
+#
+# 它只在优化强度上让步，换编译速度：
+# - `lto = false`：省掉 thin-LTO 那一整轮（release 里最贵的尾部之一）
+# - `codegen-units = 16`：LLVM 可以并行出码，而不是单线程跑一个大 CGU
+# - `incremental = true`：改几行代码后只重编受影响的 CGU
+#
+# 用法：.\scripts\build-fast.ps1
+# 交付物仍然必须是 `npx tauri build` 产出的 target/release/ZeeAI_Term.exe。
+[profile.fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true

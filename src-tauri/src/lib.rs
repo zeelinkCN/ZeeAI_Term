@@ -1,13 +1,23 @@
 pub mod commands;
 pub mod core;
+mod instance;
 mod store;
 
 use core::SessionRegistry;
 use tauri::Manager;
+// 只有自检/演示那条路径（feature = "selftest"）才发事件
+#[cfg(feature = "selftest")]
 use tauri::Emitter;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // 单实例：便携版和安装版**共用**同一份配置目录，两个实例同时跑会互相覆盖
+  // settings / history / workspace（后写的赢），通知也会各弹一遍。
+  // 第二个实例只把已有窗口叫到前面来，然后自己退出。见 instance.rs。
+  #[cfg(windows)]
+  if !instance::ensure_single_instance() {
+    return;
+  }
   tauri::Builder::default()
     .plugin(
       tauri_plugin_log::Builder::default()
@@ -45,6 +55,12 @@ pub fn run() {
       }
       // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
       // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
+      //
+      // `#[cfg(feature = "selftest")]`：**默认不编进发布二进制**。
+      // 这一段和下面的自检都会对用户自己的服务器/手机做真操作（上传、删除、装 herdr、
+      // kill adb），编进发给用户的 exe 就等于"设个环境变量就能动他的机器"。
+      // 开发时用 `cargo run --features selftest`（见 Cargo.toml 的 [features]）。
+      #[cfg(feature = "selftest")]
       if std::env::var("ZEEAI_AUTODEMO").is_ok() {
         let handle = app.handle().clone();
         std::thread::spawn(move || {
@@ -54,6 +70,8 @@ pub fn run() {
       }
       // 无人值守自检：设置 ZEEAI_SELFTEST=1 启动时，对第一条 SSH 配置跑一遍
       // tmux 列表与远端目录列举，把结果写进日志后退出。便于 CI/夜里验证。
+      // 同上：默认不编进发布二进制（`--features selftest` 才编）。
+      #[cfg(feature = "selftest")]
       if std::env::var("ZEEAI_SELFTEST").is_ok() {
         let handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {

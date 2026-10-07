@@ -1,4 +1,4 @@
-﻿# 发版脚本（Windows / PowerShell 5.1）
+# 发版脚本（Windows / PowerShell 5.1）
 #
 # 用法：
 #   $env:GH_TOKEN = '你的 GitHub token'      # 只用环境变量，绝不写进仓库
@@ -59,6 +59,13 @@ foreach ($c in $docChecks) {
   }
 }
 Write-Host '   文档版本号一致，OK'
+
+# 版本号只是"数字对不对"，这里再查"话是不是真的"：README / 界面里的承诺必须和实现一致
+# （便携版能不能一键升级、主题/配色到底几套、Fastboot 能不能刷机、自检代码在不在发布二进制里）。
+# 这几条以前全靠人记，漂移过一次：README 写着便携版可一键升级，实现里是明确拒绝的。
+Write-Host '== 1.5) 文档 × 实现一致性 =='
+& node scripts/check-docs.mjs
+if ($LASTEXITCODE -ne 0) { throw '文档与实现不一致：先改文档或改实现，再发版（node scripts/check-docs.mjs）' }
 
 if (-not (Test-Path $notes)) { throw "缺少发版说明 $notes" }
 
