@@ -25,6 +25,13 @@ use serde_json::Value;
 pub const SCAN_BYTES: u64 = 4_000_000;
 /// 每种记录各保留最后几条（保住顺序由 line_no 排序实现）
 const PER_BUCKET_KEEP: usize = 3;
+/// 判断"这份日志是谁写的"要读**文件开头**这么多字节。
+///
+/// 为什么要单独读文件头：`session_meta`（带 `originator` / `source`）是第一行，
+/// 而本机这些日志动辄几十上百 MB（实测最大一份 98MB），4MB 的尾巴窗口里**根本没有**它。
+const HEAD_BYTES: u64 = 64 * 1024;
+/// 找"用户自己那份日志"时最多往回看几份候选（同一天可能躺着几十份桌面端日志）
+const CANDIDATE_LIMIT: usize = 40;
 
 /// 把一行归到某个"状态桶"里。**宁可多归**：多归只是多传几行，漏归才会把状态算错。
 /// 真正的判定仍然由 `parse_rollout` 按解析后的 `payload.type` 做，所以正文里出现这些词不会误判。
@@ -811,11 +818,17 @@ pub fn parse_script_output(text: &str) -> Option<AiSessionSnapshot> {
     }
 }
 
-/// 本机：`%USERPROFILE%\.codex\sessions` 下最新的那个 rollout，读它的尾巴
+/// 本机：`%USERPROFILE%\.codex\sessions` 下最新的那份**不是桌面客户端写的** rollout，读它的尾巴。
+///
+/// 为什么必须区分"谁写的"（用户 2026-09-29 报的误报，见 `docs/backlog.md` 第 2 条）：
+/// 桌面版 Codex / VS Code 扩展把自己的会话日志写进**同一个** `~/.codex/sessions`。
+/// 实测用户那台机器上 21 份 rollout **全部**是 `originator=Codex Desktop`，
+/// 而旧实现只认"最新的那份" —— 于是把助手自己在桌面端干的活，当成了"用户在本机 PowerShell
+/// 里跑的任务"报出来（连它改过的文件都顺着 `cwd` 挂成了"任务产物"）。
 pub fn local_snapshot() -> Option<AiSessionSnapshot> {
     let home = std::env::var("USERPROFILE").ok()?;
     let root = std::path::Path::new(&home).join(".codex").join("sessions");
-    let newest = newest_rollout(&root, 0)?;
+    let newest = newest_user_rollout(&root)?;
     // 读窗口内的记录、按类型各取最后几条。窗口 4MB，实测那次"被挤出 40 万字节窗口"的
     // 情况在这里有十几倍余量；而真正喂给解析器的只有十几行。
     let text = read_related_tail(&newest, SCAN_BYTES)?;
@@ -827,30 +840,117 @@ pub fn local_snapshot() -> Option<AiSessionSnapshot> {
     }
 }
 
+/// rollout 头部里"这是谁写的"。
+///
+/// `originator` / `source` 是**唯一**能把"桌面客户端自己的会话"和"用户在终端里敲出来的 codex"
+/// 分开的东西 —— 两者共用同一个 `~/.codex/sessions` 目录，文件名和内容结构都一样。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RolloutOrigin {
+    pub originator: String,
+    pub source: String,
+}
+
+impl RolloutOrigin {
+    /// 桌面客户端（桌面版 Codex / VS Code 扩展）自己写的日志：**不读**。
+    ///
+    /// 依据是实测的真实日志头：`originator=Codex Desktop`、`source=vscode`；
+    /// 用户在自己终端里跑 codex 时 originator 是 `codex_cli_*` 这一类。
+    /// 读不到这两个字段（老版本日志）时按"不是桌面端"处理 —— 宁可显示，也不要静默消失。
+    pub fn is_desktop_client(&self) -> bool {
+        let originator = self.originator.trim().to_ascii_lowercase();
+        let source = self.source.trim().to_ascii_lowercase();
+        originator.contains("desktop") || source.contains("vscode")
+    }
+}
+
+/// 从 rollout 开头那段文本里读出 `originator` / `source`
+pub fn parse_origin(text: &str) -> RolloutOrigin {
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+        let originator = payload
+            .get("originator")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let source = payload.get("source").and_then(Value::as_str).unwrap_or("");
+        if kind == "session_meta" || !originator.is_empty() || !source.is_empty() {
+            return RolloutOrigin {
+                originator: originator.to_string(),
+                source: source.to_string(),
+            };
+        }
+    }
+    RolloutOrigin::default()
+}
+
+/// 最新的那份**用户自己的终端会话**日志；全是桌面客户端写的就返回 None。
+///
+/// 从新到旧逐个看文件头：跳过桌面端那种，取第一份像样的。这样"桌面版 Codex 正在干活"
+/// 不会再顶掉用户自己那份，也不会因为最新一份被跳过就整体返回空。
+fn newest_user_rollout(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let candidates = rollouts_by_mtime(root, CANDIDATE_LIMIT);
+    let total = candidates.len();
+    for path in candidates.iter() {
+        let origin = read_head(path, HEAD_BYTES)
+            .map(|head| parse_origin(&head))
+            .unwrap_or_default();
+        if origin.is_desktop_client() {
+            continue;
+        }
+        return Some(path.clone());
+    }
+    if total > 0 {
+        log::info!("本机 AI 快照：{total} 份 rollout 都是桌面客户端写的，本机不展示任务");
+    }
+    None
+}
+
+/// 读文件**开头** n 字节（几十 MB 的日志不能整个读进来）
+fn read_head(path: &std::path::Path, n: u64) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(n).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
 /// 读文件尾巴并挑出关键记录（保持原顺序）；一条都没匹配上时退回整个尾巴（不比以前差）。
 fn read_related_tail(path: &std::path::Path, window: u64) -> Option<String> {
     let raw = read_tail(path, window)?;
     Some(select_related(&raw).unwrap_or(raw))
 }
 
-/// 递归找最新的 rollout-*.jsonl（目录结构是 sessions/年/月/日/，最多三层的递归）
-fn newest_rollout(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBuf> {
+/// 列出 `sessions/年/月/日/` 下所有 `rollout-*.jsonl`，按修改时间**从新到旧**，最多 keep 条
+fn rollouts_by_mtime(root: &std::path::Path, keep: usize) -> Vec<std::path::PathBuf> {
+    let mut all: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    collect_rollouts(root, 0, &mut all);
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.truncate(keep);
+    all.into_iter().map(|(_, p)| p).collect()
+}
+
+fn collect_rollouts(
+    dir: &std::path::Path,
+    depth: u32,
+    out: &mut Vec<(std::time::SystemTime, std::path::PathBuf)>,
+) {
     if depth > 3 {
-        return None;
+        return;
     }
-    let read = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in read.flatten() {
         let path = e.path();
         if path.is_dir() {
-            if let Some(found) = newest_rollout(&path, depth + 1) {
-                let t = std::fs::metadata(&found)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
-                    best = Some((t, found));
-                }
-            }
+            collect_rollouts(&path, depth + 1, out);
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -861,11 +961,8 @@ fn newest_rollout(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBu
             .metadata()
             .and_then(|m| m.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
-            best = Some((t, path));
-        }
+        out.push((t, path));
     }
-    best.map(|(_, p)| p)
 }
 
 /// 读文件最后 n 字节（大文件不要整个读进来）
@@ -999,5 +1096,69 @@ mod tests {
         assert!(s.contains("task_complete"), "{s}");
         assert!(s.contains(&SCAN_BYTES.to_string()), "{s}");
         assert!(s.starts_with("f=$(ls -t"), "{s}");
+    }
+
+    /// 真实日志头：本机 21 份 rollout **全是**这一种（桌面版 Codex 自己写的）
+    fn desktop_head() -> String {
+        r#"{"timestamp":"2026-10-07T02:05:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"desktop-1","cwd":"D:\\AI\\ESP_board","originator":"Codex Desktop","source":"vscode"}}"#.to_string()
+    }
+
+    /// 用户在终端里自己敲 codex 时（我们**要**认的那种）
+    fn cli_head() -> String {
+        r#"{"timestamp":"2026-10-07T02:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"cli-1","cwd":"D:\\AI\\ZeeAI_term","originator":"codex_cli_rs","source":"cli"}}"#.to_string()
+    }
+
+    /// 用户报的原问题：看板把"桌面版 Codex 自己在干活"报成了"本机 PowerShell 里的任务"。
+    #[test]
+    fn desktop_client_logs_are_rejected_terminal_ones_are_kept() {
+        let desktop = parse_origin(&desktop_head());
+        assert_eq!(desktop.originator, "Codex Desktop");
+        assert_eq!(desktop.source, "vscode");
+        assert!(desktop.is_desktop_client(), "桌面版 Codex 的日志必须被拒");
+
+        let cli = parse_origin(&cli_head());
+        assert!(!cli.is_desktop_client(), "终端里跑的 codex 不能被误杀");
+
+        // 老版本日志里没有这两个字段：按"不是桌面端"处理（宁可显示，也不要静默消失）
+        let old = r#"{"type":"session_meta","payload":{"session_id":"o1","cwd":"/root/proj"}}"#;
+        assert!(!parse_origin(old).is_desktop_client());
+        assert!(!parse_origin("").is_desktop_client());
+        // 第一行是被截断的半行时，仍然能从后面的行里读出来
+        let truncated = format!("{{\"payload\":{{\"ty\n{}", desktop_head());
+        assert!(parse_origin(&truncated).is_desktop_client());
+    }
+
+    /// 挑文件这一步：最新的那份是桌面端的，必须往后找用户自己那份；全是桌面端就返回 None。
+    #[test]
+    fn picks_newest_rollout_that_is_not_a_desktop_log() {
+        let root = std::env::temp_dir().join(format!("zeeai-ai-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join("2026").join("10").join("07");
+        std::fs::create_dir_all(&day).unwrap();
+
+        let cli = day.join("rollout-2026-10-07T09-00-00-cli.jsonl");
+        let desktop_old = day.join("rollout-2026-10-07T09-30-00-desktop.jsonl");
+        let desktop_new = day.join("rollout-2026-10-07T10-00-00-desktop.jsonl");
+        std::fs::write(&cli, format!("{}\n", cli_head())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&desktop_old, format!("{}\n", desktop_head())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&desktop_new, format!("{}\n", desktop_head())).unwrap();
+
+        let picked = newest_user_rollout(&root).expect("应该挑到用户自己那份");
+        assert_eq!(
+            picked.file_name().unwrap().to_string_lossy(),
+            "rollout-2026-10-07T09-00-00-cli.jsonl",
+            "最新那份是桌面端的，必须跳过它往后找"
+        );
+
+        // 只有桌面端日志时（用户没在自己终端里跑过 codex）→ 本机不该出卡片
+        std::fs::remove_file(&cli).unwrap();
+        assert!(
+            newest_user_rollout(&root).is_none(),
+            "全是桌面端日志时，本机快照必须是 None（否则又冒出假任务）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
