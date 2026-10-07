@@ -15,6 +15,14 @@ interface Props {
   sessionId: string;
   bus: SessionBus;
   active: boolean;
+  /**
+   * 这条终端现在**看得见**吗。
+   *
+   * 和 `active` 的区别：分屏时只有一个是"焦点"（active），但几个窗格都看得见；
+   * 单窗格模式下藏起来的会话则是两者都 false。WebGL 渲染器只给看得见的挂
+   * （见下面 attachWebgl 那段说明）。不传按看得见处理。
+   */
+  visible?: boolean;
   fontSize?: number;
   light?: boolean;
   /** 终端配色（来自设置里的方案）；不传就按 light 用内置默认 */
@@ -227,6 +235,7 @@ export default function TerminalView({
   sessionId,
   bus,
   active,
+  visible = true,
   fontSize = 13,
   light = false,
   palette,
@@ -246,6 +255,11 @@ export default function TerminalView({
   const hlRef = useRef<Highlighter | null>(null);
   /** WebGL 渲染器（重绘时要清它的字形图集，否则会留下"一片点"那种残影） */
   const webglRef = useRef<WebglAddon | null>(null);
+  /** 挂 / 摘 WebGL 渲染器（不重建终端）；由 mount effect 填，可见性变化时调用 */
+  const attachWebglRef = useRef<(() => void) | null>(null);
+  const detachWebglRef = useRef<(() => void) | null>(null);
+  /** 当前是不是看得见（WebGL 只给看得见的挂；上下文丢失自愈时也要看它） */
+  const visibleRef = useRef(visible);
   /** 统一走"合并 + 只在真的变了才发"的 resize；给下面几个 effect 复用 */
   const doFitRef = useRef<(() => void) | null>(null);
   // 终端自己的右键菜单（复制/粘贴/清空/全选）—— 浏览器那套菜单已被全局屏蔽
@@ -300,7 +314,25 @@ export default function TerminalView({
       // 换掉、尺寸又没算出来，随后任何一次 refresh 都会抛
       // `Cannot read properties of undefined (reading 'dimensions')` —— 终端整块不动了。
       // （这是用无头浏览器跑功能测试时实测到的，不是猜的。）
-      if (webgl2Available()) {
+      // 只有**看得见**的终端才占一个 GPU 上下文。
+      //
+      // 为什么：单窗格模式下所有会话都挂载着（用 display:none 藏着，这样回滚缓冲不丢），
+      // 而 WebGL 上下文数量有上限 —— 以前每条会话都 `new WebglAddon()`，开十几个会话就会
+      // 把最早的上下文挤掉，那条终端从此花屏/退回慢渲染（beta 线上那条 87e0ceb 治的是
+      // "丢了不自愈"，这里治的是"根本不该同时占那么多"）。现在：可见才挂（单窗格 1 个、
+      // 分屏最多 4 个），藏起来时摘掉退回 DOM 渲染 —— 缓冲和连接都还在，只是不占 GPU。
+      let webglTries = 0;
+      const detachWebgl = () => {
+        try {
+          webglRef.current?.dispose();
+        } catch {
+          /* ignore */
+        }
+        webglRef.current = null;
+      };
+      const attachWebgl = () => {
+        if (webglRef.current) return; // 已经挂着，别重复挂
+        if (!webgl2Available()) return;
         // 上下文丢失时**重建**渲染器，而不是一丢了之。
         //
         // 以前这里只 dispose 就完事 —— 后果是这条终端**永久**退回慢的 DOM 渲染，
@@ -309,37 +341,38 @@ export default function TerminalView({
         // 显存压力等原因丢失，所以必须能自愈。
         //
         // 这条修复是从工作空间那条线（D:\AI\ZeeAI_term-beta，commit 87e0ceb）搬过来的。
-        let webglTries = 0;
-        const attachWebgl = () => {
-          try {
-            const webgl = new WebglAddon();
-            webgl.onContextLoss(() => {
-              try {
-                webgl.dispose();
-              } catch {
-                /* ignore */
-              }
-              webglRef.current = null;
-              // 200ms 后重建；最多试 5 次，避免真的没有 WebGL 时无限重试
-              if (webglTries < 5) {
-                webglTries += 1;
-                window.setTimeout(() => {
-                  try {
-                    attachWebgl();
-                  } catch {
-                    /* 重建失败：保持默认渲染 */
-                  }
-                }, 200);
-              }
-            });
-            term.loadAddon(webgl);
-            webglRef.current = webgl;
-          } catch {
-            /* WebGL 真的不可用：退回默认渲染 */
-          }
-        };
-        attachWebgl();
-      }
+        try {
+          const webgl = new WebglAddon();
+          webgl.onContextLoss(() => {
+            try {
+              webgl.dispose();
+            } catch {
+              /* ignore */
+            }
+            webglRef.current = null;
+            // 200ms 后重建；最多试 5 次，避免真的没有 WebGL 时无限重试
+            if (webglTries < 5) {
+              webglTries += 1;
+              window.setTimeout(() => {
+                // 已经切走或终端已经销毁：不要再抢上下文（不然又回到"开 N 个占 N 个"）
+                if (!visibleRef.current || termRef.current !== term) return;
+                try {
+                  attachWebgl();
+                } catch {
+                  /* 重建失败：保持默认渲染 */
+                }
+              }, 200);
+            }
+          });
+          term.loadAddon(webgl);
+          webglRef.current = webgl;
+        } catch {
+          /* WebGL 真的不可用：退回默认渲染 */
+        }
+      };
+      attachWebglRef.current = attachWebgl;
+      detachWebglRef.current = detachWebgl;
+      if (visibleRef.current) attachWebgl();
     } catch {
       /* WebGL 不可用时自动回退到 canvas/dom 渲染 */
     }
@@ -506,8 +539,33 @@ export default function TerminalView({
       termRef.current = null;
       fitRef.current = null;
       doFitRef.current = null;
+      attachWebglRef.current = null;
+      detachWebglRef.current = null;
     };
   }, [sessionId, bus]);
+
+  /**
+   * 可见性变化：挂 / 摘 WebGL 渲染器。
+   *
+   * 摘掉只是**换渲染器**（退回 DOM），终端本体、回滚缓冲、连接都不动 —— 所以
+   * "开 20 个会话"不再等于"占 20 个 GPU 上下文"（见 mount effect 里那段说明）。
+   */
+  useEffect(() => {
+    visibleRef.current = visible;
+    if (!visible) {
+      detachWebglRef.current?.();
+      return;
+    }
+    attachWebglRef.current?.();
+    // 重新挂上渲染器后整屏重画一次（跟"切回来"那条 effect 同一个道理：
+    // 藏起来这段时间画布是停的，不重画可能停在半坏状态）
+    try {
+      const term = termRef.current;
+      if (term) term.refresh(0, term.rows - 1);
+    } catch {
+      /* ignore */
+    }
+  }, [visible]);
 
   // 高亮规则/开关变了：热更新，不重建终端（v1 不会给历史输出重新上色，这是已知取舍）
   useEffect(() => {
