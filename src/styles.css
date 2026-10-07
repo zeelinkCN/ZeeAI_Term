@@ -34,6 +34,10 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
+  /* 没有显式写 color 的文字一律跟主题走。以前没有这一条，于是它们继承 body 上写死的
+     #cccccc —— 浅色主题下就是"浅底浅字"（设置对话框那个标题「设置」几乎看不见，
+     是浅色主题下对比度审计揪出来的）。 */
+  color: var(--fg);
   --bg: #1e1e1e;
   --sidebar: #252526;
   --titlebar: #323233;
@@ -47,6 +51,16 @@ body {
   --amber: #e2c08d;
   --red: #f14c4c;
   --status: #007acc;
+  /* 控件底色。**这几个必须是变量**：浅色主题以前只换 --fg（文字），而按钮 / 输入框的底色
+     是写死的深灰 —— 于是浅色下变成「深底深字」，几乎读不出来（用户截图报过，
+     见 docs/backlog.md 第 1 条）。别再往规则里写字面量颜色。 */
+  --btn-bg: #2a2d2e;
+  --btn-bg-hover: #34383a;
+  --field-bg: #3c3c3c;
+  --panel-2: #2a2d2e;
+  --code-bg: #1b1b1b;
+  --code-inline-bg: rgba(255, 255, 255, 0.08);
+  --hover: rgba(255, 255, 255, 0.07);
 }
 
 .titlebar {
@@ -158,19 +172,16 @@ body {
   --muted: #6a6a6a;
   --accent: #0a66c2;
   --accent-soft: rgba(10, 102, 194, 0.12);
-}
-
-.app.light .form input,
-.app.light .modal-input,
-.app.light .modal-field select,
-.app.light .fs-path-input,
-.app.light .git-commit input {
-  background: #ffffff;
-  color: var(--fg);
-}
-
-.app.light .attach-list {
-  background: #ffffff;
+  /* 浅色下同一批控件底色（见 .app 里那段说明）。
+     这一条同时管住 5 套浅色主题（light / github / paper / sakura / mint）——
+     App 会给它们都加上 .light 这个类，所以不用再逐套打补丁。 */
+  --btn-bg: #ececec;
+  --btn-bg-hover: #e0e0e0;
+  --field-bg: #ffffff;
+  --panel-2: #f6f6f6;
+  --code-bg: #f3f3f3;
+  --code-inline-bg: rgba(0, 0, 0, 0.07);
+  --hover: rgba(0, 0, 0, 0.07);
 }
 
 /* ---------- 主题配色 ---------- */
@@ -531,7 +542,7 @@ body {
   padding: 5px 9px;
   border: 1px solid var(--border);
   border-radius: 4px;
-  background: #2a2d2e;
+  background: var(--btn-bg);
   color: var(--fg);
   font: inherit;
   font-size: 12.5px;
@@ -540,6 +551,7 @@ body {
 
 .btn:hover {
   border-color: var(--accent);
+  background: var(--btn-bg-hover);
 }
 
 .btn.primary {
@@ -569,7 +581,7 @@ body {
 }
 
 .form input {
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 3px;
   color: var(--fg);
@@ -764,17 +776,13 @@ body {
   min-width: 0;
   resize: vertical;
   padding: 4px 6px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--fg);
   font: inherit;
   font-size: 12px;
   outline: none;
-}
-
-.app.light .git-commit-msg {
-  background: #ffffff;
 }
 
 .git-commit-btn {
@@ -830,17 +838,13 @@ body {
   flex: 1;
   min-width: 0;
   padding: 3px 6px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 3px;
   color: var(--fg);
   font: inherit;
   font-size: 12px;
   outline: none;
-}
-
-.app.light .git-newbranch input {
-  background: #ffffff;
 }
 
 .diff-modal {
@@ -1507,7 +1511,7 @@ body {
 }
 
 .settings-nav-item:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--hover);
 }
 
 .settings-nav-item.active {
@@ -1717,7 +1721,7 @@ body {
 }
 
 .tmux-head:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover);
 }
 
 .tmux-body {
@@ -1978,7 +1982,7 @@ body {
   width: calc(100% - 60px);
   margin: 2px 14px 10px 38px;
   padding: 5px 8px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--fg);
@@ -1997,7 +2001,7 @@ body {
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: #2a2d2e;
+  background: var(--panel-2);
 }
 
 .attach-item {
@@ -2010,7 +2014,7 @@ body {
 }
 
 .attach-item:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover);
 }
 
 .attach-item.active {
@@ -2074,7 +2078,7 @@ body {
 }
 
 .srv-row:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background: var(--hover);
   border-color: var(--border);
 }
 
@@ -2156,7 +2160,7 @@ body {
   width: 100%;
   margin-top: 4px;
   padding: 5px 6px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--fg);
@@ -2304,7 +2308,7 @@ body {
 }
 
 .tree-item:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover);
 }
 
 .tree-item .tag {
@@ -2378,7 +2382,7 @@ body {
   width: 100%;
   margin-top: 4px;
   padding: 5px 8px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--fg);
@@ -2389,6 +2393,39 @@ body {
 
 .modal-field input:focus {
   border-color: var(--accent);
+}
+
+/* 滑块（终端字体大小 / 回滚行数）：以前**一条样式都没有**，于是套用了上面那条 input 的深灰底 ——
+   浅色主题下就是一块压在白面板上的深灰色方块，轨道和滑块都看不出拖到哪儿了（用户截图报过）。
+   这里给一套显式的轨道 / 滑块样式，颜色全走主题变量；写在 .modal-field input 之后，
+   靠"同权重后写覆盖"把那个深底顶掉。 */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin-top: 8px;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1px solid var(--bg);
 }
 
 .modal-inline-action {
@@ -2507,7 +2544,7 @@ body {
 }
 
 .tmux-row:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover);
 }
 
 .tmux-row .dim {
@@ -2538,7 +2575,7 @@ body {
   width: calc(100% - 16px);
   margin: 0 8px 6px;
   padding: 3px 6px;
-  background: #3c3c3c;
+  background: var(--field-bg);
   border: 1px solid var(--border);
   border-radius: 3px;
   color: var(--fg);
@@ -2570,7 +2607,7 @@ body {
 }
 
 .fs-row:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--hover);
 }
 
 .fs-row .grow {
@@ -2697,13 +2734,13 @@ body {
 .md-preview code {
   font-family: "Cascadia Mono", "Consolas", monospace;
   font-size: 0.92em;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--code-inline-bg);
   padding: 1px 5px;
   border-radius: 4px;
 }
 
 .md-preview pre {
-  background: #1b1b1b;
+  background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px 12px;

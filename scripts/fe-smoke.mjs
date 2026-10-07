@@ -52,6 +52,10 @@ for (const p of profiles) {
   if (p.ssh) p.ssh.herdrEnabled = true;
 }
 const settings = readJson("settings.json", {});
+// 测试必须能"启动即恢复会话"，否则后面几十条都会假失败（我踩过：用户在设置里把
+// 「启动时恢复上次的工作空间」关掉之后，整轮 41/67 —— 看着像代码坏了，其实是设置变了）。
+// 和上面给 lz 打开 herdrEnabled 是一个道理：只改测试用的这份副本，不动用户的文件。
+settings.restoreWorkspace = true;
 const history = readJson("history.json", []);
 // 诊断开关：把假后端换成"全空"，用来判断崩溃是"数据形状不对"还是"代码本身"
 const MINIMAL = !!process.env.ZEEAI_FE_TEST_MINIMAL;
@@ -114,7 +118,7 @@ const resolveCmd = (cmd, args) => {
   const S = window.__ZEEAI_SCENARIO__;
   switch (cmd) {
     case "list_profiles": return M.profiles;
-    case "settings_get": return M.settings;
+    case "settings_get": return Object.assign({}, M.settings, S.settingsPatch || {});
     // 历史列表：herdrHistory = 带一条 herdr 会话（验证"从侧栏点开也进 herdr"）。
     // 注意三个入口（list/save/remove）都要走同一份 —— 应用启动时恢复会话会调 history_save，
     // 如果那里返回真实列表，就会把场景数据覆盖掉（我自己踩过）。
@@ -445,6 +449,9 @@ const setScenario = async (flags) => {
     createFails: false,
     restoreHerdr: false,
     herdrHistory: false,
+    // 覆盖设置（例如强制浅色主题）。**必须显式写 null**：注入脚本是累积的，
+    // 少了这一条，下一个场景会继承上一个场景的主题。
+    settingsPatch: null,
     ...flags,
   };
   await send("Page.addScriptToEvaluateOnNewDocument", {
@@ -1261,6 +1268,78 @@ check(
   JSON.stringify(mapped.tabs),
 );
 
+// ---------- (D2) 看板只摆"任务"，不摆"窗格现状"（backlog 第 2 条 ②） ----------
+//
+// 用户实测：面板标题写着当前会话、下面却列着远端的卡，于是他以为"它在探测我的 PowerShell"；
+// 而且两张 `空闲` / `已完成` 的陈旧窗格一直占着卡片位。
+// 现在的口径：标题固定；`空闲 / 已完成` 收进一行折叠；那种卡不再摆"接管"（点了也切不过去）。
+await setScenario({
+  herdrAgents: [
+    {
+      kind: "codex", status: "working", cwd: "/home/lz", paneId: "w1R:p1",
+      tabId: "w1R:t1", workspaceId: "w1R", title: "lz", focused: false, attention: false,
+    },
+    {
+      kind: "codex", status: "idle", cwd: "/home/lz", paneId: "w1Z:p1",
+      tabId: "w1Z:t1", workspaceId: "w1Z", title: "lz", focused: false, attention: false,
+    },
+  ],
+});
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(2600);
+const board2 = await evaluate(`(() => {
+  const head = (document.querySelector(".ai-panel .ai-head")?.innerText || "").trim();
+  const cards = [...document.querySelectorAll(".ai-panel .ai-task")].map((c) =>
+    (c.innerText || "").replace(/\\n/g, " / "));
+  const fold = [...document.querySelectorAll(".ai-panel button")].find((b) =>
+    (b.innerText || "").includes("不活跃的窗格"));
+  return { head, cards, fold: fold ? (fold.innerText || "").trim() : "" };
+})()`);
+check(
+  "面板标题固定成「AI 任务看板」，不再跟着当前会话（远端卡片不再冒充本机）",
+  board2.head.includes("AI 任务看板") && !board2.head.includes("AI Agent"),
+  board2.head,
+);
+check(
+  "「空闲」的窗格不占卡片位：收进一行折叠（正在跑的照常显示）",
+  !board2.cards.some((c) => c.includes("w1Z:p1")) &&
+    board2.cards.some((c) => c.includes("w1R:p1")) &&
+    board2.fold.includes("另有 1 个不活跃的窗格"),
+  `卡片=${JSON.stringify(board2.cards).slice(0, 160)} 折叠行=${board2.fold}`,
+);
+check(
+  "卡片上不再出现 `lz · lz · w1R:p1` 这种服务器名/项目名重复",
+  board2.cards.length > 0 && board2.cards.every((c) => !c.includes("lz · lz")),
+  JSON.stringify(board2.cards).slice(0, 160),
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) =>
+    (x.innerText || "").includes("不活跃的窗格"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(700);
+const shotBoardFold = await shot("13-board-folded.png");
+const unfolded = await evaluate(`(() => {
+  const c = [...document.querySelectorAll(".ai-panel .ai-task")].find((x) =>
+    (x.innerText || "").includes("w1Z:p1"));
+  return {
+    found: !!c,
+    text: c ? (c.innerText || "").replace(/\\n/g, " / ") : "",
+    buttons: c ? [...c.querySelectorAll("button")].map((b) => (b.innerText || "").trim()) : [],
+  };
+})()`);
+check(
+  "展开后能看到那个窗格，但只给「查看窗格」——不再摆一个点了也切不过去的「接管」",
+  unfolded.found && unfolded.buttons.includes("查看窗格") && !unfolded.buttons.includes("接管"),
+  JSON.stringify(unfolded).slice(0, 200),
+);
+
 // ---------- (E) 服务器右键 → 管理 herdr 工作区 ----------
 await setScenario({});
 await reload();
@@ -1416,9 +1495,142 @@ check(
   } 条`,
 );
 
+// ---------- (Z) 浅色主题下不能有「深底深字 / 浅底浅字」 ----------
+// 用户截图报过：切到浅色主题后，设置面板里一排深灰色框（按钮、两个滑块）压在白底上，
+// 文字是深色的 → 几乎读不出来（见 docs/backlog.md 第 1 条）。当时的结论是"下次一并改"，
+// 这条断言就是那次改动的守门人：以后谁再把底色写成字面量，这里会立刻红。
+//
+// 判据是**真实计算样式里的对比度**（不是看代码、也不是看截图）：逐页翻设置面板，
+// 把"直接装着文字"的元素找出来，取它的 color 与"最近一个有实底色的祖先"的 backgroundColor
+// 算 WCAG 对比度，低于 4.0 就算不合格 —— 「深底深字」的对比度大约只有 1.1，必挂。
+const CONTRAST_AUDIT = String.raw`(() => {
+  const parse = (s) => {
+    const m = /rgba?\(([^)]+)\)/.exec(s || "");
+    if (!m) return null;
+    const p = m[1].split(",").map((x) => parseFloat(x));
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  };
+  const lum = (c) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+  };
+  const ratio = (a, b) => {
+    const x = lum(a), y = lum(b);
+    return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+  };
+  const effBg = (el) => {
+    let cur = el;
+    while (cur) {
+      const c = parse(getComputedStyle(cur).backgroundColor);
+      if (c && c.a >= 0.9) return c;
+      cur = cur.parentElement;
+    }
+    return { r: 255, g: 255, b: 255, a: 1 };
+  };
+  const root = document.querySelector(".modal");
+  if (!root) return [{ tag: "-", cls: "", text: "设置面板没打开", fg: "", bg: "", ratio: 0 }];
+  const bad = [];
+  for (const el of root.querySelectorAll("*")) {
+    if (el.tagName === "OPTION") continue;
+    const st = getComputedStyle(el);
+    if (st.display === "none" || st.visibility === "hidden") continue;
+    if (parseFloat(st.opacity) < 0.6) continue;   // 禁用态（opacity: .5）不算
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    const own = [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join("");
+    if (!own) continue;
+    const fg = parse(st.color);
+    if (!fg) continue;
+    const bg = effBg(el);
+    const c = ratio(fg, bg);
+    if (c < 4.0) {
+      bad.push({
+        tag: el.tagName,
+        cls: String(el.className).slice(0, 44),
+        text: own.slice(0, 18),
+        fg: st.color,
+        bg: "rgb(" + bg.r + "," + bg.g + "," + bg.b + ")",
+        ratio: Math.round(c * 100) / 100,
+      });
+    }
+  }
+  return bad;
+})()`;
+
+const openSettings = async () =>
+  evaluate(`(() => {
+    const gear = [...document.querySelectorAll("button")].find((b) => (b.title || "").includes("设置"));
+    if (gear) gear.click();
+    return !!gear;
+  })()`);
+const clickSettingsTab = async (label) =>
+  evaluate(`(() => {
+    const nav = [...document.querySelectorAll(".settings-nav-item")].find((n) => (n.innerText || "").trim() === ${JSON.stringify(
+      label,
+    )});
+    if (nav) nav.click();
+    return !!nav;
+  })()`);
+
+// 让应用**直接以浅色主题启动**（比去点下拉框稳），再逐页查对比度
+await setScenario({ settingsPatch: { theme: "light" } });
+await reload();
+await openSettings();
+await sleep(900);
+const settingsTabs = await evaluate(
+  `[...document.querySelectorAll(".settings-nav-item")].map((n) => (n.innerText || "").trim())`,
+);
+const lightBad = [];
+for (const tab of settingsTabs) {
+  await clickSettingsTab(tab);
+  await sleep(420);
+  const bad = await evaluate(CONTRAST_AUDIT);
+  if (bad.length) lightBad.push({ tab, bad: bad.slice(0, 6) });
+}
+check(
+  "浅色主题：设置面板逐页没有「深底深字 / 浅底浅字」（按真实计算样式算对比度）",
+  lightBad.length === 0,
+  lightBad.length ? JSON.stringify(lightBad).slice(0, 500) : `${settingsTabs.length} 个页签全过`,
+);
+
+// 那两个滑块：以前没有任何样式，套用了 input 的深灰底 → 浅色下是一块深色方块
+await clickSettingsTab("外观");
+await sleep(420);
+const shotLight = await shot("12-settings-light.png");
+const sliders = await evaluate(`[...document.querySelectorAll(".modal input[type=range]")].map((i) => ({
+  bg: getComputedStyle(i).backgroundColor,
+  accent: getComputedStyle(i).accentColor,
+  w: Math.round(i.getBoundingClientRect().width),
+}))`);
+check(
+  "浅色主题：两个滑块不再是深灰方块（底色透明、滑块跟强调色）",
+  sliders.length === 2 &&
+    sliders.every((s) => s.bg === "rgba(0, 0, 0, 0)" || s.bg === "transparent") &&
+    sliders.every((s) => s.accent !== "auto" && s.w > 100),
+  JSON.stringify(sliders),
+);
+
+// 深色主题不回归：按钮仍是深底浅字（对比度审计也要过）
+await setScenario({});
+await reload();
+await openSettings();
+await sleep(900);
+const darkBtn = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal .btn")][0];
+  if (!b) return null;
+  const st = getComputedStyle(b);
+  return { bg: st.backgroundColor, fg: st.color, text: (b.innerText || "").trim().slice(0, 12) };
+})()`);
+const darkBad = await evaluate(CONTRAST_AUDIT);
+check(
+  "深色主题没回归：按钮仍是深底浅字（且对比度审计通过）",
+  !!darkBtn && darkBtn.bg === "rgb(42, 45, 46)" && darkBad.length === 0,
+  `${JSON.stringify(darkBtn)}；不合格 ${darkBad.length} 处`,
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
-console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}`);
+console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}\n${shotLight}（浅色主题·设置面板）`);
 
 ws.close();
 // 结束整棵 Edge 进程树（只 kill 父进程会留下子进程占着 profile 目录和工作目录）

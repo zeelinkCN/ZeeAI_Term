@@ -446,6 +446,21 @@ function herdrStateLabel(status: string): string {
   }
 }
 
+/**
+ * 这张看板卡该不该占卡片位（docs/backlog.md 第 2 条 ②）。
+ *
+ * 「空闲 / 已完成」是**窗格现状**，不是"有个任务在跑"—— 摆在卡片区就变成
+ * "历史上哪些窗格跑过 codex"，用户实测因此以为"它在探测我的 PowerShell"。
+ * 判据优先用 herdr 的第一手状态（agentStatus），没有它才退回进程死活（state）。
+ */
+function isActiveBoardTask(t: AiTask): boolean {
+  if (t.attention) return true; // herdr 说"等你处理"：永远占位
+  const s = (t.agentStatus ?? "").toLowerCase();
+  if (s === "working" || s === "blocked") return true;
+  if (s === "idle" || s === "done") return false;
+  return t.state === "running";
+}
+
 /** 毫秒 →「1 分 23 秒」；拿不到就显示「—」 */
 function aiDurationText(ms: number): string {
   if (!ms || ms < 0) return "—";
@@ -676,7 +691,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   aiNotifyAllArtifacts: false,
 };
 
-const APP_VERSION = "0.1.9";
+const APP_VERSION = "0.1.10";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
@@ -1053,6 +1068,15 @@ export default function App() {
   const [toolListOpen, setToolListOpen] = useState(false);
   /// 「最近任务」默认只露 3 条，想看全部点一下展开（不在那小框里上下拖）
   const [timelineAll, setTimelineAll] = useState(false);
+  /**
+   * 看板上「不活跃的窗格」（herdr 的 空闲 / 已完成）默认收成一行。
+   *
+   * 为什么：它们是**窗格现状**，不是任务 —— 摆在卡片区就变成了"历史上哪些窗格跑过 codex"，
+   * 用户实测因此误以为"它在探测我的 PowerShell"（见 docs/backlog.md 第 2 条 ②）。
+   * 本来还想按"超过 30 分钟没动静就不显示"，但 herdr 的 agent list **不给最后活动时间**
+   * （core/herdr.rs 的 HerdrAgent 里没有这类字段），拿不到就不假装有：一律折叠，要点开才看。
+   */
+  const [inactiveOpen, setInactiveOpen] = useState(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
@@ -2703,6 +2727,11 @@ export default function App() {
   }, []);
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
+  // 看板卡片分两拨：「正在跑 / 等你处理」占卡片位；「空闲 / 已完成」默认收成一行
+  //（见 isActiveBoardTask 的说明）。展开时按原顺序全显示。
+  const boardActive = boardTasks.filter(isActiveBoardTask);
+  const boardInactive = boardTasks.filter((t) => !isActiveBoardTask(t));
+  const boardVisible = inactiveOpen ? boardTasks : boardActive;
   const activeFile =
     activeSession && activeSession.activeTab !== "terminal"
       ? activeSession.openFiles.find((f) => f.name === activeSession.activeTab) ?? null
@@ -6535,7 +6564,10 @@ export default function App() {
                     <span className={d.state === "device" ? "dot ok" : "dot off"} />
                   </div>
                 ))}
-                <div className="tree-group">Fastboot（bootloader 模式）</div>
+                {/* 只读探测：这里**只能看**（fastboot devices / --version），
+                    刷机、重启到 bootloader 这些命令都还没有 —— 所以标题写清楚，
+                    别让用户以为点了能刷（README 里同步说明）。 */}
+                <div className="tree-group">Fastboot 设备（bootloader 模式 · 只读探测）</div>
                 <div className="hint">
                   {fbVer ? "fastboot 已就绪" : "未检测到 fastboot"}
                 </div>
@@ -6983,6 +7015,10 @@ export default function App() {
                     sessionId={s.id}
                     bus={bus}
                     active={s.id === activeId && s.activeTab === "terminal"}
+                    // 单窗格模式下**所有**会话都挂着（用 display:none 藏着，为了不丢回滚缓冲），
+                    // 但只有当前这条看得见 —— WebGL 渲染器只给看得见的挂，
+                    // 否则开 N 个会话就占 N 个 GPU 上下文（见 Terminal.tsx 里那段说明）
+                    visible={s.id === activeId && s.activeTab === "terminal"}
                     fontSize={settings.fontSize}
                     scrollback={settings.scrollback}
                     light={themeKind(settings.theme) === "light"}
@@ -7037,8 +7073,12 @@ export default function App() {
         {aiPanelOpen && (
           <aside className="ai-panel">
             <div className="ai-head">
-              <span className="grow ellipsis" title={activeSession?.title}>
-                AI Agent{activeSession ? ` · ${activeSession.title}` : ""}
+              {/* 标题**固定**，不再跟着当前会话走。
+                  以前写「AI Agent · PowerShell」，下面列的却是远端的卡 —— 用户实测因此以为
+                  "它探测到我的 PowerShell 里有 Codex"。面板里的卡片本来就是全环境的，
+                  所以标题只说这是什么，环境归属交给每张卡自己标（docs/backlog.md 第 2 条 ②）。 */}
+              <span className="grow ellipsis" title="全环境（本机 / WSL / 各台服务器）的 AI 任务">
+                AI 任务看板
               </span>
               <button
                 type="button"
@@ -7220,7 +7260,7 @@ export default function App() {
               </div>
             ) : null}
             <div className="ai-section">
-              AI 任务看板
+              任务卡片
               <button
                 type="button"
                 className="mini-x"
@@ -7231,15 +7271,33 @@ export default function App() {
                 ⟳
               </button>
             </div>
-            {boardTasks.length === 0 ? (
+            {boardActive.length === 0 ? (
               <div className="hint" style={{ padding: "2px 12px 8px" }}>
                 暂无运行中的 AI
               </div>
-            ) : (
+            ) : null}
+            {/* 「空闲 / 已完成」的窗格收成一行：它们是窗格现状，不是任务。
+                （本来还想"超过 30 分钟没动静就不显示"，但 herdr 的 agent list 不给最后活动时间，
+                 拿不到就不假装有 —— 一律折叠，要看点开。） */}
+            {boardInactive.length > 0 ? (
+              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="「空闲 / 已完成」是窗格现状、不是任务，所以默认不占卡片位；点开只是看看"
+                  onClick={() => setInactiveOpen((v) => !v)}
+                >
+                  {inactiveOpen
+                    ? "收起不活跃的窗格"
+                    : `另有 ${boardInactive.length} 个不活跃的窗格`}
+                </button>
+              </div>
+            ) : null}
+            {boardVisible.length > 0 ? (
               <div className="ai-board">
-                {boardTasks.map((t, i) => {
+                {boardVisible.map((t, i) => {
                   // 会话日志只有"当前会话"这一份，所以就把它挂在第一张运行中的卡片上
-                  const snapIndex = boardTasks.findIndex((x) => x.state === "running");
+                  const snapIndex = boardVisible.findIndex((x) => x.state === "running");
                   const snap = i === snapIndex ? aiSnapshot : null;
                   const state = snap?.state ?? t.state;
                   // 进程还活着但这一轮说完了 ≠ 任务结束 —— 分开说，别让看板自相矛盾
@@ -7296,7 +7354,9 @@ export default function App() {
                       {/* 第二行只给"在哪台机器、哪个项目"；完整命令行放悬停提示 */}
                       <div className="ai-task-meta ellipsis">
                         {t.server}
-                        {project ? ` · ${project}` : ""}
+                        {/* 项目名跟服务器名一样时别重复一遍：远端窗格的 cwd 常常就是 /home/lz，
+                            目录名正好等于服务器名，卡片上就出现 `lz · lz · w1Q:p1`（用户报过的脏标签） */}
+                        {project && project !== t.server ? ` · ${project}` : ""}
                         {t.herdrPane ? ` · ${t.herdrPane}` : t.pane ? ` · ${t.pane}` : ""}
                         {linkedAny
                           ? ` · 已开在「${linkedAny.title}」${linkedControl ? "" : "（只读）"}`
@@ -7353,6 +7413,10 @@ export default function App() {
                           >
                             查看窗格
                           </button>
+                          {/* 「接管」只在"这确实是个活任务"或"已经开着标签"时才给。
+                              空闲 / 已完成摆两个看起来都能点的按钮，用户实测会以为"点了能过去"
+                              （其实切不过去）—— 那种卡只留「查看窗格」。 */}
+                          {(isActiveBoardTask(t) || linkedControl) && (
                           <button
                             type="button"
                             className="mini-btn"
@@ -7377,6 +7441,7 @@ export default function App() {
                           >
                             {linkedControl ? "切到标签" : "接管"}
                           </button>
+                          )}
                         </div>
                       ) : null}
                       {/* 这一轮产出的文件：点一下直接看（远端走应用内预览，本地用资源管理器） */}
@@ -7410,7 +7475,7 @@ export default function App() {
                   </div>
                 )}
               </div>
-            )}
+            ) : null}
 
             {/* ---------- AI 任务时间线（G-01）：落盘的历史，应用重启后还在 ---------- */}
             <div className="ai-section">
