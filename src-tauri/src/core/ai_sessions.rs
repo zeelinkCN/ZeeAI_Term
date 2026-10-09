@@ -851,15 +851,21 @@ pub struct RolloutOrigin {
 }
 
 impl RolloutOrigin {
-    /// 桌面客户端（桌面版 Codex / VS Code 扩展）自己写的日志：**不读**。
+    /// 桌面客户端（桌面版 Codex）自己写的日志：**不读**。
     ///
-    /// 依据是实测的真实日志头：`originator=Codex Desktop`、`source=vscode`；
-    /// 用户在自己终端里跑 codex 时 originator 是 `codex_cli_*` 这一类。
-    /// 读不到这两个字段（老版本日志）时按"不是桌面端"处理 —— 宁可显示，也不要静默消失。
+    /// 依据是实测的真实日志头：桌面端 `originator=Codex Desktop`；
+    /// 用户在自己终端里跑 codex 时是 `codex_cli_rs` / `codex-tui` 这一类。
+    ///
+    /// **判据以 `originator` 为主，`source` 只在 originator 缺失时兜底** —— 这是 2026-10-09
+    /// 在真机上踩到的：远端 CLI 的 rollout 里同样会出现 `source=vscode`（用户在 VS Code 的
+    /// **集成终端**里跑 codex CLI，v0.1.10 之前会把它当桌面端**误杀**）。
+    /// 老版本日志两个字段都没有时按"不是桌面端"处理 —— 宁可显示，也不要静默消失。
     pub fn is_desktop_client(&self) -> bool {
         let originator = self.originator.trim().to_ascii_lowercase();
-        let source = self.source.trim().to_ascii_lowercase();
-        originator.contains("desktop") || source.contains("vscode")
+        if !originator.is_empty() {
+            return originator.contains("desktop");
+        }
+        self.source.trim().to_ascii_lowercase().contains("vscode")
     }
 }
 
@@ -1118,6 +1124,24 @@ mod tests {
 
         let cli = parse_origin(&cli_head());
         assert!(!cli.is_desktop_client(), "终端里跑的 codex 不能被误杀");
+
+        // 真机踩到的回归（2026-10-09）：远端 CLI 的 rollout 里**也会**带 source=vscode
+        //（用户在 VS Code 的集成终端里跑 codex CLI）—— 只看 source 会把真任务误杀。
+        let vscode_terminal = parse_origin(
+            r#"{"type":"session_meta","payload":{"session_id":"v1","cwd":"/home/user","originator":"codex-tui","source":"vscode"}}"#,
+        );
+        assert!(
+            !vscode_terminal.is_desktop_client(),
+            "VS Code 集成终端里的 codex CLI 不能被误杀"
+        );
+        // 只有在 originator 缺失时，才拿 source 兜底
+        let no_originator = parse_origin(
+            r#"{"type":"session_meta","payload":{"session_id":"v2","cwd":"/home/user","source":"vscode"}}"#,
+        );
+        assert!(
+            no_originator.is_desktop_client(),
+            "originator 缺失时才用 source 兜底"
+        );
 
         // 老版本日志里没有这两个字段：按"不是桌面端"处理（宁可显示，也不要静默消失）
         let old = r#"{"type":"session_meta","payload":{"session_id":"o1","cwd":"/root/proj"}}"#;
