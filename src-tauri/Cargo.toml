@@ -1,6 +1,6 @@
 [package]
 name = "zeeai-terminal"
-version = "0.1.10"
+version = "0.1.11"
 description = "ZeeAI Terminal - Windows multi-protocol terminal workbench"
 authors = ["ZeeAI"]
 license = "GPL-3.0-or-later"

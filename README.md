@@ -46,11 +46,11 @@
 
 到 [**Releases**](https://github.com/zeelinkCN/ZeeAI_Term/releases/latest) 取最新版，四个产物任选一个：
 
-| 产物（当前 **0.1.10**） | 适合谁 | 体积 |
+| 产物（当前 **0.1.11**） | 适合谁 | 体积 |
 |---|---|---|
-| `ZeeAI_Term_0.1.10_x64-setup.exe` | 大多数人：双击安装，带开始菜单与卸载 | ~6 MB |
-| `ZeeAI_Term_0.1.10_x64_en-US.msi` | 需要走组策略 / 批量部署 | ~9 MB |
-| `ZeeAI_Term-0.1.10-portable.zip` | 不想安装：解压即用，**内含 platform-tools** | ~9 MB |
+| `ZeeAI_Term_0.1.11_x64-setup.exe` | 大多数人：双击安装，带开始菜单与卸载 | ~6 MB |
+| `ZeeAI_Term_0.1.11_x64_en-US.msi` | 需要走组策略 / 批量部署 | ~9 MB |
+| `ZeeAI_Term-0.1.11-portable.zip` | 不想安装：解压即用，**内含 platform-tools** | ~9 MB |
 | `ZeeAI_Term.exe` | 已经有安装目录，只想换主程序 | ~8 MB |
 
 > 便携版：解压后 `resources/` 目录**必须和 exe 放在一起**（ADB 在里面）。
@@ -83,7 +83,7 @@ npm run fe:smoke                     # 界面功能测试：无头 Edge 真点�
 ## 文档
 
 - [技术设计与里程碑](docs/design.md) · [决策与待确认事项](docs/decisions.md)
-- [发版说明](docs/release-notes-v0.1.10.md) —— 每版都写清改了什么、为什么、已知限制
+- [发版说明](docs/release-notes-v0.1.11.md) —— 每版都写清改了什么、为什么、已知限制
 - 实现日志：[herdr](docs/impl-log-2026-09-29-herdr.md) · [herdr 会话](docs/impl-log-2026-09-29-herdr-session.md) · [其它](docs/impl-log-2026-09-27.md)
 
 ## 许可证

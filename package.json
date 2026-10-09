@@ -1,7 +1,7 @@
 {
   "name": "zeeai-terminal",
   "private": true,
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "description": "Windows multi-protocol terminal workbench",
   "license": "GPL-3.0-or-later",
