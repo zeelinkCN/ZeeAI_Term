@@ -32,6 +32,15 @@ interface Props {
   highlightEnabled?: boolean;
   onHighlightEnabled?: (v: boolean) => void;
   onOpenHighlightRules?: () => void;
+  /**
+   * 作用范围=「全局默认」却被更具体的层盖住时给这一行：{ name: 真正生效的方案名, from: 谁定的 }。
+   * 没有它用户只会看到"改了没反应"。
+   */
+  overrideNote?: { name: string; from: string } | null;
+  onClearOverride?: () => void;
+  /** 列表顶部那一项「跟随全局」（只在"某一类终端"这档出现） */
+  followGlobal?: { active: boolean; name: string; palette: TermPalette };
+  onFollowGlobal?: () => void;
 }
 
 /** 16 色预览条：一眼看出这套配色长什么样 */
@@ -143,6 +152,10 @@ export default function TermThemeDialog({
   highlightEnabled,
   onHighlightEnabled,
   onOpenHighlightRules,
+  overrideNote,
+  onClearOverride,
+  followGlobal,
+  onFollowGlobal,
 }: Props) {
   // 自定义配色：从当前生效值起步（用户改到一半切走也不丢，因为每次都写进 settings）
   const [customDraft, setCustomDraft] = useState<TermPalette>(() =>
@@ -255,6 +268,21 @@ export default function TermThemeDialog({
           </div>
 
           <div className="tt-list">
+            {/* 「某一类终端」这档：给一项"跟随全局" —— 否则这里设过之后就再也撤不回去
+                （配色列表里只有具体方案，没有"回到全局"） */}
+            {followGlobal && (
+              <button
+                type="button"
+                className={"tt-item" + (followGlobal.active ? " active" : "")}
+                onClick={onFollowGlobal}
+              >
+                <span>
+                  <SwatchStrip palette={followGlobal.palette} />
+                </span>
+                <span className="tt-name">跟随全局（{followGlobal.name}）</span>
+                <span className="tt-kind">跟随</span>
+              </button>
+            )}
             {TERM_SCHEMES.map((s) => (
               <button
                 key={s.key}

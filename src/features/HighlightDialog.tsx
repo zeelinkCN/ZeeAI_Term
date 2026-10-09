@@ -216,10 +216,10 @@ export default function HighlightDialog({
           </label>
 
           <div className="hint" style={{ padding: "6px 0 10px" }}>
-            高亮只在**界面**上生效：日志文件仍然是原来的纯文本（落盘前就剥掉了颜色码）。
+            高亮只在界面上生效：日志文件仍然是原来的纯文本（落盘前就剥掉了颜色码）。
             <br />
-            改规则**只影响之后新到达的输出**，历史输出不会重新上色（留到 v2 用 decoration 做）。
-            不支持正则语法（写 <code>.*</code> 会把渲染拖死，v2 再加且会限量限长）。
+            改规则只影响之后新到达的输出，历史输出不会重新上色（留到 v2 用 decoration 做）。
+            不支持正则语法（会把渲染拖死，v2 再加且会限量限长）。
           </div>
 
           <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
