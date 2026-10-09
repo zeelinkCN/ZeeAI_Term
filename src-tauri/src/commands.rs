@@ -5,8 +5,9 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, ai_sessions, ai_tasks, elevate, git, herdr, highlight, pty, remote_fs, serial, sftp,
-    ssh, tmux, AiTaskRegistry, HerdrPaneRegistry, SessionEvent, SessionRegistry,
+    adb, ai, ai_sessions, ai_tasks, elevate, git, herdr, highlight, paste as paste_core, pty,
+    remote_fs, serial, sftp, ssh, tmux, AiTaskRegistry, HerdrPaneRegistry, SessionEvent,
+    SessionRegistry,
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
@@ -298,7 +299,15 @@ pub fn open_ssh(
         cfg.jump.as_deref(),
     );
     let program = ssh::ssh_exe();
-    let title = format!("{} · {}", profile.name, cfg.host);
+    // 用户**自己填了** tmux 会话名时，标题就用它。
+    //
+    // 以前这里一律写 `profile · host`，于是"我填了名字"的人看到标签和侧栏还是自动名
+    // （实测反馈），以为名字没生效。只有"显式命名"（mode = "name" 且真的解析出 tmux 会话）
+    // 才改；默认模式（模板自动命名）保持原样。
+    let title = match resolved_tmux.as_deref() {
+        Some(name) if mode == "name" => format!("{} · {}", profile.name, name),
+        _ => format!("{} · {}", profile.name, cfg.host),
+    };
 
     let handle = pty::spawn(
         &id,
@@ -1893,6 +1902,40 @@ pub async fn fs_mkdir(
     log::info!("ipc: fs_mkdir path={path}");
     let conn = sftp_for(&profile_id, user_override).await?;
     sftp::mkdir(&conn, &path).await
+}
+
+/// 把前端从**剪贴板 / 拖拽**拿到的文件落到本地临时文件，返回绝对路径。
+///
+/// 为什么要绕这一下：WebView 的 `paste` 事件能直接拿到文件字节（资源管理器里复制的文件、
+/// 别的截图工具塞进剪贴板的位图，Chromium 都当 file 给出来），而上传送给已有的 `fs_upload`，
+/// 它要的是**本地路径** —— 中间只差这一步落盘。见 core/paste.rs 的说明。
+#[tauri::command]
+pub fn paste_save_file(name: String, data_b64: String) -> Result<String, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .map_err(|e| format!("内容不是合法的 base64：{e}"))?;
+    let path = paste_core::save(&name, &bytes)?;
+    log::info!("ipc: paste_save_file -> {path}（{} 字节）", bytes.len());
+    Ok(path)
+}
+
+/// 上传成功后把本地临时文件删掉（只认粘贴临时目录里的路径，见 core/paste.rs）
+#[tauri::command]
+pub fn paste_discard_file(path: String) -> Result<(), String> {
+    paste_core::discard(&path)
+}
+
+/// 把用户选中的本地文件收进粘贴临时目录，返回新路径（上传/预览/清理都只认这一个目录）
+#[tauri::command]
+pub fn paste_adopt_file(path: String) -> Result<String, String> {
+    paste_core::adopt(&path)
+}
+
+/// 读粘贴进来的文件做**预览**（base64）。只认粘贴临时目录、最多 4MB。
+#[tauri::command]
+pub fn paste_read_thumb(path: String) -> Result<String, String> {
+    let bytes = paste_core::read_thumb(&path)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 #[tauri::command]

@@ -293,6 +293,31 @@ pub struct Settings {
     pub ai_notify_needs_you: bool,
     /// 产物范围：true = 任何新文件都算"有产物"；false = 只算 HTML / Markdown 文档（默认）
     pub ai_notify_all_artifacts: bool,
+    /// 粘贴/拖进来的图片、文件在**远端**落到哪个目录（前端解析成绝对路径后再传上来）。
+    ///
+    /// 默认 `~/.zeeai/paste`：不往用户的项目目录里丢东西。
+    /// 填 `.` 表示"跟随终端当前目录"（落进项目里，对 CLI agent 的沙箱最友好）。
+    pub paste_dir: String,
+    /// 哪个键负责粘贴：`ctrl-v` / `shift-insert` / `both`（默认）。
+    ///
+    /// 为什么这是个"二选一"而不是"开关"：两个键在 Windows 下都能直接触发浏览器的粘贴
+    ///（不需要读剪贴板权限）。所以设置的意思是"**哪个键留给终端**" —— 没被选中的那个会
+    /// 原样送给远端：Ctrl+V 送 `^V`（readline 的 quoted-insert、vim 的块选择），
+    /// Shift+Insert 送 Insert 键。终端老手要的就是这个。
+    pub paste_key: String,
+    /// 终端里点**右键**做什么：`menu` = 弹菜单（默认）；`paste` = 直接粘贴文本。
+    ///
+    /// `paste` 模式下 Shift+右键仍然弹菜单（PuTTY 的习惯）。直接粘贴读的是剪贴板**文本**，
+    /// 万一被系统拒绝会自动退回弹菜单并给一句提示（图片仍然靠 Ctrl+V / Shift+Insert）。
+    pub right_click: String,
+    /// 怎么复制：`ctrl-shift-c`（默认）/ `ctrl-c-smart`（有选中就复制，没选中发 SIGINT）/
+    /// `select`（选中即复制，不用按键）。
+    pub copy_key: String,
+    /// **直接粘进终端**（不经过输入窗）上传完成后，弹一个几秒的缩略图预览。
+    ///
+    /// 默认开：那样"我粘对了没有"不用靠猜 —— 粘贴的语义就是"现在就发"，
+    /// 发错了得能立刻看出来。走输入窗时不需要它（那边附件是常驻缩略图）。
+    pub paste_toast: bool,
 }
 
 impl Default for Settings {
@@ -336,6 +361,16 @@ impl Default for Settings {
             ai_notify_docs: true,
             ai_notify_needs_you: true,
             ai_notify_all_artifacts: false,
+            // 粘贴/拖进来的图片、文件在远端的落地目录（不往项目里丢东西；填 "." 可改成跟随当前目录）
+            paste_dir: "~/.zeeai/paste".into(),
+            // 终端交互的三个习惯项：默认跟大多数人一样（Ctrl+V 与 Shift+Insert 都能粘、
+            // 右键弹菜单、Ctrl+Shift+C 复制）
+            paste_key: "both".into(),
+            right_click: "menu".into(),
+            copy_key: "ctrl-shift-c".into(),
+            // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
+            // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
+            paste_toast: false,
         }
     }
 }

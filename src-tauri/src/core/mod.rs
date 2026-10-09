@@ -9,6 +9,7 @@ pub mod herdr;
 pub mod herdr_stream;
 pub mod highlight;
 pub mod job;
+pub mod paste;
 pub mod pty;
 pub mod remote_fs;
 pub mod secret;
