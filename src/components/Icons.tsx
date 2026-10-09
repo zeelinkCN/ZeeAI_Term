@@ -40,6 +40,35 @@ export const IconLogoRadio = ({ size = 18, className }: IconProps) => (
   </svg>
 );
 
+/**
+ * 两条**堆叠向上**的箭头（展开底部的 AI 输入窗）。
+ *
+ * 为什么要专门画：用户明确要"像书名号《那样两条叠着、**看得出是两支**"——
+ * 直接用字符 `︽` 会随字体回退忽大忽小、基线也会飘；自己画则跟其它图标同规格。
+ * 几何：每条 V 形跨度 14 单位（24 单位画布），两条的斜边**平行且相距约 4.5 单位**，
+ * 所以缩到 16px 也是清清楚楚两条，不会糊成一坨。
+ */
+export const IconChevronsUp = ({ size = 16, className }: IconProps) =>
+  base(
+    <>
+      <path d="M5 10.5 L12 4.2 L19 10.5" />
+      <path d="M5 20 L12 13.7 L19 20" />
+    </>,
+    size,
+    className,
+  );
+
+/** 同上，方向朝下（输入窗展开后用它收起） */
+export const IconChevronsDown = ({ size = 16, className }: IconProps) =>
+  base(
+    <>
+      <path d="M5 13.5 L12 19.8 L19 13.5" />
+      <path d="M5 4 L12 10.3 L19 4" />
+    </>,
+    size,
+    className,
+  );
+
 function base(paths: React.ReactNode, size: number, className?: string) {
   return (
     <svg

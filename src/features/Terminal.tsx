@@ -59,6 +59,26 @@ interface Props {
   herdrPane?: { paneId: string; mode?: "observe" | "control" };
   /** 输入通道还没建好/断了时，让上层去建（同一个会话只会建一次） */
   onHerdrInputNeeded?: () => void;
+  /**
+   * 终端里按 Ctrl+V 时，剪贴板里是**文件**（图片 / 从资源管理器复制的文件）就走这里。
+   *
+   * 为什么要抢在 xterm 前面：这两种在浏览器里都表现为 file（截图工具塞进剪贴板的位图是
+   * CF_DIB，复制的文件是 CF_HDROP），xterm 只会把它们当"没有文本"而什么都不做 ——
+   * 上层拿到字节后会上传到远端、再把远端路径插进输入行，等于给 CLI agent"贴了张图"。
+   * **纯文本粘贴一律不拦截**（照旧走 xterm 自己那套）。
+   */
+  onPasteFiles?: (files: { name: string; bytes: Uint8Array }[]) => void;
+  /**
+   * 哪个键负责粘贴：`both`（默认）/ `ctrl-v` / `shift-insert`。
+   *
+   * **没被选中的那个键留给远端**：`ctrl-v` 模式下按 Ctrl+V 会送 `^V`（readline 的
+   * quoted-insert、vim 的块选择），`shift-insert` 模式下按 Shift+Insert 会送 Insert 键。
+   */
+  pasteKey?: string;
+  /** 终端里点右键：`menu`（默认）/ `paste`（直接粘贴文本；Shift+右键仍弹菜单） */
+  rightClick?: string;
+  /** 复制方式：`ctrl-shift-c`（默认）/ `ctrl-c-smart` / `select`（选中即复制） */
+  copyKey?: string;
 }
 
 /** 从 OSC 7 的内容里取出路径：file://host/path 或 file:///path */
@@ -248,6 +268,10 @@ export default function TerminalView({
   highlightRules,
   herdrPane,
   onHerdrInputNeeded,
+  onPasteFiles,
+  pasteKey = "both",
+  rightClick = "menu",
+  copyKey = "ctrl-shift-c",
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -281,6 +305,16 @@ export default function TerminalView({
   herdrPaneRef.current = herdrPane;
   const needHerdrInputRef = useRef<Props["onHerdrInputNeeded"]>(onHerdrInputNeeded);
   needHerdrInputRef.current = onHerdrInputNeeded;
+  // 粘贴进来的文件（图片/复制的文件）交给上层去上传 + 插路径；同样用 ref 存
+  const onPasteFilesRef = useRef<Props["onPasteFiles"]>(onPasteFiles);
+  onPasteFilesRef.current = onPasteFiles;
+  // 三个"终端习惯"设置：只在事件发生时读，所以放 ref（改了立刻生效，不用重建终端）
+  const pasteKeyRef = useRef(pasteKey);
+  pasteKeyRef.current = pasteKey;
+  const rightClickRef = useRef(rightClick);
+  rightClickRef.current = rightClick;
+  const copyKeyRef = useRef(copyKey);
+  copyKeyRef.current = copyKey;
   /**
    * 可写 herdr 流的输入通道是否已经断了。
    *
@@ -427,7 +461,7 @@ export default function TerminalView({
       // 元素还没布局好（首帧常常是 0 宽或几十像素）时不要 fit：
       // 这时候算出来的列数会非常离谱，一旦按它去 resize，远端会真的按那个宽度重排、
       // 本地也会按那个宽度换行 —— 用户看到的就是"启动时几个提示符折叠在一起"
-      //（用户截图里那段 `[lz@iZbp13 / lx01nj91v3 / 7nkv2uZ ~]` 就是这么来的）。
+      //（用户截图里那段 `[user@host ~]` 就是这么来的）。
       const box = hostRef.current;
       if (!box || box.clientWidth < MIN_FIT_W || box.clientHeight < MIN_FIT_H) return;
       try {
@@ -453,6 +487,109 @@ export default function TerminalView({
       if (hl.active) hl.push(bytes);
       else term.write(bytes);
     });
+
+    /**
+     * 输入通道：上层（AI 输入窗）要往这条终端"打字"时走它。
+     *
+     * 为什么用 `term.paste()` 而不是直接 `session_write`：xterm 知道**远端有没有开
+     * bracketed paste**（TUI 靠它区分"粘贴了一整段多行文本"和"你连按了三次回车"），
+     * 走 paste 才会带上正确的转义序列 —— 否则多行提示词会被 codex / claude 的界面
+     * 当成多次提交，一条消息被拆成几轮。
+     */
+    bus.attachInput(sessionId, (text, submit) => {
+      try {
+        term.paste(text);
+      } catch {
+        // 老版本 xterm 没有 paste()：退回原样写（至少内容能进去）
+        term.input(text);
+      }
+      if (submit) term.input("\r");
+      // **不要把焦点抢到终端来**：从 AI 输入窗发完一条，用户多半还要接着写第二条 ——
+      // 焦点留在输入框里（用户明确要求；要回终端自己点一下）。
+    });
+
+    /**
+     * 剪贴板里是**文件**时（图片 / 从资源管理器复制的文件），抢在 xterm 前面接住：
+     * 这种粘贴在浏览器里表现为 `clipboardData.files`，xterm 只会当"没有文本"而什么都不做。
+     * 纯文本**一律不碰**（不 preventDefault），照旧走 xterm 自己的粘贴。
+     */
+    const onPaste = (e: ClipboardEvent) => {
+      const files = Array.from(e.clipboardData?.files ?? []);
+      if (!files.length) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void (async () => {
+        const out: { name: string; bytes: Uint8Array }[] = [];
+        for (const f of files) {
+          try {
+            out.push({ name: f.name || "paste.png", bytes: new Uint8Array(await f.arrayBuffer()) });
+          } catch {
+            /* 单个读失败就跳过，别把整次粘贴搞没 */
+          }
+        }
+        if (out.length) onPasteFilesRef.current?.(out);
+      })();
+    };
+    host.addEventListener("paste", onPaste, true);
+
+    /**
+     * 终端的键盘习惯（两个设置项）—— 走 xterm 自己的钩子，而不是在 window 上抢事件：
+     * 这个回调返回 false 表示"这条按键不归 xterm 管"，所以不会**同时又发一遍**给远端。
+     *
+     * - **粘贴键**：没被选中的那个返回 true，让 xterm 按它的映射送出去
+     *   （Ctrl+V → `^V`，Shift+Insert → `\x1b[2~`）—— 终端老手要的就是这个；
+     *   被选中的那个返回 false，把按键**让给浏览器**（它的默认动作就是粘贴，
+     *   连图片都能粘；自己实现就得读剪贴板，那要权限）。
+     * - **复制键**：Ctrl+Shift+C 三种口径下都复制；`ctrl-c-smart` 只在没有选中时
+     *   才把 Ctrl+C 交给远端（留作 SIGINT）。
+     */
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const ctrlOnly = e.ctrlKey && !e.altKey && !e.metaKey;
+      const key = e.key.toLowerCase();
+      if (ctrlOnly && !e.shiftKey && key === "v") {
+        const paste = pasteKeyRef.current;
+        return !(paste === "both" || paste === "ctrl-v");
+      }
+      if (e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Insert") {
+        const paste = pasteKeyRef.current;
+        return !(paste === "both" || paste === "shift-insert");
+      }
+      if (ctrlOnly && e.shiftKey && key === "c") {
+        void copySelection();
+        return false;
+      }
+      if (ctrlOnly && !e.shiftKey && key === "c" && copyKeyRef.current === "ctrl-c-smart") {
+        if (term.getSelection()) {
+          void copySelection();
+          return false;
+        }
+      }
+      return true;
+    });
+
+    /**
+     * 「选中即复制」（copyKey = select）：选中一变就写剪贴板。
+     * 去抖 + 去重：拖选过程中会连续触发，没必要每动一下就写一次。
+     */
+    let lastAutoCopied = "";
+    let selTimer: number | null = null;
+    const selSub = term.onSelectionChange(() => {
+      if (copyKeyRef.current !== "select") return;
+      const text = term.getSelection();
+      if (!text || text === lastAutoCopied) return;
+      if (selTimer !== null) window.clearTimeout(selTimer);
+      selTimer = window.setTimeout(() => {
+        selTimer = null;
+        const now = term.getSelection();
+        if (!now || now === lastAutoCopied) return;
+        lastAutoCopied = now;
+        void navigator.clipboard
+          .writeText(now)
+          .catch(() => onNotice?.("自动复制失败（剪贴板被拒）：选中后按 Ctrl+Shift+C"));
+      }, 120);
+    });
+
     const sub = term.onData((data) => {
       const pane = herdrPaneRef.current;
       if (pane) {
@@ -460,6 +597,21 @@ export default function TerminalView({
         // 直接把原始字节交上去（回车之类都由 herdr 那边按终端语义处理）
         if (pane.mode === "control") {
           if (herdrInputDeadRef.current) return; // 通道已断：不再逐键重试/报错
+          // **粘贴不能走 A 通道**：真机实测（2026-10-09）A 通道会把 bracketed paste 的结尾标记
+          // `\x1b[201~` 吃掉、并把换行当成逐个回车 —— 多行粘贴会被拆成好几条命令，
+          // TUI 还可能停在"没结束的粘贴"。B 通道（`pane send-text`）逐字节透明，所以：
+          // 凡是"像粘贴"的一律改走 B 通道，并补上 bracketed paste 的包裹。
+          const looksLikePaste = data.startsWith("\x1b[200~") || data.includes("\n");
+          if (looksLikePaste) {
+            const payload = data.startsWith("\x1b[200~")
+              ? data
+              : `\x1b[200~${data}\x1b[201~`;
+            void herdrPaneType(sessionId, payload).catch(() => {
+              herdrInputDeadRef.current = true;
+              onNotice?.("这个窗格的输入送不出去了（可能已被别的客户端接管，或窗格已关闭）");
+            });
+            return;
+          }
           void herdrPaneInput(sessionId, bytesToB64(new TextEncoder().encode(data))).catch(
             () => {
               herdrInputDeadRef.current = true;
@@ -528,10 +680,14 @@ export default function TerminalView({
       for (const t of timers) window.clearTimeout(t);
       ro.disconnect();
       host.removeEventListener("wheel", onWheel, { capture: true });
+      host.removeEventListener("paste", onPaste, true);
+      if (selTimer !== null) window.clearTimeout(selTimer);
+      selSub.dispose();
       sub.dispose();
       osc7.dispose();
       osc133.dispose();
       bus.detach(sessionId);
+      bus.detachInput(sessionId);
       hl.dispose();
       hlRef.current = null;
       webglRef.current = null;
@@ -645,14 +801,34 @@ export default function TerminalView({
     }
   }
 
-  async function pasteClipboard() {
+  /**
+   * 读剪贴板**文本**写进会话。返回 false 表示被系统拒绝（调用方可以退回弹菜单）。
+   *
+   * 注意：这条路只拿得到文本；图片仍然靠 Ctrl+V / Shift+Insert 那条浏览器原生的粘贴
+   *（它不需要权限，而且能带文件）。
+   */
+  async function pasteClipboard(): Promise<boolean> {
     try {
       const text = await navigator.clipboard.readText();
-      if (!text) return;
+      if (!text) return true; // 剪贴板空着（或只有图片）：没什么可粘的，但不算失败
+      const pane = herdrPaneRef.current;
+      if (pane) {
+        // herdr 窗格没有"本地 PTY"可写；而且粘贴必须走 B 通道（原因见上面 onData 里那段实测说明）
+        if (pane.mode !== "control") {
+          onNotice?.("这是只读观察窗，发不了字：先在卡片上点「接管」再发");
+          return false;
+        }
+        void herdrPaneType(sessionId, `\x1b[200~${text}\x1b[201~`).catch(() =>
+          needHerdrInputRef.current?.(),
+        );
+        return true;
+      }
       void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(text)));
+      return true;
     } catch {
       // 剪贴板读取被拒绝时，告诉用户用 Ctrl+V（xterm 自己处理粘贴，不需要权限）
-      onNotice?.("读取剪贴板被拒绝，请用 Ctrl+V 粘贴");
+      onNotice?.("读取剪贴板被拒绝：用 Ctrl+V / Shift+Insert 粘贴（那条路不需要权限）");
+      return false;
     }
   }
 
@@ -663,6 +839,15 @@ export default function TerminalView({
         ref={hostRef}
         onContextMenu={(e) => {
           e.preventDefault();
+          // 右键行为可配：`paste` = 直接把剪贴板文本粘进去（PuTTY 那套习惯）。
+          // Shift+右键**始终**弹菜单（想用菜单时不用改设置）；
+          // 剪贴板读不出来（被系统拒绝）也退回弹菜单，不吞掉用户这一下。
+          if (rightClickRef.current === "paste" && !e.shiftKey) {
+            void pasteClipboard().then((ok) => {
+              if (!ok) setMenu({ x: e.clientX, y: e.clientY });
+            });
+            return;
+          }
           setMenu({ x: e.clientX, y: e.clientY });
         }}
       />

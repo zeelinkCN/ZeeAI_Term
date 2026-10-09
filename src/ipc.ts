@@ -535,6 +535,39 @@ export async function fsMkdir(
   return invoke("fs_mkdir", { profileId, path, userOverride: userOverride ?? null });
 }
 
+/**
+ * 把从剪贴板 / 拖拽拿到的文件落到本地临时文件，返回**绝对路径**（随后交给 fsUpload）。
+ *
+ * 为什么要绕这一下：WebView 的 paste 事件能直接拿到文件字节，而上传走的是 fs_upload，
+ * 它要本地路径 —— 中间只差这一步落盘。后端会把文件名洗干净（空格/引号换成 `_`，中文保留）。
+ */
+export async function pasteSaveFile(name: string, dataB64: string): Promise<string> {
+  return invoke<string>("paste_save_file", { name, dataB64 });
+}
+
+/**
+ * 把用户**选中 / 拖进来**的本地文件收进粘贴临时目录（带时间戳改名），返回新路径。
+ *
+ * 为什么所有附件都要"收进一个目录"：上传、缩略图预览、用完清理这三件事就只认一个目录，
+ * 守卫写一次就够；也不用给应用开"读任意路径"的权限。
+ */
+export async function pasteAdoptFile(path: string): Promise<string> {
+  return invoke<string>("paste_adopt_file", { path });
+}
+
+/**
+ * 读一张预览图（base64）。只认粘贴临时目录、最多 4MB（缩略图不需要原图）。
+ * 拿不到就静默降级成"没有预览"，不要打扰用户。
+ */
+export async function pasteReadThumb(path: string): Promise<string> {
+  return invoke<string>("paste_read_thumb", { path });
+}
+
+/** 删掉粘贴临时文件（上传成功后清理，或用户移除附件时）。只认那个临时目录。 */
+export async function pasteDiscardFile(path: string): Promise<void> {
+  return invoke("paste_discard_file", { path });
+}
+
 export async function fsRemove(
   profileId: string,
   path: string,

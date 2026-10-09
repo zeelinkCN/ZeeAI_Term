@@ -34,6 +34,10 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
+  /* 应用得自己画"底"：以前 .app 没有 background，窗口的底一直是 body 上写死的
+     #1e1e1e 在画 —— 于是切浅色主题时只有部分面板变浅，**缝隙/边角永远是深色**
+     （实测 appBg=rgba(0,0,0,0)、bodyBg=rgb(30,30,30)），看起来就像"主题没生效"。 */
+  background: var(--bg);
   /* 没有显式写 color 的文字一律跟主题走。以前没有这一条，于是它们继承 body 上写死的
      #cccccc —— 浅色主题下就是"浅底浅字"（设置对话框那个标题「设置」几乎看不见，
      是浅色主题下对比度审计揪出来的）。 */
@@ -614,6 +618,13 @@ body {
   color: var(--muted);
 }
 
+/* 设置在对话框里时，分组标题要和控件左边缘对齐（控件是 14px，默认 12px 会差 2px，
+   看着就像"标题没对齐"）。 */
+.modal-body .tree-group {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
 /* ---------- 侧栏「服务器」区标题行：标题 + 两个看得见的按钮 ---------- */
 .side-head-row {
   display: flex;
@@ -988,7 +999,8 @@ body {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background: var(--bg);
+  /* 同 .pane：分屏时每个格子的底色也跟自己的终端配色走（App.tsx 写 --term-bg） */
+  background: var(--term-bg, var(--bg));
   border: 2px solid transparent;
 }
 
@@ -1961,7 +1973,7 @@ body {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 5px 14px;
+  padding: 7px 14px;
   font-size: 12.5px;
   color: var(--fg);
   cursor: pointer;
@@ -2150,7 +2162,7 @@ body {
 
 .modal-field {
   display: block;
-  padding: 2px 14px 10px;
+  padding: 2px 14px 12px;
   font-size: 12px;
   color: var(--muted);
 }
@@ -2478,7 +2490,16 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 10px 12px;
   color: var(--muted);
   font-size: 12px;
-  line-height: 1.7;
+  line-height: 1.6;
+}
+
+/* 设置项里的提示（藏在 label 里的那句小字）。
+   以前它是 inline 的 span，inline 元素的 padding-top 根本不产生间距 —— 所以"控件和提示
+   挤在一起"是必然的。这里统一改成块级 + 与控件留 4px。 */
+.modal-field > .hint {
+  display: block;
+  margin-top: 4px;
+  padding: 0;
 }
 
 .local-module {
@@ -2938,18 +2959,31 @@ input[type="range"]::-webkit-slider-thumb {
   position: relative;
   flex: 1;
   min-height: 0;
-  background: #181818;
+  /* 终端画布底色跟**终端配色**走（不是界面主题）：App.tsx 会给 .pane / .pane-cell
+     写 --term-bg（分屏时每个格子用自己的配色）。写死深色的话，选了浅色终端配色，
+     终端四周那圈 padding 仍然是黑的，看着像"配色没生效"。
+     **没有会话时**（空状态那块）没有"终端配色"可言，就退回界面主题的底色 ——
+     否则浅色主题下会留一大块黑（实测：空状态区域一片深色）。 */
+  background: var(--term-bg, var(--bg));
 }
 
 .term-wrap {
   position: absolute;
   inset: 0;
   padding: 6px 8px;
+  /* herdr 会话在终端上方还有一条状态条（.herdr-bar）。这里必须用 flex 把这块高度**分**给
+     两者，并且禁止溢出 —— 否则 .terminal-host 的 height:100% 是按"整个框"算的，
+     多出来的那一条会**画到下面的输入窗上**（用户截图：终端最后一行被输入窗细栏盖住）。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .terminal-host {
   width: 100%;
-  height: 100%;
+  /* 不写 height: 100%：那会忽略同一层里 .herdr-bar 占掉的高度，终端底部被裁掉一行 */
+  flex: 1;
+  min-height: 0;
 }
 
 .empty {
@@ -3080,3 +3114,175 @@ input[type="range"]::-webkit-slider-thumb {
 .tree-item.srv-node:hover {
   background: rgba(55, 148, 255, 0.22);
 }
+
+/* ---------- AI 输入窗（状态栏「✍ 发给 AI」拉出来的那个） ----------
+   颜色全部走主题变量 —— 浅色主题下也得正常（这是 0.1.10 那轮踩过的坑：
+   控件底色写死深灰，浅色下就成了"深底深字"）。 */
+.composer {
+  flex: none; /* 贴在 main 底部、状态栏上方 */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+}
+
+.composer-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.composer-input {
+  width: 100%;
+  min-height: 72px;
+  max-height: 40vh;
+  resize: vertical; /* 想写长一点就自己往下拉 */
+  padding: 6px 8px;
+  background: var(--field-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  outline: none;
+}
+
+.composer-input:focus {
+  border-color: var(--accent);
+}
+
+.composer-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 280px;
+  padding: 1px 2px 1px 8px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---------- 收起时那条细栏（默认状态：只占 26px，终端照旧随便用） ---------- */
+.composer.collapsed {
+  padding: 0;
+  gap: 0;
+}
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.composer-bar:hover {
+  background: var(--hover);
+}
+
+/* ---------- 附件缩略图卡片：粘完先看一眼"是不是这张" ---------- */
+.composer-card {
+  position: relative;
+  width: 128px;
+  padding: 4px;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.composer-thumb {
+  display: block;
+  width: 118px;
+  height: 78px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--panel-2);
+}
+
+/* 非图片（.md / .txt / .zip…）：没有预览就放个图标，别显示裂图 */
+.composer-thumb-file {
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+}
+
+.composer-card-name {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.composer-card-x {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  padding: 0 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* ---------- 「刚粘进去什么」的浮层：几秒后自己消失 ---------- */
+.paste-card {
+  position: fixed; /* 固定贴窗口右下角：不受任何祖先定位影响 */
+  right: 14px;
+  /* 62px：让开状态栏（~28px）+ 收起态的细栏（26px），不然会压在细栏上 */
+  bottom: 62px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 420px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.paste-card-thumb {
+  width: 96px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.paste-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--fg);
+}
+

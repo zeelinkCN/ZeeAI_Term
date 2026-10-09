@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
@@ -87,6 +89,10 @@ import {
   sessionLogDir,
   openInExplorer,
   openExternalUrl,
+  pasteAdoptFile,
+  pasteDiscardFile,
+  pasteReadThumb,
+  pasteSaveFile,
   updateDownloadInstall,
   updateInstallKind,
   updateTakeResult,
@@ -141,6 +147,8 @@ import {
   IconAndroid,
   IconChevronDown,
   IconChevronRight,
+  IconChevronsDown,
+  IconChevronsUp,
   IconClose,
   IconCmd,
   IconFile,
@@ -546,16 +554,25 @@ function highlightRulesFor(
 /**
  * 某个会话该用哪套终端配色（16 色）：
  * 这台服务器/设备独立设过 → 用它自己的；否则用"该终端类型"那一档 → 全局那套。
+ *
+ * `from` 是**这套值是从哪一层来的**，给界面用：用户改"全局默认"却被上层盖住时，
+ * 必须能看见"现在真正生效的是谁、谁定的"（否则就是"改了没反应"的困惑，实测踩过）。
  */
 function termSchemeFor(
   settings: AppSettings,
   profile: ConnectionProfile | undefined,
   terminalKind?: string,
-): { key: string; custom?: string } {
+): { key: string; custom?: string; from: "profile" | "kind" | "global" } {
   const byKind = terminalKind ? settings.termSchemeByKind?.[terminalKind] : "";
-  const key = (profile?.termScheme || byKind || settings.termScheme || "").trim();
+  const own = (profile?.termScheme ?? "").trim();
+  const from: "profile" | "kind" | "global" = own
+    ? "profile"
+    : (byKind ?? "").trim()
+      ? "kind"
+      : "global";
+  const key = (own || byKind || settings.termScheme || "").trim();
   const custom = profile?.termSchemeCustom ?? settings.termSchemeCustom;
-  return { key: key || settings.termScheme, custom };
+  return { key: key || settings.termScheme, custom, from };
 }
 
 /** 直接算出某个会话该用的 16 色配色 */
@@ -607,6 +624,8 @@ const SETTINGS_TABS: { key: string; label: string }[] = [
   { key: "look", label: "外观" },
   { key: "term", label: "终端与会话" },
   { key: "log", label: "会话日志" },
+  // 应用级行为（启动恢复会话 / 关闭窗口时）—— 跟"终端怎么跑"是两件事，单独一页
+  { key: "app", label: "应用" },
   { key: "notify", label: "通知" },
   { key: "update", label: "更新与关于" },
 ];
@@ -689,9 +708,20 @@ const DEFAULT_SETTINGS: AppSettings = {
   aiNotifyDocs: true,
   aiNotifyNeedsYou: true,
   aiNotifyAllArtifacts: false,
+  // 粘贴/拖进来的图片、文件在远端落到哪个目录；`.` = 跟随终端当前目录
+  pasteDir: "~/.zeeai/paste",
+  // 终端的三个习惯项（和后端 store.rs 的默认值保持一致）：
+  // 两个键都能粘、右键弹菜单、Ctrl+Shift+C 复制 —— 跟大多数人预期一致
+  pasteKey: "both",
+  rightClick: "menu",
+  copyKey: "ctrl-shift-c",
+  // 直接粘进终端（不经过输入窗）时是否给一眼缩略图。
+  // **默认关**：用户明确要求"图片上传/粘贴不要在右下角弹消息"——要确认粘对了没有，
+  // 看输入行里那串路径就够了（想开的人可以在设置里打开）。
+  pasteToast: false,
 };
 
-const APP_VERSION = "0.1.10";
+const APP_VERSION = "0.1.11";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
@@ -1077,6 +1107,59 @@ export default function App() {
    * （core/herdr.rs 的 HerdrAgent 里没有这类字段），拿不到就不假装有：一律折叠，要点开才看。
    */
   const [inactiveOpen, setInactiveOpen] = useState(false);
+  /**
+   * AI 输入窗（状态栏「✍ 发给 AI」拉出来的那个）：多行编辑 + 附件。
+   *
+   * 为什么要有它：在 TUI 里敲长提示词很难受（不能点鼠标改、粘多行还容易被当成连按回车）。
+   * 这里编辑好，发送时走 `bus.sendInput` → `term.paste()`（自动带 bracketed paste），
+   * 多行提示词才会被 codex / claude 当成**一条**消息。
+   */
+  /**
+   * 输入窗是否**展开**。默认收起 —— 收起时终端最下面只留一条细栏（点它展开）。
+   * 终端才是主角，输入窗是"要用时才拿出来的工具"。
+   */
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerText, setComposerText] = useState("");
+  /**
+   * 已上传的附件：显示名 + 远端绝对路径（发送时把路径拼进正文）
+   * + 本地临时路径（用完删）+ 缩略图 data URL（只用于"发送前确认粘对了没有"）。
+   */
+  const [composerFiles, setComposerFiles] = useState<
+    { name: string; local: string; remote: string; thumb?: string; size?: number }[]
+  >([]);
+  const [composerBusy, setComposerBusy] = useState(false);
+
+  /**
+   * Ctrl+Alt+A：展开 / 收起底部的 AI 输入窗（键盘党的入口）。
+   * 用捕获阶段 + preventDefault：免得这个组合键被别处（终端/浏览器）先吃掉。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.altKey || e.key.toLowerCase() !== "a") return;
+      e.preventDefault();
+      setComposerOpen((v) => !v);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+  /**
+   * 「直接粘进终端」时的缩略图浮层（几秒后自己消失）。
+   *
+   * 为什么不走输入窗就不给预览：那条路是"粘完就发"，用户没有任何别的地方能确认粘对没有 ——
+   * 一张图比一行日志有用得多。这个设置（pasteToast）现在管的是"在终端区直接粘图片走哪条路"：
+   * 不勾 = 放进输入窗（默认，能确认能补话）；勾上 = 插路径进终端 + 弹这张浮层。
+   */
+  const [pasteCard, setPasteCard] = useState<{
+    thumb?: string;
+    name: string;
+    remote: string;
+  } | null>(null);
+  const pasteCardTimer = useRef<number | null>(null);
+  /**
+   * 当前会话的 ref：原生拖拽回调只订阅一次，但每次都要发给**当时**那个会话。
+   * （在 activeSession 算出来之后赋值，见下面的 `activeSessionRef.current = activeSession`）
+   */
+  const activeSessionRef = useRef<OpenSession | null>(null);
   const [updateMsg, setUpdateMsg] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   /** 检查到新版本时记下可下载的产物，设置面板里会给出「立即下载」按钮 */
@@ -2727,6 +2810,22 @@ export default function App() {
   }, []);
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
+  // 拖拽回调只订阅一次，所以"当前会话"要放进 ref（见下面的 onDragDropEvent）
+  activeSessionRef.current = activeSession;
+  /**
+   * 终端画布的底色 —— 跟**终端配色**（那个 16 色板）走，而不是界面主题。
+   *
+   * 为什么要有：`.pane` / `.pane-cell` 以前写死深色，于是用户把"终端配色"选成浅色时，
+   * 终端四周那圈 padding 仍然是黑的，看着像"配色没生效"。分屏时每个格子用自己的会话配色。
+   */
+  const termBgOf = (s: OpenSession | null | undefined) =>
+    s
+      ? termPaletteFor(
+          settings,
+          profiles.find((p) => p.id === s.profileId),
+          kindOfSession(s.kind),
+        ).background
+      : undefined;
   // 看板卡片分两拨：「正在跑 / 等你处理」占卡片位；「空闲 / 已完成」默认收成一行
   //（见 isActiveBoardTask 的说明）。展开时按原顺序全显示。
   const boardActive = boardTasks.filter(isActiveBoardTask);
@@ -2880,6 +2979,362 @@ export default function App() {
         : "info";
     setStatusMsg({ text, at: Date.now(), kind });
   }
+
+  // ---------- 给 AI 发文件 / 发消息（粘贴、拖拽、「✍ 发给 AI」输入窗共用这一套） ----------
+
+  /** 粘贴文件的落盘名：`paste-20261009-213045-原名`（本地时间，一眼看得出先后，且不撞名） */
+  function pasteName(name: string): string {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(
+      d.getMinutes(),
+    )}${p(d.getSeconds())}`;
+    const suffix = (name || "paste.png").replace(/[\\/]/g, "_");
+    return `paste-${ts}-${suffix}`;
+  }
+
+  /** 路径最后一段（本地是 `\`、远端是 `/`，两种都要切） */
+  function baseName(p: string): string {
+    const parts = p.split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+  }
+
+  /** Windows 路径 → WSL 路径：`C:\a\b.png` → `/mnt/c/a/b.png` */
+  function toWslPath(p: string): string {
+    const m = /^([a-zA-Z]):[\\/](.*)$/.exec(p);
+    if (!m) return p.replace(/\\/g, "/");
+    return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}`;
+  }
+
+  /**
+   * 把本地文件送到"AI 读得到的地方"，返回它该用的路径。
+   *
+   * - **远端**：上传到设置里的目录（默认 `~/.zeeai/paste`；填 `.` 就跟终端当前目录），
+   *   返回**远端绝对路径** —— CLI agent 只认路径，不认你本机的文件；
+   * - **WSL**：不用传，返回 `/mnt/c/...`；
+   * - **本机 PowerShell / CMD**：原样返回（本地 agent 读的就是这个路径）。
+   */
+  async function uploadToSession(session: OpenSession, localPaths: string[]): Promise<string[]> {
+    if (session.kind !== "remote" || !session.profileId) {
+      return session.kind === "wsl" ? localPaths.map(toWslPath) : localPaths;
+    }
+    const profileId = session.profileId;
+    const user = session.user ?? null;
+    // fs_list 不带路径时，返回的是登录后的**家目录绝对路径**（后端 canonicalize(".")）
+    const home = (await fsList(profileId, undefined, user)).path;
+    const cfg = (settingsRef.current.pasteDir || "").trim() || "~/.zeeai/paste";
+    const dir =
+      cfg === "." ? session.cwd || home : cfg.startsWith("~/") ? home + cfg.slice(1) : cfg;
+    try {
+      await fsMkdir(profileId, dir, user);
+    } catch {
+      // "已存在"也会报错，属正常；新目录是两层的（~/.zeeai/paste）时补建父目录再试一次
+      const parent = dir.replace(/\/[^/]*$/, "");
+      if (parent && parent !== dir) {
+        try {
+          await fsMkdir(profileId, parent, user);
+        } catch {
+          /* 忽略：父目录多半已存在 */
+        }
+        try {
+          await fsMkdir(profileId, dir, user);
+        } catch {
+          /* 忽略：后面 upload 失败会给出真正的错误 */
+        }
+      }
+    }
+    await fsUpload(profileId, localPaths, dir, user);
+    return localPaths.map((p) => `${dir}/${baseName(p)}`);
+  }
+
+  /**
+   * 往会话的输入行插一段文本；`submit = true` 表示插完**再敲一次回车**（把消息交给 AI）。
+   * 返回是否真的送到。
+   *
+   * 普通 / tmux 会话走 `bus.sendInput` → `term.paste()`：xterm 会按远端有没有开
+   * bracketed paste 决定要不要包转义序列（多行提示词才不会被 TUI 当成连按回车）。
+   *
+   * herdr 窗格走 B 通道（`pane send-text`）。**文本与回车必须是同一个 await 序列**：
+   * 2026-10-10 用户实测"文字到了、但 AI 不执行"，根因就在这里原来是 fire-and-forget
+   * —— `submitLine()` 紧跟着发回车，两条异步调用赛跑：输入泵还没建起来时回车那条
+   * 直接失败（错误还被 catch 吞掉），泵建好了回车也可能**先于**文本写进去（等于敲了个空行）。
+   */
+  async function insertText(
+    session: OpenSession,
+    text: string,
+    submit = false,
+  ): Promise<boolean> {
+    const pane = session.herdrPane;
+    if (pane && session.herdrMode !== "control") {
+      notify("这是只读观察窗，发不了字：先在卡片上点「接管」再发");
+      return false;
+    }
+    if (pane) {
+      // 走 **B 通道**（herdr 的 `pane send-text` = herdrPaneType），不要用 herdrPaneInput：
+      //
+      // 2026-10-09 在真机上用 `head -3 > 文件` 实测（载荷 `\x1b[200~第一行\n第二行\n第三行\n\x1b[201~`，42 字节）：
+      // A 通道（herdr_pane_input，写窗格流）**结尾标记 `\x1b[201~` 被 herdr 吃掉**、换行被当成逐个回车
+      // → 一段多行提示词会被 shell 当成两条命令执行；B 通道逐字节透明（42 字节原样到达）。
+      // 所以多行/粘贴一律走 B，并且自己带上 bracketed paste 的包裹。
+      try {
+        // 顺序不能换、也不能不 await：见上面那段踩坑说明
+        await ensureHerdrInput(session.id, session.profileId ?? "", session.user ?? null, pane);
+        await herdrPaneType(session.id, `\x1b[200~${text}\x1b[201~`);
+        if (submit) await submitHerdrPane(session.id);
+        return true;
+      } catch (e) {
+        notify("窗格输入送不出去（可能已被别的客户端接管，或窗格已关闭）：" + String(e));
+        return false;
+      }
+    }
+    if (bus.sendInput(session.id, text, submit)) return true;
+    // 终端还没挂载（极少见，例如刚恢复的会话）：退回直接写 PTY。
+    // 这条路上没有 bracketed paste，多行会被当成多次回车 —— 总比什么都不发生强。
+    // 注意：回车**必须一起写**（以前这里只写文本，于是"消息发出去了但没执行"）。
+    void sessionWrite(
+      session.id,
+      bytesToB64(new TextEncoder().encode(submit ? `${text}\r` : text)),
+    );
+    return true;
+  }
+
+  /**
+   * 在 herdr 窗格里敲一次回车。
+   *
+   * 先用 B 通道送**一个字面 CR**：`\r` 就是键盘回车在 PTY 上的字节，而 B 通道是实测
+   * 逐字节透明的 —— 这样不依赖 herdr 的按键名表（`pane send-keys` 认不认 `enter` 没验过，
+   * 而且泵里那条命令是 `>/dev/null 2>&1`，失败也看不见）。只有这条 IPC 自己失败时才退回
+   * `pane send-keys enter`。**两条都失败一定要报出来，不能静默**（用户上次就是这么踩的）。
+   */
+  async function submitHerdrPane(id: string) {
+    try {
+      await herdrPaneType(id, "\r");
+      return;
+    } catch {
+      /* 落到下面的按键通道再试一次 */
+    }
+    try {
+      await herdrPaneKey(id, "enter");
+    } catch (e) {
+      notify("回车没送出去（窗格可能已被接管或关闭）：" + String(e));
+    }
+  }
+
+  /**
+   * 附件的缩略图（data URL）。**只对图片后缀尝试** —— 别的文件读出来也没法显示，
+   * 白花一次 IPC。失败一律静默：没有预览而已，不该为这个弹提示。
+   */
+  async function thumbFor(local: string, name: string): Promise<string | undefined> {
+    if (!/\.(png|jpe?g|gif|webp|bmp)$/i.test(name)) return undefined;
+    try {
+      const b64 = await pasteReadThumb(local);
+      const mime = /\.jpe?g$/i.test(name)
+        ? "image/jpeg"
+        : /\.gif$/i.test(name)
+          ? "image/gif"
+          : /\.webp$/i.test(name)
+            ? "image/webp"
+            : /\.bmp$/i.test(name)
+              ? "image/bmp"
+              : "image/png";
+      return `data:${mime};base64,${b64}`;
+    } catch {
+      return undefined; // 超过 4MB / 读不到：没有预览而已，不打扰
+    }
+  }
+
+  /** 弹一张"刚上传了什么"的小卡片，几秒后自己消失（可在设置里关掉） */
+  function showPasteCard(card: { thumb?: string; name: string; remote: string }) {
+    if (!settingsRef.current.pasteToast) return;
+    if (pasteCardTimer.current !== null) window.clearTimeout(pasteCardTimer.current);
+    setPasteCard(card);
+    pasteCardTimer.current = window.setTimeout(() => {
+      pasteCardTimer.current = null;
+      setPasteCard(null);
+    }, 4500);
+  }
+
+  /** 本地已存在的文件（拖拽进来的 / 文件选择器选的）→ 上传 → 把远端路径插进输入行 */
+  async function handleIncomingPaths(session: OpenSession, paths: string[]) {
+    if (!paths.length) return;
+    try {
+      // 先"收进"粘贴临时目录：上传、预览、用完删除都只认那一个目录（守卫只写一次）
+      const locals: string[] = [];
+      for (const p of paths) {
+        try {
+          locals.push(await pasteAdoptFile(p));
+        } catch (e) {
+          notify("收不了这个文件：" + String(e));
+        }
+      }
+      if (!locals.length) return;
+      // 「在终端区直接粘图片/文件」走哪条路，由设置里的 pasteToast 决定（默认不勾）：
+      //   不勾 = **放进输入窗**：能确认粘对了没有，还能补一句话再发；不往终端里插路径。
+      //   勾上 = 快路径：立刻把远端路径插进终端输入行 + 弹几秒缩略图。
+      // 纯文本不受这个设置影响 —— 它永远按焦点走（焦点在终端就进终端）。
+      if (!settingsRef.current.pasteToast) {
+        setComposerOpen(true);
+        await composerAttachPaths(session, locals, true); // 已经在粘贴临时目录里了，不用再收一遍
+        return;
+      }
+      const name = baseName(locals[0]);
+      const thumb = await thumbFor(locals[0], name);
+      const remotes = await uploadToSession(session, locals);
+      void insertText(session, remotes.join(" ") + " ");
+      notify(`已上传 ${remotes.length} 个文件：${remotes[0]}${remotes.length > 1 ? " 等" : ""}`);
+      showPasteCard({ thumb, name: baseName(remotes[0]), remote: remotes[0] });
+      for (const l of locals) void pasteDiscardFile(l).catch(() => {});
+    } catch (e) {
+      notify("上传失败：" + String(e));
+    }
+  }
+
+  /**
+   * 剪贴板里的文件（截图工具塞进来的位图 / 资源管理器里复制的文件）→ 落盘 → 上传 → 插路径。
+   *
+   * 不做二段确认、不弹窗：粘贴的语义就是"现在就发"，错了删掉重来即可。
+   * 但会给一张几秒的缩略图卡片 —— 没有它，用户根本不知道自己粘对了没有。
+   */
+  async function handleIncomingFiles(
+    session: OpenSession,
+    files: { name: string; bytes: Uint8Array }[],
+  ) {
+    if (!files.length) return;
+    try {
+      const locals: string[] = [];
+      for (const f of files) locals.push(await pasteSaveFile(pasteName(f.name), bytesToB64(f.bytes)));
+      // 同 handleIncomingPaths：默认（不勾 pasteToast）**放进输入窗**，勾上才走"插路径 + 浮层"的快路径
+      if (!settingsRef.current.pasteToast) {
+        setComposerOpen(true);
+        await composerAttachPaths(session, locals, true);
+        return;
+      }
+      const name = baseName(locals[0]);
+      const thumb = await thumbFor(locals[0], name);
+      const remotes = await uploadToSession(session, locals);
+      void insertText(session, remotes.join(" ") + " ");
+      notify(`已上传 ${remotes.length} 个文件：${remotes[0]}`);
+      showPasteCard({ thumb, name: baseName(remotes[0]), remote: remotes[0] });
+      for (const l of locals) void pasteDiscardFile(l).catch(() => {});
+    } catch (e) {
+      notify("粘贴上传失败：" + String(e));
+    }
+  }
+
+  /**
+   * 输入窗：把文件上传后只加"附件"（不插进终端 —— 用户还没点发送）。
+   *
+   * `alreadyLocal = true` 表示传进来的路径**已经在粘贴临时目录里**（例如从剪贴板粘的），
+   * 不用再 copy 一遍。
+   */
+  async function composerAttachPaths(
+    session: OpenSession,
+    paths: string[],
+    alreadyLocal = false,
+  ) {
+    if (!paths.length) return;
+    setComposerBusy(true);
+    try {
+      const locals: string[] = [];
+      for (const p of paths) {
+        try {
+          locals.push(alreadyLocal ? p : await pasteAdoptFile(p));
+        } catch (e) {
+          notify("收不了这个文件：" + String(e));
+        }
+      }
+      if (!locals.length) return;
+      const remotes = await uploadToSession(session, locals);
+      const cards: {
+        name: string;
+        local: string;
+        remote: string;
+        thumb?: string;
+      }[] = [];
+      for (let i = 0; i < locals.length; i++) {
+        const name = baseName(locals[i]);
+        // 顺序要紧：**先取缩略图再删本地文件**，否则预览就没了
+        const thumb = await thumbFor(locals[i], name);
+        cards.push({ name, local: locals[i], remote: remotes[i], thumb });
+        void pasteDiscardFile(locals[i]).catch(() => {});
+      }
+      setComposerFiles((prev) => [...prev, ...cards]);
+      notify(`附件已就绪：${remotes[0]}${remotes.length > 1 ? " 等" : ""}`);
+    } catch (e) {
+      notify("附件上传失败：" + String(e));
+    } finally {
+      setComposerBusy(false);
+    }
+  }
+
+  /** 输入窗：点「＋」选本地文件 */
+  async function composerPickFiles(session: OpenSession) {
+    try {
+      const picked = await openLocalDialog({
+        multiple: true,
+        title: "选择要发给 AI 的文件（图片 / 文本都行）",
+      });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      await composerAttachPaths(session, paths);
+    } catch (e) {
+      notify("选文件失败：" + String(e));
+    }
+  }
+
+  /**
+   * 输入窗：发送。
+   *
+   * 正文 = 用户写的字 +（有附件时）空行 + 每个附件的**远端路径各占一行** ——
+   * codex / claude 都能按路径读文件，这是"给终端里的 AI 发图"唯一稳的做法。
+   * 发完**不关窗**（方便接着发下一条），只清空内容。
+   */
+  async function sendComposer() {
+    const session = activeSessionRef.current;
+    if (!session || composerBusy) return;
+    const text = composerText.trim();
+    if (!text && composerFiles.length === 0) {
+      notify("先写点内容，或点「＋」加个附件");
+      return;
+    }
+    const paths = composerFiles.map((f) => f.remote).join("\n");
+    const body = composerFiles.length ? (text ? `${text}\n\n${paths}` : paths) : text;
+    // 文本与回车**在同一个 await 里一次做完**（herdr 那条通道顺序敏感，见 insertText 的说明）
+    if (!(await insertText(session, body, true))) return; // 只读观察窗之类：别接着敲回车
+    setComposerText("");
+    setComposerFiles([]);
+  }
+
+  /**
+   * 拖拽：把文件拖进窗口 → 上传到当前会话 + 把远端路径插进输入行。
+   *
+   * 用的是 Tauri 的**原生**拖拽事件（拿得到真实本地路径），不是 HTML5 那套
+   *（WebView 里 HTML5 的 drop 拿不到路径）。
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    try {
+      void getCurrentWebview()
+        .onDragDropEvent((event) => {
+          if (event.payload.type !== "drop") return;
+          const cur = activeSessionRef.current;
+          if (!cur) return;
+          void handleIncomingPaths(cur, event.payload.paths);
+        })
+        .then((f) => {
+          unlisten = f;
+        })
+        .catch(() => {
+          /* 拿不到原生拖拽事件就算了（不拖拽也不影响其它功能） */
+        });
+    } catch {
+      /* 这个环境下没有原生拖拽（例如无头测试）：同样不影响其它功能 */
+    }
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 状态栏提示自动消失（错误留久一点，让你看清）
   useEffect(() => {
@@ -3067,11 +3522,16 @@ export default function App() {
       // 最终显示名算一次、两处都用：标签上显示什么，历史里就存什么。
       // （以前历史存的是 setSessions 之前的 title，于是 herdr 会话出现了两条记录：
       //   标签/后端叫 "lz · herdr w9:p1"，历史里却躺着 "lz · w9:p1" —— 用户实测踩到。）
+      //
+      // 用户**显式给了 tmux 会话名**时（explicitName），一律用它拼标题，不采用后端返回的
+      // title —— 后端的 title 曾经固定是 `profile · host`，用户会以为"我填的名字没生效"。
       const finalTitle = titleOverride?.trim()
         ? title
-        : tmuxMode === "none"
+        : explicitName
           ? title
-          : info.title || title;
+          : tmuxMode === "none"
+            ? title
+            : info.title || title;
       setSessions((prev) =>
         prev.map((s) =>
           s.id === id
@@ -5143,6 +5603,28 @@ export default function App() {
   /** 当前作用范围实际生效的配色（用作对话框里"当前"的显示） */
   const lookPalette = termPaletteFor(settings, undefined, lookKind || undefined);
   const lookScheme = termSchemeFor(settings, undefined, lookKind || undefined);
+  /** 全局那套叫什么名字（「跟随全局」那一项要写出来，用户才知道会跟到哪套） */
+  const globalSchemeName =
+    TERM_SCHEMES.find((s) => s.key === settings.termScheme)?.name ?? settings.termScheme;
+  /** 「按类型」这档现在是不是"跟随全局"（= 该类型没有自己的覆盖） */
+  const kindFollowsGlobal = !!lookKind && !(settings.termSchemeByKind?.[lookKind] ?? "").trim();
+
+  /**
+   * 作用范围 =「全局默认」、但**当前会话实际被更具体的层盖住**时，给对话框一行提示：
+   * 现在真正生效的是哪套、是谁定的。
+   *
+   * 为什么要这一行：用户改完"全局默认"发现没反应 —— 因为这台机器/这一类终端早先钉过一套，
+   * 而界面对此一个字都不说（实测踩过：2 分钟里连试 5 套主题以为坏了）。
+   */
+  /**
+   * 「按类型」那档的「跟随全局」：删掉该类型的覆盖，回到全局那套
+   */
+  async function kindFollowGlobalNow() {
+    if (!lookKind) return;
+    const next = { ...(settings.termSchemeByKind ?? {}) };
+    delete next[lookKind];
+    void updateSettings({ termSchemeByKind: next });
+  }
 
   /** 给当前作用范围（全局 / 某类终端）选配色方案 */
   async function setLookScheme(key: string, custom?: string) {
@@ -5152,10 +5634,18 @@ export default function App() {
       });
       return;
     }
+    // 这一档写的是「全局默认（所有终端）」—— 那就**真的**对所有终端生效：
+    // 把"按类型"那几层的覆盖一并清掉。否则用户在这里改了、SSH 那边纹丝不动，
+    // 只能看到"改了没反应"（用户实测报过）。
+    // 单台机器自己钉的 `profile.termScheme` **不动** —— 那是"这台就这样"，
+    // 留给「编辑服务器」里按需撤。
+    const hadKindOverrides = Object.keys(settings.termSchemeByKind ?? {}).length > 0;
     void updateSettings({
       termScheme: key,
       ...(custom !== undefined ? { termSchemeCustom: custom } : {}),
+      ...(hadKindOverrides ? { termSchemeByKind: {} } : {}),
     });
+    if (hadKindOverrides) notify("已同步到所有终端类型（原来的按类型配色已清掉）");
   }
 
   /** 给当前作用范围（某类终端）绑高亮规则集 */
@@ -6885,7 +7375,10 @@ export default function App() {
             </div>
           )}
 
-          <div className="pane">
+          <div
+            className="pane"
+            style={{ "--term-bg": termBgOf(activeSession) } as CSSProperties}
+          >
             {paneLayout !== "single" && (
               <div className={"pane-grid " + paneLayout}>
                 {paneSlots.map((sid, i) => {
@@ -6894,6 +7387,7 @@ export default function App() {
                     <div
                       key={i}
                       className={"pane-cell" + (i === focusedPane ? " focused" : "")}
+                      style={{ "--term-bg": termBgOf(ps) } as CSSProperties}
                       onClick={() => {
                         setFocusedPane(i);
                         if (sid) setActiveId(sid);
@@ -6929,6 +7423,10 @@ export default function App() {
                             sessionId={ps.id}
                             bus={bus}
                             active={i === focusedPane}
+                            onPasteFiles={(files) => void handleIncomingFiles(ps, files)}
+                            pasteKey={settings.pasteKey}
+                            rightClick={settings.rightClick}
+                            copyKey={settings.copyKey}
                             fontSize={settings.fontSize}
                             scrollback={settings.scrollback}
                             light={themeKind(settings.theme) === "light"}
@@ -6990,8 +7488,12 @@ export default function App() {
                   key={s.id}
                   className="term-wrap"
                   style={{
+                    // 用 flex（不是 block）：`.term-wrap` 里除了终端还可能有一条 `.herdr-bar`，
+                    // 靠 flex 把高度**分**给两者。写成 block 会让 `.terminal-host` 的 flex:1 失效、
+                    // 终端按自己的内容高度撑开，最后一行就被下面的输入窗盖住了（用户报的 bug）。
+                    // 这里只管"显不显示"，布局规则在 styles.css 的 .term-wrap 里。
                     display:
-                      s.id === activeId && s.activeTab === "terminal" ? "block" : "none",
+                      s.id === activeId && s.activeTab === "terminal" ? "flex" : "none",
                   }}
                 >
                   {/* herdr 会话：终端上方挂一条**一眼可见**的状态条（像 tmux 的状态栏那样），
@@ -7015,6 +7517,10 @@ export default function App() {
                     sessionId={s.id}
                     bus={bus}
                     active={s.id === activeId && s.activeTab === "terminal"}
+                    onPasteFiles={(files) => void handleIncomingFiles(s, files)}
+                    pasteKey={settings.pasteKey}
+                    rightClick={settings.rightClick}
+                    copyKey={settings.copyKey}
                     // 单窗格模式下**所有**会话都挂着（用 display:none 藏着，为了不丢回滚缓冲），
                     // 但只有当前这条看得见 —— WebGL 渲染器只给看得见的挂，
                     // 否则开 N 个会话就占 N 个 GPU 上下文（见 Terminal.tsx 里那段说明）
@@ -7068,6 +7574,154 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {/* ---------- AI 输入窗：**默认收起**成一条细栏，点箭头才拉出来慢慢写 ----------
+              终端才是主角：收起时只占 26px，你照旧直接在 SSH 里敲字；
+              要用它写长提示词 / 传图片时再展开（展开后终端会自动重排，见 Terminal 的 ResizeObserver）。 */}
+          {activeSession && (
+            <div className={"composer" + (composerOpen ? " open" : " collapsed")}>
+              <button
+                type="button"
+                className="composer-bar"
+                title={
+                  composerOpen
+                    ? "收起输入窗（Esc 或 Ctrl+Alt+A）"
+                    : "拉出输入窗：多行编辑、可粘贴 / 上传图片，Enter 发送（Ctrl+Alt+A）"
+                }
+                onClick={() => setComposerOpen((v) => !v)}
+              >
+                {composerOpen ? <IconChevronsDown size={16} /> : <IconChevronsUp size={16} />}
+                <span className="grow ellipsis" style={{ textAlign: "left" }}>
+                  发给 AI · {activeSession.title}
+                  <span className="dim">
+                    {activeSession.herdrPane
+                      ? activeSession.herdrMode === "control"
+                        ? " · herdr 接管窗格"
+                        : " · herdr 只读观察窗（发不了字，先接管）"
+                      : activeSession.kind === "remote"
+                        ? " · SSH"
+                        : " · 本机"}
+                  </span>
+                </span>
+                {!composerOpen && <span className="dim">点这里展开</span>}
+              </button>
+              {composerOpen && (
+                <>
+              {composerFiles.length > 0 && (
+                <div className="composer-files">
+                  {composerFiles.map((f) => (
+                    <div className="composer-card" key={f.remote} title={`${f.name}\n${f.remote}`}>
+                      {f.thumb ? (
+                        <img className="composer-thumb" src={f.thumb} alt={f.name} />
+                      ) : (
+                        <div className="composer-thumb composer-thumb-file">📄</div>
+                      )}
+                      <span className="composer-card-name ellipsis">{f.name}</span>
+                      <button
+                        type="button"
+                        className="mini-x composer-card-x"
+                        style={{ opacity: 1 }}
+                        title="移除这个附件（顺手删掉本地临时文件）"
+                        onClick={() => {
+                          void pasteDiscardFile(f.local).catch(() => {});
+                          setComposerFiles((prev) => prev.filter((x) => x.remote !== f.remote));
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <textarea
+                className="composer-input"
+                placeholder="写给 AI 的话…（Enter 发送 / Shift+Enter 换行；可直接 Ctrl+V 粘图片，或把文件拖进来）"
+                value={composerText}
+                autoFocus
+                onChange={(e) => setComposerText(e.target.value)}
+                onPaste={(e) => {
+                  const files = Array.from(e.clipboardData?.files ?? []);
+                  if (!files.length) return; // 纯文本：照旧粘进编辑框，不拦
+                  e.preventDefault();
+                  e.stopPropagation();
+                  void (async () => {
+                    const out: { name: string; bytes: Uint8Array }[] = [];
+                    for (const f of files) {
+                      try {
+                        out.push({
+                          name: f.name || "paste.png",
+                          bytes: new Uint8Array(await f.arrayBuffer()),
+                        });
+                      } catch {
+                        /* 单个读失败就跳过 */
+                      }
+                    }
+                    if (!out.length) return;
+                    try {
+                      const locals: string[] = [];
+                      for (const f of out)
+                        locals.push(await pasteSaveFile(pasteName(f.name), bytesToB64(f.bytes)));
+                      await composerAttachPaths(activeSession, locals, true);
+                    } catch (err) {
+                      notify("粘贴上传失败：" + String(err));
+                    }
+                  })();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setComposerOpen(false);
+                    return;
+                  }
+                  // Enter 发送、Shift+Enter 换行 —— 和 VS Code / 主流聊天框一致。
+                  // **有意这么选**：写长提示词时换行比发送更常用，所以把修饰键留给换行。
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void sendComposer();
+                  }
+                }}
+              />
+              <div className="composer-actions">
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={composerBusy}
+                  title="选本地文件（图片 / 文本都行）：先上传到远端，再把路径一起发给 AI"
+                  onClick={() => void composerPickFiles(activeSession)}
+                >
+                  ＋ 添加图片 / 文件
+                </button>
+                {composerBusy && <span className="hint">正在上传…</span>}
+                <span className="hint">Enter 发送 · Shift+Enter 换行 · 可直接 Ctrl+V 粘图片</span>
+                <span className="grow" />
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={composerBusy}
+                  onClick={() => void sendComposer()}
+                >
+                  发送
+                </button>
+              </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* 直接粘进终端时的缩略图浮层：几秒后自己消失（没有它，用户不知道粘对没有） */}
+          {pasteCard && (
+            <div className="paste-card" onClick={() => setPasteCard(null)} title="点一下关掉">
+              {pasteCard.thumb ? (
+                <img className="paste-card-thumb" src={pasteCard.thumb} alt={pasteCard.name} />
+              ) : null}
+              <div className="paste-card-meta">
+                <span className="ellipsis">已上传：{pasteCard.name}</span>
+                <span className="dim ellipsis" title={pasteCard.remote}>
+                  {pasteCard.remote}
+                </span>
+              </div>
+            </div>
+          )}
         </main>
 
         {aiPanelOpen && (
@@ -7354,7 +8008,7 @@ export default function App() {
                       {/* 第二行只给"在哪台机器、哪个项目"；完整命令行放悬停提示 */}
                       <div className="ai-task-meta ellipsis">
                         {t.server}
-                        {/* 项目名跟服务器名一样时别重复一遍：远端窗格的 cwd 常常就是 /home/lz，
+                        {/* 项目名跟服务器名一样时别重复一遍：远端窗格的 cwd 常常就是 /home/<user>，
                             目录名正好等于服务器名，卡片上就出现 `lz · lz · w1Q:p1`（用户报过的脏标签） */}
                         {project && project !== t.server ? ` · ${project}` : ""}
                         {t.herdrPane ? ` · ${t.herdrPane}` : t.pane ? ` · ${t.pane}` : ""}
@@ -8368,8 +9022,12 @@ export default function App() {
         </div>
       )}
 
-      {sessionRename && (
-        <div className="modal-backdrop" onClick={() => setSessionRename(null)}>
+      {sessionRename && (() => {
+        // 点弹窗**外面**：什么都不做 —— 用户明确要求"弹窗不手动叉掉就不要关闭"。
+        // 弹窗留着、输入留着（既不保存也不丢弃）；只有三个出口能动它：
+        // ✕/「取消」= 关掉不保存、Enter/「保存」= 保存、Esc = 取消。
+        return (
+        <div className="modal-backdrop">
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">重命名会话</div>
             <div className="modal-body">
@@ -8384,12 +9042,13 @@ export default function App() {
                   }
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void renameSession(sessionRename.id, sessionRename.value);
+                    // Esc = 取消（保留原名）：这是"我改主意了"的正规出口
                     if (e.key === "Escape") setSessionRename(null);
                   }}
                 />
               </label>
               <div className="hint" style={{ padding: "0 14px" }}>
-                改完会同时记进「会话历史」，下次从历史点进来还是这个名字。
+                改完会同时记进「会话历史」（「保存」或 Enter 生效；Esc /「取消」放弃）。
               </div>
             </div>
             <div className="modal-actions">
@@ -8406,7 +9065,8 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {fsMenu && (
         <div
@@ -9249,11 +9909,43 @@ export default function App() {
                 </>
               )}
 
+              {settingsTab === "app" && (
+                <>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.restoreWorkspace}
+                  onChange={(e) => void updateSettings({ restoreWorkspace: e.target.checked })}
+                />
+                <span>启动时恢复上次的会话（SSH / 本地终端 / 串口；只记"怎么开回来"，不存文件内容）</span>
+              </label>
+
+              <label className="modal-field">
+                关闭窗口时
+                <select
+                  value={settings.closeAction}
+                  onChange={(e) =>
+                    void updateSettings({
+                      closeAction: e.target.value as AppSettings["closeAction"],
+                    })
+                  }
+                >
+                  <option value="exit">退出应用</option>
+                  <option value="tray">收进系统托盘（后台继续运行）</option>
+                </select>
+              </label>
+
+              <div className="hint" style={{ padding: "2px 14px 8px" }}>
+                这两条是应用级行为，跟"终端怎么跑"无关。
+              </div>
+                </>
+              )}
+
               {settingsTab === "notify" && (
                 <>
               <div className="tree-group">什么时候提醒我</div>
               <div className="hint" style={{ padding: "0 14px 6px" }}>
-                AI 跑的小任务很多，默认**不**为"跑完了"打扰你，只报下面这两类要你动手的事。
+                AI 跑的小任务很多，默认不为"跑完了"打扰你，只报下面这两类要你动手的事。
               </div>
               <label className="form-check">
                 <input
@@ -9345,31 +10037,86 @@ export default function App() {
                 <span>SSH 断开后自动重连（会重新附加 tmux，最多重试 5 次）</span>
               </label>
 
-              <label className="form-check">
+              {/* ---------- 发给 AI：图片与文件 ----------
+                  这 5 项是一件事的五个开关（落地目录 / 粘贴键 / 右键 / 复制 / 直粘走哪条路），
+                  所以收在一个分组里；正文只回答"这条是干什么的"，"为什么这么设计"一律进 title。
+                  提示一律纯文本 —— 这个界面不渲染 markdown，别写 ** 或反引号。 */}
+              <div className="tree-group" style={{ marginTop: 4 }}>
+                发给 AI（图片与文件）
+              </div>
+
+              <label
+                className="modal-field"
+                title="粘贴 / 拖进来的图片与文件会先传到服务器上，再把「远端路径」交给 AI —— CLI agent 只认路径，它自己会去读这个文件。"
+              >
+                图片 / 文件传到远端哪个目录
                 <input
-                  type="checkbox"
-                  checked={settings.restoreWorkspace}
-                  onChange={(e) => void updateSettings({ restoreWorkspace: e.target.checked })}
+                  type="text"
+                  value={settings.pasteDir}
+                  placeholder="~/.zeeai/paste"
+                  onChange={(e) => void updateSettings({ pasteDir: e.target.value })}
                 />
-                <span>
-                  退出时保存工作区，下次打开自动恢复上次的会话（SSH / 本地终端 / 串口；
-                  只存"怎么开回来"，不存文件内容）
-                </span>
+                <span className="hint">默认 ~/.zeeai/paste；填 . = 跟随终端当前目录</span>
               </label>
 
-              <label className="modal-field">
-                关闭窗口时
+              {/* 终端的三个"习惯项"：老终端用户各有各的肌肉记忆，做成可配比替他决定强 */}
+              <label
+                className="modal-field"
+                title="没被选中的那个键会原样交给终端里的程序：Ctrl+V 变成 ^V（readline 的 quoted-insert、vim 的块选择），Shift+Insert 变成 Insert 键。选中的那个键走浏览器原生粘贴，图片也能直接粘。"
+              >
+                粘贴用哪个键
                 <select
-                  value={settings.closeAction}
-                  onChange={(e) =>
-                    void updateSettings({
-                      closeAction: e.target.value as AppSettings["closeAction"],
-                    })
-                  }
+                  value={settings.pasteKey}
+                  onChange={(e) => void updateSettings({ pasteKey: e.target.value })}
                 >
-                  <option value="exit">退出应用</option>
-                  <option value="tray">收进系统托盘（后台继续运行）</option>
+                  <option value="both">Ctrl+V 和 Shift+Insert 都能粘（默认）</option>
+                  <option value="ctrl-v">只用 Ctrl+V（Shift+Insert 送给远端）</option>
+                  <option value="shift-insert">只用 Shift+Insert（Ctrl+V 送 ^V 给远端）</option>
                 </select>
+                <span className="hint">默认两个键都能粘；没被选中的那个原样送给远端</span>
+              </label>
+
+              <label
+                className="modal-field"
+                title="选「直接粘贴」时 Shift+右键仍然弹菜单（想用菜单时不用改设置）；万一系统拒绝读剪贴板，会自动退回菜单并给一句提示。图片请用 Ctrl+V / Shift+Insert。"
+              >
+                终端里点右键
+                <select
+                  value={settings.rightClick}
+                  onChange={(e) => void updateSettings({ rightClick: e.target.value })}
+                >
+                  <option value="menu">弹菜单（默认）</option>
+                  <option value="paste">直接粘贴剪贴板文本</option>
+                </select>
+                <span className="hint">默认弹菜单；Shift+右键始终弹菜单</span>
+              </label>
+
+              <label
+                className="modal-field"
+                title="三种口径下 Ctrl+Shift+C 都是复制。「选中即复制」跟 X11 一个脾气：鼠标一划就走剪贴板（选中就写，不用按键）。"
+              >
+                怎么复制
+                <select
+                  value={settings.copyKey}
+                  onChange={(e) => void updateSettings({ copyKey: e.target.value })}
+                >
+                  <option value="ctrl-shift-c">Ctrl+Shift+C（默认；Ctrl+C 始终是中断）</option>
+                  <option value="ctrl-c-smart">Ctrl+C：有选中就复制，没选中才是中断</option>
+                  <option value="select">选中即复制（不用按键）</option>
+                </select>
+                <span className="hint">默认 Ctrl+Shift+C；选中即复制 = 划一下就走剪贴板</span>
+              </label>
+
+              <label
+                className="form-check"
+                title="不勾（默认）：图片先进输入窗，能确认粘对了没有、还能补一句话再发。勾上：快路径 —— 立刻把远端路径插进终端输入行，并弹几秒缩略图。纯文本粘贴两种情况下都按光标所在位置走。"
+              >
+                <input
+                  type="checkbox"
+                  checked={settings.pasteToast}
+                  onChange={(e) => void updateSettings({ pasteToast: e.target.checked })}
+                />
+                <span>在终端里直接粘图片：放进输入窗（勾上 = 直接插路径）</span>
               </label>
 
                 </>
@@ -9482,6 +10229,16 @@ export default function App() {
           onHighlightEnabled={(v) => void updateSettings({ highlightEnabled: v })}
           onOpenHighlightRules={() => setShowHighlight(true)}
           onPick={(key, custom) => void setLookScheme(key, custom)}
+          followGlobal={
+            lookKind
+              ? {
+                  active: kindFollowsGlobal,
+                  name: globalSchemeName,
+                  palette: resolveTermPalette(settings.termScheme, settings.termSchemeCustom),
+                }
+              : undefined
+          }
+          onFollowGlobal={lookKind ? () => void kindFollowGlobalNow() : undefined}
           onClose={() => setShowTermTheme(false)}
           onNotice={notify}
         />
@@ -9612,7 +10369,7 @@ export default function App() {
                 />
               </label>
               <div className="hint" style={{ padding: "0 0 8px 14px" }}>
-                登录用户只对**这次会话**生效，不会改动服务器配置（要改配置请用「服务器管理」）
+                登录用户只对这次会话生效，不会改动服务器配置（要改配置请用「服务器管理」）
               </div>
               {/* 会话名字：留空 = 自动命名（普通 shell 会自动编号 1、2、3…），
                   这样同一台机器开多个普通会话，历史列表里也能一一对应、不会互相覆盖 */}

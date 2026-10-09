@@ -392,6 +392,26 @@ export interface AppSettings {
   termSchemeCustom: string;
   /** 会话日志目录；空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions */
   logDir: string;
+  /**
+   * 粘贴 / 拖进来的图片、文件在**远端**落到哪个目录。
+   *
+   * 默认 `~/.zeeai/paste`；填 `.` = 跟随终端当前目录（文件落进项目里，
+   * 对 CLI agent 的沙箱最友好 —— 有些 agent 只肯读工作区内的文件）。
+   */
+  pasteDir: string;
+  /**
+   * 哪个键负责粘贴：`both`（默认）/ `ctrl-v` / `shift-insert`。
+   *
+   * 语义是"**哪个键留给终端**"：没被选中的那个会原样送给远端
+   *（Ctrl+V → `^V`，readline 的 quoted-insert；Shift+Insert → Insert 键）。
+   */
+  pasteKey: string;
+  /** 终端里点右键：`menu`（默认，弹菜单）/ `paste`（直接粘贴文本；Shift+右键仍弹菜单） */
+  rightClick: string;
+  /** 复制方式：`ctrl-shift-c`（默认）/ `ctrl-c-smart`（有选中就复制）/ `select`（选中即复制） */
+  copyKey: string;
+  /** 直接粘进终端（不经过输入窗）时，弹几秒缩略图预览；默认开 */
+  pasteToast: boolean;
   /** 终端关键字高亮总开关（SSH / 串口 / 本地终端共用） */
   highlightEnabled: boolean;
   /** 终端关键字高亮规则 */
