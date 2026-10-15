@@ -85,19 +85,40 @@ pub async fn connect(
             log::info!("sftp: 经跳板机 {j_user}@{j_host}:{j_port} 连接 {host}:{port}");
             let mut jump_session = client::connect(config.clone(), (j_host.as_str(), j_port), Client)
                 .await
-                .map_err(|e| format!("连接跳板机 {j_host}:{j_port} 失败: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "连接跳板机 {j_host}:{j_port} 失败：{}",
+                        crate::core::ssh::friendly_ssh_error(&e.to_string())
+                    )
+                })?;
             authenticate(&mut jump_session, &j_user, key_path, password).await?;
             let ch = jump_session
                 .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
                 .await
-                .map_err(|e| format!("跳板机转发到 {host}:{port} 失败: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "跳板机转发到 {host}:{port} 失败：{}",
+                        crate::core::ssh::friendly_ssh_error(&e.to_string())
+                    )
+                })?;
             client::connect_stream(config.clone(), ch.into_stream(), Client)
                 .await
-                .map_err(|e| format!("经跳板机连接 {host}:{port} 失败: {e}"))?
+                .map_err(|e| {
+                    format!(
+                        "经跳板机连接 {host}:{port} 失败：{}",
+                        crate::core::ssh::friendly_ssh_error(&e.to_string())
+                    )
+                })?
         }
         None => client::connect(config.clone(), (host, port), Client)
             .await
-            .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?,
+            .map_err(|e| {
+                // 这一条是用户最常看到的：把 russh 的英文报错分类成中文，原文附在后面
+                format!(
+                    "连接 {host}:{port} 失败：{}",
+                    crate::core::ssh::friendly_ssh_error(&e.to_string())
+                )
+            })?,
     };
 
     authenticate(&mut session, user, key_path, password).await?;

@@ -49,9 +49,12 @@ pub fn scp_args(
         "BatchMode=yes".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
-        "-P".into(),
-        port.to_string(),
     ];
+    // 0 = "没说"：不传 -P，交给 ~/.ssh/config 的 Port（和 ssh_args 同一套口径）
+    if port != 0 {
+        args.push("-P".into());
+        args.push(port.to_string());
+    }
     if recursive {
         args.push("-r".into());
     }
@@ -67,12 +70,37 @@ pub fn scp_args(
 }
 
 /// scp 的远端路径写法：`user@host:'/绝对/路径'`（单引号给远端 shell 用）。
+/// 用户名没说时退化成 `host:'/路径'`，同样是为了让 config 的 User 生效。
 pub fn scp_remote(host: &str, user: &str, remote_path: &str) -> String {
-    format!("{user}@{host}:{}", crate::core::remote_fs::sq(remote_path))
+    format!(
+        "{}:{}",
+        ssh_target(host, user),
+        crate::core::remote_fs::sq(remote_path)
+    )
+}
+
+/// `user@host`；**用户名没说时只给 `host`** —— 让 `~/.ssh/config` 里的 `User` 生效。
+pub fn ssh_target(host: &str, user: &str) -> String {
+    let user = user.trim();
+    let host = host.trim();
+    if user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{user}@{host}")
+    }
 }
 
 /// 组装 ssh 命令行。复用用户本机已经配好的密钥/agent/config，
 /// 因此不在这里处理密码认证（交给 ssh 自己在终端里提示）。
+///
+/// **端口 / 用户名允许"没说"**：`port == 0`、或用户名为空时，我们**不传** `-p`、
+/// 不写 `user@`，把这两项交给用户的 `~/.ssh/config` 决定。
+///
+/// 为什么要这样：以前永远显式传 `-p 22 root@host`，会把 config 里的 `Port`/`User`
+/// **顶掉** —— 实测 `ssh -p 22 root@myalias` 解析出来是 `user root / port 22`，
+/// 而只给别名时 config 才会生效（`user alice / port 2222 / identityfile …`）。
+/// 于是"本机配了免密、界面里填了别名"的用户永远连不上（2026-10 用户报障）。
+/// 显式值仍然优先：用户填了就是我们说了算。
 pub fn ssh_args(
     host: &str,
     port: u16,
@@ -90,9 +118,12 @@ pub fn ssh_args(
         "ServerAliveCountMax=3".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
-        "-p".into(),
-        port.to_string(),
     ];
+    // 0 = "没说"，交给 ~/.ssh/config 的 Port
+    if port != 0 {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
     if batch_mode {
         args.push("-o".into());
         args.push("BatchMode=yes".into());
@@ -108,7 +139,7 @@ pub fn ssh_args(
             args.push(k.to_string());
         }
     }
-    args.push(format!("{user}@{host}"));
+    args.push(ssh_target(host, user));
     if let Some(cmd) = remote_cmd {
         args.push(cmd.to_string());
     }
@@ -185,9 +216,11 @@ tmux set-option -g window-size latest 2>/dev/null; ";
     }
 
     // 注意：这里的提示信息保持 ASCII，避免远端 locale 不是 UTF-8 时中文变乱码。
+    // **不要用 ` - ` 这种破折号**：用户会把中文提示里的孤立 `-` 当成我们的 bug
+    //（2026-10 报障就是这么来的），所以这里统一用 "." 断句。
     format!(
         "if command -v tmux >/dev/null 2>&1; then {tune}exec {tmux}; \
-else printf '\\n[ZeeAI] tmux not found on this server - falling back to a plain shell.\\n\
+else printf '\\n[ZeeAI] tmux not found on this server. Falling back to a plain shell.\\n\
 [ZeeAI] Install it to get persistent sessions:  yum install -y tmux   (or: apt-get install -y tmux)\\n\\n'; \
 exec \"${{SHELL:-/bin/bash}}\"; fi"
     )
@@ -215,7 +248,7 @@ pub fn herdr_command(session_name: &str) -> String {
     format!(
         "if command -v herdr >/dev/null 2>&1; then exec herdr --session '{name}'; \
 elif [ -x \"$HOME/.local/bin/herdr\" ]; then exec \"$HOME/.local/bin/herdr\" --session '{name}'; \
-else printf '\\n[ZeeAI] herdr not found on this server - falling back to a plain shell.\\n\
+else printf '\\n[ZeeAI] herdr not found on this server. Falling back to a plain shell.\\n\
 [ZeeAI] The herdr option is only available when herdr is installed on this machine.\\n\\n'; \
 exec \"${{SHELL:-/bin/bash}}\"; fi"
     )
@@ -254,6 +287,8 @@ pub fn shell_with_cwd_report() -> String {
 }
 
 /// 组装一次非交互式 `ssh <host> "<cmd>"` 调用（用于 tmux 列表 / kill 这类一次性命令）。
+///
+/// 端口 0 / 用户名空 = "没说"，不传 `-p` / 不写 `user@`（口径同 [`ssh_args`]）。
 pub fn ssh_exec_args(
     host: &str,
     port: u16,
@@ -267,9 +302,11 @@ pub fn ssh_exec_args(
         "BatchMode=yes".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
-        "-p".into(),
-        port.to_string(),
     ];
+    if port != 0 {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
     if let Some(k) = key_path {
         if !k.trim().is_empty() {
             args.push("-i".into());
@@ -280,7 +317,128 @@ pub fn ssh_exec_args(
         args.push("-J".into());
         args.push(j.to_string());
     }
-    args.push(format!("{user}@{host}"));
+    args.push(ssh_target(host, user));
     args.push(remote_command.to_string());
     args
+}
+
+/// 把 russh（纯 Rust 实现）的**英文报错**分类成中文短句，并**保留英文原文**。
+///
+/// 为什么要做：这些错误以前被原样透给界面 —— 例如
+/// `No common Kex algorithm - ours: […], theirs: […]`（russh-0.53/src/lib.rs:183），
+/// 中文提示里冒出一个孤零零的 `-`，用户只能猜（2026-10 用户报障：以为是我们打错了）。
+///
+/// 分类只做够用的四类，原文一律附在后面（排查时不用翻日志，前端也可以放进悬停）。
+pub fn friendly_ssh_error(raw: &str) -> String {
+    let low = raw.to_ascii_lowercase();
+    let algo = (low.contains("no common") || low.contains("not supported"))
+        && (low.contains("algorithm") || low.contains("kex") || low.contains("host key"));
+    let auth = low.contains("auth")
+        || low.contains("permission denied")
+        || low.contains("publickey")
+        || low.contains("password");
+    let net = low.contains("timed out")
+        || low.contains("timeout")
+        || low.contains("refused")
+        || low.contains("unreachable")
+        || low.contains("no route")
+        || low.contains("dns")
+        || low.contains("connect")
+        || low.contains("resolve");
+    let kind = if algo {
+        "算法不匹配（这台服务器的加密算法和我们的实现对不上：试试改用密钥/系统 ssh，或让管理员开启现代算法）"
+    } else if auth {
+        "认证失败（用户名、密码或密钥不对，或服务器不允许这种登录方式）"
+    } else if net {
+        "连不上服务器（网络、端口、防火墙，或地址写错了）"
+    } else {
+        "连接失败"
+    };
+    format!("{kind}｜原始信息：{raw}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has(args: &[String], s: &str) -> bool {
+        args.iter().any(|a| a == s)
+    }
+
+    /// port = 0 = "没说"：不许传 `-p`（ssh）/ `-P`（scp），否则会把 config 的端口顶掉
+    #[test]
+    fn port_zero_leaves_port_to_ssh_config() {
+        let a = ssh_args("myalias", 0, "root", None, None, false, None);
+        assert!(!has(&a, "-p"), "port=0 不该传 -p：{a:?}");
+        let b = ssh_exec_args("myalias", 0, "root", None, "ls", None);
+        assert!(!has(&b, "-p"), "一次性命令也不该传 -p：{b:?}");
+        let c = scp_args(0, None, false, "a", "b");
+        assert!(!has(&c, "-P"), "scp 的端口开关是 -P：{c:?}");
+    }
+
+    /// 用户名空 = "没说"：只给 host，让 config 的 User 生效
+    #[test]
+    fn empty_user_leaves_user_to_ssh_config() {
+        let a = ssh_args("myalias", 22, "", None, None, false, None);
+        assert!(has(&a, "myalias"), "{a:?}");
+        assert!(
+            !a.iter().any(|x| x.contains('@')),
+            "空用户名不该拼出 user@host：{a:?}"
+        );
+        // 全是空格也算没说
+        let b = ssh_args("h", 22, "   ", None, None, false, None);
+        assert!(has(&b, "h"), "{b:?}");
+        assert_eq!(scp_remote("myalias", "", "/tmp/x"), "myalias:'/tmp/x'");
+    }
+
+    /// 显式填了端口/用户名时，行为跟以前一模一样（用户说了算）
+    #[test]
+    fn explicit_port_and_user_still_win() {
+        let a = ssh_args(
+            "h",
+            2222,
+            "alice",
+            Some("/k"),
+            Some("echo hi"),
+            true,
+            Some("jump"),
+        );
+        assert!(has(&a, "-p") && has(&a, "2222"), "{a:?}");
+        assert!(has(&a, "alice@h"), "{a:?}");
+        assert!(has(&a, "-i") && has(&a, "/k"), "{a:?}");
+        assert!(has(&a, "-J") && has(&a, "jump"), "{a:?}");
+        assert!(has(&a, "BatchMode=yes") && has(&a, "-tt"), "{a:?}");
+        assert_eq!(a.last().unwrap(), "echo hi");
+    }
+
+    #[test]
+    fn no_tty_variant_only_drops_tt() {
+        let a = ssh_args_no_tty("h", 0, "", None, "cmd", None);
+        assert!(!has(&a, "-tt"), "{a:?}");
+        assert!(has(&a, "h") && has(&a, "cmd"), "{a:?}");
+        assert!(!has(&a, "-p"), "{a:?}");
+    }
+
+    /// russh 的英文报错要分类成中文，但**原文必须留着**（否则没法排查）
+    #[test]
+    fn russh_errors_are_classified_with_raw_text_kept() {
+        let algo = friendly_ssh_error(
+            "No common Kex algorithm - ours: [curve25519], theirs: [diffie-hellman-group1-sha1]",
+        );
+        assert!(algo.contains("算法不匹配"), "{algo}");
+        assert!(algo.contains("No common Kex algorithm"), "原文要留着：{algo}");
+        assert!(friendly_ssh_error("Permission denied (publickey,password)").contains("认证失败"));
+        assert!(friendly_ssh_error("connect timed out").contains("连不上服务器"));
+        let other = friendly_ssh_error("something weird");
+        assert!(other.contains("连接失败") && other.contains("something weird"), "{other}");
+    }
+
+    /// 远端提示里不能再出现孤立的 ` - `（用户会当成我们的 bug）
+    #[test]
+    fn remote_notices_have_no_stray_dash() {
+        for s in [tmux_command("s", None), herdr_command("s")] {
+            assert!(!s.contains(" - "), "不该有孤立破折号：{s}");
+            assert!(s.contains("Falling back to a plain shell."), "{s}");
+        }
+    }
 }
