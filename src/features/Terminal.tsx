@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { sessionResize, sessionWrite } from "../ipc";
 import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
+import { runAfterFirstPaint, startupMark } from "../startup";
 import { bytesToB64 } from "../util";
 import { rememberTerminalSize } from "./terminalSize";
 import { Highlighter } from "../highlight";
@@ -406,7 +407,15 @@ export default function TerminalView({
       };
       attachWebglRef.current = attachWebgl;
       detachWebglRef.current = detachWebgl;
-      if (visibleRef.current) attachWebgl();
+      // **等首帧画完再挂 WebGL**：WebglAddon 要栅格化整个字形图集，是首屏最贵的一步，
+      // 挂在 mount 里就会跟首屏渲染抢主线程（用户报的"启动卡顿一下"有它一份）。
+      // 这里只推迟时机、不改变行为：可见性变化那条路（下面 visible 的 effect）照旧即时挂/摘。
+      if (visibleRef.current) {
+        runAfterFirstPaint(() => {
+          // 等这一下的工夫里组件可能已经被卸载、或换了另一个终端 —— 只给"还是当前这个"挂
+          if (visibleRef.current && termRef.current === term) attachWebgl();
+        });
+      }
     } catch {
       /* WebGL 不可用时自动回退到 canvas/dom 渲染 */
     }
@@ -495,17 +504,35 @@ export default function TerminalView({
      * bracketed paste**（TUI 靠它区分"粘贴了一整段多行文本"和"你连按了三次回车"），
      * 走 paste 才会带上正确的转义序列 —— 否则多行提示词会被 codex / claude 的界面
      * 当成多次提交，一条消息被拆成几轮。
+     *
+     * **回车要晚一点点单独写**（2026-10-16 真机实测）：正文与回车是两次写入，但
+     * **本地 ConPTY 会把它们合成同一次 read** —— 拿一个"假 TUI"（开 bracketed paste、
+     * 把收到的字节原样记下来）实测，本地只看到 **1 段**：
+     *   `\x1b[200~正文\x1b[201~\r`
+     * 而走 ssh 的远程会话是分开到达的。同一条消息，本地和远程"喂给程序的样子"不一样，
+     * 正是"远程正常、本地不提交"这类怪事最喜欢藏的地方。隔 40ms 让本地也变成两次，
+     * 两种环境行为一致（对普通 shell 毫无影响：探针里"正文+CR 同批"和"CR 晚 80ms"
+     * 都能执行，只有光发 LF 不行）。
+     *
+     * 写入用一条**串行链**：保证"上一条的回车"永远排在下一条的正文前面 ——
+     * 否则连发两条时，第 2 条的正文可能插到第 1 条的回车之前。
      */
+    let inputChain: Promise<void> = Promise.resolve();
     bus.attachInput(sessionId, (text, submit) => {
-      try {
-        term.paste(text);
-      } catch {
-        // 老版本 xterm 没有 paste()：退回原样写（至少内容能进去）
-        term.input(text);
-      }
-      if (submit) term.input("\r");
-      // **不要把焦点抢到终端来**：从 AI 输入窗发完一条，用户多半还要接着写第二条 ——
-      // 焦点留在输入框里（用户明确要求；要回终端自己点一下）。
+      inputChain = inputChain.then(async () => {
+        try {
+          term.paste(text);
+        } catch {
+          // 老版本 xterm 没有 paste()：退回原样写（至少内容能进去）
+          term.input(text);
+        }
+        if (submit) {
+          await new Promise((r) => setTimeout(r, 40));
+          term.input("\r");
+        }
+        // **不要把焦点抢到终端来**：从 AI 输入窗发完一条，用户多半还要接着写第二条 ——
+        // 焦点留在输入框里（用户明确要求；要回终端自己点一下）。
+      });
     });
 
     /**
