@@ -9,6 +9,83 @@ use tauri::Manager;
 #[cfg(feature = "selftest")]
 use tauri::Emitter;
 
+/// 启动计时起点（进程内第一次用到时开始算）
+static STARTUP_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// 窗口是否已经显示过。前端 ready 与 setup 里的兜底线程可能同时到达，只允许一次。
+static WINDOW_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn startup_ms() -> u128 {
+  STARTUP_T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
+/// 启动阶段标记：**日志 + 一个专用小文件**，两个都写。
+///
+/// 为什么要文件：测量脚本在画面稳定后就把进程关掉，而日志插件的文件写入有自己的
+/// 缓冲/线程 —— 实测被强杀时最后几行会丢，`logger().flush()` 也救不回来
+/// （甚至出现过 flush 之后那一行彻底不见）。启动耗时是要拿数字说话的东西，不能靠运气。
+fn mark_startup(stage: &str) {
+  let ms = startup_ms();
+  log::info!("startup: {} at {} ms", stage, ms);
+  let Some(base) = std::env::var("LOCALAPPDATA").ok() else {
+    return;
+  };
+  let dir = std::path::Path::new(&base)
+    .join("com.zeeai.terminal")
+    .join("logs");
+  if std::fs::create_dir_all(&dir).is_err() {
+    return;
+  }
+  if let Ok(mut f) = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(dir.join("startup-marks.log"))
+  {
+    use std::io::Write;
+    let _ = writeln!(f, "stage={stage} at_ms={ms} pid={}", std::process::id());
+    let _ = f.flush();
+  }
+}
+
+/// 前端**首屏画完了** → 记一笔启动耗时（窗口本身是可见创建的，见下面的说明）。
+///
+/// 用户报的问题："启动瞬间一大一小两个相同画面重影 + 卡顿一下"。
+/// `scripts/startup-probe.ps1` + `scripts/startup-capture.ps1` 实测到的真相是：
+///   · 窗口在 ~225ms 就**映射到屏幕上**，而 WebView2 那时**一帧都还没画** ——
+///     这段时间屏幕上留着的是**上一次那个窗口的残留**（重开时就是同一个应用的界面，
+///     所以看起来是"两个相同的画面，一大一小"），接着才画出一片**白**，最后才是深色界面；
+///   · 一直等到 ~830ms 画面才稳定 —— 那一下"卡顿"就是首屏在跟 WebGL 挂载 / 看板扫描 /
+///     快照轮询抢主线程。
+/// 试过"窗口隐藏创建、前端 ready 再 show"（`visible: false`）：**实测更差** ——
+/// Chromium 对隐藏窗口会推迟渲染，窗口虽然 250ms 就 show 了，但**第一帧要到 ~1.4s** 才出来，
+/// 用户会对着一个空窗口干等一秒。所以最终没那么做，改成：
+///   1. `tauri.conf.json` 设窗口背景色（不再白闪）+ `index.html` 里一块**不依赖 JS 的静态启动屏**
+///      —— 保证"第一眼看到的是我们自己的画面"；
+///   2. 把重活（WebGL、看板扫描、快照、更新检查）推迟到首帧之后（见 `src/startup.ts`）。
+/// 这条命令因此只做计时/日志，`show()` 只是保险（窗口已经可见时是空操作）。
+#[tauri::command]
+fn frontend_ready(app: tauri::AppHandle, at_ms: Option<f64>) {
+  if WINDOW_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    return;
+  }
+  mark_startup(&format!(
+    "frontend ready（前端自报 {} ms）",
+    at_ms.unwrap_or(0.0) as u64
+  ));
+  if let Some(w) = app.get_webview_window("main") {
+    if !w.is_visible().unwrap_or(true) {
+      let _ = w.show();
+      mark_startup("window shown");
+    }
+  }
+}
+
+/// 前端把"某个阶段好了"写进日志（终端就绪 / 空闲任务补齐…），用来对比启动耗时。
+/// 故意做成"只记日志"：它不该影响任何行为，也不该因为失败打断启动。
+#[tauri::command]
+fn startup_mark(name: String) {
+  mark_startup(&name);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   // 单实例：便携版和安装版**共用**同一份配置目录，两个实例同时跑会互相覆盖
@@ -26,6 +103,34 @@ pub fn run() {
     )
     .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
+      // 启动计时起点。（窗口是**可见创建**的：试过"隐藏创建 + 前端 ready 再 show"，
+      // 实测 Chromium 会推迟隐藏窗口的渲染 —— 窗口 250ms 就 show 了，但第一帧要到 ~1.4s 才出来，
+      // 用户对着空窗口干等一秒，反而更差。完整结论写在 frontend_ready 的注释里。）
+      STARTUP_T0.get_or_init(std::time::Instant::now);
+      mark_startup("window created");
+      // WebView2 在画出第一帧之前是**白底**（实测 400ms 时整窗纯白、四周还露着旧窗口的边），
+      // 这就是"启动闪一下"的来源。`tauri.conf.json` 的窗口颜色只盖住窗口层，
+      // **webview 层仍是白的** —— 必须用 `set_background_color`（它两层一起设）。
+      // 这里先按深色主题设；界面渲染好后由前端自己画底（`.app { background: var(--bg) }`）。
+      if let Some(w) = app.get_webview_window("main") {
+        if let Err(e) = w.set_background_color(Some(tauri::window::Color(30, 30, 30, 255))) {
+          log::warn!("startup: 设置窗口底色失败（只是没有白闪防护）：{e}");
+        }
+      }
+      {
+        // 保险丝：万一窗口因为什么原因没显示（改配置、前端没跑起来），5 秒后兜底显示。
+        let handle = app.handle().clone();
+        std::thread::spawn(move || {
+          std::thread::sleep(std::time::Duration::from_secs(5));
+          WINDOW_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+          if let Some(w) = handle.get_webview_window("main") {
+            if !w.is_visible().unwrap_or(true) {
+              log::warn!("startup: 5 秒后窗口仍不可见，兜底显示");
+              let _ = w.show();
+            }
+          }
+        });
+      }
       // 系统托盘：配合「关闭时收进托盘」使用，也能快速唤回窗口
       {
         use tauri::menu::{Menu, MenuItem};
@@ -507,6 +612,9 @@ pub fn run() {
     // 「AI 任务看板」里"App 自己启动的"那批任务的账本
     .manage(crate::core::ai_tasks::AiTaskRegistry::new())
     .invoke_handler(tauri::generate_handler![
+      // 启动节奏：前端首帧 ready → 显示窗口；startup_mark 只记启动阶段耗时
+      frontend_ready,
+      startup_mark,
       commands::list_profiles,
       commands::save_profile,
       commands::delete_profile,
@@ -584,6 +692,13 @@ pub fn run() {
       commands::ai_tasks_clear_finished,
       commands::ai_session_snapshot,
       commands::ai_task_artifacts,
+      // 看板 v2 §10：统一「AI 实例」模型（前端把已采集的数据送进来，合并/判状态在后端做）
+      commands::ai_instances,
+      commands::cli_health,
+      // 本机 CLI 的「一键修」：重装（二次确认 + 白名单 + 输出回显）/
+      // 只把「以 --no-daemon 启动」记进设置（不跑安装、不动全局配置）
+      commands::cli_health_fix,
+      commands::cli_health_set_flag,
       commands::ai_timeline_list,
       commands::ai_timeline_add,
       commands::ai_timeline_clear,

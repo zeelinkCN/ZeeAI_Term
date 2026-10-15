@@ -1,6 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
+import { afterFirstPaint } from "./startup";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
@@ -20,3 +22,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>,
 );
+
+// 首屏画好了：摘掉 index.html 里那块静态启动屏（它只为盖住"WebView2 还没画出来"的那一下），
+// 再告诉后端"我画完了"（后端拿它记启动阶段耗时；窗口本身是可见创建的，原因见 lib.rs 的说明）。
+// `.catch` 是给 fe-smoke 那种没有真后端的环境用的：这条命令不该让任何东西挂掉。
+afterFirstPaint(() => {
+  document.getElementById("boot")?.remove();
+  void invoke("frontend_ready", { atMs: Math.round(performance.now()) }).catch(() => {});
+});

@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "ZeeAI_Term",
   "mainBinaryName": "ZeeAI_Term",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "identifier": "com.zeeai.terminal",
   "build": {
     "frontendDist": "../dist",
@@ -19,7 +19,9 @@
         "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "center": true,
+        "backgroundColor": "#1e1e1e"
       }
     ],
     "security": {
