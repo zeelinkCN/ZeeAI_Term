@@ -19,7 +19,7 @@
 //! 兼容性判据是**协议号**（`latest.json` 里的 `protocol`，二进制自己也能 `api schema` 打出来），
 //! 不是版本号 —— herdr 半年发了 40 多个版本，追版本号必死；而它明确说 client/server 版本可以不一致。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// herdr 官方的版本清单：版本号 / 协议号 / 各平台直链 / 各平台 sha256。
 pub const LATEST_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
@@ -116,7 +116,9 @@ pub fn platform_key(uname_sm: &str) -> Option<String> {
 }
 
 /// herdr 的一个 agent（`herdr agent list` 里的一条）
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+///
+/// `Deserialize` 是给 AI 看板 v2 用的：前端把已采集到的 agent 列表送回 `ai_instances`。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HerdrAgent {
     /// agent 的种类：codex / claude / ...（herdr 自己认出来的）

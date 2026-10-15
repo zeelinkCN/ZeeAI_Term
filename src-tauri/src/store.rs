@@ -279,8 +279,21 @@ pub struct Settings {
     pub highlight_set_by_kind: std::collections::HashMap<String, String>,
     /// AI 有新消息/要你处理时，除活动栏红点外，是否再闪 Windows 任务栏
     pub ai_notify_taskbar: bool,
-    /// 是否在左侧活动栏的 AI 星号上显示红点/数字
+    /// 是否在左侧活动栏的 AI 星号上显示红点/数字。
+    ///
+    /// ⚠️ 老的总开关：口径已改成下面两条独立规则（`docs/design-ai-board-v2.md` §10.6
+    /// "红点只为两种情况亮"），界面不再用它。字段留着只为**读得懂老配置**。
     pub ai_notify_badge: bool,
+    /// 红点规则 ①（§10.6）：有实例在「需要你」时亮 —— **亮到你处理为止**。默认开。
+    ///
+    /// 为什么这条不能漏：那是唯一真正值得打断用户的事（等你批准 / 回话）。
+    #[serde(default = "default_true")]
+    pub ai_notify_needs_you_badge: bool,
+    /// 红点规则 ②（§10.6）：某一轮跑完**并停下**时亮一个未读 —— 点开面板即清。默认开。
+    ///
+    /// 注意"只产出文件但还没停"**不算**（那条老口径已被 §10.9 冲突清单否掉）。
+    #[serde(default = "default_true")]
+    pub ai_notify_finished_badge: bool,
     /// 通知策略：**每一轮跑完**就提醒一次。
     ///
     /// 默认**关**：用户的原话是"我跑的小任务太多，每跑一个都弹一条，很烦"。
@@ -318,6 +331,16 @@ pub struct Settings {
     /// 默认开：那样"我粘对了没有"不用靠猜 —— 粘贴的语义就是"现在就发"，
     /// 发错了得能立刻看出来。走输入窗时不需要它（那边附件是常驻缩略图）。
     pub paste_toast: bool,
+    /// 本机 agent CLI 的**额外启动参数**（命令名 → 参数表，例如 `codex` → `["--no-daemon"]`）。
+    ///
+    /// 为什么存在这里：cli_health 认出"守护进程起不来（os error 5）"时官方建议 `--no-daemon`，
+    /// 但我们**不去改用户的全局配置**（那会影响他所有终端里的用法）—— 只记住
+    /// "**我们自己**启动这个 CLI 时**多带一个参数**"，并在界面上说清这一点。
+    ///
+    /// 值只能是白名单里的参数（见 `commands::cli_health_set_flag`），
+    /// 因为它最终会被拼进"在终端里启动"那条命令。
+    #[serde(default)]
+    pub agent_launch_args: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -352,6 +375,11 @@ impl Default for Settings {
             // 默认只在活动栏的 AI 图标上点红点（最不打扰）；闪任务栏/右下角提示由用户自己开
             ai_notify_taskbar: false,
             ai_notify_badge: true,
+            // 红点的两条规则，默认都开（§10.6）：
+            //   ① 需要你 → 亮到你处理；② 跑完一轮并停下 → 点开面板就消。
+            // 其它情况（运行中/空闲/陈旧/只产出文件/探测不到）不提醒。
+            ai_notify_needs_you_badge: true,
+            ai_notify_finished_badge: true,
             // 通知的默认口径（用户明确要求"别每跑一个小任务都弹"）：
             //   - 跑完就提醒：关（小任务太多）
             //   - 产出了 HTML/MD 文档：开（这是要你去看的成果）
@@ -371,6 +399,9 @@ impl Default for Settings {
             // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
             // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
             paste_toast: false,
+            // 一个都没有：我们默认**不动**用户装好的 CLI 的启动方式，
+            // 只有他点了「以 --no-daemon 启动」才记进去
+            agent_launch_args: std::collections::HashMap::new(),
         }
     }
 }
@@ -625,7 +656,18 @@ mod settings_tests {
         // 出厂状态没有规则集，靠 load_settings 的迁移补出「默认」那套
         assert!(s.highlight_rule_sets.is_empty());
         assert!(!s.highlight_rules.is_empty(), "兜底规则默认就是预设");
-        assert!(s.ai_notify_badge, "活动栏数字默认打开");
+        assert!(s.ai_notify_badge, "活动栏数字默认打开（老开关，界面已不用它）");
+        // §10.6：红点的两条规则**默认都开** —— "需要你"漏了就白等了
+        assert!(s.ai_notify_needs_you_badge, "「需要你处理时提醒」默认开");
+        assert!(s.ai_notify_finished_badge, "「跑完一轮并停下时提醒」默认开");
+    }
+
+    /// 老配置里没有这两条新键时，必须**默认都开**（§10.6：不能为了降噪把"需要你"漏掉）
+    #[test]
+    fn old_config_without_badge_rules_defaults_both_on() {
+        let s: Settings = serde_json::from_str("{}").expect("空配置也要能读");
+        assert!(s.ai_notify_needs_you_badge);
+        assert!(s.ai_notify_finished_badge);
     }
 
     /// 服务器可以绑定规则集；不绑就是 None

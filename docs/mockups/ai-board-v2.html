@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>AI 看板 v2 · 可视化样品（不是成品）</title>
+<style>
+  /* ===== 真实设计语言：直接照搬 src/styles.css 的变量与卡片样式 ===== */
+  :root{
+    --bg:#1e1e1e; --sidebar:#252526; --titlebar:#323233; --tab:#2d2d2d;
+    --border:#3c3c3c; --fg:#cccccc; --muted:#9d9d9d; --accent:#3794ff;
+    --accent-soft:rgba(55,148,255,.14); --green:#89d185; --amber:#e2c08d;
+    --red:#f14c4c; --status:#007acc; --btn-bg:#2a2d2e; --panel-2:#2a2d2e;
+    --card:rgba(255,255,255,.03); --card-2:rgba(255,255,255,.02);
+    --warn-bg:rgba(205,49,49,.08);
+  }
+  html[data-theme="light"]{
+    --bg:#ffffff; --sidebar:#f3f3f3; --titlebar:#e4e4e4; --tab:#ececec;
+    --border:#cfcfcf; --fg:#1f1f1f; --muted:#6a6a6a; --accent:#0a66c2;
+    --accent-soft:rgba(10,102,194,.12); --green:#107c41; --amber:#9a6700;
+    --red:#c62828; --status:#0a66c2; --btn-bg:#ececec; --panel-2:#f6f6f6;
+    --card:rgba(0,0,0,.03); --card-2:rgba(0,0,0,.02);
+    --warn-bg:rgba(198,40,40,.08);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:13px/1.55 "Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+  }
+  .mono{font-family:"Cascadia Mono",Consolas,monospace}
+
+  /* 顶部：说明 + 场景按钮 */
+  header{
+    position:sticky; top:0; z-index:5; background:var(--titlebar);
+    border-bottom:1px solid var(--border); padding:10px 14px;
+  }
+  .h-top{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .h-top h1{font-size:14px; margin:0; font-weight:600}
+  .h-note{font-size:11.5px; color:var(--muted)}
+  .spacer{flex:1}
+  .tabs{display:flex; gap:6px; flex-wrap:wrap; margin-top:9px}
+  .tab{
+    padding:5px 10px; border:1px solid var(--border); border-radius:4px;
+    background:var(--btn-bg); color:var(--fg); font:inherit; font-size:12px; cursor:pointer;
+  }
+  .tab:hover{border-color:var(--accent)}
+  .tab.on{background:var(--accent-soft); border-color:var(--accent); color:var(--fg); font-weight:600}
+  .btn{
+    display:inline-flex; align-items:center; gap:5px; padding:5px 9px;
+    border:1px solid var(--border); border-radius:4px; background:var(--btn-bg);
+    color:var(--fg); font:inherit; font-size:12.5px; cursor:pointer;
+  }
+  .btn:hover{border-color:var(--accent)}
+  main{padding:14px; display:none}
+  main.on{display:block}
+  .cols{display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap}
+  .col-panel{width:340px; flex:none; background:var(--sidebar); border:1px solid var(--border); border-radius:6px; overflow:hidden}
+  .col-notes{flex:1; min-width:320px; display:flex; flex-direction:column; gap:10px}
+  .pane-head{
+    display:flex; align-items:center; gap:6px; padding:8px 10px;
+    border-bottom:1px solid var(--border); background:var(--titlebar);
+    font-size:12.5px; font-weight:600;
+  }
+  .pane-body{padding:4px 0 8px}
+
+  /* 真实卡片样式（照搬 .ai-task / .ai-tag / .ai-state / .dot / .ai-section） */
+  .ai-section{
+    display:flex; align-items:center; gap:6px; padding:8px 12px 4px;
+    font-size:11px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--muted);
+  }
+  .ai-section .count{margin-left:auto; letter-spacing:0; text-transform:none}
+  .ai-board{display:flex; flex-direction:column; gap:4px; padding:0 8px 6px}
+  .ai-task{
+    border:1px solid var(--border); border-left:3px solid var(--muted); border-radius:5px;
+    padding:6px 8px; background:var(--card);
+  }
+  .ai-task.running{border-left-color:var(--green)}
+  .ai-task.done{opacity:.72}
+  .ai-task.needs-approval{border-left-color:var(--red); background:var(--warn-bg)}
+  .ai-task.inferred{border-left-style:dashed}
+  .ai-task-line{display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600}
+  .ai-task-meta{margin-top:2px; font-size:11px; color:var(--muted)}
+  .ai-task-cmd{
+    margin-top:3px; font-size:11px; color:var(--fg);
+    font-family:"Cascadia Mono",Consolas,monospace;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .ai-tag{
+    flex:none; padding:0 5px; border-radius:3px; border:1px solid var(--border);
+    background:var(--accent-soft); color:var(--fg); font-size:10.5px; font-weight:500; line-height:15px;
+  }
+  .ai-tag.ghost{background:transparent; border-style:dashed; color:var(--muted)}
+  .ai-state{flex:none; font-size:10.5px; font-weight:600}
+  .ai-state.running{color:var(--green)}
+  .ai-state.idle{color:var(--muted)}
+  .ai-state.needs-approval,.ai-state.waiting-user{color:var(--amber)}
+  .ai-state.done{color:var(--muted)}
+  .dot{width:7px; height:7px; border-radius:50%; flex:none; background:var(--muted)}
+  .dot.ok{background:var(--green)}
+  .dot.idle{background:var(--muted)}
+  .dot.warn{background:var(--red); box-shadow:0 0 0 2px rgba(205,49,49,.25)}
+  .dot.ghost{background:transparent; border:1.5px solid var(--muted)}   /* 推断状态：空心点 */
+  .ai-actions{display:flex; gap:5px; margin-top:6px}
+  .ai-actions .btn{padding:3px 7px; font-size:11px}
+  .rowlet{
+    display:flex; align-items:center; gap:6px; padding:3px 8px; margin:0 8px;
+    border-left:2px solid var(--border); border-radius:4px; background:var(--card-2);
+    font-size:11.5px;
+  }
+  .fold{
+    display:flex; align-items:center; gap:6px; padding:5px 12px; cursor:pointer;
+    font-size:11.5px; color:var(--muted); border-top:1px dashed var(--border); margin-top:4px;
+  }
+  .fold:hover{color:var(--fg)}
+  .empty-note{padding:10px 12px; font-size:11.5px; color:var(--muted)}
+
+  /* 说明卡 */
+  .note{
+    border:1px solid var(--border); border-left:3px solid var(--accent);
+    border-radius:5px; padding:9px 11px; background:var(--card);
+  }
+  .note h3{margin:0 0 5px; font-size:12.5px; font-weight:600}
+  .note p{margin:0 0 4px; font-size:12px; color:var(--fg)}
+  .note .q{font-size:11.5px; color:var(--muted)}
+  .note.decision{border-left-color:var(--amber)}
+  .note.plain{border-left-color:var(--border)}
+  .legend{display:flex; gap:12px; flex-wrap:wrap; font-size:11.5px; color:var(--muted); margin-top:6px}
+  .legend span{display:inline-flex; align-items:center; gap:5px}
+
+  /* 状态栏（真实样式：底部一条 accent 底） */
+  .statusbar{
+    display:flex; align-items:center; gap:10px; padding:3px 10px;
+    background:var(--status); color:#fff; font-size:11.5px;
+  }
+  .statusbar .s-chip{background:rgba(255,255,255,.16); border-radius:3px; padding:0 6px}
+  .statusbar .s-need{background:#fff; color:var(--status); border-radius:3px; padding:0 6px; font-weight:700}
+  .statusbar.old{background:var(--status); opacity:.9}
+  .tiny{font-size:11px; color:var(--muted); margin:6px 0 2px}
+  .badge-mix{display:flex; gap:6px; flex-wrap:wrap; margin-top:4px}
+  code{background:var(--card); padding:0 4px; border-radius:3px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="h-top">
+    <h1>AI 看板 v2 · 可视化样品</h1>
+    <span class="h-note">这是<strong>画给你看的样品</strong>，不是成品：点按钮切换场景，看"会不会乱"。</span>
+    <span class="spacer"></span>
+    <button class="btn" id="themeBtn">切浅色</button>
+  </div>
+  <div class="tabs" id="tabs"></div>
+</header>
+
+<!-- 0 图例 -->
+<main id="s0" class="on">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head">先看这个图例</div>
+      <div class="pane-body">
+        <div class="ai-section">状态点</div>
+        <div class="ai-board">
+          <div class="ai-task-line" style="padding:2px 0"><span class="dot ok"></span> 运行中（第一手：herdr 告诉我们）</div>
+          <div class="ai-task-line" style="padding:2px 0"><span class="dot ghost"></span> 运行中（<strong>推断</strong>：只看到进程，不知道它卡没卡）</div>
+          <div class="ai-task-line" style="padding:2px 0"><span class="dot warn"></span> 等你处理（第一手）</div>
+          <div class="ai-task-line" style="padding:2px 0"><span class="dot idle"></span> 空闲 / 已完成</div>
+        </div>
+        <div class="ai-section">徽标</div>
+        <div class="ai-board">
+          <div class="ai-task-line" style="padding:2px 0"><span class="ai-tag">herdr</span><span class="ai-tag">tmux</span><span class="ai-tag">裸 SSH</span><span class="ai-tag">本机</span> 承载方式</div>
+          <div class="ai-task-line" style="padding:2px 0"><span class="ai-tag" style="background:transparent">第一手</span><span class="ai-tag ghost">推断</span> 信息可信度</div>
+        </div>
+        <div class="empty-note">推断的<strong>绝不写成事实</strong>：推断用<strong>虚线边框 + 空心点</strong>，一眼能分开。</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>先把"看图规则"定下来，后面每屏都用它。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：状态点只有一种实心绿/红，看不出"这是它自己报的还是我们猜的"。</p>
+        <p>新方案：<strong>第一手 = 实心点</strong>，<strong>推断 = 空心点 + 虚线左边框</strong>，卡片右上角还有来源徽标。</p></div>
+      <div class="note decision"><h3>决策点 5：推断怎么标</h3>
+        <p class="q">A（推荐，就是这一屏）徽标 + 空心点，一眼分得开。<br>B 只在悬停时说明 —— 界面更干净，但"猜的"会被当成"事实"。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 1 本地 PowerShell -->
+<main id="s1">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot ok"></span> AI · 本机（PowerShell）</div>
+      <div class="pane-body">
+        <div class="ai-section">需要你 <span class="count">0</span></div>
+        <div class="ai-section">运行中 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="ai-task running">
+            <div class="ai-task-line"><span class="dot ok"></span> codex <span class="ai-tag">本机 · PowerShell</span> <span class="ai-state running">运行中</span></div>
+            <div class="ai-task-meta">最后动作 12 秒前 · 已跑 4 分 20 秒 · 12.4k tokens</div>
+            <div class="ai-task-cmd">codex --model gpt-5-codex  （窗格 本机 · 标签 3）</div>
+            <div class="ai-actions"><button class="btn">切过去</button></div>
+          </div>
+        </div>
+        <div class="fold">▸ 最近完成 1 项（claude · 13:52 · 产物 report.md）</div>
+        <div class="fold">▸ 空闲 1 项（claude · 上次活动 26 分钟前）</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>本机跑着的三个 agent：一个在跑、一个刚做完、一个闲着。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：三种状态混在一列大卡里，完成的那张也占一整块。</p>
+        <p>新方案：面板<strong>只有两个区</strong>（需要你 / 运行中），<strong>完成与空闲各折成一行带计数</strong>，点开才看全。</p></div>
+      <div class="note decision"><h3>你已拍板</h3>
+        <p class="q">面板默认只有「需要你」+「运行中」；最近完成与空闲折成一行；独立的「最近任务 / 时间线」列表删掉。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 2 裸 SSH -->
+<main id="s2">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot ghost"></span> AI · lz（裸 SSH）</div>
+      <div class="pane-body">
+        <div class="ai-section">需要你 <span class="count">—</span></div>
+        <div class="ai-board">
+          <div class="ai-task inferred">
+            <div class="ai-task-line"><span class="dot ghost"></span> codex <span class="ai-tag">lz</span> <span class="ai-tag ghost">裸 SSH</span> <span class="ai-state running">运行中（进程推断，可能已卡住）</span></div>
+            <div class="ai-task-meta">进程 41288 已跑 7 分 · 可能有输出也可能卡住 · 看不到是否在等你</div>
+            <div class="ai-task-cmd">/home/lz/.local/bin/codex</div>
+          </div>
+        </div>
+        <div class="empty-note">裸 SSH 上<strong>永远不会显示「等你处理」</strong>：我们没有它的状态，只有"进程还在"。猜错比不显示更糟。</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>没有 tmux / herdr 的普通 SSH：只能靠"看进程"，所以只说"在跑"，不说"在等你"。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：裸 SSH 的卡和 herdr 的卡长得一样，读的人会以为信息一样准。</p>
+        <p>新方案：虚线边框 + <strong>「运行中（推断）」</strong>字样，徽标注明 <span class="ai-tag ghost">裸 SSH</span>。</p></div>
+      <div class="note decision"><h3>你已拍板</h3>
+        <p class="q">裸 SSH 永不显示「等你处理」，只说「运行中（进程推断，可能已卡住）」。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 3 tmux -->
+<main id="s3">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot ok"></span> AI · Ali_root（tmux）</div>
+      <div class="pane-body">
+        <div class="ai-section">运行中 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="ai-task running">
+            <div class="ai-task-line"><span class="dot ok"></span> codex <span class="ai-tag">Ali_root</span> <span class="ai-tag">tmux: work.1</span> <span class="ai-state running">运行中</span></div>
+            <div class="ai-task-meta">最后输出 4 秒前 · 已跑 11 分 · 31.2k tokens</div>
+            <div class="ai-task-cmd">tmux attach -t work → 窗格 1</div>
+            <div class="ai-actions"><button class="btn">切过去</button></div>
+          </div>
+        </div>
+        <div class="fold">▸ 最近完成 1 项（claude · tmux work.2 · 13:47 结束 · 产物 2 个）</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>同一个 tmux 会话里的两个窗格，各跑一个 agent，各自一张卡。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：卡片会把两个窗格合并成"一个环境"，看不出谁是谁。</p>
+        <p>新方案：<strong>一张卡 = 一个 agent 实例</strong>，卡上直接写承载（<code>tmux: work.1</code>），点"切过去"就到那个窗格。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 4 herdr -->
+<main id="s4">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot warn"></span> AI · lz（herdr 工作区 w1）</div>
+      <div class="pane-body">
+        <div class="ai-section">需要你 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="ai-task needs-approval">
+            <div class="ai-task-line"><span class="dot warn"></span> codex <span class="ai-tag">lz</span> <span class="ai-tag">herdr w1:p1</span> <span class="ai-tag" style="background:transparent">第一手</span> <span class="ai-state needs-approval">等你处理</span></div>
+            <div class="ai-task-meta">它问：是否允许执行 <span class="mono">rm -rf build/</span> · 等了 2 分钟</div>
+            <div class="ai-actions"><button class="btn">接管</button><button class="btn">查看窗格</button></div>
+          </div>
+        </div>
+        <div class="ai-section">运行中 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="ai-task running">
+            <div class="ai-task-line"><span class="dot ok"></span> claude <span class="ai-tag">lz</span> <span class="ai-tag">herdr w1:p2</span> <span class="ai-state running">运行中</span></div>
+            <div class="ai-task-meta">最后输出 1 秒前 · 已跑 3 分</div>
+            <div class="ai-actions"><button class="btn">查看窗格</button></div>
+          </div>
+        </div>
+        <div class="fold">▸ 空闲 1 项（gemini · herdr w1:p3）</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>herdr 是唯一能"第一手"知道 agent 在等你的承载 —— 那种卡就该跳出来、红点、可接管。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：herdr 服务/工作区另有一排界面，和上面的卡各说各话。</p>
+        <p>新方案：<strong>承载信息收进卡片里的一个徽标</strong>（<code>herdr w1:p1</code>），"等你处理"只有一处：最上面那一张卡 + 状态栏一个数字。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 5 混合 12 个 -->
+<main id="s5">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot warn"></span> AI（本机 + 5 台服务器）</div>
+      <div class="pane-body">
+        <div class="ai-section">需要你 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="ai-task needs-approval">
+            <div class="ai-task-line"><span class="dot warn"></span> codex <span class="ai-tag">lz</span> <span class="ai-tag">herdr w1:p1</span> <span class="ai-state needs-approval">等你处理</span></div>
+            <div class="ai-task-meta">它问：是否允许执行 <span class="mono">rm -rf build/</span> · 等了 2 分钟</div>
+            <div class="ai-actions"><button class="btn">接管</button><button class="btn">查看窗格</button></div>
+          </div>
+        </div>
+        <div class="ai-section">运行中 <span class="count">6</span></div>
+        <div class="ai-board">
+          <div class="rowlet"><span class="dot ok"></span> codex · <span class="ai-tag">herdr w1:p2</span> · 1 秒前 · 3 分</div>
+          <div class="rowlet"><span class="dot ok"></span> claude · <span class="ai-tag">tmux work.1</span> · 4 秒前 · 11 分</div>
+          <div class="rowlet"><span class="dot ok"></span> codex · <span class="ai-tag">本机 PowerShell</span> · 12 秒前 · 4 分</div>
+          <div class="rowlet"><span class="dot ghost"></span> codex · <span class="ai-tag ghost">裸 SSH · lz</span> · 推断运行中 · 7 分</div>
+          <div class="rowlet"><span class="dot ghost"></span> claude · <span class="ai-tag ghost">裸 SSH · Ali_root</span> · 推断运行中 · 2 分</div>
+          <div class="rowlet"><span class="dot ok"></span> gemini · <span class="ai-tag">tmux build.2</span> · 22 秒前 · 9 分</div>
+        </div>
+        <div class="fold">▸ 最近完成 4 项（13:52 / 13:47 / 13:31 / 13:20）</div>
+        <div class="fold">▸ 空闲 1 项</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>你最担心的那一屏：<strong>12 个实例、跨 6 个地方，只有 1 个需要你</strong>。</p></div>
+      <div class="note plain"><h3>"会不会乱"的答案</h3>
+        <p><strong>不会</strong>：需要你的只有 1 张大卡（最上面）；其余 6 个运行中是<strong>一行一个</strong>的窄条；4 个完成、1 个空闲<strong>折成两行</strong>。整屏 <strong>约 12 行</strong>，且你看第一眼只需要看第一行。</p></div>
+      <div class="note"><h3>对照：现在的看板（同一批 12 个实例）</h3>
+        <p>12 张大卡 + 一条"最近任务"时间线 + 底部状态栏的"已完成"提示 —— <strong>同一件事在三处各说一遍</strong>，一屏放不下，得滚动；哪个在等你，要靠逐张读。</p></div>
+      <div class="note decision"><h3>已拍板：没跑 agent 的承载（CMD 之类）<strong>不上板</strong></h3>
+        <p class="q">就是这一屏：看板只出现"真有 agent 在跑"的东西；CMD 这类空承载不占行，只在「承载健康」悬停里可查。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 6 全空闲 -->
+<main id="s6">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot ok"></span> AI</div>
+      <div class="pane-body">
+        <div class="empty-note" style="padding-top:14px">没有需要你的事，也没有在跑的 agent。</div>
+        <div class="fold">▸ 最近完成 3 项（点开看：谁 / 什么时候 / 产物）</div>
+        <div class="fold">▸ 空闲 2 项</div>
+        <div class="empty-note" style="padding-top:4px">承载健康<strong>只在异常时出现</strong>：没异常时它完全不占位置。</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>没事的时候，面板应该<strong>几乎空掉</strong>。</p></div>
+      <div class="note plain"><h3>和现在比，变化是什么</h3>
+        <p>现在：没事的时候也堆着旧卡和旧时间线，你还得逐条确认"这些是不是过期了"。</p>
+        <p>新方案：只剩两行折叠条，<strong>空就是空</strong>。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 7 状态栏对照 -->
+<main id="s7">
+  <div class="cols">
+    <div class="col-notes" style="min-width:100%">
+      <div class="note"><h3>这一屏在讲什么</h3><p>底部那一行：现在挤了技术标识，改后只留"看状态"要用的。</p></div>
+
+      <div class="pane-head" style="border:1px solid var(--border); border-radius:6px 6px 0 0">改前（现在）</div>
+      <div class="statusbar old" style="border-radius:0 0 6px 6px">
+        <span>● 已连接 · lz</span><span class="s-chip">UTF-8</span><span class="s-chip">xterm-256color</span>
+        <span class="s-chip">AI 已完成：claude</span><span class="s-chip">120×32</span><span class="s-chip">Ctrl+滚轮 字号</span>
+      </div>
+      <div class="tiny">问题：技术标识（编码、终端类型、尺寸）和"有事发生"混在一行，扫一眼分不出哪条要管。</div>
+
+      <div class="pane-head" style="border:1px solid var(--border); border-radius:6px 6px 0 0; margin-top:8px">改后（新方案）</div>
+      <div class="statusbar" style="border-radius:0 0 6px 6px">
+        <span>● lz · herdr w1</span><span class="s-need">需要你 1</span><span class="s-chip">运行中 6</span>
+        <span class="s-chip">↑ 传 2 项 34%</span>
+        <span class="spacer"></span><span>UTF-8 / xterm-256color / 120×32 · 悬停可见</span>
+      </div>
+      <div class="tiny">左侧=你现在在哪、连得通不通；中间=<strong>要你做的事</strong>（可点，点了跳到那张卡）；传输只在真有上传时出现；技术细节收进悬停。</div>
+
+      <div class="note decision"><h3>你已拍板</h3>
+        <p class="q">状态栏只留：会话 · 连通性 · 需要你 · 传输（有上传才出现）；UTF-8 / xterm-256color / 窗口尺寸收进悬停。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 8 删掉列表前后 -->
+<main id="s8">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head">改前：大卡列表 + 独立的「最近任务」时间线</div>
+      <div class="pane-body">
+        <div class="ai-section">AI 任务 <span class="count">3</span></div>
+        <div class="ai-board">
+          <div class="ai-task running">
+            <div class="ai-task-line"><span class="dot ok"></span> codex <span class="ai-tag">lz</span> <span class="ai-state running">运行中</span></div>
+            <div class="ai-task-meta">最后输出 1 秒前 · 已跑 3 分</div>
+          </div>
+          <div class="ai-task done">
+            <div class="ai-task-line"><span class="dot idle"></span> claude <span class="ai-tag">lz</span> <span class="ai-state done">已完成</span></div>
+            <div class="ai-task-meta">13:47 结束 · 产物 report.md · 花了 6 分</div>
+          </div>
+          <div class="ai-task done">
+            <div class="ai-task-line"><span class="dot idle"></span> gemini <span class="ai-tag">Ali_root</span> <span class="ai-state done">已完成</span></div>
+            <div class="ai-task-meta">13:31 结束 · 无产物</div>
+          </div>
+        </div>
+        <div class="ai-section">最近任务（时间线） <span class="count">3</span></div>
+        <div class="ai-board">
+          <div class="rowlet">13:52 claude 完成 · report.md</div>
+          <div class="rowlet">13:47 codex 完成 · 无产物</div>
+          <div class="rowlet">13:31 gemini 完成 · 无产物</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-panel">
+      <div class="pane-head">改后：两个区 + 两行折叠</div>
+      <div class="pane-body">
+        <div class="ai-section">需要你 <span class="count">0</span></div>
+        <div class="ai-section">运行中 <span class="count">1</span></div>
+        <div class="ai-board">
+          <div class="rowlet"><span class="dot ok"></span> codex · <span class="ai-tag">lz</span> · 1 秒前 · 3 分</div>
+        </div>
+        <div class="fold">▸ 最近完成 2 项（13:52 / 13:31）</div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>把独立的「最近任务 / 时间线」删掉之后，同一批信息还剩多少。</p></div>
+      <div class="note plain"><h3>少了什么、没少什么</h3>
+        <p><strong>少了</strong>：常驻的时间线列表，以及同一件事的"第二遍、第三遍"（状态栏里还有一遍"AI 已完成"）。</p>
+        <p><strong>没少</strong>：数据仍然照常落盘；点开「▸ 最近完成 2 项」就能看到谁、什么时候完成、有什么产物 —— 只是<strong>不再常驻占屏</strong>。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 9 已定的 7 条 -->
+<main id="s9">
+  <div class="cols">
+    <div class="col-notes" style="min-width:100%">
+      <div class="note"><h3>你已经拍板的 7 条（这一版样品就是按它们画的）</h3>
+        <p>1. 删掉独立的「最近任务」列表，只留折叠一行「▸ 最近完成 N 项」。</p>
+        <p>2. 面板默认只有两个区：<strong>需要你</strong> + <strong>运行中</strong>；完成与空闲各折一行；承载健康只在异常时出现。</p>
+        <p>3. 状态栏只留：会话 · 连通性 · <strong>需要你</strong> · 传输；UTF-8 / xterm-256color / 窗口尺寸收进悬停。</p>
+        <p>4. 裸 SSH 永不显示「等你处理」，只说「运行中（进程推断，可能已卡住）」。</p>
+        <p>5. 没跑 agent 的承载（CMD 等）<strong>不上板</strong>，只在「承载健康」悬停里可查。</p>
+        <p>6. 红点只在两件事亮：<strong>需要你</strong>（亮到你处理）、<strong>跑完停下</strong>（点开就消）；运行中 / 空闲 / 只产出文件都不亮（见第 10 屏）。</p>
+        <p>7. OSC 7501 暂缓：等 codex / claude 发版支持后再接 —— 接了裸 SSH 才能如实显示「需要你」。</p>
+      </div>
+      <div class="note plain"><h3>怎么验收</h3>
+        <p>拿第 5 屏当标尺：只有 1 张大卡、运行中一行一个、完成与空闲各一行折叠、承载健康不出现 —— 扫一眼状态栏就知道"要不要我管"；红点规则看第 10 屏。</p></div>
+      <div class="note decision"><h3>暂缓（不是放弃）：OSC 7501</h3>
+        <p class="q">让 agent 自己上报状态（有自报就能在裸 SSH 上显示"等你处理"）。等 codex / claude 发版支持后再接，现在不动。</p></div>
+    </div>
+  </div>
+</main>
+
+<!-- 10 红点与通知 -->
+<main id="s10">
+  <div class="cols">
+    <div class="col-panel">
+      <div class="pane-head"><span class="dot warn"></span> 最左侧的 AI 按钮 · 红点规则</div>
+      <div class="pane-body">
+        <div class="ai-section">① 需要你 → 红点亮到你处理为止</div>
+        <div class="ai-board">
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 2px">
+            <span style="position:relative;display:inline-flex;width:28px;height:28px;border-radius:8px;background:#2b2f38;color:#cfd6e4;align-items:center;justify-content:center;font-size:12px">AI</span>
+            <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#e5534b"></span>
+            <span style="font-size:12px;opacity:.75">agent 在等你回话 —— 它不会自己继续</span>
+          </div>
+          <div class="rowlet"><span class="dot warn"></span> 一直亮着，直到你处理（批准 / 回话 / 接管）</div>
+        </div>
+        <div class="ai-section">② 跑完一轮并停下 → 点开面板就消</div>
+        <div class="ai-board">
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 2px">
+            <span style="position:relative;display:inline-flex;width:28px;height:28px;border-radius:8px;background:#2b2f38;color:#cfd6e4;align-items:center;justify-content:center;font-size:12px">AI</span>
+            <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#e5534b"></span>
+            <span style="font-size:12px;opacity:.75">当"未读"：这一轮有结果、而且它停下来了</span>
+          </div>
+          <div class="rowlet"><span class="dot ok"></span> 点一次面板 = 已读 → 红点消失</div>
+        </div>
+        <div class="ai-section">③ 这些情况不亮（红点不变）</div>
+        <div class="ai-board">
+          <div class="rowlet"><span class="dot ghost"></span> 运行中 —— 它还在干活，没什么要你管的</div>
+          <div class="rowlet"><span class="dot ghost"></span> 空闲 / 陈旧窗格 —— 不是"值得打断你"的事</div>
+          <div class="rowlet"><span class="dot ghost"></span> 只产出了文件，但还在跑 —— 等它停下来再说</div>
+          <div class="rowlet"><span class="dot ghost"></span> 探测不到（网络 / 权限）—— 只在承载健康里提示</div>
+        </div>
+        <div class="ai-section">④ 设置里就这两个开关（默认都开）</div>
+        <div class="ai-board" style="padding:10px 12px;line-height:2">
+          <div>☑ 需要你处理时提醒</div>
+          <div>☑ 跑完一轮并停下时提醒</div>
+          <div class="ai-task-meta">其它情况不提醒：运行中、空闲、状态变化、只是产出了文件。<br>红点规则：需要你 → 亮到你处理；跑完停下 → 点开就消；同一实例同一轮只亮一次。</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-notes">
+      <div class="note"><h3>这一屏在讲什么</h3><p>红点别吵：<strong>只有"要你管"和"跑完了"才亮</strong>。</p></div>
+      <div class="note plain"><h3>为什么这么定</h3>
+        <p>红点的唯一价值是"值得打断你"。运行中、空闲、只是多了个文件 —— 这些都不值得。</p>
+        <p><strong>漏掉"需要你"才是真损失</strong>，所以那一条亮到你处理为止；"跑完停下"只是提示，点开就消。</p></div>
+      <div class="note decision"><h3>去重规则（防"每 60 秒吵一次"）</h3>
+        <p class="q">同一实例、同一轮，<strong>只亮一次</strong>：反复刷新 / 轮询不能让它又冒出来。</p></div>
+    </div>
+  </div>
+</main>
+
+<script>
+  const scenes = [
+    ["s0","0 · 看图例"],["s1","1 · 本机 PowerShell"],["s2","2 · 裸 SSH"],
+    ["s3","3 · tmux"],["s4","4 · herdr"],["s5","5 · 12 个混在一起"],
+    ["s6","6 · 全都闲着"],["s7","7 · 状态栏对照"],
+    ["s8","8 · 删掉列表前后"],["s9","9 · 已定的 7 条"],["s10","10 · 红点与通知"]
+  ];
+  const tabs = document.getElementById('tabs');
+  scenes.forEach(([id,label],i)=>{
+    const b = document.createElement('button');
+    b.className = 'tab' + (i===0?' on':''); b.textContent = label;
+    b.onclick = ()=>{
+      document.querySelectorAll('main').forEach(m=>m.classList.remove('on'));
+      document.getElementById(id).classList.add('on');
+      tabs.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+      b.classList.add('on'); window.scrollTo({top:0});
+    };
+    tabs.appendChild(b);
+  });
+  const tb = document.getElementById('themeBtn');
+  tb.onclick = ()=>{
+    const light = document.documentElement.getAttribute('data-theme') === 'light';
+    document.documentElement.setAttribute('data-theme', light ? 'dark' : 'light');
+    tb.textContent = light ? '切浅色' : '切深色';
+  };
+</script>
+</body>
+</html>

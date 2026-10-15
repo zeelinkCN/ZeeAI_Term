@@ -31,7 +31,10 @@ const LAUNCHERS: [&str; 14] = [
 ];
 
 /// 看板上的一张卡片
-#[derive(Clone, Debug, Serialize)]
+///
+/// `Deserialize` 是给 AI 看板 v2 用的：前端把已经采集到的扫描结果**原样送回**
+/// `ai_instances` 命令，由 Rust 侧统一映射/合并（口径只允许有一份实现）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiTask {
     pub id: String,

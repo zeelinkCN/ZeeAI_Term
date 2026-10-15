@@ -13,7 +13,7 @@
 //! `approval_request` 就算"在等你批准"），因为日志格式会随版本演进，
 //! 而我们只需要它别崩、别把明显不是的状态说成是。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 扫描窗口：只读文件最后这么多字节。
@@ -104,7 +104,7 @@ fn select_related(raw: &str) -> Option<String> {
     Some(out)
 }
 
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiUsage {
     pub input: u64,
@@ -119,7 +119,7 @@ pub struct AiUsage {
     pub context_window: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSessionSnapshot {
     pub session_id: String,
