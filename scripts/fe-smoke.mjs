@@ -111,7 +111,12 @@ window.__ZEEAI_SCENARIO__ = {
     tabId: "w2:t1", workspaceId: "w2", title: "proj", focused: true, attention: true,
   }],
   tasks: [],
+  // 本机 CLI 健康：默认一条都没有（没异常 → 承载健康那块不出现，§10.2）
+  cliHealth: [],
+  cliLaunchArgs: {},
 };
+window.__ZEEAI_CLI_FIXED__ = [];
+window.__ZEEAI_CLI_FLAGS__ = [];
 window.__ZEEAI_SESSION__ = ${JSON.stringify({
   version: 1,
   savedAt: Date.now(),
@@ -120,6 +125,215 @@ window.__ZEEAI_SESSION__ = ${JSON.stringify({
     ? [{ kind: "remote", title: "lz · codex", profileId: lz.id, user: lz.ssh?.user, tmuxMode: "none" }]
     : [],
 })};
+
+// ---------- 看板 v2：把前端送进来的 BoardSources 合成为「AI 实例」 ----------
+// 这是**后端 core/ai_instance.rs 的镜像**（口径 docs/design-ai-board-v2.md §10）。
+// 为什么要有一份镜像：真合并逻辑在 Rust 里（有 16 条单测兜着），但无头测试要能验
+// **前端**那一侧 —— 卡片是不是按统一模型渲染、红点是不是按两条规则亮。
+// 所以这里只镜像语义（承载闸门 / 陈旧降级 / 一个实例一张卡），不追求逐字节一致。
+const MOCK_STALE_MS = 10 * 60 * 1000;
+const MOCK_CARRIER_SPEC = { herdr: 5, tmux: 4, "ssh-bare": 3, "local-powershell": 2, wsl: 1, "local-cmd": 0 };
+const MOCK_CARRIER_KEY = {
+  herdr: "herdr", tmux: "tmux", "ssh-bare": "ssh",
+  "local-powershell": "local", wsl: "wsl", "local-cmd": "cmd",
+};
+const MOCK_CARRIER_LABEL = {
+  herdr: "herdr \u7b2c\u4e00\u624b", tmux: "tmux \u7a97\u683c", "ssh-bare": "\u88f8 SSH",
+  "local-powershell": "\u672c\u673a\u8fdb\u7a0b\u8868", wsl: "WSL \u8fdb\u7a0b\u626b\u63cf",
+  "local-cmd": "\u672c\u673a CMD",
+};
+const MOCK_SRC_LABEL = {
+  "herdr-agent-list": "herdr \u7b2c\u4e00\u624b", "app-ledger": "\u672c\u5e94\u7528\u8d26\u672c",
+  rollout: "rollout \u65e5\u5fd7", "remote-tmux-ps": "\u8fdc\u7a0b\u8fdb\u7a0b\u626b\u63cf",
+  "local-process-table": "\u672c\u673a\u8fdb\u7a0b\u8868", "wsl-ps": "WSL \u8fdb\u7a0b\u626b\u63cf",
+};
+const MOCK_SRC_RANK = {
+  "herdr-agent-list": 5, "app-ledger": 4, rollout: 3, "remote-tmux-ps": 2,
+  "local-process-table": 1, "wsl-ps": 0,
+};
+const MOCK_AGENT = { codex: "codex", claude: "claude", gemini: "gemini", aider: "aider" };
+const mockAgentOf = (tool) => MOCK_AGENT[String(tool || "").trim().toLowerCase()] || (String(tool || "").trim() ? { other: String(tool).trim() } : "unknown");
+const mockAgentKey = (a) => (a && typeof a === "object" ? String(a.other || "").toLowerCase() : String(a || ""));
+const mockAllowsNeedsYou = (c) => c === "herdr";
+const mockSanitize = (carrier, state) => {
+  if (carrier === "local-cmd") return [state === "unknown" ? "unknown" : "unknown", state === "unknown" ? null : state];
+  if (state === "needs-you" && !mockAllowsNeedsYou(carrier)) return ["working", "needs-you"];
+  if (state === "finished" && (carrier === "ssh-bare" || carrier === "local-cmd")) return ["unknown", "finished"];
+  return [state, null];
+};
+const mockHumanAge = (ms) => {
+  const s = Math.floor((ms || 0) / 1000);
+  if (s < 60) return s + " \u79d2\u524d";
+  if (s < 3600) return Math.floor(s / 60) + " \u5206\u949f\u524d";
+  return Math.floor(s / 3600) + " \u5c0f\u65f6\u524d";
+};
+const mockBadge = (inst) => {
+  const evs = inst.evidence.slice().sort((a, b) =>
+    (Number(b.confidence === "first-hand") - Number(a.confidence === "first-hand")) ||
+    (MOCK_SRC_RANK[b.source] - MOCK_SRC_RANK[a.source]));
+  const src = evs[0] ? evs[0].source : "local-process-table";
+  let s = (MOCK_SRC_LABEL[src] || src) + " \u00b7 " + mockHumanAge(inst.ageMs);
+  if (!inst.evidence.some((e) => e.confidence === "first-hand")) s += "\uff0c\u53ea\u80fd\u8bf4\u660e\u5b83\u5728\u8dd1";
+  if (inst.state === "unknown" && inst.downgradedFrom === "working") s += "\uff1b\u8d85\u8fc7 10 \u5206\u949f\u6ca1\u6709\u65b0\u8bc1\u636e\uff0c\u53ef\u80fd\u5df2\u5361\u4f4f";
+  return s;
+};
+const mockMergeBoard = (src, nowMs) => {
+  const builders = [];
+  const orphans = [];
+  const push = (ob) => {
+    const anchor = ob.anchor ? ob.anchor.kind + ":" + ob.anchor.value : null;
+    if (!anchor) { orphans.push(ob); return; }
+    const hit = builders.find((b) => b.carrier === ob.carrier && b.env === ob.env && b.anchor === anchor);
+    if (hit) {
+      hit.evidence.push({ source: ob.source, atMs: ob.atMs, confidence: ob.confidence });
+      hit.claims.push({ source: ob.source, state: ob.state });
+      hit.activity = Object.assign({}, hit.activity, ob.activity);
+      if (!hit.sessionId) hit.sessionId = ob.sessionId;
+    } else {
+      builders.push({
+        carrier: ob.carrier, agent: ob.agent, env: ob.env, cwd: ob.cwd, anchor: anchor,
+        sessionId: ob.sessionId,
+        evidence: [{ source: ob.source, atMs: ob.atMs, confidence: ob.confidence }],
+        claims: [{ source: ob.source, state: ob.state }],
+        activity: Object.assign({}, ob.activity),
+      });
+    }
+  };
+  const matchesIdentity = (b, ob) => b.env === ob.env && mockAgentKey(b.agent) === mockAgentKey(ob.agent) && !!b.cwd && !!ob.cwd && b.cwd === ob.cwd;
+  const taskObs = (t) => {
+    const env = t.env === "local" ? "\u672c\u673a" : t.env === "wsl" ? "WSL" : t.server;
+    const pane = String(t.pane || "").trim();
+    // cmdCarrier：场景显式声明"这是个 CMD 会话"（本机扫描其实看不出 CMD / PowerShell，
+    // 所以真后端那边由前端按会话类型补）—— 用来验 §10.5 的空承载闸门。
+    const carrier = t.cmdCarrier
+      ? "local-cmd"
+      : t.env === "local"
+        ? "local-powershell"
+        : t.env === "wsl"
+          ? "wsl"
+          : pane
+            ? "tmux"
+            : "ssh-bare";
+    const source = t.source === "app" ? "app-ledger" : t.source === "winproc" ? "local-process-table" : (t.env === "local" ? "local-process-table" : t.env === "wsl" ? "wsl-ps" : "remote-tmux-ps");
+    const state = t.state === "running" ? "working" : t.state === "done" ? "finished" : "unknown";
+    const anchor = t.source === "app" && t.id ? { kind: "ledger", value: t.id } : pane ? { kind: "tmux", value: pane } : t.pid > 0 ? { kind: "pid", value: String(t.pid) } : null;
+    return {
+      carrier, agent: mockAgentOf(t.tool), env, cwd: (t.cwd || "").trim() || null, anchor, state, source,
+      atMs: nowMs, confidence: source === "app-ledger" ? "first-hand" : "inferred", sessionId: null,
+      activity: { lastLine: (t.command || "").trim() || null, artifacts: [] },
+    };
+  };
+  (src.tasks || []).forEach((t) => push(taskObs(t)));
+  (src.herdr || []).forEach((g) => {
+    (g.agents || []).forEach((a) => {
+      const st = { working: "working", blocked: "needs-you", done: "finished", idle: "idle" }[String(a.status || "").trim().toLowerCase()] || "unknown";
+      push({
+        carrier: "herdr", agent: mockAgentOf(a.kind), env: g.env, cwd: (a.cwd || "").trim() || null,
+        anchor: a.paneId ? { kind: "herdr", value: a.paneId } : null, state: st,
+        source: "herdr-agent-list", atMs: nowMs, confidence: "first-hand", sessionId: null,
+        activity: {
+          lastLine: a.title && a.title !== a.cwd ? a.title : null,
+          artifacts: Array.isArray(a.artifacts) ? a.artifacts.slice() : [],
+        },
+      });
+    });
+  });
+  (src.ledger || []).forEach((g) => {
+    (g.items || []).forEach((it) => {
+      const state = it.running ? "working" : "finished";
+      const at = Math.min((it.last_running_at || 0) * 1000, nowMs);
+      push({
+        carrier: g.carrier || "local-powershell", agent: mockAgentOf(it.tool), env: g.env,
+        cwd: g.cwd || null,
+        anchor: g.herdrPane ? { kind: "herdr", value: g.herdrPane } : g.tmuxTarget ? { kind: "tmux", value: g.tmuxTarget } : { kind: "ledger", value: it.id },
+        state, source: "app-ledger", atMs: at, confidence: "first-hand", sessionId: g.sessionId || null,
+        activity: { lastLine: (it.command || "").trim() || null, artifacts: [] },
+      });
+    });
+  });
+  (src.rollouts || []).forEach((g) => {
+    const s = g.snapshot || {};
+    const cwd = (s.cwd || "").trim() || null;
+    const state = { running: "working", idle: "idle", "needs-approval": "needs-you", "waiting-user": "needs-you" }[s.state] || "unknown";
+    const env = g.env;
+    push({
+      carrier: g.carrier || (env === "\u672c\u673a" ? "local-powershell" : "ssh-bare"),
+      agent: "codex", env, cwd, anchor: null, state, source: "rollout", atMs: nowMs,
+      confidence: "inferred", sessionId: s.sessionId || null,
+      activity: { lastLine: (s.lastMessage || s.lastAction || "").trim() || null, artifacts: (g.artifacts || []).slice() },
+    });
+  });
+  orphans.forEach((ob) => {
+    const cands = builders.filter((b) => matchesIdentity(b, ob));
+    if (cands.length === 1) {
+      const b = cands[0];
+      b.evidence.push({ source: ob.source, atMs: ob.atMs, confidence: ob.confidence });
+      b.claims.push({ source: ob.source, state: ob.state });
+      b.activity = Object.assign({}, b.activity, ob.activity);
+      if (!b.sessionId) b.sessionId = ob.sessionId;
+    } else {
+      builders.push({
+        carrier: ob.carrier, agent: ob.agent, env: ob.env, cwd: ob.cwd, anchor: null,
+        sessionId: ob.sessionId,
+        evidence: [{ source: ob.source, atMs: ob.atMs, confidence: ob.confidence }],
+        claims: [{ source: ob.source, state: ob.state }],
+        activity: Object.assign({}, ob.activity),
+      });
+    }
+  });
+  const merged = [];
+  builders.slice()
+    .sort((a, b) => (MOCK_CARRIER_SPEC[b.carrier] || 0) - (MOCK_CARRIER_SPEC[a.carrier] || 0))
+    .forEach((b) => {
+      const dup = merged.find((m) =>
+        m.env === b.env && mockAgentKey(m.agent) === mockAgentKey(b.agent) && m.cwd === b.cwd &&
+        (MOCK_CARRIER_SPEC[m.carrier] || 0) > (MOCK_CARRIER_SPEC[b.carrier] || 0) &&
+        m.carrier === "herdr" && b.carrier !== "herdr");
+      if (dup) {
+        b.evidence.forEach((e) => { if (!dup.evidence.some((x) => x.source === e.source && x.atMs === e.atMs)) dup.evidence.push(e); });
+        dup.claims = dup.claims.concat(b.claims);
+        dup.activity = Object.assign({}, dup.activity, b.activity);
+        if (!dup.sessionId) dup.sessionId = b.sessionId;
+      } else {
+        merged.push(b);
+      }
+    });
+  const out = [];
+  merged.forEach((b) => {
+    let best = null;
+    b.evidence.forEach((e) => {
+      const key = [e.confidence === "first-hand" ? 1 : 0, MOCK_SRC_RANK[e.source] || 0, e.atMs];
+      if (!best || key[0] > best.key[0] || (key[0] === best.key[0] && (key[1] > best.key[1] || (key[1] === best.key[1] && key[2] > best.key[2])))) best = { key: key, ev: e };
+    });
+    const claimed = best ? (b.claims.find((c) => c.source === best.ev.source) || {}).state || "unknown" : "unknown";
+    const san = mockSanitize(b.carrier, claimed);
+    let state = san[0];
+    let downgraded = san[1];
+    const latest = b.evidence.reduce((a, e) => Math.max(a, e.atMs), 0);
+    if (state === "working" && nowMs - latest > MOCK_STALE_MS) { downgraded = downgraded || "working"; state = "unknown"; }
+    if (b.carrier === "local-cmd") return;
+    if (mockAgentKey(b.agent) === "") return;
+    const anchorKey = (b.anchor || "log").split(":").slice(0, 1)[0] + ":" + (b.anchor || "log");
+    const whereParts = [b.env];
+    if (b.cwd) whereParts.push(b.cwd);
+    whereParts.push(b.anchor ? b.anchor.replace(":", ":") : "log");
+    const inst = {
+      id: (MOCK_CARRIER_KEY[b.carrier] || b.carrier) + ":" + whereParts.join("/") + ":" + anchorKey,
+      carrier: b.carrier, agent: b.agent, where: whereParts.join(" \u00b7 "), state: state,
+      evidence: b.evidence, activity: b.activity, sessionId: b.sessionId || null,
+      downgradedFrom: downgraded, ageMs: Math.max(0, nowMs - latest),
+    };
+    inst.badge = mockBadge(inst);
+    out.push(inst);
+  });
+  const rank = { "needs-you": 0, working: 1, finished: 2, idle: 3, unknown: 4 };
+  // ⚠️ 必须给兜底值：rank[x] - rank[y] 里只要有一个 undefined 就是 NaN，
+  //    而 [].sort 的比较函数返回 NaN 时**排序结果不确定**、元素可能被丢掉
+  //（这里真踩过：idle 的实例从看板上凭空消失）。
+  const rankOf = (x) => (rank[x] === undefined ? 9 : rank[x]);
+  out.sort((a, b) => (rankOf(a.state) - rankOf(b.state)) || mockAgentKey(a.agent).localeCompare(mockAgentKey(b.agent)) || a.id.localeCompare(b.id));
+  return out;
+};
 
 const noop = () => {};
 const resolveCmd = (cmd, args) => {
@@ -227,7 +441,61 @@ const resolveCmd = (cmd, args) => {
         source: "官方·直连", sha256: "2a02fed1", bytes: 26207464, path: "$HOME/.local/bin/herdr",
       };
     case "settings_set": return null;
-    case "ai_tasks_remote": return S.tasks;
+    // 看板 v2 的场景任务（herdrTasks）：假的"远端 tmux+ps 扫描结果"。
+    // 真后端那两条路是 ssh 出去跑 tmux/ps，无头测试里没法真跑，所以用场景数据代替；
+    // 它们走的仍然是**同一条链路**（前端采集 → BoardSources → ai_instances）。
+    case "ai_tasks_remote": return (S.herdrTasks || []).concat(S.tasks || []);
+    // 看板 v2：合并 + 承载闸门 + 陈旧降级都在"后端"（这里是镜像），前端只画
+    case "ai_instances": {
+      const merged = mockMergeBoard(args && args.sources ? args.sources : {}, Date.now());
+      // 调试用：把"后端"合出来的东西留一份，断言失败时能直接看
+      window.__ZEEAI_LAST_BOARD__ = merged;
+      window.__ZEEAI_LAST_SOURCES__ = args && args.sources ? args.sources : {};
+      return merged;
+    }
+    // 本机 CLI 健康检查：**按场景回数据**（默认空 = 没有异常）。
+    // 真后端那份判据在 core/cli_health.rs（有单测兜着），这里只回它会给的形状。
+    case "cli_health": return S.cliHealth || [];
+    /**
+     * 一键修。
+     * - 没确认 → 只回"将执行什么"（一个进程都不起）——界面拿它显示确认框；
+     * - 确认了 → 模拟"装好了"：把那一项的状态改成 ok，并回新的 health。
+     * 另外把**真正执行过的命令**记到 __ZEEAI_CLI_FIXED__：断言"确认之后才跑、跑的是哪条"。
+     */
+    case "cli_health_fix": {
+      const agent = (args && args.agent) || "";
+      const want = (S.cliHealth || []).find((h) => h.command === agent) || { runCmd: agent };
+      const execCmd = agent === "aider"
+        ? "python -m pip install -U aider-chat"
+        : "npm install -g " + (agent === "codex" ? "@openai/codex" : agent === "claude" ? "@anthropic-ai/claude-code" : agent === "gemini" ? "@google/gemini-cli" : agent) + "@latest";
+      if (!(args && args.confirm)) {
+        if (agent === "aider") {
+          return { agent: agent, command: agent, execCmd: execCmd, ok: false, exitCode: null,
+            output: "", health: [], refused: true, needsConfirm: false,
+            message: "这条命令我们不代跑（" + execCmd + "）：它不在我们的白名单里，请把上面这条命令自己粘进终端执行。" };
+        }
+        return { agent: agent, command: agent, execCmd: execCmd, ok: false, exitCode: null,
+          output: "", health: [], refused: false, needsConfirm: true,
+          message: "将执行：" + execCmd + "（还没跑，等你确认）" };
+      }
+      window.__ZEEAI_CLI_FIXED__.push(execCmd);
+      const rest = (S.cliHealth || []).filter((h) => h.command !== agent);
+      S.cliHealth = rest;
+      return { agent: agent, command: agent, execCmd: execCmd, ok: true, exitCode: 0,
+        output: "added 1 package in 6s", health: rest, refused: false, needsConfirm: false,
+        message: execCmd + " 跑完了（退出码 0）" };
+    }
+    // 「以 --no-daemon 启动」：**只写设置**（真后端就是写进 settings.json 的 agentLaunchArgs），
+    // 不跑任何安装命令 —— 断言会看这里有没有被调用、以及 cli_health_fix 有没有被误调
+    case "cli_health_set_flag": {
+      const cmd = (args && args.agent) || "";
+      const flag = (args && args.flag) || "";
+      window.__ZEEAI_CLI_FLAGS__.push({ cmd: cmd, flag: flag });
+      const runCmd = flag ? cmd + " " + flag : cmd;
+      if (S.cliHealth) S.cliHealth = S.cliHealth.map((h) => (h.command === cmd ? Object.assign({}, h, { runCmd: runCmd }) : h));
+      return { agent: cmd, command: cmd, flag: flag, runCmd: runCmd,
+        note: "只影响我们从这里启动它的方式（下次用它启动时会带上）；没动你的全局配置，在别的终端里还是原来的用法。" };
+    }
     case "ai_tasks_local": return [];
     case "ai_tasks_clear_finished": return null;
     case "ai_session_snapshot": return null;
@@ -301,6 +569,43 @@ window.__TAURI_INTERNALS__ = {
 };
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: noop };
 `;
+
+// ---------- 本机 AI CLI 健康（承载健康第三档）的场景数据 ----------
+// 为什么长这样：用户本机 codex 真实踩过的四种坏法见 core/cli_health.rs，
+// 这里取三种最典型的 —— ①「装了但起不来（缺平台二进制）」要冒异常；
+// ②「没装」不算异常；③「守护进程起不来」的修法是换启动参数，不是重装。
+//
+// ⚠️ 这一个坑真踩过：数据里**别出现反斜杠**（路径写成正斜杠）。
+//    这份数据是模块作用域的，但 `setScenario` 会把它 JSON.stringify 进注入脚本，
+//    而注入脚本本身又是模板字符串 —— 少一层转义注入脚本就会当场语法错，
+//    整份假后端失效、页面白屏（报的是 SyntaxError: Invalid or unexpected token）。
+//    换行用**模板字符串里的真换行**（别写转义序列，理由同上）。
+// 它在**模块作用域**（不在上面那个注入脚本里）：`setScenario({ cliHealth: [...] })` 要用它。
+const MOCK_CLI_BROKEN = {
+  agent: "codex", command: "codex", status: "installed-but-broken",
+  summary: "装了但起不来：缺平台二进制（安装没装完，最常见的是一次被打断的自动更新）",
+  detail: `C:/Users/a/AppData/Roaming/npm/codex.cmd
+---
+Error: Missing optional dependency @openai/codex-win32-x64`,
+  fix: { label: "重装：npm install -g @openai/codex@latest", kind: { kind: "reinstall" } },
+  runCmd: "codex",
+};
+const MOCK_CLI_NOT_INSTALLED = {
+  agent: "claude", command: "claude", status: "not-installed",
+  summary: "没找到这个命令（PATH 和 npm 全局目录里都没有）",
+  detail: "",
+  fix: { label: "安装：npm install -g @anthropic-ai/claude-code@latest", kind: { kind: "reinstall" } },
+  runCmd: "claude",
+};
+const MOCK_CLI_NO_DAEMON = {
+  agent: "gemini", command: "gemini", status: "installed-but-broken",
+  summary: "装了但起不来：启动被系统拒绝（后台守护进程起不来）",
+  detail: `C:/Users/a/AppData/Roaming/npm/gemini.cmd
+---
+Error: 拒绝访问。 (os error 5)`,
+  fix: { label: "以 gemini --no-daemon 启动", kind: { kind: "add-flag", value: "--no-daemon" } },
+  runCmd: "gemini",
+};
 
 try {
   rmSync(OUT, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -483,6 +788,13 @@ const setScenario = async (flags) => {
     // 覆盖设置（例如强制浅色主题）。**必须显式写 null**：注入脚本是累积的，
     // 少了这一条，下一个场景会继承上一个场景的主题。
     settingsPatch: null,
+    // 本机 CLI 健康（承载健康第三档）：**每轮显式重置成空数组** ——
+    // 注入脚本是累积的，上一个场景塞进去的"codex 起不来"会污染下一个场景
+    //（那种污染在这份文件里踩过不止一次：herdrNotInstalled / herdrScan 都栽过）。
+    cliHealth: [],
+    // 看板 v2 的场景数据（前端只采集、后端合并 —— 假后端那份合并见 mockMergeBoard）。
+    // ⚠️ herdrTasks / herdrScan **故意不在这里重置**：注入脚本是累积的，每轮都写 null
+    //    会把前面场景放进去的任务清空（我踩过一次：D2 那条用例的卡片突然只剩 herdr 的）。
     ...flags,
   };
   await send("Page.addScriptToEvaluateOnNewDocument", {
@@ -529,38 +841,83 @@ await new Promise((r) => setTimeout(r, 2500));
 const shot2 = await shot("02-ai-panel.png");
 const panel = await evaluate("document.querySelector('.ai-panel') ? document.querySelector('.ai-panel').innerText : ''");
 check("AI 面板能打开", opened === "clicked" && panel.length > 0, `打开方式=${opened}`);
-check("面板显示状态来源 = herdr", panel.includes("状态来源：herdr 0.9.1"), panel.split("\n").find((l) => l.includes("herdr")) ?? "");
-check("herdr 卡片显示「等你处理」", panel.includes("等你处理"));
+check(
+  "面板第一眼只有「需要你」「运行中」两个区（§10.2）",
+  panel.includes("需要你 1") && panel.includes("运行中 0"),
+  panel.split("\n").slice(0, 6).join(" / "),
+);
+check(
+  "herdr 卡片显示「需要你」（§10.6 唯一值得亮红点的那件事）",
+  panel.includes("需要你 1") && panel.includes("codex"),
+);
 check("herdr 卡片带「查看窗格」入口", panel.includes("查看窗格"));
-check("卡片标了来源 = herdr 状态", panel.includes("herdr 状态"));
+check(
+  "卡片标了来源 = herdr 第一手（后端 badge()）",
+  panel.includes("herdr 第一手"),
+  panel.split("\n").find((l) => l.includes("herdr 第一手")) ?? "",
+);
 check("装了 herdr 时不显示一键安装", !panel.includes("一键安装"));
 
 // ---------- herdr 服务生命周期：可见 + 可控（停止要二段确认） ----------
-check(
-  "AI 面板显示 herdr 服务状态（运行中 + 窗格数）",
-  panel.includes("herdr 服务：运行中"),
-  panel.split("\n").find((l) => l.includes("herdr 服务")) ?? "",
-);
-const stopArmed = await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").includes("停止服务"));
-  if (!b) return { found: false };
-  b.click();
-  return { found: true };
-})()`);
-await new Promise((r) => setTimeout(r, 400));
-const armed = await evaluate(`[...document.querySelectorAll(".ai-panel button")].map((b) => (b.innerText || "").trim())`);
-check(
-  "「停止服务」要二段确认（会关掉所有 herdr 窗格）",
-  stopArmed.found && armed.some((t) => t.includes("确认停止")),
-  armed.filter((t) => t.includes("停止") || t.includes("取消")).join(" | "),
-);
-// 取消掉，别把后面的用例带进"确认态"
+// 承载健康那一块只在"有异常"时出现（上面默认场景里有 3 个工作区没在用 / 2 个空壳）。
+// 这里把工作区扫成"一个都没有"，健康块就回到正常态：只剩服务那一行。
+// 注意 setScenario 只对**下一次加载**生效，所以必须 reload 再重新打开面板。
+await setScenario({ herdrScan: { workspaces: [], panes: [] } });
+await reload();
 await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").trim() === "取消");
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
   if (b) b.click();
 })()`);
-
+await sleep(2800);
+const panelHealth = await evaluate("document.querySelector('.ai-panel') ? document.querySelector('.ai-panel').innerText : ''");
+check(
+  "没有异常时「承载健康」不常驻：面板里不再有「herdr 工作区」「探测失败」这些行（§10.2）",
+  !panelHealth.includes("herdr 工作区") && !panelHealth.includes("探测失败"),
+  panelHealth.split("\n").filter((l) => l.includes("承载") || l.includes("工作区")).join(" / "),
+);
+check(
+  "装了 herdr 时「服务：运行中」仍在（只是折起来，不占常驻位置）",
+  panelHealth.includes("herdr 服务：运行中"),
+  panelHealth.split("\n").find((l) => l.includes("herdr 服务")) ?? "",
+);
+// 把工作区扫描恢复成默认场景（后面的清理空壳用例还要用它）。
+// 注意不能写 null：假后端是 `S.herdrScan || {默认}`，null 会被兜底吃掉、
+// 继续沿用上一场景那个空数组。
+await setScenario({
+  herdrScan: {
+    workspaces: ["w9", "wD", "wE"],
+    panes: [
+      { paneId: "w9:p1", procName: "bash" },
+      { paneId: "wD:p1", procName: "bash" },
+      { paneId: "wE:p1", procName: "claude" },
+    ],
+  },
+});
+// 恢复只对**下一次加载**生效，所以这里 reload 一次并重新打开面板。
+// 这一步顺带验证"承载健康只在异常时出现"的**互斥**：有工作区要清理时，
+// 面板上只给清理入口（不把"停止服务"也堆出来 —— 那正是它要收掉的乱）。
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(2800);
+const healthRowNow = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  const all = [...p.querySelectorAll("button")];
+  return {
+    clean: all.some((x) => (x.textContent || "").includes("清理空壳")),
+    stop: all.some((x) => (x.textContent || "").includes("停止服务")),
+  };
+})()`);
+check(
+  "有工作区要清理时，承载健康只给清理入口（不把「停止服务」也堆上来）",
+  healthRowNow.clean && !healthRowNow.stop,
+  JSON.stringify(healthRowNow),
+);
 // ---------- herdr 工作区生命周期：挑出"空壳" + 二段确认清理 ----------
+// 这一段验的是"异常时才出现"的那块：默认场景里 3 个工作区没在用、其中 2 个是空壳，
+// 所以承载健康那一行会带着清理入口出现（正常态它是收起的，见上面那两条断言）。
 const wsLine = await evaluate(`(() => {
   const el = [...document.querySelectorAll(".ai-panel .hint")].find((x) => (x.innerText || "").includes("herdr 工作区"));
   return el ? (el.innerText || "").replace(/\\n/g, " / ") : "";
@@ -611,6 +968,31 @@ check(
     cleanResult.others === 0,
   JSON.stringify(cleanResult),
 );
+
+// ---------- 「停止服务」二段确认 ----------
+// 放在工作区清理之后：清干净了健康块才回到"只有服务那一行"的形态，
+// 那个开关才会露出来（有东西要清理时优先让用户清理，两行不堆一起 —— §10.2）。
+const stopArmed = await evaluate(`(() => {
+  // 用 textContent 而不是 innerText：那张"服务运行中"的折叠块（<details>）收起时
+  // innerText 是空的，但里面的按钮照样点得动。
+  const all = [...document.querySelectorAll(".ai-panel button")];
+  const b = all.find((x) => (x.textContent || "").includes("停止服务"));
+  if (!b) return { found: false, texts: all.map((x) => (x.textContent || "").trim()).slice(0, 14) };
+  b.click();
+  return { found: true };
+})()`);
+await new Promise((r) => setTimeout(r, 600));
+const armed = await evaluate(`[...document.querySelectorAll(".ai-panel button")].map((b) => (b.textContent || "").trim())`);
+check(
+  "「停止服务」要二段确认（会关掉所有 herdr 窗格）",
+  stopArmed.found && armed.some((x) => x.includes("确认停止")),
+  `found=${stopArmed.found} ${JSON.stringify(stopArmed.texts || armed.slice(0, 14))}`,
+);
+// 取消掉，别把后面的用例带进"确认态"
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.innerText || "").trim() === "取消");
+  if (b) b.click();
+})()`);
 
 // ---------- 点「查看窗格」：应当开一个 herdr-pane 观察窗，并建立输入通道 ----------
 const clickedPane = await evaluate(`(() => {
@@ -1054,6 +1436,59 @@ check(
 );
 const shot7 = await shot("07-powershell-7.png");
 
+// ---------- 输入窗 → **本地 PowerShell**：正文与回车都要写进 PTY ----------
+//
+// 用户报（2026-10-16）：远程 SSH 的输入窗正常，**本地 PowerShell 回车发不过去**。
+// 后端已用真机探针排除（`examples/local_enter_probe.rs`：原文+CR、bracketed paste+CR 都能执行，
+// 只有 LF 不执行），所以这里钉住前端：本地会话必须和远程一样，正文与回车都送到。
+const localComposerSend = await evaluate(`(async () => {
+  const bar = document.querySelector(".composer-bar");
+  if (bar && !document.querySelector(".composer-input")) bar.click();
+  await new Promise((r) => setTimeout(r, 350));
+  const ta = document.querySelector(".composer-input");
+  if (!ta) return { error: "输入窗没打开", bar: !!bar };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+  setter.call(ta, "本地回车的标记词");
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  const before = window.__ZEEAI_CALLARGS__.length;
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 900));
+  const calls = window.__ZEEAI_CALLARGS__.slice(before).filter((c) => c.cmd === "session_write");
+  const dec = (b64) => {
+    try {
+      return new TextDecoder().decode(Uint8Array.from(atob(String(b64 || "")), (ch) => ch.charCodeAt(0)));
+    } catch (e) {
+      return "<解码失败>";
+    }
+  };
+  const payloads = calls.map((c) => dec((c.args || {}).dataB64));
+  const textIdx = payloads.findIndex((p) => p.includes("本地回车的标记词"));
+  const crIdx = payloads.findIndex((p) => p === "\\r");
+  return {
+    count: calls.length,
+    ids: [...new Set(calls.map((c) => String((c.args || {}).id || "")))],
+    payloads: payloads.map((p) => JSON.stringify(p)),
+    textIdx,
+    crIdx,
+    trailing: crIdx >= 0 ? payloads.length - crIdx - 1 : -1,
+  };
+})()`);
+check(
+  "输入窗发给本地 PowerShell：正文与回车**分两次写**、回车在后且是最后一次写入",
+  localComposerSend.textIdx === 0 &&
+    localComposerSend.crIdx > localComposerSend.textIdx &&
+    localComposerSend.trailing === 0,
+  JSON.stringify(localComposerSend).slice(0, 320),
+);
+await evaluate(`(() => {
+  const bar = document.querySelector(".composer-bar");
+  if (bar && document.querySelector(".composer-input")) bar.click();
+  const ta = document.querySelector(".xterm-helper-textarea");
+  if (ta) ta.focus();
+  return true;
+})()`);
+await sleep(300);
+
 // ---------- (A4) 一键安装按钮：点了要真的调 herdr_install ----------
 await setScenario({ herdrNotInstalled: true });
 await reload();
@@ -1454,8 +1889,8 @@ const board2 = await evaluate(`(() => {
   const head = (document.querySelector(".ai-panel .ai-head")?.innerText || "").trim();
   const cards = [...document.querySelectorAll(".ai-panel .ai-task")].map((c) =>
     (c.innerText || "").replace(/\\n/g, " / "));
-  const fold = [...document.querySelectorAll(".ai-panel button")].find((b) =>
-    (b.innerText || "").includes("不活跃的窗格"));
+  const fold = [...document.querySelectorAll(".ai-panel .ai-fold")].find((b) =>
+    (b.innerText || "").includes("空闲"));
   return { head, cards, fold: fold ? (fold.innerText || "").trim() : "" };
 })()`);
 check(
@@ -1467,8 +1902,8 @@ check(
   "「空闲」的窗格不占卡片位：收进一行折叠（正在跑的照常显示）",
   !board2.cards.some((c) => c.includes("w1Z:p1")) &&
     board2.cards.some((c) => c.includes("wB:p1")) &&
-    board2.fold.includes("另有 1 个不活跃的窗格"),
-  `卡片=${JSON.stringify(board2.cards).slice(0, 160)} 折叠行=${board2.fold}`,
+    board2.fold.includes("▸ 空闲 1 项"),
+  `卡片=${JSON.stringify(board2.cards).slice(0, 140)} 折叠行=${board2.fold}`
 );
 check(
   "卡片上不再出现 `lz · lz · wB:p1` 这种服务器名/项目名重复",
@@ -1476,8 +1911,8 @@ check(
   JSON.stringify(board2.cards).slice(0, 160),
 );
 await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".ai-panel button")].find((x) =>
-    (x.innerText || "").includes("不活跃的窗格"));
+  const b = [...document.querySelectorAll(".ai-panel .ai-fold")].find((x) =>
+    (x.innerText || "").includes("空闲"));
   if (b) b.click();
   return !!b;
 })()`);
@@ -1508,6 +1943,13 @@ await evaluate(`(() => {
   return !!b;
 })()`);
 await sleep(2200);
+// 诊断开关：假后端这一轮到底合出了什么（排查"卡片的断言挂了"时很有用）
+if (process.env.ZEEAI_FE_DEBUG_BOARD) {
+  const dbg = await evaluate(
+    `JSON.stringify({ board: window.__ZEEAI_LAST_BOARD__ || null, herdr: (window.__ZEEAI_LAST_SOURCES__ || {}).herdr || null })`,
+  );
+  console.log("---- [debug] 假后端这一轮合出来的看板 ----\n" + dbg);
+}
 // 「AI 命令行工具」现在收在右下角：默认只剩一个小按钮，点开才展开
 const dockClosed = await evaluate(`(() => {
   const b = document.querySelector(".tool-dock-btn");
@@ -1589,6 +2031,393 @@ check(
   armedRow.some((t) => t.includes("确认关掉 w9")),
   armedRow.join(" | ").slice(0, 160),
 );
+
+// 清掉上一块场景留下的"进程扫描结果"（herdrTasks 是跨块累积的：注入脚本只覆盖
+// 它显式写到的键，不写就等于沿用上一块 —— 不显式清会让卡片数一直涨）。
+const clearBoardTasks = () => setScenario({ herdrTasks: null, herdrScan: null });
+/**
+ * 等"看板真的拉过一轮"。
+ *
+ * 为什么要等而不是固定 sleep：首屏那一下要等 index.html 起来 + deferUntilIdle 之后才发
+ * `ai_instances`，固定等 1.2 秒有时候会读到"还没拉"的状态 —— 红点那几条断言就是被它坑过。
+ */
+/** 活动栏 AI 图标上的红点（没有就是空串） */
+const readDot = async () =>
+  evaluate(`(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`);
+/**
+ * 轮询等红点变成期望的样子。
+ *
+ * 为什么不固定 sleep、也不等"ai_instances 调用次数"：reload 会把页面里的调用记录清空，
+ * 而"看板拉完 → 红点出现"这一步本身要等首帧 + deferUntilIdle + 一次 IPC，
+ * 固定 1.2 秒有时候只读到"还没拉"。直接轮询 DOM 最稳。
+ */
+const waitDot = async (want, timeoutMs = 25000) => {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await readDot();
+    const hit = want === "" ? v === "" : v !== "";
+    if (hit || Date.now() - t0 > timeoutMs) return v;
+    await sleep(250);
+  }
+};
+
+// ---------- (F0) 看板 v2 §10：两区 + 折叠行 + 徽标 + 闸门（界面照 docs/mockups/ai-board-v2.html） ----------
+//
+// 这一批断言就是"不能再退回去"的那几条：
+//   §10.1 独立时间线列表不存在，只剩折叠一行（收起时不渲染明细）
+//   §10.2 面板默认只有「需要你」「运行中」两个区；完成/空闲各一行折叠
+//   §10.4 裸 SSH 永不出现「需要你」
+//   §10.5 没跑 agent 的承载（CMD）不上板
+//   §10.6 红点只认"需要你 / 跑完停下"
+//
+// 这一段要在"四个状态都有东西"的场景下验：补两条进程扫描结果 ——
+// 一条远端裸 SSH（进「运行中」）、一条 tmux 已完成（进「最近完成」那一行）。
+await setScenario({
+  herdrScan: {
+    workspaces: ["w9", "wD", "wE"],
+    panes: [
+      { paneId: "w9:p1", procName: "bash" },
+      { paneId: "wD:p1", procName: "bash" },
+      { paneId: "wE:p1", procName: "claude" },
+    ],
+  },
+  herdrTasks: [
+    { id: "ps:lz:9001", env: "remote", server: "lz", tool: "claude", command: "claude",
+      cwd: "/srv/idle", pane: "", source: "ps", state: "running", durationMs: 3_000,
+      pid: 9001, startedAt: null, exitCode: null },
+    { id: "tmux:lz:web:0.1", env: "remote", server: "lz", tool: "gemini", command: "gemini",
+      cwd: "/srv/web", pane: "web:0.1", source: "tmux", state: "done", durationMs: 60_000,
+      pid: 0, startedAt: null, exitCode: null },
+  ],
+});
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(2600);
+const v2 = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  if (!p) return { missing: true };
+  const secs = [...p.querySelectorAll(".ai-section")].map((e) => (e.innerText || "").trim());
+  const cards = [...p.querySelectorAll(".ai-task")];
+  const folds = [...p.querySelectorAll(".ai-fold")].map((e) => (e.innerText || "").trim());
+  const badges = [...p.querySelectorAll(".ai-task .ai-badge-owner")];
+  return {
+    secs,
+    headCardCount: cards.length,
+    folds,
+    foldText: folds.join(" | "),
+    badgeCount: badges.length,
+    badgeText: badges.map((e) => (e.innerText || "").trim()),
+    badgeTitle: badges.map((e) => e.getAttribute("title") || ""),
+    hasTimeline: !!p.querySelector(".ai-timeline"),
+    detailW1Z: cards.some((c) => (c.innerText || "").includes("w1Z:p1")),
+    cardText: cards.map((c) => (c.innerText || "").replace(/\\n/g, " / ")),
+    panelText: p.innerText,
+  };
+})()`);
+const v2Folds = v2.folds || [];
+check(
+  "面板只有两个区：需要你 / 运行中（§10.2）",
+  (v2.secs || []).some((s) => s.startsWith("需要你")) &&
+    (v2.secs || []).some((s) => s.startsWith("运行中")) &&
+    !(v2.secs || []).some((s) => s === "任务卡片"),
+  JSON.stringify(v2.secs),
+);
+check(
+  "没有独立的时间线列表：收起时 .ai-timeline 根本不存在（§10.1）",
+  v2.hasTimeline === false,
+  `hasTimeline=${v2.hasTimeline}`,
+);
+check(
+  "「最近完成」「空闲」各折成一行，收起时不渲染明细（§10.1 / §10.2）",
+  v2Folds.some((f) => f.startsWith("▸ 最近完成")) &&
+    v2Folds.some((f) => f.startsWith("▸ 空闲")) &&
+    v2.detailW1Z === false,
+  v2.foldText,
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel .ai-fold")].find((x) =>
+    (x.innerText || "").includes("空闲"));
+  if (b) b.click();
+})()`);
+await sleep(400);
+const v2Open = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  return {
+    folds: [...p.querySelectorAll(".ai-fold")].map((e) => (e.innerText || "").trim()),
+    cards: [...p.querySelectorAll(".ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / ")),
+  };
+})()`);
+check(
+  "点开那一行才渲染明细（空闲的窗格这时才出现，且只给「查看窗格」）",
+  v2Open.folds.some((f) => f.startsWith("▾ 空闲")) &&
+    v2Open.cards.some((c) => c.includes("w1Z:p1")) &&
+    !v2Open.cards.some((c) => c.includes("w1Z:p1") && c.includes("接管")),
+  JSON.stringify(v2Open.cards).slice(0, 200),
+);
+check(
+  "每张卡都有来源徽标（谁说的 / 多久前 / 能证明什么）（§3.3 / §10.2）",
+  v2.badgeCount >= 1 &&
+    v2.badgeText.every((b) => b.includes("前")) &&
+    v2.badgeTitle.every((t) => t.includes("怎么得出的") && t.includes("谁说的") && t.includes("能证明什么")),
+  `徽标=${JSON.stringify(v2.badgeText)} 悬停=${JSON.stringify(v2.badgeTitle[0] || "").slice(0, 90)}`,
+);
+
+// ---------- (F1) mock 裸 SSH 会话：永不出现「需要你」；CMD 空承载不上板（§10.4 / §10.5） ----------
+await clearBoardTasks();
+await setScenario({
+  herdrScan: { workspaces: [], panes: [] },
+  herdrTasks: [
+    { id: "ssh:lz:4242", env: "remote", server: "lz", tool: "codex", command: "codex --full-auto",
+      cwd: "/srv/app", pane: "", source: "ps", state: "running", durationMs: 12_000, pid: 4242,
+      startedAt: null, exitCode: null },
+    { id: "cmd:local:9", env: "local", server: "本机 CMD", tool: "codex", command: "codex",
+      cwd: "C:/work", pane: "", source: "winproc", state: "running", durationMs: 1_000, pid: 9,
+      startedAt: null, exitCode: null, cmdCarrier: true },
+  ],
+});
+await reload();
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(2800);
+const bare = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  const cards = [...p.querySelectorAll(".ai-task")];
+  const texts = cards.map((c) => (c.innerText || "").replace(/\\n/g, " / "));
+  // 只看"进程扫描那条路"上来的卡（带 herdr 徽标的那张是上一段场景留下的，
+  // 不显式清就让卡片数一直涨 —— 见 clearBoardTasks 的说明）
+  const scanned = texts.filter((x) => !x.includes("herdr 第一手"));
+  return {
+    cardCount: scanned.length,
+    sshCard: scanned.find((x) => x.includes("进程推断")) || "",
+    cards: texts,
+    panelText: p.innerText,
+  };
+})()`);
+check(
+  "mock 裸 SSH 会话不出现「需要你」：只说「运行中（进程推断，可能已卡住）」（§10.4）",
+  bare.sshCard.includes("运行中（进程推断，可能已卡住）") &&
+    !bare.sshCard.includes("需要你") &&
+    !bare.sshCard.includes("等你处理"),
+  (bare.sshCard || "(没有裸 SSH 卡)") + " 全部卡=" + JSON.stringify(bare.cards).slice(0, 300),
+);
+check(
+  "CMD 空承载不在板上占行（§10.5）",
+  bare.cardCount === 1 && !bare.panelText.includes("CMD"),
+  `卡片数=${bare.cardCount} ${JSON.stringify(bare.cards).slice(0, 160)}`,
+);
+
+// ---------- (F2) 红点规则（§10.6）：只有"需要你 / 跑完停下"亮 ----------
+// ② 只是"运行中" → 不亮
+await clearBoardTasks();
+await setScenario({
+  herdrScan: { workspaces: [], panes: [] },
+  herdrAgents: [
+    { kind: "codex", status: "working", cwd: "/home/user/proj", paneId: "w7:p1",
+      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: false },
+  ],
+});
+await reload();
+const dotWorking = await waitDot("");
+check(
+  "运行中不点红点（§10.6：只有「需要你 / 跑完停下」值得亮）",
+  dotWorking === "",
+  `红点="${dotWorking}"`,
+);
+
+// ② 跑完并停下 → 亮一个未读；点开面板即清
+await setScenario({
+  herdrScan: { workspaces: [], panes: [] },
+  herdrAgents: [
+    { kind: "codex", status: "done", cwd: "/home/user/proj", paneId: "w7:p1",
+      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: false },
+  ],
+});
+await reload();
+const dotFinished = await waitDot("1");
+check(
+  "跑完一轮并停下 → 红点亮；点开面板即清（当未读）（§10.6）",
+  dotFinished !== "",
+  `点开前红点="${dotFinished}"`,
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(1500);
+const dotAfterOpen = await evaluate(
+  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
+);
+check(
+  "「跑完停下」那条未读点开面板就消（§10.6）",
+  dotAfterOpen === "",
+  `点开后红点="${dotAfterOpen}"`,
+);
+
+// ① 需要你 → 亮；而且**打开面板后仍然亮**（亮到你处理为止），反复轮询也只亮一次
+await setScenario({
+  herdrScan: { workspaces: [], panes: [] },
+  herdrAgents: [
+    { kind: "codex", status: "blocked", cwd: "/home/user/proj", paneId: "w7:p1",
+      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: true },
+  ],
+});
+await reload();
+const dotNeeds0 = await waitDot("1");
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(1400);
+const dotNeeds1 = await evaluate(
+  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
+);
+// 面板里那两个 20 秒周期的刷新会再拉几次看板：数字不许自己往上涨（同一实例同一轮只亮一次）
+const beforeCalls = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.title || "").includes("重新扫描"));
+  if (b) b.click();
+  return true;
+})()`);
+await sleep(2000);
+const dotNeeds2 = await evaluate(
+  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
+);
+const afterCalls = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+check(
+  "需要你 → 红点亮；打开面板后**仍然亮**（亮到你处理为止）（§10.6）",
+  dotNeeds0 !== "" && dotNeeds0 === dotNeeds1,
+  `点开前=${dotNeeds0} 点开后=${dotNeeds1}`,
+);
+check(
+  "反复轮询不会让红点自己往上涨（同一实例同一轮只亮一次）（§10.6）",
+  dotNeeds0 === dotNeeds2 && afterCalls > beforeCalls,
+  `${dotNeeds0} → ${dotNeeds2}（ai_instances ${beforeCalls} → ${afterCalls} 次）`,
+);
+
+// ③ 只产出文件但还在跑 → 不亮（"产物"不是点红点的理由，跑完停下才是）
+await clearBoardTasks();
+await setScenario({
+  herdrScan: { workspaces: [], panes: [] },
+  herdrAgents: [
+    { kind: "codex", status: "working", cwd: "/home/user/proj", paneId: "w7:p1",
+      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: false,
+      artifacts: ["report.md", "index.html"] },
+  ],
+});
+await reload();
+const dotDocs = await waitDot("");
+check(
+  "只产出文件但还没停 → 不亮红点（§10.6 / §10.9 冲突清单）",
+  dotDocs === "",
+  `红点="${dotDocs}"`,
+);
+
+// ---------- (F3) 状态栏只留四件事：不含 UTF-8 / xterm-256color（§10.3） ----------
+const statusLine = await evaluate(
+  `(() => { const s = document.querySelector(".statusbar"); return s ? (s.innerText || "").replace(/\\n/g, " / ") : ""; })()`,
+);
+const statusTip = await evaluate(
+  `(() => { const s = document.querySelector(".statusbar"); return s ? (s.getAttribute("title") || "") : ""; })()`,
+);
+check(
+  "状态栏不含 UTF-8 / xterm-256color（技术标识收进悬停）（§10.3）",
+  !statusLine.includes("UTF-8") &&
+    !statusLine.includes("xterm-256color") &&
+    statusTip.includes("UTF-8") &&
+    statusTip.includes("xterm-256color"),
+  `状态栏=${statusLine} 悬停=${statusTip.slice(0, 80)}`,
+);
+
+// ---------- (F4) 12 个实例混在一起：那一屏还读得下来（截图 24 / 25） ----------
+await clearBoardTasks();
+await setScenario({
+  herdrTasks: [
+    { id: "ssh:lz:4242", env: "remote", server: "lz", tool: "codex", command: "codex",
+      cwd: "/srv/app", pane: "", source: "ps", state: "running", durationMs: 7_000, pid: 4242,
+      startedAt: null, exitCode: null },
+    { id: "ssh:ali:77", env: "remote", server: "Ali_root", tool: "claude", command: "claude",
+      cwd: "/root/api", pane: "", source: "ps", state: "running", durationMs: 2_000, pid: 77,
+      startedAt: null, exitCode: null },
+    { id: "cmd:local:9", env: "local", server: "本机 CMD", tool: "codex", command: "codex",
+      cwd: "C:/work", pane: "", source: "winproc", state: "running", durationMs: 1_000, pid: 9,
+      startedAt: null, exitCode: null, cmdCarrier: true },
+    { id: "tmux:lz:work:0.1", env: "remote", server: "lz", tool: "gemini", command: "gemini",
+      cwd: "/srv/build", pane: "work:0.1", source: "tmux", state: "running", durationMs: 9_000,
+      pid: 0, startedAt: null, exitCode: null },
+    { id: "tmux:lz:build:0.2", env: "remote", server: "lz", tool: "claude", command: "claude",
+      cwd: "/srv/web", pane: "build:0.2", source: "tmux", state: "done", durationMs: 120_000,
+      pid: 0, startedAt: null, exitCode: null },
+  ],
+  herdrAgents: [
+    { kind: "codex", status: "blocked", cwd: "/home/user/proj", paneId: "w1:p1",
+      tabId: "w1:t1", workspaceId: "w1", title: "改登录", focused: true, attention: true },
+    { kind: "codex", status: "working", cwd: "/home/user/proj", paneId: "w1:p2",
+      tabId: "w1:t1", workspaceId: "w1", title: "proj", focused: false, attention: false },
+    { kind: "claude", status: "idle", cwd: "/home/user/proj", paneId: "w1:p3",
+      tabId: "w1:t1", workspaceId: "w1", title: "proj", focused: false, attention: false },
+    { kind: "gemini", status: "done", cwd: "/home/user/proj", paneId: "w2:p1",
+      tabId: "w2:t1", workspaceId: "w2", title: "proj", focused: false, attention: false },
+  ],
+  herdrScan: { workspaces: [], panes: [] },
+});
+await reload();
+await sleep(1400);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(2800);
+const mixed = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  const secs = [...p.querySelectorAll(".ai-section")].map((e) => (e.innerText || "").trim());
+  const folds = [...p.querySelectorAll(".ai-fold")].map((e) => (e.innerText || "").trim());
+  const cards = [...p.querySelectorAll(".ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / "));
+  return {
+    secs, folds, cards,
+    badgeCount: [...p.querySelectorAll(".ai-badge-owner")].length,
+    panelText: p.innerText,
+  };
+})()`);
+check(
+  "12 个实例混在一起时：需要你只 1 张卡，其余运行中一行一张、完成与空闲各一行折叠（§10.2）",
+  (mixed.secs || []).some((s) => s === "需要你 1") &&
+    (mixed.secs || []).some((s) => s === "运行中 4") &&
+    mixed.folds.some((f) => f.includes("最近完成")) &&
+    mixed.folds.some((f) => f.includes("空闲")),
+  `区=${JSON.stringify(mixed.secs)} 折叠=${JSON.stringify(mixed.folds)}`,
+);
+check(
+  "这一屏里没有 CMD 卡、也没有裸 SSH 的「需要你」（§10.4 / §10.5）",
+  !mixed.panelText.includes("CMD") &&
+    mixed.cards.filter((c) => c.includes("进程推断")).every((c) => !c.includes("需要你")),
+  `卡片=${JSON.stringify(mixed.cards).slice(0, 200)}`,
+);
+const shotMixedDark = await shot("24-board-mixed-dark.png");
+await setScenario({ settingsPatch: { theme: "light" } });
+await reload();
+await sleep(1400);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+  if (b) b.click();
+})()`);
+await sleep(2800);
+const shotMixedLight = await shot("25-board-mixed-light.png");
+await setScenario({ settingsPatch: { theme: "dark" } });
+check(
+  "混排那一屏在深色 / 浅色下都截了图（给人看的）",
+  shotMixedDark.endsWith("24-board-mixed-dark.png") && shotMixedLight.endsWith("25-board-mixed-light.png"),
+  `${shotMixedDark} / ${shotMixedLight}`,
+);
+
 
 // ---------- (F) 尺寸闸门：整个跑测过程中不许出现"小得离谱"的 resize ----------
 //
@@ -2663,6 +3492,323 @@ check(
     afterEsc.tabs.some((t) => t.includes(renamedTo)) &&
     !afterEsc.tabs.some((t) => t.includes("不该保存的名字")),
   JSON.stringify(afterEsc.tabs),
+);
+
+// ---------- (Z) 本机 AI CLI 的承载健康 + 一键修 ----------
+// 口径：承载健康**只在异常时出现**（§10.2）；`not-installed` 不算异常（不冒红）。
+// 这三段验的是前端那一侧：异常时看不看得见、状态栏那条点不点得动、
+// 「重装」是不是**先给命令原文再执行**、「换启动参数」是不是**只写设置**。
+const openAiPanel = async () => {
+  await evaluate(`(() => {
+    const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(2200);
+};
+
+// ① 异常（装了但起不来）→ 看板那块出现 + 状态栏有一条可点的提示
+await setScenario({ cliHealth: [MOCK_CLI_BROKEN] });
+await reload();
+const statusChip = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
+    (x.innerText || "").includes("codex"));
+  return {
+    found: !!b,
+    text: b ? (b.innerText || "").trim() : "",
+    title: b ? (b.title || "") : "",
+    cli: JSON.stringify(window.__ZEEAI_SCENARIO__.cliHealth || null),
+  };
+})()`);
+check(
+  "本机 CLI 起不来时，状态栏出现一条可点的提示（例如「codex 起不来 · 查看」）",
+  statusChip.found && statusChip.text.includes("codex") && statusChip.text.includes("查看"),
+  JSON.stringify(statusChip).slice(0, 200),
+);
+check(
+  "那条提示的悬停里带着证据原文（stderr / 命令），点开看板就能重装",
+  statusChip.title.includes("Missing optional dependency") && statusChip.title.includes("点这里打开看板"),
+  JSON.stringify(statusChip),
+);
+// 点它 = 打开看板并定位到承载健康那块
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
+    (x.innerText || "").includes("codex"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1500);
+const panelHealth2 = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  if (!p) return { open: false, text: "" };
+  const line = [...p.querySelectorAll(".ai-cli-health .ai-source-line")].map((x) => (x.innerText || "").trim());
+  const anchor = document.getElementById("cli-health-block");
+  return {
+    open: true,
+    line: line,
+    lineTitle: anchor && anchor.querySelector(".ai-source-line") ? anchor.querySelector(".ai-source-line").title : "",
+    scrolled: anchor && anchor.closest(".ai-panel") ? anchor.closest(".ai-panel").scrollTop : -1,
+  };
+})()`);
+check(
+  "点状态栏那条 → 打开看板并出现「承载健康」那一块（异常才出现）",
+  panelHealth2.open && panelHealth2.line.length === 1 && panelHealth2.line[0].includes("codex 起不来"),
+  JSON.stringify(panelHealth2.line).slice(0, 200),
+);
+check(
+  "那一行的悬停里是证据原文（含 stderr）",
+  panelHealth2.lineTitle.includes("Missing optional dependency"),
+  panelHealth2.lineTitle.slice(0, 140),
+);
+check(
+  "没有异常时「承载健康」不出现（这里是异常场景，所以它必须出现）",
+  panelHealth2.line.length === 1 && panelHealth2.line[0].includes("承载健康"),
+  JSON.stringify(panelHealth2.line).slice(0, 160),
+);
+const cliShot = await shot("23-cli-health.png");
+
+// ② `not-installed` 不算异常：不冒红、不进承载健康
+await setScenario({ cliHealth: [MOCK_CLI_NOT_INSTALLED] });
+await reload();
+const notInstalled = await evaluate(`(() => {
+  const chip = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
+    (x.innerText || "").includes("claude"));
+  return { chip: !!chip, body: document.body.innerText.includes("承载健康 · claude 没装") };
+})()`);
+await openAiPanel();
+const panelNotInstalled = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  if (!p) return { open: false, cli: [] };
+  return { open: true, cli: [...p.querySelectorAll(".ai-cli-health")].length };
+})()`);
+check(
+  "「没装」不算异常：状态栏不冒红、看板里也没有承载健康那一块（§10.2）",
+  !notInstalled.chip && !notInstalled.body && panelNotInstalled.open && panelNotInstalled.cli === 0,
+  JSON.stringify(notInstalled) + " " + JSON.stringify(panelNotInstalled),
+);
+
+// ③ 「重装」：**先显示「将执行：<命令>」**，确认之后才真的调用执行命令
+await setScenario({ cliHealth: [MOCK_CLI_BROKEN] });
+await reload();
+await openAiPanel();
+const beforeFix = await evaluate(`(() => {
+  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
+    (x.innerText || "").includes("重装"));
+  return { btn: btn ? (btn.innerText || "").trim() : "", fixed: window.__ZEEAI_CLI_FIXED__.length };
+})()`);
+check(
+  "异常那条旁边有「重装」按钮（文案来自后端 fix.label 的语义）",
+  beforeFix.btn.includes("重装") && beforeFix.fixed === 0,
+  JSON.stringify(beforeFix),
+);
+await evaluate(`(() => {
+  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
+    (x.innerText || "").includes("重装"));
+  if (btn) btn.click();
+  return !!btn;
+})()`);
+await sleep(900);
+const fixArmed = await evaluate(`(() => {
+  const el = [...document.querySelectorAll(".ai-panel .ai-cli-health .hint")].find((x) =>
+    (x.innerText || "").includes("将执行"));
+  const hasConfirm = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].some((x) =>
+    (x.innerText || "").includes("确认执行"));
+  return {
+    text: el ? (el.innerText || "").trim() : "",
+    hasConfirm: hasConfirm,
+    fixed: window.__ZEEAI_CLI_FIXED__.length,
+    calls: window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "cli_health_fix").map((c) => c.args),
+  };
+})()`);
+check(
+  "点「重装」**先显示「将执行：<命令>」并且这一趟没有真的执行**（不得静默安装）",
+  fixArmed.text.includes("将执行") &&
+    fixArmed.text.includes("npm install -g @openai/codex@latest") &&
+    fixArmed.hasConfirm &&
+    fixArmed.fixed === 0 &&
+    fixArmed.calls.some((a) => a && a.confirm === false && a.agent === "codex"),
+  JSON.stringify(fixArmed).slice(0, 260),
+);
+await shot("24-cli-fix-confirm.png");
+await evaluate(`(() => {
+  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
+    (x.innerText || "").includes("确认执行"));
+  if (btn) btn.click();
+  return !!btn;
+})()`);
+await sleep(1400);
+const afterFix = await evaluate(`(() => {
+  const out = document.querySelector(".ai-panel .ai-cli-fix-out");
+  return {
+    fixed: window.__ZEEAI_CLI_FIXED__.slice(),
+    confirmCalls: window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "cli_health_fix" && c.args && c.args.confirm === true).map((c) => c.args.agent),
+    output: out ? (out.innerText || "").trim() : "",
+    stillBroken: [...document.querySelectorAll(".ai-panel .ai-cli-health")].length,
+  };
+})()`);
+check(
+  "确认之后才真的执行，跑完把输出回显、并重新探测刷新状态",
+  afterFix.fixed.includes("npm install -g @openai/codex@latest") &&
+    afterFix.confirmCalls.includes("codex") &&
+    afterFix.output.includes("added 1 package") &&
+    afterFix.stillBroken === 0,
+  JSON.stringify(afterFix).slice(0, 300),
+);
+await shot("25-cli-fix-done.png");
+
+// ④ 「以 --no-daemon 启动」：**只写设置，不跑安装**
+await setScenario({ cliHealth: [MOCK_CLI_NO_DAEMON] });
+await reload();
+await openAiPanel();
+const beforeFlag = await evaluate(`(() => {
+  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
+    (x.innerText || "").includes("--no-daemon"));
+  return {
+    btn: btn ? (btn.innerText || "").trim() : "",
+    title: btn ? (btn.title || "") : "",
+    flags: window.__ZEEAI_CLI_FLAGS__.length,
+  };
+})()`);
+await evaluate(`(() => {
+  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
+    (x.innerText || "").includes("--no-daemon"));
+  if (btn) btn.click();
+  return !!btn;
+})()`);
+await sleep(1200);
+const afterFlag = await evaluate(`(() => ({
+  flags: window.__ZEEAI_CLI_FLAGS__.slice(),
+  fixed: window.__ZEEAI_CLI_FIXED__.slice(),
+  called: window.__ZEEAI_CALLS__.filter((c) => c === "cli_health_set_flag").length,
+  fixCalled: window.__ZEEAI_CALLS__.filter((c) => c === "cli_health_fix").length,
+}))()`);
+check(
+  "「以 --no-daemon 启动」只写设置（cli_health_set_flag），不跑任何安装命令",
+  beforeFlag.btn.includes("--no-daemon") &&
+    beforeFlag.title.includes("不动你的全局配置") &&
+    afterFlag.called > 0 &&
+    afterFlag.fixCalled === 0 &&
+    afterFlag.flags.some((f) => f.cmd === "gemini" && f.flag === "--no-daemon") &&
+    afterFlag.fixed.length === 0,
+  JSON.stringify(afterFlag).slice(0, 260),
+);
+
+// ---------- (Z2) SSH 表单：留空 = 交给 ~/.ssh/config，文案要说清 ----------
+// 用户报障（后端已改成"端口 0 不传 -p、用户名空只给 host"）：界面上原来默认填着
+// 22 / root，那会把 ~/.ssh/config 里的 Port / User 顶掉 —— "我明明配了别名却连不上"。
+// 这里验前端那一半：默认留空、留空能存成 0，以及三处文案一致。
+await setScenario({});
+await reload();
+// 先把「连接」模块切出来（服务器列表在那个侧栏里），再点「＋ 新建服务器」
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) =>
+    /连接|服务器/.test((x.innerText || "") + (x.title || "")));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(800);
+const openEditDialogNow = async () => {
+  const clicked = await evaluate(`(() => {
+    const b = [...document.querySelectorAll("button")].find((x) =>
+      (x.innerText || "").trim().includes("＋ 新建服务器"));
+    if (b) { b.click(); return (b.innerText || "").trim(); }
+    return "";
+  })()`);
+  await sleep(800);
+  return clicked;
+};
+const clickedNewServer = await openEditDialogNow();
+const sshForm = await evaluate(`(() => {
+  const m = document.querySelector(".modal");
+  if (!m) return { open: false };
+  const fields = [...m.querySelectorAll(".modal-field, .modal-row .modal-field")].map((f) => {
+    const lab = (f.innerText || "").trim().split("\\n")[0].trim();
+    const inp = f.querySelector("input");
+    return { lab: lab, value: inp ? inp.value : null, ph: inp ? (inp.placeholder || "") : "" };
+  });
+  const byLabel = {};
+  for (const f of fields) if (!(f.lab in byLabel)) byLabel[f.lab] = f;
+  return { open: true, fields: fields, byLabel: byLabel, head: (m.innerText || "").split("\\n")[0] };
+})()`);
+if (process.env.ZEEAI_FE_DEBUG_FORM) {
+  console.log("---- [debug] 新建服务器表单 ----\n" + JSON.stringify(sshForm, null, 2));
+}
+const fHost = sshForm.byLabel?.["主机"] ?? {};
+const fName = sshForm.byLabel?.["名称"] ?? {};
+const fPort = sshForm.byLabel?.["端口"] ?? {};
+const fUser = sshForm.byLabel?.["用户名"] ?? {};
+const fKey = sshForm.byLabel?.["私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）"] ?? {};
+check(
+  "新建服务器：主机那一行说清「填别名才能带上 config 里的密钥/端口/用户」",
+  (fHost.ph || "").includes("~/.ssh/config 里的别名") && (fHost.ph || "").includes("密钥/端口/用户"),
+  JSON.stringify(fHost),
+);
+check(
+  "新建服务器：名称那一行说清「只是标签，不参与连接」",
+  (fName.ph || "").includes("只是标签，不参与连接"),
+  JSON.stringify(fName),
+);
+check(
+  "新建服务器：端口 / 用户名**默认留空**（留空 = 用 config 里的值），并各自写清默认是什么",
+  fPort.value === "" && fUser.value === "" &&
+    (fPort.ph || "").includes("留空则用 ~/.ssh/config 里的值（默认 22）") &&
+    (fUser.ph || "").includes("留空则用 ~/.ssh/config 里的值（默认当前用户名）"),
+  JSON.stringify({ port: fPort, user: fUser }),
+);
+check(
+  "新建服务器：私钥路径的措辞是「留空则用默认密钥 / ~/.ssh/config」（两处同名文案一致）",
+  (fKey.ph || "").length > 0,
+  JSON.stringify(fKey),
+);
+// 只填别名 + 名称，端口/用户名留空 → 存进后端的 port 必须是 0、user 必须是空串
+await evaluate(`(() => {
+  const setV = (inp, v) => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+    setter.call(inp, v);
+    inp.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const m = document.querySelector(".modal");
+  const field = (lab) => [...m.querySelectorAll(".modal-field")].find((f) => (f.innerText || "").trim().startsWith(lab));
+  const h = field("主机") && field("主机").querySelector("input");
+  const n = field("名称") && field("名称").querySelector("input");
+  if (h) setV(h, "myalias");
+  if (n) setV(n, "别名测试机");
+  return true;
+})()`);
+await sleep(300);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".modal-actions .btn")].find((x) =>
+    (x.innerText || "").trim() === "保存");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(900);
+const savedProfile = await evaluate(`(() => {
+  const calls = window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "save_profile");
+  const last = calls.length ? calls[calls.length - 1].args.profile : null;
+  return last ? { host: last.ssh.host, port: last.ssh.port, user: last.ssh.user } : null;
+})()`);
+check(
+  "留空的端口 / 用户名存下去是 0 / 空串（不是 22 / root，也不是 NaN）",
+  savedProfile && savedProfile.host === "myalias" && savedProfile.port === 0 &&
+    savedProfile.user === "",
+  JSON.stringify(savedProfile),
+);
+// 错误展示那条（后端返回的是「中文短句｜原始信息：<英文>」）：
+// 无头页面里没法真造一次 SSH 认证失败，所以这里扫构建产物 + 源码，钉住三件事 ——
+// 中英分离、原文进悬停、认证失败时补一句能照做的话（默认 BatchMode=yes 下最常踩的坑）。
+const errUi = await evaluate(`(async () => {
+  const html = await (await fetch("/assets/" + [...document.querySelectorAll("script")]
+    .map((s) => (s.src || "").split("/").pop()).find((f) => f && f.startsWith("index-")))).text();
+  return {
+    split: html.includes("｜原始信息："),
+    authHint: html.includes("这台服务器可能要密码：在「编辑服务器」里勾上「允许在终端里输入密码」再连"),
+  };
+})()`);
+check(
+  "错误展示：中文短句直接显示、原始信息收进悬停，且「认证失败/权限拒绝」会补一句可照做的提示",
+  errUi.split && errUi.authHint,
+  JSON.stringify(errUi),
 );
 
 console.log("\n--- 页面控制台里的 error/warning ---");

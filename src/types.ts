@@ -195,6 +195,143 @@ export interface AiTask {
   agentStatus?: string | null;
   /** 这一条是不是在"等人接手"（= herdr 说 blocked） */
   attention?: boolean;
+  // ---------- 看板 v2 从统一模型带上来的字段（后端 `AiInstance`） ----------
+  /** 后端拼好的来源徽标：谁说的 · 多久前 · 能证明什么 */
+  badge?: string;
+  /** 实例的"环境 · 目录 · 窗格"（后端 `where`） */
+  where?: string;
+  /** 承载（决定"能承诺什么状态"） */
+  carrier?: AiCarrier;
+  /** 支撑这张卡的证据条数 */
+  evidenceCount?: number;
+  /** 最后一句 / 最后一个动作（进程扫描拿不到就是空） */
+  activityLastLine?: string | null;
+  /** 这一轮的 token 数（只有 rollout 有） */
+  activityTokens?: number | null;
+}
+
+// ============================================================================
+// AI 看板 v2 的统一实体 —— 和后端 `core/ai_instance.rs` 一一对应
+// （口径见 docs/design-ai-board-v2.md §10；字段名以 serde 的实际输出为准）
+// ============================================================================
+
+/** 这条实例跑在什么承载上（§3.3：界面按它决定"能承诺什么状态"） */
+export type AiCarrier = "local-powershell" | "local-cmd" | "wsl" | "ssh-bare" | "tmux" | "herdr";
+
+/**
+ * 跑的是什么 agent。
+ *
+ * 后端是 Rust 枚举：单元变体序列化成字符串（`"codex"`），带数据的变体序列化成
+ * 单键对象（`{ other: "myagent" }`）—— 所以这里必须两种都收，认不出来是 `"unknown"`。
+ */
+export type AiAgentKind = "codex" | "claude" | "gemini" | "aider" | { other: string } | "unknown";
+
+/** 界面只用这五个词（§3.1） */
+export type AiState = "needs-you" | "working" | "finished" | "idle" | "unknown";
+
+/** 这条结论是谁说的（悬停里要写清"怎么得出的"） */
+export type AiEvidenceSource =
+  | "herdr-agent-list"
+  | "remote-tmux-ps"
+  | "local-process-table"
+  | "wsl-ps"
+  | "app-ledger"
+  | "rollout";
+
+export type AiConfidence = "first-hand" | "inferred";
+
+export interface AiEvidence {
+  source: AiEvidenceSource;
+  atMs: number;
+  confidence: AiConfidence;
+}
+
+/** 最后动作/产出：拿不到就留空，**不许编**（§3.1 取舍） */
+export interface AiActivity {
+  lastLine?: string | null;
+  startedAtMs?: number | null;
+  durationMs?: number | null;
+  tokens?: number | null;
+  artifacts: string[];
+}
+
+/**
+ * 合并之后的一张卡（后端 `AiInstance`）。
+ *
+ * `badge` 是**后端算好的**（谁说的 / 多久前 / 能证明什么）—— 前端别自己再拼一份：
+ * 口径只能有一份实现，这正是这轮重构要收掉的东西。
+ */
+export interface AiInstance {
+  id: string;
+  carrier: AiCarrier;
+  agent: AiAgentKind;
+  /** 环境 + 目录 + 窗格/工作区（界面直接显示） */
+  where: string;
+  state: AiState;
+  evidence: AiEvidence[];
+  activity: AiActivity;
+  sessionId?: string | null;
+  /** 被承载能力闸门降级过的话，这里记原值（界面可写"有来源声称 X"） */
+  downgradedFrom?: AiState | null;
+  /** 最新证据距今多久（毫秒） */
+  ageMs: number;
+  /** 后端拼好的徽标文案，直接显示 + 放进悬停 */
+  badge: string;
+}
+
+/**
+ * 本应用自己启动的 AI 任务（账本条目，`ai_tasks.rs::AppTask`）。
+ *
+ * **snake_case 是故意的**：这层是原样透传给后端的，不在这里做风格转换
+ * （转一道就等于多一份映射，正是老看板"两趟打补丁"的起点）。
+ */
+export interface AiLedgerItem {
+  id: string;
+  env: string;
+  server: string;
+  tool: string;
+  command: string;
+  started_at: number;
+  last_running_at: number;
+  running: boolean;
+}
+
+/** 账本按"环境 + 承载"分组：前端知道它跑在哪个窗格就带上（能和第一手观测同锚合并） */
+export interface AiLedgerGroup {
+  env: string;
+  carrier?: AiCarrier | null;
+  herdrPane?: string | null;
+  tmuxTarget?: string | null;
+  cwd?: string | null;
+  sessionId?: string | null;
+  items: AiLedgerItem[];
+}
+
+/** 一台机器/本机的一组 herdr agent */
+export interface AiHerdrGroup {
+  env: string;
+  agents: HerdrAgent[];
+}
+
+/** rollout 快照（codex 会话日志）→ 观测；没有窗格锚，靠"环境 + agent + 目录"认领 */
+export interface AiRolloutGroup {
+  env: string;
+  snapshot: AiSessionSnapshot;
+  carrier?: AiCarrier | null;
+  artifacts: string[];
+}
+
+/**
+ * 一次轮询里前端采集到的**全部来源**（后端 `BoardSources`）。
+ *
+ * 为什么让前端送、后端合：**可信度闸门 / 陈旧降级 / "一个实例一张卡"** 这三条口径
+ * 只能有一份实现（老看板在前端 JS 里合并，于是出现了两趟打补丁 + "两个 codex 只剩一张卡"）。
+ */
+export interface BoardSources {
+  tasks: AiTask[];
+  herdr: AiHerdrGroup[];
+  ledger: AiLedgerGroup[];
+  rollouts: AiRolloutGroup[];
 }
 
 /** herdr 认出来的一个 agent（来自 `herdr agent list`） */
@@ -424,8 +561,17 @@ export interface AppSettings {
   highlightSetByKind: Record<string, string>;
   /** AI 有需要你处理的事情时，除活动栏红点外再闪 Windows 任务栏 */
   aiNotifyTaskbar: boolean;
-  /** 是否在左侧活动栏的 AI 星号上显示红点 / 数字 */
+  /**
+   * 旧的那条总开关（"跑完了就点红点"）。
+   *
+   * 已被下面两条独立开关取代（口径 docs/design-ai-board-v2.md §10.6：红点只为两种情况亮）。
+   * 字段留着只为**读得懂老配置**，界面不再用它 —— 别在新代码里引用。
+   */
   aiNotifyBadge: boolean;
+  /** 红点规则 ①：有实例在「需要你」时亮 —— **亮到你处理为止**（默认开） */
+  aiNotifyNeedsYouBadge: boolean;
+  /** 红点规则 ②：某一轮跑完并停下时亮一个未读 —— **点开面板即清**（默认开） */
+  aiNotifyFinishedBadge: boolean;
   /**
    * 通知策略：**每一轮跑完**就提醒。
    * 默认关 —— 用户原话"跑的小任务太多，每跑一个都弹一条，很烦"。
@@ -437,6 +583,81 @@ export interface AppSettings {
   aiNotifyNeedsYou: boolean;
   /** 产物范围：true = 任何新文件都算；false = 只算 HTML / Markdown 文档（默认） */
   aiNotifyAllArtifacts: boolean;
+  /**
+   * 本机 agent CLI 的**额外启动参数**（`codex` → `["--no-daemon"]`）。
+   *
+   * 只影响"我们从这里替你启动它"时多带哪个参数；**不改**用户的全局配置。
+   * 界面不当成可选项暴露，但必须原样带回去（settings_set 是整体替换）。
+   */
+  agentLaunchArgs: Record<string, string[]>;
+}
+
+// ============================================================================
+// 本机 AI CLI 的健康检查（后端 core/cli_health.rs）—— 「装了没 / 装了但坏了 / 正在自更新」
+// ============================================================================
+
+/**
+ * 探测结果。**"没装"和"装了但坏了"必须分开**：前者要装，后者要修。
+ * 界面上只有 `installed-but-broken` / `updating` 算异常（§10.2 承载健康只在异常时出现）。
+ */
+export type CliStatus = "ok" | "not-installed" | "installed-but-broken" | "updating" | "unknown";
+
+/** 建议的修法：重装 / 换个启动参数 / 只能看文档。`value` 里是**命令或参数原文**。 */
+export type CliFixKind =
+  | { kind: "reinstall" }
+  | { kind: "add-flag"; value: string }
+  | { kind: "open-docs" };
+
+export interface CliFix {
+  /** 按钮/一行字的文案（中文，用户能照做） */
+  label: string;
+  kind: CliFixKind;
+}
+
+export interface CliHealth {
+  agent: AiAgentKind;
+  /** 我们实际用的命令名（codex / claude / …） */
+  command: string;
+  status: CliStatus;
+  /** 一行结论（状态栏/看板异常位直接用这句） */
+  summary: string;
+  /** 证据原文（stderr / 找到的路径）—— 悬停时看 */
+  detail: string;
+  fix?: CliFix | null;
+  /**
+   * 「在终端里启动它」该敲的那一行，后端已经带上存过的额外参数
+   * （例如 `codex --no-daemon`）。别在前端自己拼。
+   */
+  runCmd?: string;
+}
+
+/** 「一键修」的结果（`cli_health_fix`） */
+export interface CliFixReport {
+  agent: string;
+  command: string;
+  /** 将要执行 / 已经执行的命令**原文**（界面「将执行：…」显示的就是它） */
+  execCmd: string;
+  ok: boolean;
+  exitCode?: number | null;
+  /** stdout + stderr 摘要（失败时截得更长） */
+  output: string;
+  /** 跑完之后重新探测的结果 */
+  health: CliHealth[];
+  message: string;
+  /** 我们拒绝代跑（不在白名单里）：只给命令原文，让用户自己粘 */
+  refused: boolean;
+  /** 还没确认：这一趟没起任何进程 */
+  needsConfirm: boolean;
+}
+
+/** 「以 --no-daemon 启动」的结果（`cli_health_set_flag`） */
+export interface CliFlagReport {
+  agent: string;
+  command: string;
+  flag: string;
+  runCmd: string;
+  /** 一句人话：这只影响我们启动的方式 */
+  note: string;
 }
 
 export interface GitFile {

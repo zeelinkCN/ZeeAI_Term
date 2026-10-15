@@ -11,6 +11,7 @@ import { lastTerminalSize } from "./features/terminalSize";
 import TermThemeDialog from "./features/TermThemeDialog";
 import HighlightDialog from "./features/HighlightDialog";
 import { SessionBus } from "./sessionBus";
+import { deferUntilIdle, startupMark } from "./startup";
 import {
   adbDevices,
   adbVersion,
@@ -24,12 +25,16 @@ import {
   aiTasksClearFinished,
   aiTasksLocal,
   aiTasksRemote,
+  aiInstances,
   aiSessionSnapshot,
   aiTaskArtifacts,
   aiTimelineAdd,
   aiTimelineClear,
   aiTimelineList,
   aiSourceProbe,
+  cliHealth,
+  cliHealthFix,
+  cliHealthSetFlag,
   herdrAgents,
   herdrInstall,
   herdrPanes,
@@ -120,6 +125,15 @@ import type {
   AiSessionSnapshot,
   AiArtifact,
   AiTask,
+  AiActivity,
+  AiAgentKind,
+  AiCarrier,
+  AiHerdrGroup,
+  AiInstance,
+  AiLedgerGroup,
+  AiRolloutGroup,
+  AiState,
+  BoardSources,
   HerdrAgent,
   HerdrPane,
   HerdrServerStatus,
@@ -127,6 +141,8 @@ import type {
   AiTurnRecord,
   AiSourceInfo,
   AppSettings,
+  CliFixReport,
+  CliHealth,
   ConnectionProfile,
   GitBranch,
   GitCommit,
@@ -342,109 +358,62 @@ function aiEnvLabel(env: string): string {
   return "本地";
 }
 
-/** 这张卡片是怎么被发现的（越靠前越准） */
-function aiSourceLabel(src: string): string {
-  switch (src) {
-    case "app":
-      return "App 启动（最准）";
-    case "herdr":
-      return "herdr 状态";
-    case "tmux":
-      return "tmux 窗格";
-    case "winproc":
-      return "Windows 进程表";
+/**
+ * 这张卡该不该占「需要你 / 运行中」两个区（口径 docs/design-ai-board-v2.md §10.2）。
+ *
+ * 「空闲 / 最近完成」是**窗格/实例现状**，不是"有个任务在跑" —— 摆在卡片区就变成
+ * "历史上哪些窗格跑过 codex"，用户实测因此以为"它在探测我的 PowerShell"。
+ *
+ * 这里只说"占不占大卡位"：**状态的判定不在这里** —— 统一状态由后端模型给
+ * （`AiState` / 承载能力闸门），前端不再自己推。
+ */
+function isActiveInstance(i: AiInstance): boolean {
+  return i.state === "needs-you" || i.state === "working";
+}
+
+/**
+ * 卡片上那句状态词（§3.1 的五个词 + §10.4 对裸 SSH 的一句如实降级）。
+ *
+ * 裸 SSH 的 working 是**进程推断**出来的：只能看到"有这么个进程"，
+ * 看不到它在等谁、也看不出它是不是卡住了 —— 所以那句要写全：
+ * 「运行中（进程推断，可能已卡住）」。其它承载照旧只写状态词，推断与否交给来源徽标说。
+ */
+function aiStateLabelOf(i: AiInstance): string {
+  const firstHand = i.evidence.some((e) => e.confidence === "first-hand");
+  if (i.carrier === "ssh-bare" && i.state === "working" && !firstHand) {
+    return "运行中（进程推断，可能已卡住）";
+  }
+  return aiStateLabel(i.state);
+}
+
+/** 统一状态 → 卡片上那句中文（只有这五个词，§3.1） */
+function aiStateLabel(s: AiState): string {
+  switch (s) {
+    case "needs-you":
+      return "需要你";
+    case "working":
+      return "运行中";
+    case "finished":
+      return "已完成";
+    case "idle":
+      return "空闲";
     default:
-      return "ps 扫描";
+      return "状态未知";
   }
 }
 
 /**
- * 信号源的"可信度"排序，合并同一张卡时用。
- * App 自己启动的最准（开始时间/结束都是自己记的）；herdr 次之（它真在管这个 agent，
- * 能给 working/blocked）；再往下是 tmux 窗格和裸进程表。
- */
-function srcRank(src: string): number {
-  if (src === "app") return 3;
-  if (src === "herdr") return 2;
-  if (src === "tmux") return 1;
-  return 0;
-}
-
-/**
- * 这张卡"在哪个窗格"——herdr 的窗格号 / tmux 的窗格号，都没有就是空串。
+ * herdr 的原始状态词 → 界面上那句中文（「接管已有窗格」那一列还在用它）。
  *
- * 看板合并的两趟都靠它：带窗格的卡不能被只看到进程的那些抹掉，
- * 而**两个不同的窗格是两张卡**（这正是用户要的"两个 codex 要显示两个"）。
+ * 口径和后端 `ai_instance::state_of_herdr` 对齐：`blocked` = **需要你**（不是"跑完了"），
+ * `idle` 与 `done` 是两件事（老看板把两者都压成"已完成"，那是错的）。
  */
-function paneIdOf(t: AiTask): string {
-  return t.herdrPane ?? t.pane ?? "";
-}
-
-/** 合并用的"同一组"：环境 + 服务器 + 工具 + 目录（不含窗格） */
-function groupKeyOf(t: AiTask): string {
-  return `${t.env}|${t.server}|${t.tool}|${t.cwd || ""}`;
-}
-
-/** 合并用的完整键 = 同组 + 窗格。同组但不同窗格**不合并**。 */
-function taskKeyOf(t: AiTask): string {
-  return `${groupKeyOf(t)}|${paneIdOf(t)}`;
-}
-
-/**
- * 两张卡说的是同一个 agent 时，谁的信息更该留。
- * 源越准越优先（App > herdr > tmux > ps）；同源则保留带窗格的、耗时更短的。
- */
-function betterTask(a: AiTask, b: AiTask): boolean {
-  return (
-    srcRank(a.source) > srcRank(b.source) ||
-    (srcRank(a.source) === srcRank(b.source) &&
-      ((!b.pane && !!a.pane) || b.durationMs < a.durationMs))
-  );
-}
-
-/**
- * 把 `src` 的信息并进 `dst`（**只在 src 更准的时候调用**），
- * 但"看得见窗格"的那几个字段不能被抹掉 —— 它们是"点这张卡就能跳到那个终端"的
- * 唯一凭据，而 App 记录和 ps 扫描这两种来源都没有它们。
- */
-function absorbTask(dst: AiTask, src: AiTask): void {
-  const keep = { herdrPane: dst.herdrPane, herdrProfileId: dst.herdrProfileId, pane: dst.pane };
-  Object.assign(dst, src);
-  dst.herdrPane = dst.herdrPane ?? keep.herdrPane;
-  dst.herdrProfileId = dst.herdrProfileId ?? keep.herdrProfileId;
-  dst.pane = dst.pane ?? keep.pane;
-}
-
-/** 把 herdr 的一个 agent 映射成看板卡片（时长/pid 拿不到，就留空 —— 不编） */
-function herdrAgentToTask(a: HerdrAgent, server: string, profileId: string): AiTask {
-  return {
-    id: `herdr|${server}|${a.paneId}`,
-    env: "remote",
-    server,
-    tool: a.kind || "ai",
-    command: "",
-    cwd: a.cwd,
-    pane: a.paneId,
-    source: "herdr",
-    state: a.status === "working" ? "running" : "done",
-    durationMs: 0,
-    pid: 0,
-    startedAt: null,
-    exitCode: null,
-    herdrPane: a.paneId,
-    herdrProfileId: profileId,
-    agentStatus: a.status,
-    attention: a.attention,
-  };
-}
-
-/** herdr 的状态 → 卡片上那句中文（blocked 是"等你处理"，不是"跑完了"） */
 function herdrStateLabel(status: string): string {
-  switch (status) {
+  switch ((status || "").trim().toLowerCase()) {
     case "working":
       return "运行中";
     case "blocked":
-      return "等你处理";
+      return "需要你";
     case "done":
       return "已完成";
     case "idle":
@@ -455,18 +424,177 @@ function herdrStateLabel(status: string): string {
 }
 
 /**
- * 这张看板卡该不该占卡片位（docs/backlog.md 第 2 条 ②）。
+ * 概览徽标：承载（"它是怎么被看见的"）。
  *
- * 「空闲 / 已完成」是**窗格现状**，不是"有个任务在跑"—— 摆在卡片区就变成
- * "历史上哪些窗格跑过 codex"，用户实测因此以为"它在探测我的 PowerShell"。
- * 判据优先用 herdr 的第一手状态（agentStatus），没有它才退回进程死活（state）。
+ * §10.4：裸 SSH 只能说"运行中（进程推断，可能已卡住）"—— 那句话在卡片上是**承载 + 状态**
+ * 合起来说的，所以这里由承载决定前缀。
  */
-function isActiveBoardTask(t: AiTask): boolean {
-  if (t.attention) return true; // herdr 说"等你处理"：永远占位
-  const s = (t.agentStatus ?? "").toLowerCase();
-  if (s === "working" || s === "blocked") return true;
-  if (s === "idle" || s === "done") return false;
-  return t.state === "running";
+function aiCarrierLabel(c: AiCarrier): string {
+  switch (c) {
+    case "herdr":
+      return "herdr 第一手";
+    case "tmux":
+      return "tmux 窗格";
+    case "ssh-bare":
+      return "裸 SSH";
+    case "wsl":
+      return "WSL";
+    case "local-cmd":
+      return "本机 CMD";
+    default:
+      return "本机 PowerShell";
+  }
+}
+
+/** agent 枚举（含带数据的 `{other}` 变体）→ 界面文字 */
+function aiAgentLabel(a: AiAgentKind): string {
+  if (a && typeof a === "object") return a.other || "未知工具";
+  switch (a) {
+    case "codex":
+      return "codex";
+    case "claude":
+      return "claude";
+    case "gemini":
+      return "gemini";
+    case "aider":
+      return "aider";
+    default:
+      return "未知工具";
+  }
+}
+
+/**
+ * 后端 `AiInstance.badge` 里已经带了"谁说的 / 多久前 / 能不能证明"，
+ * 但没带"在哪儿" —— 悬停写"怎么得出的"时，第一句要能回答"这是哪台机器 / 哪个目录"。
+ */
+function aiInstanceWhere(i: AiInstance): string {
+  const parts = i.where.split(" · ");
+  return parts.slice(0, 2).filter(Boolean).join(" · ");
+}
+
+/**
+ * 承载健康（本机 CLI 那一档）**只在异常时出现**。
+ *
+ * 口径 §10.2 的原话是"承载健康只在异常时出现"，而这里的"异常"只有两种：
+ * `installed-but-broken`（装了但起不来）和 `updating`（正在自更新，期间不接受输入）。
+ *
+ * 为什么 **`not-installed` 不算异常**：它只是"这台机器没装这个可选工具"，
+ * 冒红点等于把"我没装 Aider"说成"出故障了" —— 用户会去修一个根本不存在的问题。
+ * `unknown`（探测超时 / 没探）同理不冒：**没法证明的，不许说成事实**。
+ */
+function cliHealthAnomaly(h: CliHealth): boolean {
+  return h.status === "installed-but-broken" || h.status === "updating";
+}
+
+/** 异常状态的短词（状态栏那一行 + 看板那一行的前缀） */
+function cliStatusWord(s: CliHealth["status"]): string {
+  switch (s) {
+    case "installed-but-broken":
+      return "起不来";
+    case "updating":
+      return "正在自更新";
+    case "not-installed":
+      return "没装";
+    default:
+      return "状态未知";
+  }
+}
+
+/** 这一条要不要给「重装」按钮（后端 `fix.kind` 说了算，前端不自己判症状） */
+function cliFixAction(h: CliHealth): "reinstall" | "add-flag" | null {
+  const k = h.fix?.kind;
+  if (!k) return null;
+  if (k.kind === "reinstall") return "reinstall";
+  if (k.kind === "add-flag") return "add-flag";
+  return null;
+}
+
+/**
+ * 「换个启动参数」那个按钮要加的**参数原文**。
+ *
+ * 参数值来自后端（`fix.kind.value`，例如 `--no-daemon`）—— 前端**不写死**，
+ * 免得以后后端换参数时界面还在显示旧的（那种"界面和实际不一致"最难查）。
+ */
+function cliFlagOf(h: CliHealth): string {
+  const k = h.fix?.kind;
+  return k && k.kind === "add-flag" ? k.value : "--no-daemon";
+}
+
+/**
+ * 卡片上那个来源徽标的悬停文案（§3.3 的要求：**谁说的 / 多久前 / 能证明什么**）。
+ *
+ * `badge()` 已经把后两件事写全了（含"只能说明它在跑"、"可能已卡住"这些如实降级），
+ * 这里只补三样：这是哪里、这句话是谁说的（枚举名）、一共几条证据。
+ */
+function aiBadgeTitle(i: AiInstance): string {
+  const source = i.evidence
+    .map(
+      (e) =>
+        `${aiEvidenceSourceLabel(e.source)}（${e.confidence === "first-hand" ? "第一手" : "推断"}）`,
+    )
+    .join("、");
+  return (
+    `${aiInstanceWhere(i)}\n` +
+    `${aiAgentLabel(i.agent)} · ${aiCarrierLabel(i.carrier)}\n` +
+    `怎么得出的：${i.badge}\n` +
+    `谁说的：${source || "（没有证据）"} · 共 ${i.evidence.length} 条\n` +
+    `能证明什么：${
+      i.evidence.some((e) => e.confidence === "first-hand")
+        ? "对面自己报的状态"
+        : "只能说明有这么个进程在跑，说不了它在等谁 / 跑完没"
+    }`
+  );
+}
+
+/**
+ * 卡片上那枚来源徽标（`badge()`）**已经说过的**来源，就别在下面那行再说一遍。
+ *
+ * 为什么：§9① 用户抱怨的原话就是"同一件事说了三遍"。徽标写的是"谁说的"
+ *（herdr 第一手 / 本应用账本 / rollout 日志），只有"进程扫描"这一类它写成
+ * "只能说明它在跑"、没点明是哪张进程表 —— 所以这时才在下面补一句。
+ */
+function aiBadgeCoversSource(i: AiInstance): boolean {
+  if (!i.badge) return false;
+  return !/只能说明它在跑/.test(i.badge);
+}
+
+/** 证据来源的中文短语（和后端 `EvidenceSource::label()` 对齐；认不出就写"未知来源"） */
+function aiEvidenceSourceLabel(s: string): string {  switch (s) {
+    case "herdr-agent-list":
+      return "herdr 第一手";
+    case "app-ledger":
+      return "本应用账本";
+    case "rollout":
+      return "rollout 日志";
+    case "remote-tmux-ps":
+      return "远端进程扫描";
+    case "local-process-table":
+      return "本机进程表";
+    case "wsl-ps":
+      return "WSL 进程扫描";
+    default:
+      return "未知来源";
+  }
+}
+
+/** 后端观测来源 → 旧的卡片文案（卡片上那行 `耗时 X · 来源` 还在用） */
+function aiSourceLabelOf(source: string): string {
+  switch (source) {
+    case "app-ledger":
+      return "App 启动（最准）";
+    case "herdr-agent-list":
+      return "herdr 第一手";
+    case "rollout":
+      return "rollout 日志";
+    case "remote-tmux-ps":
+      return "tmux / ps 扫描";
+    case "local-process-table":
+      return "Windows 进程表";
+    case "wsl-ps":
+      return "WSL 进程扫描";
+    default:
+      return "ps 扫描";
+  }
 }
 
 /** 毫秒 →「1 分 23 秒」；拿不到就显示「—」 */
@@ -585,14 +713,90 @@ function termPaletteFor(
   return resolveTermPalette(look.key, look.custom);
 }
 
+/**
+ * 服务器列表上那一行「谁@哪台机器:端口」。
+ *
+ * 端口/用户留空是**合法**的（= 交给 `~/.ssh/config`），所以不能原样拼出
+ * `@myalias:0` 这种看不懂的东西 —— 那种显示会让人以为配置坏了。
+ */
+function sshTargetLabel(ssh: { host: string; user?: string; port?: number }): string {
+  const user = (ssh.user ?? "").trim();
+  const port = ssh.port ?? 0;
+  return `${user ? user + "@" : ""}${ssh.host}${port ? ":" + port : ""}`;
+}
+
 const EMPTY_PROFILE = {
   name: "",
   host: "",
-  port: 22,
-  user: "root",
+  /**
+   * 端口 / 用户**默认留空**（"没说"）。
+   *
+   * 为什么不留 22 / root：这两个值一旦填上，后端就会拼出 `ssh -p 22 root@myalias` ——
+   * 实测这会把 `~/.ssh/config` 里的 `Port` / `User` **顶掉**，于是"本机配了免密别名"
+   * 的用户永远连不上（2026-10 用户报障）。留空时后端不传 `-p`、只给 `host`，
+   * config 才生效（默认 22 / 当前用户名）。显式填了仍然是我们说了算。
+   *
+   * port 存**字符串**而不是数字：`<input type="number">` 清空时 `Number("")` 是 0，
+   * 但界面上得能看见"空"，数字类型一存就变成 `NaN` 或被迫回填 22（两种都出过）。
+   */
+  port: "",
+  user: "",
   group: "默认",
   keyPath: "",
 };
+
+/** 端口留空 = 0 = "没说"：交给 `~/.ssh/config` 的 Port（后端已支持）。 */
+function portOrZero(v: string): number {
+  const n = Number(String(v).trim());
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+/**
+ * 把后端的报错拆成「中文短句」+「原始信息」两半。
+ *
+ * 后端（russh 那条路）现在返回的是 `中文短句｜原始信息：<英文>` 这种形状。
+ * 界面上只该看见中文那半（英文原文一长串，挤在状态栏里没人读得下去），
+ * 但排查问题又必须能拿到原文 —— 所以原文进悬停（`title`）。
+ */
+function splitErrText(text: string): { short: string; detail: string } {
+  const i = text.indexOf("｜原始信息：");
+  if (i < 0) return { short: text, detail: text };
+  return { short: text.slice(0, i).trim(), detail: text };
+}
+
+/**
+ * 错误看着像"认证失败 / 权限拒绝"吗？
+ *
+ * 为什么要单独判：默认 `BatchMode=yes`（见 `src-tauri/src/commands.rs` 里 `open_ssh` 的
+ * `!cfg.allow_password`）—— 不勾「允许在终端里输入密码」时，密码登录**根本不会问你**，
+ * 直接以 `Permission denied (publickey,password)` 收场。用户看到"认证失败"只会以为
+ * 是密钥配错了，其实只差一个勾。所以这种情况必须**给一句能照做的话**。
+ */
+function looksLikeAuthFailure(text: string): boolean {
+  const low = text.toLowerCase();
+  return (
+    text.includes("认证失败") ||
+    text.includes("权限拒绝") ||
+    text.includes("拒绝访问") ||
+    low.includes("permission denied") ||
+    low.includes("publickey") ||
+    low.includes("authentication failed")
+  );
+}
+
+/**
+ * 连接类报错 → 状态栏那一行文字。
+ *
+ * `what` 是我们自己的上下文（"SSH 连接失败"这种），后面接后端的原始报错；
+ * 原始信息部分会在 `notify` 里被挪进悬停。
+ */
+function connErrorText(what: string, err: unknown): string {
+  const raw = String(err);
+  const hint = looksLikeAuthFailure(raw)
+    ? "\n这台服务器可能要密码：在「编辑服务器」里勾上「允许在终端里输入密码」再连"
+    : "";
+  return `${what}：${raw}${hint}`;
+}
 
 /** GitHub Release 里的一个附件（检查更新时用来挑安装包） */
 interface Asset {
@@ -701,6 +905,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
   aiNotifyTaskbar: false,
   aiNotifyBadge: true,
+  // 红点只为两种情况亮（docs/design-ai-board-v2.md §10.6）：
+  // ① 有人需要你 → 亮到你处理；② 跑完一轮并停下 → 点开就消。其它情况不提醒。
+  aiNotifyNeedsYouBadge: true,
+  aiNotifyFinishedBadge: true,
   // 「什么时候才提醒我」的默认口径（和后端 store.rs 保持一致）：
   // 小任务太多，跑完就弹会很吵 → 默认关；
   // 真正要人接手的两种（产出了 HTML/MD 文档、AI 在等你做选择题）默认开。
@@ -719,9 +927,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   // **默认关**：用户明确要求"图片上传/粘贴不要在右下角弹消息"——要确认粘对了没有，
   // 看输入行里那串路径就够了（想开的人可以在设置里打开）。
   pasteToast: false,
+  // 一个"额外启动参数"都没有：默认不动用户装好的 CLI 的启动方式
+  agentLaunchArgs: {},
 };
 
-const APP_VERSION = "0.1.11";
+const APP_VERSION = "0.1.12";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
@@ -891,7 +1101,10 @@ export default function App() {
    * 曾经有过一个中央浮层 toast，用户明确要求"不要在这里悬浮任何消息"——已彻底移除。
    */
   const [statusMsg, setStatusMsg] = useState<{
+    /** 状态栏上显示的那一行（只看中文短句） */
     text: string;
+    /** 悬停时看的完整原文（含 `｜原始信息：<英文>`；没有额外原文时等于 text） */
+    detail: string;
     at: number;
     kind: "info" | "warn" | "error";
   } | null>(null);
@@ -995,12 +1208,26 @@ export default function App() {
   const [aiState, setAiState] = useState<AiProbe | null>(null);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   const aiWasRunning = useRef(false);
-  // AI 任务看板（v1）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片
+  // AI 任务看板（v2）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片。
+  //
+  // ⚠️ `boardTasks` 是**渲染用的扁平形状**（沿用老卡片样式，界面先不大改），
+  // 它是从后端的 `AiInstance` 映射出来的 —— 合并/去重/判状态都在后端做完了。
   const [boardTasks, setBoardTasks] = useState<AiTask[]>([]);
   /** AI 任务时间线（落盘的历史，G-01） */
   const [timeline, setTimeline] = useState<AiTurnRecord[]>([]);
   /** 看板快照（给"这条提醒该算在哪个窗口头上"用） */
   const boardTasksRef = useRef<AiTask[]>([]);
+  /**
+   * 最近一次采集到的**原始来源**（rollout 快照 / 这一轮的产物）。
+   *
+   * 为什么要留一份：`refreshBoard` 把它们当 `BoardSources` 送回后端（那边才能算陈旧、
+   * 才能把 rollout 认领到某个实例上）；而快照是 10 秒一采、看板是 20 秒一刷，两者不同步。
+   */
+  const snapshotRef = useRef<{
+    session: OpenSession;
+    snapshot: AiSessionSnapshot;
+    artifacts: AiArtifact[];
+  } | null>(null);
   /** 各会话最近一次命令的退出码（G-02：只有注入过 shell 集成的会话才有） */
   const [cmdExit, setCmdExit] = useState<Record<string, { exit: number; at: number }>>({});
   /** 这台机器的「AI 状态来源」：装了 herdr 就是它的 agent 状态机，否则是我们自己的探测 */
@@ -1050,8 +1277,6 @@ export default function App() {
   }
   /** 已经建好输入通道的观察窗会话（一个会话只建一次；断了会从这里删掉再重连） */
   const herdrInputs = useRef<Set<string>>(new Set());
-  /** 已经为哪些"herdr 在等人"的窗格提醒过（离开 blocked 之后再进会重新提醒） */
-  const herdrNotified = useRef<Set<string>>(new Set());
   /** 「停止 herdr 服务」是个会关掉所有 herdr 窗格的动作 → 二段确认（不弹窗、不打断） */
   const [herdrStopArmed, setHerdrStopArmed] = useState(false);
   /** herdr 服务状态（只读探测；面板打开时刷新） */
@@ -1076,12 +1301,6 @@ export default function App() {
   const lastLocalScan = useRef(0);
   // 会话日志快照（有新消息/在等你/耗时/token 都从这儿来）
   const [aiSnapshot, setAiSnapshot] = useState<AiSessionSnapshot | null>(null);
-  /// 需要你处理的事情还没被看过时，活动栏 AI 图标上的红点
-  const [aiUnread, setAiUnread] = useState(0);
-  /// 右下角那几条"AI 需要你"的提示（可点可清）
-  const [aiAlerts, setAiAlerts] = useState<
-    { id: string; text: string; sessionId: string; time: number }[]
-  >([]);
   /// 已经通知过的那一轮 —— **按会话分别记**（共用一个 key 会让两个会话互相"看起来是新的"，数字会一直涨）
   const aiTurnKey = useRef<Record<string, string>>({});
   const aiSeeded = useRef<Record<string, boolean>>({});
@@ -1099,14 +1318,56 @@ export default function App() {
   /// 「最近任务」默认只露 3 条，想看全部点一下展开（不在那小框里上下拖）
   const [timelineAll, setTimelineAll] = useState(false);
   /**
-   * 看板上「不活跃的窗格」（herdr 的 空闲 / 已完成）默认收成一行。
+   * 「最近完成 N 项」/「空闲 N 项」两行折叠（§10.1 / §10.2）。
    *
-   * 为什么：它们是**窗格现状**，不是任务 —— 摆在卡片区就变成了"历史上哪些窗格跑过 codex"，
-   * 用户实测因此误以为"它在探测我的 PowerShell"（见 docs/backlog.md 第 2 条 ②）。
-   * 本来还想按"超过 30 分钟没动静就不显示"，但 herdr 的 agent list **不给最后活动时间**
-   * （core/herdr.rs 的 HerdrAgent 里没有这类字段），拿不到就不假装有：一律折叠，要点开才看。
+   * 默认都收起：**收起时不渲染明细**（不是 display:none —— 那样"展开前明细不可见"
+   * 这条断言就成了看样式，看板也不该为看不见的东西干活）。
    */
-  const [inactiveOpen, setInactiveOpen] = useState(false);
+  const [finishedOpen, setFinishedOpen] = useState(false);
+  const [idleOpen, setIdleOpen] = useState(false);
+  /**
+   * 后端合并出来的**统一模型**（AI 实例）。
+   *
+   * 看板卡片从此只认这一份数据：前端不再自己合并/去重/判状态
+   * （老看板的 `taskKeyOf` / `betterTask` / `absorbTask` 两趟补丁已删）。
+   * 口径 docs/design-ai-board-v2.md §10；`badge()` 也是后端拼好的。
+   */
+  const [boardInstances, setBoardInstances] = useState<AiInstance[]>([]);
+  /**
+   * 红点规则 ①（§10.6）：当前**还在等你**的实例 —— 红点亮到它们不再是 needs-you 为止。
+   *
+   * 存下来是为了让红点在"轮询刷新"之间保持稳定（不能靠一次差量累加：那样一刷新就没了）。
+   */
+  const [aiNeedIds, setAiNeedIds] = useState<string[]>([]);
+  /**
+   * 红点规则 ②（§10.6）：**跑完并停下**、你还没点开面板看的那几轮（按实例 + 轮次去重）。
+   * 打开面板即清 —— 它是一条"未读"。
+   */
+  const [aiPendingFinish, setAiPendingFinish] = useState<string[]>([]);
+  /// 上面两条规则的去重集合（同一实例同一轮只亮一次；反复轮询不该再冒出来）
+  const aiFinishedSeen = useRef<Set<string>>(new Set());
+  /** 已经为哪些"需要你"的实例打扰过一次（离开 needs-you 之后再进会重新提醒） */
+  const aiNeedsNotified = useRef<Set<string>>(new Set());
+  /** 第一次拿到看板之前不补报（否则"一开应用就红点"，那不是"这一轮跑完并停下"） */
+  const aiBoardSeeded = useRef(false);
+  /**
+   * 这一轮刚采集到的 herdr agent（profileId → agents）。
+   *
+   * 为什么要留一份：后端的 `AiInstance` 只带"服务器名 + 窗格号"（它不知道本应用的
+   * 连接配置 id），而"查看窗格 / 接管"两个按钮**必须要 profileId**；
+   * 这份索引就是那条对应关系，不涉及任何合并逻辑。
+   */
+  const lastHerdrAgents = useRef<Record<string, HerdrAgent[]>>({});
+  /**
+   * 活动栏 AI 图标上的红点数字（§10.6）。
+   *
+   * 它只由两件事决定，而且两条规则各有一个开关：
+   * ① 还在等你处理的有几个（亮到你处理为止）；② 跑完停下、还没点开面板的有几轮。
+   * 运行中 / 空闲 / 陈旧 / 只产出文件 / 探测不到 —— **一个都不算**。
+   */
+  const aiBadgeCount =
+    (settings.aiNotifyNeedsYouBadge ? aiNeedIds.length : 0) +
+    (settings.aiNotifyFinishedBadge ? aiPendingFinish.length : 0);
   /**
    * AI 输入窗（状态栏「✍ 发给 AI」拉出来的那个）：多行编辑 + 附件。
    *
@@ -1128,6 +1389,41 @@ export default function App() {
     { name: string; local: string; remote: string; thumb?: string; size?: number }[]
   >([]);
   const [composerBusy, setComposerBusy] = useState(false);
+
+  // ---------- 本机 AI CLI 的承载健康（装了没 / 装了但坏了 / 正在自更新） ----------
+  /**
+   * 本机四个 agent 的探测结果。
+   *
+   * 判据全在后端（`core/cli_health.rs`，带 5 秒缓存）：前端只负责显示 —— 尤其
+   * **不许在这里自己判"这个报错算不算坏"**，那是同一件事的第二份实现。
+   */
+  const [cliList, setCliList] = useState<CliHealth[]>([]);
+  /** 正在探测（界面显示"正在探测本机 AI CLI…"，而不是显示上一次的旧结论） */
+  const [cliProbing, setCliProbing] = useState(false);
+  /** 「一键修」：等用户确认的那一条（`execCmd` 是**后端算出来的真正会跑的命令**） */
+  const [cliConfirm, setCliConfirm] = useState<CliFixReport | null>(null);
+  /** 「一键修」正在跑（安装要几分钟，期间按钮要禁用并说明在等什么） */
+  const [cliFixing, setCliFixing] = useState(false);
+  /** 「一键修」的结果（命令原文 + stdout/stderr 摘要），显示在承载健康那块里 */
+  const [cliFixResult, setCliFixResult] = useState<CliFixReport | null>(null);
+  /**
+   * 本机 CLI 的**异常**（起不来 / 正在自更新）—— 看板那块和状态栏那条都用它。
+   *
+   * 算一次、两处共用：状态栏那条文案（"一个"还是"N 个"）和看板那块的条数
+   * 必须是同一份事实，两处各 filter 一次迟早会不一致。
+   * `not-installed` **不在里面**（§10.2：没装只是"可选安装"，不是异常）。
+   */
+  const cliAnomalies = cliList.filter(cliHealthAnomaly);
+  /**
+   * 承载健康那一块（本机 CLI）的 DOM 锚点。
+   *
+   * 为什么要它：状态栏那条提示点一下要"**打开/定位到**承载健康那块" ——
+   * 面板可能没开、也可能已经开在很下面（时间线很长），光 `setAiPanelOpen(true)`
+   * 用户还是看不到那块。所以先开面板，下一帧再把它滚进视野。
+   */
+  const cliHealthRef = useRef<HTMLDivElement | null>(null);
+  /** 状态栏那条提示被点过：等面板渲染出来就去滚（见下面的 effect） */
+  const [cliFocusTick, setCliFocusTick] = useState(0);
 
   /**
    * Ctrl+Alt+A：展开 / 收起底部的 AI 输入窗（键盘党的入口）。
@@ -1355,7 +1651,8 @@ export default function App() {
     const MIN_INTERVAL_SECS = 6 * 3600;
     const due = () =>
       Date.now() / 1000 - (settingsRef.current.lastUpdateCheck ?? 0) > MIN_INTERVAL_SECS;
-    if (due()) void checkForUpdates({ silent: true });
+    // 静默的更新检查要发网络请求 —— 别让它挤在启动那一下
+    if (due()) deferUntilIdle(() => void checkForUpdates({ silent: true }));
     const timer = window.setInterval(
       () => {
         if (due()) void checkForUpdates({ silent: true });
@@ -1397,6 +1694,90 @@ export default function App() {
     notify(text);
   }
 
+  /**
+   * 收下后端探测的本机 CLI 健康结果。
+   *
+   * 为什么统一从这里进 state：`cli_health` 和"一键修跑完之后的重新探测"都要更新它，
+   * 而 `cli_health_fix` 的返回值里就带着新的 `health` —— 用同一个入口，
+   * 免得修完显示的还是旧结论（"点了没反应"那种）。
+   * 非数组一律忽略：宁可少一次刷新，也不能让面板渲染时炸掉。
+   */
+  function applyCliHealth(list: unknown) {
+    if (Array.isArray(list)) setCliList(list as CliHealth[]);
+  }
+
+  /** 探一次本机 CLI 健康（探测要起进程，后端有 5 秒缓存，20 秒轮询不心疼） */
+  async function refreshCliHealth() {
+    setCliProbing(true);
+    try {
+      applyCliHealth(await cliHealth());
+    } catch (e) {
+      // 探测失败**不清空**上一次结果：清空会让"异常那一块"忽闪忽闪的，比旧数据更烦人
+      console.warn("cli_health 失败：" + String(e));
+    } finally {
+      setCliProbing(false);
+    }
+  }
+
+  /**
+   * 「一键修」第一步：**只问"将要执行什么"，不起任何进程**。
+   *
+   * 界面上那句「将执行：<命令>」用的就是后端回给我们的 `execCmd` ——
+   * 显示的和真正会跑的是**同一个字符串**，不是前端自己拼的近似文案。
+   */
+  async function askCliReinstall(agent: string) {
+    if (cliFixing) return;
+    setCliFixResult(null);
+    try {
+      const r = await cliHealthFix(agent, false);
+      if (r.refused) {
+        // 白名单外（例如 aider 的 pip 命令）：我们不代跑，只把命令原文给他
+        setCliFixResult(r);
+        notify(r.message);
+        return;
+      }
+      setCliConfirm(r);
+    } catch (e) {
+      notify("取重装命令失败：" + String(e));
+    }
+  }
+
+  /** 「一键修」第二步：用户点过确认了，才真的跑（跑完顺手重新探测 + 刷新面板） */
+  async function runCliReinstall() {
+    const c = cliConfirm;
+    if (!c || cliFixing) return;
+    setCliFixResult(null);
+    setCliConfirm(null);
+    setCliFixing(true);
+    try {
+      const r = await cliHealthFix(c.agent, true);
+      setCliFixResult(r);
+      applyCliHealth(r.health);
+      // 状态栏只说结论；命令原文和 stdout/stderr 留在承载健康那块里给人看
+      notify(`${r.command} 重装：${r.ok ? "成功" : "失败"}（退出码 ${r.exitCode ?? "?"}）`);
+    } catch (e) {
+      notify("重装失败：" + String(e));
+    } finally {
+      setCliFixing(false);
+    }
+  }
+
+  /**
+   * 「以 `--no-daemon` 启动」：**只写设置，不跑安装、不动全局配置**。
+   *
+   * 存进去之后，下次由我们启动这个 CLI 时会带上这个参数（`run_cmd` 由后端拼好）。
+   */
+  async function applyCliFlag(agent: string, flag: string) {
+    try {
+      const r = await cliHealthSetFlag(agent, flag);
+      notify(`${r.command} 启动参数已记下：${r.flag}（下次我们从这里启动它时会带上）`);
+      // 立刻重探：`run_cmd` 变了，界面要让用户马上看见（后端这条路径不走 5 秒缓存）
+      await refreshCliHealth();
+    } catch (e) {
+      notify("记启动参数失败：" + String(e));
+    }
+  }
+
   /** 会话 → 看板上的「环境 + 服务器」 */
   function boardEnvOf(s: OpenSession): { env: string; server: string } {
     if (s.kind === "remote") {
@@ -1416,117 +1797,305 @@ export default function App() {
    * - Windows 全进程表扫描偏重 → 只有真有本机会话时才调，而且 20 秒才一次；
    * - 卡片上只给「运行中 / 已结束 + 耗时」，**不做进度条**（TUI 没有百分比可拿）。
    */
-  async function refreshBoard() {
-    if (boardBusy.current) return;
-    boardBusy.current = true;
-    try {
-      const now = Date.now();
-      const jobs: Promise<AiTask[]>[] = [];
-      const seenRemote = new Set<string>();
-      const seenLocal = new Set<string>();
-      for (const s of sessionsRef.current) {
-        if (s.kind === "remote" && s.profileId) {
-          const key = `${s.profileId}|${s.user ?? ""}`;
-          if (seenRemote.has(key)) continue;
-          seenRemote.add(key);
+  /**
+   * 后端的 `AiInstance[]` → 卡片渲染用的扁平形状。
+   *
+   * 这是**纯形状转换 + 找回"点它能去哪"的凭据**（窗格号、对应的会话标签），
+   * 不带任何合并/去重/判状态 —— 那些都在后端做完了。
+   *
+   * 两个字段需要在这里补：
+   * - `pane`：herdr 实例的锚就是窗格号；从 `where`（`环境 · 目录 · herdr:w1:p1`）里取回来，
+   *   它是"查看窗格 / 接管"这两个按钮唯一的凭据。取不到就留空 —— **不编**。
+   * - `herdrProfileId`：后端不知道 profileId（那是本应用的连接配置），
+   *   但前端刚把 herdr agent list 送进去过，按「服务器名 + 窗格号」查得回来。
+   */
+  function instanceTasks(list: AiInstance[]): AiTask[] {
+    /**
+     * 按「服务器 + 窗格号」索引**这一轮刚采集到的** herdr agent。
+     *
+     * 为什么不用探测缓存（`herdrAvail`）：那份只有"装了没/几个 agent"，没有窗格列表；
+     * 而这里要的是 profileId（后端不知道本应用的连接配置 id，只有服务器名）。
+     */
+    const paneIndex = new Map<
+      string,
+      { profileId: string; paneId: string; agentStatus: string; attention: boolean }
+    >();
+    for (const [pid, agents] of Object.entries(lastHerdrAgents.current)) {
+      const server =
+        profilesRef.current.find((p) => p.id === pid)?.name ?? String(pid);
+      for (const a of agents) {
+        if (!a.paneId) continue;
+        paneIndex.set(`${server}|${a.paneId}`, {
+          profileId: pid,
+          paneId: a.paneId,
+          agentStatus: a.status,
+          attention: !!a.attention,
+        });
+      }
+    }
+    return list.map((i) => {
+      const parts = i.where.split(" · ");
+      const pane = parts.length >= 3 ? parts[parts.length - 1].replace(/^[a-z]+:/, "") : "";
+      const hit = pane ? paneIndex.get(`${parts[0]}|${pane}`) : undefined;
+      const activity: AiActivity = i.activity ?? { artifacts: [] };
+      const source =
+        i.evidence
+          .map((e) => e.source)
+          .sort(
+            (a, b) =>
+              Number(b === "herdr-agent-list") - Number(a === "herdr-agent-list") ||
+              Number(b === "app-ledger") - Number(a === "app-ledger"),
+          )[0] ?? "local-process-table";
+      return {
+        id: i.id,
+        env: parts[0] === "本机" ? "local" : parts[0] === "WSL" ? "wsl" : "remote",
+        server: parts[0] ?? "",
+        tool: aiAgentLabel(i.agent),
+        command: activity.lastLine ?? "",
+        cwd: parts[1] ?? "",
+        pane: hit?.paneId ?? pane,
+        source,
+        // 老卡片样式只认 running / done 两档；**状态的判定不在这里**——
+        // 它来自后端（承载能力闸门 + 陈旧降级），这里只做显示映射。
+        state: i.state === "needs-you" || i.state === "working" ? "running" : "done",
+        durationMs: activity.durationMs ?? 0,
+        pid: 0,
+        startedAt:
+          activity.startedAtMs !== null && activity.startedAtMs !== undefined
+            ? Math.round(activity.startedAtMs / 1000)
+            : null,
+        exitCode: null,
+        herdrPane: hit?.paneId ?? null,
+        herdrProfileId: hit?.profileId ?? null,
+        herdrMode: hit?.paneId ? "control" : null,
+        agentStatus: hit?.agentStatus ?? null,
+        attention: i.state === "needs-you",
+        // v2 新带上的几个字段（卡片上要显示来源徽标与悬停说明）
+        badge: i.badge,
+        activityLastLine: activity.lastLine ?? null,
+        activityTokens: activity.tokens ?? null,
+        activityStartedAtMs: activity.startedAtMs ?? null,
+        where: i.where,
+        carrier: i.carrier,
+        evidenceCount: i.evidence.length,
+      };
+    });
+  }
+
+  /**
+   * 红点 / 通知（口径 docs/design-ai-board-v2.md §10.6）。
+   *
+   * **只有两件事值得亮**：
+   * ① 有实例进了 `needs-you` → 亮到**你处理为止**（所以它每次刷新都重算，不是差量累加）；
+   * ② 某一轮跑完**而且停下**（`finished`）→ 当"未读"，**点开面板即清**。
+   *
+   * **不亮**：运行中、空闲、陈旧（unknown）、只产出文件还没停、探测不到。
+   * **去重**：同一实例、同一轮只亮一次 —— 反复轮询不能让它又冒出来。
+   */
+  function applyBoardAlerts(list: AiInstance[]) {
+    // ① 需要你：直接看当前快照里还有几个 needs-you —— 它天然"亮到你处理为止"
+    const needs = list.filter((i) => i.state === "needs-you").map((i) => i.id);
+    setAiNeedIds(needs);
+    // ② 这一轮跑完并停下：按「实例 + 轮次」去重。
+    //    轮次 = 实例 id + 最后一次证据的时间（后端把 activity.startedAtMs / 证据时间都带了回来）
+    const fresh: string[] = [];
+    for (const i of list) {
+      if (i.state !== "finished") continue;
+      const round = `${i.id}@${i.evidence.map((e) => e.atMs).reduce((a, b) => Math.max(a, b), 0)}`;
+      if (aiFinishedSeen.current.has(round)) continue;
+      aiFinishedSeen.current.add(round);
+      fresh.push(round);
+    }
+    if (fresh.length) setAiPendingFinish((prev) => [...prev, ...fresh]);
+    // 第一次拿到看板时不"补报"历史完成项吗？——**不特地处理**：
+    // 上面那个 `aiFinishedSeen` 只对"看过一次快照之后新出现的轮次"计数，
+    // 而这第一份快照里的 finished 本来就该算你还没看过的那一轮。
+    // ⚠️ 曾经在这里 `setAiPendingFinish([])` 清一次，结果把"需要你"那条也一起抹了
+    //（它独立于历史，是"亮到你处理为止"的）—— 别再那么写。
+    if (!aiBoardSeeded.current) aiBoardSeeded.current = true;    // "需要你"要打扰（状态栏 + 任务栏闪一下），同一实例只提醒一次
+    for (const i of list) {
+      if (i.state !== "needs-you") continue;
+      if (aiNeedsNotified.current.has(i.id)) continue;
+      aiNeedsNotified.current.add(i.id);
+      raiseAiAttention(
+        `${aiAgentLabel(i.agent)} 在等你处理（${aiInstanceWhere(i)}）· 点开看板可接管`,
+      );
+    }
+    for (const id of Array.from(aiNeedsNotified.current)) {
+      if (!needs.includes(id)) aiNeedsNotified.current.delete(id);
+    }
+  }
+
+  /**
+   * 采集一份 `BoardSources` 用的原始数据（**只采不管**）。
+   *
+   * 这里刻意不做任何合并/去重/判状态：那三条口径只能有一份实现，在后端
+   * （`core/ai_instance.rs`；见 §10 与 `commands::ai_instances` 的注释）。
+   */
+  function collectBoardSources() {
+    const sources: BoardSources = { tasks: [], herdr: [], ledger: [], rollouts: [] };
+    const jobs: Promise<void>[] = [];
+    const seenRemote = new Set<string>();
+    const seenLocal = new Set<string>();
+    const now = Date.now();
+    for (const s of sessionsRef.current) {
+      if (s.kind === "remote" && s.profileId) {
+        const key = `${s.profileId}|${s.user ?? ""}`;
+        if (seenRemote.has(key)) continue;
+        seenRemote.add(key);
+        const server = boardEnvOf(s).server;
+        jobs.push(
+          aiTasksRemote(s.profileId, server, s.user ?? null)
+            .then((list) => {
+              sources.tasks.push(...list);
+            })
+            .catch(() => {}),
+        );
+        // herdr 是"第一手"状态源：装了它的机器上，`agent list` 能给出 working / blocked
+        // 这种我们扫进程拿不到的判定，还能直接定位到窗格（点卡片就能开观察窗）。
+        // 没装（或还没探过）就照旧只看 ps/tmux 那两条路 —— 探测结果按服务器缓存，不会反复 ssh。
+        const src = herdrAvailRef.current[s.profileId];
+        if (src === undefined) {
+          // 第一次遇到这台机器：探测是异步的，这一轮看板还拿不到 herdr 的 agent。
+          // 探完再补刷一次，不然用户要盯着"暂无运行中的 AI"等下一个 20 秒周期。
+          const pid0 = s.profileId;
           jobs.push(
-            aiTasksRemote(s.profileId, boardEnvOf(s).server, s.user ?? null).catch(() => []),
-          );
-          // herdr 是"第一手"状态源：装了它的机器上，`agent list` 能给出 working / blocked
-          // 这种我们扫进程拿不到的判定，还能直接定位到窗格（点卡片就能开观察窗）。
-          // 没装（或还没探过）就照旧只看 ps/tmux 那两条路 —— 探测结果按服务器缓存，不会反复 ssh。
-          const src = herdrAvailRef.current[s.profileId];
-          if (src === undefined) {
-            // 第一次遇到这台机器：探测是异步的，这一轮看板还拿不到 herdr 的 agent。
-            // 探完再补刷一次，不然用户要盯着"暂无运行中的 AI"等下一个 20 秒周期。
-            const pid0 = s.profileId;
-            void probeHerdrFor(s.profileId, s.user).then(() => {
+            probeHerdrFor(s.profileId, s.user).then(() => {
               // 只有"这一次真的把结果拿到了"才补刷；否则（比如同一台机器已经在探）
               // 交给那个在飞的探针去收尾，免得两边互相触发、把看板刷成死循环。
               if (herdrAvailRef.current[pid0] !== undefined) {
                 boardRefreshQueued.current = true;
               }
-            });
-          } else if (src && src.herdrVersion && src.compat !== "too_old") {
-            const server = boardEnvOf(s).server;
-            const pid = s.profileId; // 闭包里 TS 认不出上面的非空收窄，这里钉一下
-            jobs.push(
-              herdrAgents(pid, s.user ?? null)
-                .then((list) => list.map((a) => herdrAgentToTask(a, server, pid)))
-                .catch(() => []),
-            );
-          }
-        } else if (s.kind === "powershell" || s.kind === "wsl" || s.kind === "cmd") {
-          // 每种本地终端只扫一次（多开几个 PowerShell 没必要扫好几遍进程表）
-          if (seenLocal.has(s.kind)) continue;
-          seenLocal.add(s.kind);
-          // 本机扫描要起一个 PowerShell 去枚举进程（实测 0.6~1 秒），比远端探针贵得多，
-          // 所以单独限流：最多 60 秒一次。看板对"本机多出来了哪个 AI"并不需要秒级新鲜度。
-          if (now - lastLocalScan.current < LOCAL_SCAN_MIN_INTERVAL_MS) continue;
-          lastLocalScan.current = now;
-          jobs.push(aiTasksLocal(s.kind, shellLabelOf(s.kind), null).catch(() => []));
+            }),
+          );
+        } else if (src && src.herdrVersion && src.compat !== "too_old") {
+          const pid = s.profileId; // 闭包里 TS 认不出上面的非空收窄，这里钉一下
+          jobs.push(
+            herdrAgents(pid, s.user ?? null)
+              .then((agents) => {
+                lastHerdrAgents.current = { ...lastHerdrAgents.current, [pid]: agents };
+                if (agents.length) sources.herdr.push({ env: server, agents });
+              })
+              .catch(() => {}),
+          );
         }
-      }
-      if (jobs.length === 0) {
-        setBoardTasks([]);
-        return;
-      }
-      const lists = await Promise.all(jobs);
-      const flat = lists.flat();
-      // 同一台机器上同一种工具可能被探测成多条（node 壳 + 内部二进制，或 App 记录的那条），
-      // 所以要合并。但**合并的粒度必须带上"哪个窗格"**：以前只按「环境+服务器+工具+目录」
-      // 合并，于是"同一台机器、同一个目录里开了两个 codex"在看板上只剩一张卡
-      // （用户实测：明明有两个终端在跑，看板只显示一个）。
-      const merged: AiTask[] = [];
-      for (const t of flat) {
-        const hit = merged.find((m) => taskKeyOf(m) === taskKeyOf(t));
-        if (!hit) {
-          merged.push({ ...t });
-          continue;
-        }
-        if (betterTask(t, hit)) absorbTask(hit, t);
-      }
-      // 第二趟：把"说不出自己在哪个窗格"的卡片并进同组里带窗格的那张。
-      //
-      // 为什么需要：同一个 agent 会被两路同时看到 —— herdr 说得清窗格，ps 扫描只看到一个
-      // 进程（它不知道那是 herdr 的窗格）。不并的话一张卡会变成两张。
-      // 反过来，同组里**有多张**带窗格的卡（就是"两个 codex"那种）时，没窗格的那张并到
-      // 时间最近的那张上 —— 它本来就认不出是哪一个。
-      const paned = merged.filter((t) => paneIdOf(t));
-      const out: AiTask[] = [];
-      for (const t of merged) {
-        if (paneIdOf(t)) {
-          out.push(t);
-          continue;
-        }
-        const kin = paned.filter((m) => groupKeyOf(m) === groupKeyOf(t));
-        if (!kin.length) {
-          out.push(t);
-          continue;
-        }
-        const host = kin.reduce((a, b) => (betterTask(b, a) ? b : a));
-        if (betterTask(t, host)) absorbTask(host, t);
-      }
-      setBoardTasks(out);
-      boardTasksRef.current = out;
-      // herdr 说"有人在等你"：这是最值钱的一路信号（我们自己的进程扫描永远拿不到）。
-      // 同一张卡"进入 blocked"只提醒一次；它离开 blocked 之后再进会重新提醒。
-      const waiting = new Set<string>();
-      for (const t of merged) {
-        if (!t.attention || !t.herdrPane) continue;
-        const key = `${t.herdrProfileId ?? ""}|${t.herdrPane}`;
-        waiting.add(key);
-        if (herdrNotified.current.has(key)) continue;
-        herdrNotified.current.add(key);
-        raiseAiAttention(
-          `「${t.server}」的 ${aiToolLabel(t.tool)} 在等你处理${t.cwd ? `（${t.cwd}）` : ""}` +
-            `${t.herdrProfileId ? " · 可点「查看窗格」" : ""}`,
-          "",
+      } else if (s.kind === "powershell" || s.kind === "wsl" || s.kind === "cmd") {
+        // 每种本地终端只扫一次（多开几个 PowerShell 没必要扫好几遍进程表）
+        if (seenLocal.has(s.kind)) continue;
+        seenLocal.add(s.kind);
+        // 本机扫描要起一个 PowerShell 去枚举进程（实测 0.6~1 秒），比远端探针贵得多，
+        // 所以单独限流：最多 60 秒一次。看板对"本机多出来了哪个 AI"并不需要秒级新鲜度。
+        if (now - lastLocalScan.current < LOCAL_SCAN_MIN_INTERVAL_MS) continue;
+        lastLocalScan.current = now;
+        jobs.push(
+          aiTasksLocal(s.kind, shellLabelOf(s.kind), null)
+            .then((list) => {
+              sources.tasks.push(...list);
+            })
+            .catch(() => {}),
         );
       }
-      for (const k of Array.from(herdrNotified.current)) {
-        if (!waiting.has(k)) herdrNotified.current.delete(k);
+    }
+    return { sources, jobs };
+  }
+
+  /**
+   * 刷新 AI 任务看板（口径 docs/design-ai-board-v2.md §10.1 / §10.2 / §10.5）。
+   *
+   * 数据怎么走：**前端只采集**（herdr agent list / 远端 tmux+ps / 本机 winproc / WSL /
+   * App 账本 / rollout 快照）→ 原样送进 `BoardSources` → 后端合并成 `AiInstance[]` →
+   * 前端只负责画。
+   *
+   * 为什么合并必须在后端：**可信度闸门**（推断不许说成事实）、**陈旧降级**、
+   * **一个实例一张卡** 这三条口径只能有一份实现 —— 老看板在前端 JS 里用两趟补丁逼近，
+   * 于是留下过"同一目录两个 codex 只剩一张卡"这种毛病。
+   *
+   * 几条必须守住的取舍（没变过）：
+   * - WSL 里的进程从 Windows 侧看不见（只有 wslhost/vmmem），所以交给后端**进 WSL 里查**；
+   * - CMD 没有脚本钩子 → 空承载**不上板**（§10.5，只在承载健康里可查）；
+   * - Windows 全进程表扫描偏重 → 只有真有本机会话时才调，而且 60 秒才一次；
+   * - 卡片上只给「运行中 / 已结束 + 耗时」，**不做进度条**（TUI 没有百分比可拿）。
+   */
+  async function refreshBoard() {
+    if (boardBusy.current) return;
+    boardBusy.current = true;
+    try {
+      const { sources, jobs } = collectBoardSources();
+      await Promise.all(jobs);
+      // App 账本：只挑我们自己启动的那批（`source == "app"`），按"环境 + 承载/窗格"分组。
+      // 分组时把**前端才知道的**窗格信息带上：带上之后它和该窗格的第一手观测**锚相同**，
+      // 后端第一趟合并就会并成一张卡（不需要模型层"按目录猜"那种危险规则）。
+      const ledgerByKey = new Map<string, AiLedgerGroup>();
+      for (const t of sources.tasks) {
+        if (t.source !== "app") continue;
+        const pane = t.herdrPane ?? t.pane ?? "";
+        const carrier: AiCarrier =
+          t.env === "local" || t.env === "wsl"
+            ? t.env === "wsl"
+              ? "wsl"
+              : "local-powershell"
+            : t.herdrPane
+              ? "herdr"
+              : pane
+                ? "tmux"
+                : "ssh-bare";
+        const key = `${t.env}|${carrier}|${pane}`;
+        let g = ledgerByKey.get(key);
+        if (!g) {
+          g = {
+            env: t.server,
+            carrier,
+            herdrPane: t.herdrPane ?? null,
+            tmuxTarget: t.herdrPane ? null : t.pane || null,
+            cwd: t.cwd || null,
+            sessionId: null,
+            items: [],
+          };
+          ledgerByKey.set(key, g);
+        }
+        g.items.push({
+          id: t.id,
+          env: t.env,
+          server: t.server,
+          tool: t.tool,
+          command: t.command,
+          // AiTask.startedAt 是 **Unix 秒**，账本那层是 snake_case 的秒
+          started_at: t.startedAt ?? 0,
+          last_running_at: t.startedAt ?? 0,
+          running: t.state === "running",
+        });
       }
+      sources.ledger = Array.from(ledgerByKey.values());
+      // rollout 快照：**当前会话那一份**（codex 日志）。它没有窗格锚，
+      // 后端只在"环境 + agent + 目录"候选唯一时认领一个已有实例，认不到就单独成卡。
+      const snap = snapshotRef.current;
+      if (snap?.session) {
+        const ss = snap.snapshot;
+        const carrier: AiCarrier =
+          snap.session.kind === "remote"
+            ? snap.session.herdrPane
+              ? "herdr"
+              : snap.session.tmuxMode && snap.session.tmuxMode !== "none"
+                ? "tmux"
+                : "ssh-bare"
+            : snap.session.kind === "wsl"
+              ? "wsl"
+              : "local-powershell";
+        const rollout: AiRolloutGroup = {
+          env: boardEnvOf(snap.session).server,
+          snapshot: ss,
+          carrier,
+          artifacts: snap.artifacts.map((a) => a.name),
+        };
+        sources.rollouts = [rollout];
+      }
+      // 合并 + 闸门 + 排序全在后端（这里只等结果）
+      const list = await aiInstances(sources);
+      const out = instanceTasks(list);
+      setBoardInstances(list);
+      setBoardTasks(out);
+      boardTasksRef.current = out;
+      applyBoardAlerts(list);
     } finally {
       boardBusy.current = false;
       // 这一轮里"探测 herdr 完事"是异步回来的：等当前这轮真的结束再补刷，避免互相顶掉
@@ -1974,6 +2543,9 @@ export default function App() {
         null,
       );
       setAiSnapshot(snap);
+      // 留给 `refreshBoard` 当 rollout 观测（看板 20 秒一刷、快照 10 秒一采，两者不同步）
+      if (snap) snapshotRef.current = { session: cur, snapshot: snap, artifacts: [] };
+      else snapshotRef.current = null;
       // 同样要"算到真正在跑 AI 的那个窗口头上"：当前窗口可能是普通 shell，
       // 而 AI 在同一个服务器的 tmux 窗口里跑（用户实测就是这么被带错的）。
       if (snap) considerSnapshot(pickAiSession(boardEnvOf(cur).server) ?? cur, snap);
@@ -2002,7 +2574,12 @@ export default function App() {
         startedAt,
       );
       // 只有"当前会话"的产物才铺到看板卡片上（后台会话只是用来提醒）
-      if (cur.id === activeId) setAiArtifacts(list);
+      if (cur.id === activeId) {
+        setAiArtifacts(list);
+        if (snapshotRef.current?.session.id === cur.id) {
+          snapshotRef.current = { ...snapshotRef.current, artifacts: list };
+        }
+      }
       return list;
     } catch {
       setAiArtifacts([]);
@@ -2181,13 +2758,11 @@ export default function App() {
             `「${cur.title}」产出了 ${interesting.length} 个文档：${names}${
               interesting.length > 3 ? " 等" : ""
             }（卡片下面可点开）`,
-            cur.id,
           );
           return;
         }
         raiseAiAttention(
           `「${cur.title}」这一轮跑完了：${aiShorten(snap.lastMessage, 60)}`,
-          cur.id,
         );
       });
       return;
@@ -2200,22 +2775,19 @@ export default function App() {
       snap.state === "needs-approval"
         ? `「${cur.title}」等你批准：${snap.lastAction}`
         : `「${cur.title}」等你回话`,
-      cur.id,
     );
   }
 
   /**
-   * 提醒用户：红点（总会）+ 状态栏一行 + 按设置闪任务栏 / 右下角提示。
+   * 打扰用户一下：进面板里的通知列表 + 按设置闪任务栏。
    *
-   * `sessionId` 只是"点这条告警要切到哪个标签页"（没有就传空串）——
-   * herdr 报上来的"有人在等你"未必对应我们本地开着哪个标签页。
+   * ⚠️ **不在这里动红点**（§10.6）：红点只认「需要你 / 跑完停下」两条规则 ——
+   * 第一条"亮到你处理为止"（每次刷新按当前快照重算，不是差量累加），
+   * 第二条"点开面板即清"（当未读）。两件事的差别化处理在 `applyBoardAlerts`
+   * 与"打开面板"那个 effect 里，这里只负责"响一声"。
    */
-  function raiseAiAttention(text: string, sessionId: string) {
-    setAiUnread((n) => n + 1);
-    setAiAlerts((prev) =>
-      [{ id: uid(), text, sessionId, time: Date.now() }, ...prev].slice(0, 5),
-    );
-    notify(text);
+  function raiseAiAttention(text: string) {
+    pushAiNotice(text);
     if (settingsRef.current.aiNotifyTaskbar && !document.hasFocus()) {
       // 只在窗口不在前台时闪（前台闪没有意义）；回到窗口时下面那个 effect 会取消
       void getCurrentWindow()
@@ -2232,27 +2804,40 @@ export default function App() {
     void refreshAiSource();
     // herdr 服务状态（装了 ≠ 在跑），面板打开时一起刷
     void refreshHerdrServer();
-    void refreshBoard();
-    void loadTimeline();
-    // 会话日志是通知的主判据，跟着面板一起刷
-    void refreshSnapshot();
+    // 本机 CLI 健康（承载健康那一块的第三档：装了但坏了 / 正在自更新）。
+    // 跟着面板一起刷：异常要能自己冒出来，不能等用户去点刷新。
+    void refreshCliHealth();
+    // 时间线是**重活**（读落盘文件），跟首帧抢主线程不值得 —— 推迟到主线程空下来再做。
+    deferUntilIdle(() => {
+      void loadTimeline();
+    });
     const t = window.setInterval(() => void refreshAi(), 8000);
-    // 看板重一些（远端要跑 ps、本机要扫进程表），20 秒一次就够
-    const t2 = window.setInterval(() => {
-      void refreshBoard();
-      void refreshSnapshot();
-    }, 20000);
-    return () => {
-      window.clearInterval(t);
-      window.clearInterval(t2);
-    };
+    return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiPanelOpen, activeId]);
 
-  // 打开 AI 面板 = 你已经看到了 → 清掉红点
+  // 打开 AI 面板 = 你已经看到了 → 清掉「跑完停下」那几条未读（§10.6 规则②）。
+  // ⚠️ 只清这一种：**「需要你」的红点亮到你处理为止**，打开面板不算处理
+  // （那条由 `applyBoardAlerts` 按当前快照重算，这里碰它就会变成"点开就消失"）。
   useEffect(() => {
-    if (aiPanelOpen) setAiUnread(0);
+    if (aiPanelOpen) setAiPendingFinish([]);
   }, [aiPanelOpen, activeId]);
+
+  /**
+   * 状态栏那条「codex 起不来 · 查看」被点过之后，把承载健康那一块滚进视野。
+   *
+   * 为什么不用 `scrollIntoView`：那会把**整页**一起滚（我们要的是"面板里滚到那块"），
+   * `block: "nearest"` 也会带动外层滚动容器。所以直接改面板自己的 `scrollTop`，只动它一个。
+   * `cliFocusTick` 是触发器：点的那一帧才 setAiPanelOpen(true)，下一帧 DOM 里才有那块。
+   */
+  useEffect(() => {
+    if (!cliFocusTick || !aiPanelOpen) return;
+    const el = cliHealthRef.current;
+    const panel = el?.closest(".ai-panel") as HTMLElement | null;
+    if (!el || !panel) return;
+    // 往上留 60px 余量：正好贴顶反而看不到"这一块是从哪开始的"
+    panel.scrollTop = Math.max(0, el.offsetTop - 60);
+  }, [cliFocusTick, aiPanelOpen]);
 
   /**
    * 「新建会话」对话框里**只要选中了某台服务器**就探一下她那台机器有没有 herdr。
@@ -2275,13 +2860,47 @@ export default function App() {
    * "跑完了/有新消息/产出文件"根本没人提醒（这就是"为什么没提示我看那个 Markdown"的主因之一）。
    */
   useEffect(() => {
-    void refreshSnapshot();
+    // 首次快照（通知的主判据）也挪到首帧之后：它要读 rollout 文件，压首屏不值当。
+    deferUntilIdle(() => {
+      void refreshSnapshot();
+      startupMark("idle tasks done");
+    });
     const t = window.setInterval(() => void refreshSnapshot(), 10000);
     const t2 = window.setInterval(() => void refreshOtherSnapshots(), 30000);
     return () => {
       window.clearInterval(t);
       window.clearInterval(t2);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
+
+  /**
+   * 盯看板 —— **面板关着也要盯**（§10.6 的前提）。
+   *
+   * 为什么必须常驻：红点的两条规则都建立在"看板一直在刷"上 ——
+   *  ① 「需要你」要亮到你处理为止；② 「这一轮跑完并停下」要在你没开面板时也亮出来。
+   * 以前这段轮询挂在"面板打开"那个 effect 里（面板一关就没人刷看板），
+   * 于是"跑完了但面板没开 → 红点永远不亮"，§10.6 就成了空话。
+   *
+   * 代价就是那点扫描开销，所以：看板 20 秒一次（远端要跑 ps、本机要枚举进程表）；
+   * 第一次照旧推迟到主线程空下来（首屏优先，见 src/startup.ts）。
+   */
+  useEffect(() => {
+    deferUntilIdle(() => {
+      void refreshBoard();
+      void refreshSnapshot();
+      // 本机 CLI 健康也**面板关着就探**：异常要在状态栏自己冒出来，
+      // 不能等用户先想起去看板才告诉他"codex 起不来"
+      void refreshCliHealth();
+    });
+    const t = window.setInterval(() => {
+      void refreshBoard();
+      void refreshSnapshot();
+      // 本机探测比远端便宜得多（where + --version，各带 5 秒超时、后端还有 5 秒缓存），
+      // 所以跟看板同一个 20 秒节奏就够了
+      void refreshCliHealth();
+    }, 20000);
+    return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
@@ -2826,11 +3445,218 @@ export default function App() {
           kindOfSession(s.kind),
         ).background
       : undefined;
-  // 看板卡片分两拨：「正在跑 / 等你处理」占卡片位；「空闲 / 已完成」默认收成一行
-  //（见 isActiveBoardTask 的说明）。展开时按原顺序全显示。
-  const boardActive = boardTasks.filter(isActiveBoardTask);
-  const boardInactive = boardTasks.filter((t) => !isActiveBoardTask(t));
-  const boardVisible = inactiveOpen ? boardTasks : boardActive;
+  // 看板只摆两个区：**需要你** + **运行中**（§10.2）。
+  // 「最近完成」「空闲」各折成一行，点开才渲染明细；承载健康只在异常时出现。
+  const boardNeedsYou = boardInstances.filter((i) => i.state === "needs-you");
+  const boardWorking = boardInstances.filter((i) => i.state === "working");
+  const boardFinished = boardInstances.filter((i) => i.state === "finished");
+  const boardIdle = boardInstances.filter((i) => i.state === "idle" || i.state === "unknown");
+  /** 卡片渲染用的扁平行（保序：后端的排序就是需要你 → 运行中 → …） */
+  const taskOfInstance = new Map(boardTasks.map((t) => [t.id, t]));
+  /**
+   * 面板上要显示的"没在用"和"可清理"（只读计算，不产生任何副作用）。
+   *
+   * 放在这里（而不是下面用它的地方）：承载健康那一行、管理面板、调试输出都要用同一份，
+   * 早算一次就够了 —— 各算各的容易让界面自相矛盾。
+   */
+  const herdrOrphanList = herdrOrphans();
+  const herdrCleanList = herdrCleanable();
+
+  /**
+   * 看板卡片（两个区共用）。
+   *
+   * 样式沿用现有的 `ai-task` 那一套，这一轮先把**数据来源**换成统一模型 ——
+   * 状态、要不要上板、来源徽标全部来自后端 `AiInstance`，前端不再自己判
+   * （口径 docs/design-ai-board-v2.md §10）。
+   */
+  function boardCard(i: AiInstance) {
+    const t = taskOfInstance.get(i.id);
+    // 后端刚给过这张卡，理论上一定找得到；万一没有就整张不画（**不编**一张假的）
+    if (!t) return null;
+    const active = isActiveInstance(i);
+    const attention = i.state === "needs-you";
+    const project = dirBase(t.cwd || "");
+    // 这张卡对着的**终端标签**（看板 ↔ 标签栏的对应关系）。
+    // 分开两个概念：
+    // - `linkedControl`：这个窗格已经**可写**地开着 → 按钮变成"切到标签"，
+    //   点了就走过去，而不是再开一条（再开一条会跟它抢输入和尺寸）；
+    // - `linkedAny`：只读观察窗也算"已经开在标签里"，用来告诉用户卡和标签的对应。
+    const same = (s: OpenSession) =>
+      s.profileId === t.herdrProfileId && s.herdrPane === t.herdrPane;
+    const linkedControl = t.herdrPane
+      ? sessions.find((s) => same(s) && s.herdrMode === "control")
+      : undefined;
+    const linkedAny = t.herdrPane ? linkedControl ?? sessions.find(same) : undefined;
+    // 会话日志快照只有"当前会话"这一份 → 只往它自己那张卡上挂
+    const withSnap =
+      !!aiSnapshot &&
+      (i.state === "working" || attention) &&
+      (aiSnapshot.cwd ? aiSnapshot.cwd === t.cwd : false);
+    const usage = withSnap ? aiSnapshot?.usage : undefined;
+    const pct =
+      usage && usage.contextWindow > 0
+        ? Math.min(100, Math.round((usage.total / usage.contextWindow) * 100))
+        : 0;
+    return (
+      <div
+        className={"ai-task " + (attention ? "needs-approval" : active ? "running" : "done")}
+        key={i.id}
+      >
+        {/* 第一行：谁（agent）+ 状态。`t.server` / 窗格号在下面那行"在哪"，这里不重复。 */}
+        <div className="ai-task-line">
+          <span className={"dot " + (attention ? "warn" : active ? "ok" : "idle")} />
+          <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
+          <span className="ai-tag">{aiEnvLabel(t.env)}</span>
+          <span
+            className={"ai-state " + (attention ? "needs-approval" : active ? "running" : "done")}
+          >
+            {aiStateLabelOf(i)}
+          </span>
+        </div>
+        {/* 来源徽标（§3.3 / §10.2：每张卡都要有）：
+            文字直接用后端 `badge()`，悬停写清**谁说的 / 多久前 / 能证明什么**。
+            裸 SSH 只写「运行中（进程推断，可能已卡住）」—— 永不显示"需要你"（§10.4）。 */}
+        <div className="ai-task-meta">
+          <span className="ai-badge-owner" title={aiBadgeTitle(i)}>
+            {i.badge}
+          </span>
+          {i.downgradedFrom ? (
+            <span
+              title={
+                "有来源声称它是「" +
+                aiStateLabel(i.downgradedFrom) +
+                "」，但这个承载看不到这个状态 —— 推断绝不说成事实（§10.4 / §10.5）"
+              }
+            >
+              {" "}
+              · 该承载看不到「{aiStateLabel(i.downgradedFrom)}」
+            </span>
+          ) : null}
+        </div>
+        {/* 第三行只给"在哪台机器、哪个项目"；完整命令行放悬停提示 */}
+        <div className="ai-task-meta ellipsis">
+          {t.server}
+          {/* 项目名跟服务器名一样时别重复一遍：远端窗格的 cwd 常常就是 /home/<user>，
+              目录名正好等于服务器名，卡片上就出现 `lz · lz · w1Q:p1`（用户报过的脏标签） */}
+          {project && project !== t.server ? ` · ${project}` : ""}
+          {t.herdrPane ? ` · ${t.herdrPane}` : t.pane ? ` · ${t.pane}` : ""}
+          {linkedAny
+            ? ` · 已开在「${linkedAny.title}」${linkedControl ? "" : "（只读）"}`
+            : ""}
+        </div>
+        {withSnap && aiSnapshot && usage ? (
+          <div className="ai-task-meta">
+            token {tokenM(usage.total)}
+            {pct >= 1 ? ` · 上下文 ${pct}%` : ""}
+            {aiSnapshot.lastTurnDurationMs > 0
+              ? ` · 上一轮 ${aiDurationText(aiSnapshot.lastTurnDurationMs)}`
+              : ""}
+          </div>
+        ) : null}
+        {withSnap && aiSnapshot?.lastAction ? (
+          <div className="ai-task-cmd ellipsis" title={aiSnapshot.lastAction}>
+            {aiSnapshot.lastAction}
+          </div>
+        ) : null}
+        {/* G-02：shell 集成报上来的退出码（只有注入过 PROMPT_COMMAND 的会话才有；
+            tmux 会话拿不到，那一侧受限于老 tmux，见 core/ssh.rs 里的说明） */}
+        {withSnap && activeId && cmdExit[activeId] ? (
+          <div
+            className="ai-task-meta"
+            title={new Date(cmdExit[activeId].at).toLocaleString("zh-CN")}
+          >
+            最近一条命令退出码 {cmdExit[activeId].exit}
+            {cmdExit[activeId].exit === 0 ? "（成功）" : "（失败）"}
+          </div>
+        ) : null}
+        <div
+          className="ai-task-meta ellipsis"
+          title={`${t.command || "（拿不到命令行）"}\n${aiSourceLabelOf(t.source)} · 证据 ${
+            t.evidenceCount ?? 1
+          } 条`}
+        >
+          耗时 {aiDurationText(t.durationMs)}
+          {/* 来源已经在上面那枚徽标里说过了就不重复（§9①"同一件事说了三遍"就是这毛病）；
+              徽标只写"谁说的"，所以这里补的是"读的是哪种数据"。 */}
+          {aiBadgeCoversSource(i) ? "" : ` · ${aiSourceLabelOf(t.source)}`}
+        </div>
+        {/* herdr 卡片能直接开观察窗：只看那个窗格的实时画面，不抢它的尺寸、
+            也不会像 attach TUI 那样退出时花屏（见 core/herdr.rs 顶部说明） */}
+        {t.herdrPane ? (
+          <div className="ai-task-actions">
+            <button
+              type="button"
+              className="mini-btn"
+              onClick={() => void openHerdrPane(t.herdrProfileId ?? "", t.herdrPane ?? "", t.tool)}
+              title="开一个只读观察窗（不会影响窗格本身的尺寸）"
+            >
+              查看窗格
+            </button>
+            {/* 「接管」只在"这确实是个活任务"或"已经开着标签"时才给。
+                空闲 / 已完成摆两个看起来都能点的按钮，用户实测会以为"点了能过去"
+                （其实切不过去）—— 那种卡只留「查看窗格」。 */}
+            {(active || linkedControl) && (
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() =>
+                  linkedControl
+                    ? // 这个窗格已经作为标签开着了：**切过去**，
+                      // 而不是再开一个（再开一个会跟它抢输入/尺寸）
+                      setActiveId(linkedControl.id)
+                    : void openHerdrPane(
+                        t.herdrProfileId ?? "",
+                        t.herdrPane ?? "",
+                        t.tool,
+                        null,
+                        "control",
+                      )
+                }
+                title={
+                  linkedControl
+                    ? `这张卡对应的终端标签已经开着了：「${linkedControl.title}」`
+                    : "接管这个窗格：可读可写，能直接回答它的选择题（会抢过输入；关掉标签就交还，窗格留在服务器上）"
+                }
+              >
+                {linkedControl ? "切到标签" : "接管"}
+              </button>
+            )}
+          </div>
+        ) : null}
+        {/* 这一轮产出的文件（统一模型带的产物）：点一下直接看
+            （远端走应用内预览，本地用资源管理器） */}
+        {withSnap && aiArtifacts.length > 0 && activeSession && aiSnapshot ? (
+          <div className="ai-artifacts">
+            {aiArtifacts.map((a) => (
+              <button
+                key={a.path}
+                type="button"
+                className="ai-artifact"
+                title={`${a.path} · ${humanSize(a.size)}`}
+                onClick={() => void openArtifact(activeSession, aiSnapshot.cwd, a)}
+              >
+                📄 {a.name}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {/* 后端带上来的产物清单（可能来自 rollout，不一定在本地打开得了）：
+            只列名字，点开文件由上面那一排负责 —— 这里**不编**一个点了没反应的按钮 */}
+        {!withSnap && i.activity.artifacts.length > 0 ? (
+          <div className="ai-artifacts">
+            {i.activity.artifacts.slice(0, 6).map((name) => (
+              <span className="ai-tag" key={name} title={name}>
+                📄 {name}
+              </span>
+            ))}
+            {i.activity.artifacts.length > 6 ? (
+              <span className="dim">+{i.activity.artifacts.length - 6}</span>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
   const activeFile =
     activeSession && activeSession.activeTab !== "terminal"
       ? activeSession.openFiles.find((f) => f.name === activeSession.activeTab) ?? null
@@ -2877,6 +3703,8 @@ export default function App() {
         );
         break;
       case "error":
+        // 后端给的是「中文短句｜原始信息：<英文>」（见 core::ssh::friendly_ssh_error）：
+        // 中文那半直接显示，英文原文自动进悬停（notify 里做），这里不用再加工。
         notify(e.message);
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, state: "error" } : s)),
@@ -2970,6 +3798,12 @@ export default function App() {
    *   error 出错（失败、无法、请先…）→ ❗ 红底加粗并闪一下
    */
   function notify(text: string) {
+    // 后半句"这台服务器可能要密码…"是**给用户照做的**，不能被切掉 —— 所以先把它摘出来，
+    // 只把「中文短句｜原始信息：…」那一半送进拆分逻辑（见 splitErrText）。
+    const nl = text.indexOf("\n");
+    const head = nl >= 0 ? text.slice(0, nl) : text;
+    const tail = nl >= 0 ? text.slice(nl) : "";
+    const { short, detail } = splitErrText(head);
     const kind: "info" | "warn" | "error" = /失败|错误|不能|请|无法|不支持|被拒绝|不正确|超时|不存在|为空/.test(
       text,
     )
@@ -2977,7 +3811,7 @@ export default function App() {
       : /还没|没有|已尝试|重试|注意|不可|未/.test(text)
         ? "warn"
         : "info";
-    setStatusMsg({ text, at: Date.now(), kind });
+    setStatusMsg({ text: short + tail, detail: detail + tail, at: Date.now(), kind });
   }
 
   // ---------- 给 AI 发文件 / 发消息（粘贴、拖拽、「✍ 发给 AI」输入窗共用这一套） ----------
@@ -3090,11 +3924,23 @@ export default function App() {
     if (bus.sendInput(session.id, text, submit)) return true;
     // 终端还没挂载（极少见，例如刚恢复的会话）：退回直接写 PTY。
     // 这条路上没有 bracketed paste，多行会被当成多次回车 —— 总比什么都不发生强。
-    // 注意：回车**必须一起写**（以前这里只写文本，于是"消息发出去了但没执行"）。
-    void sessionWrite(
-      session.id,
-      bytesToB64(new TextEncoder().encode(submit ? `${text}\r` : text)),
-    );
+    // 注意两点：
+    //   1) 回车**必须一起写**（以前这里只写文本，于是"消息发出去了但没执行"）；
+    //   2) 正文与回车**分两次写、中间隔 40ms**：本地 ConPTY 会把挨着的两次写入合成
+    //      同一次 read（真机实测：假 TUI 只收到一段 `正文 + \r`），远程 ssh 却是分开到的。
+    //      隔开一点，本地和远程就一样了（见 Terminal.tsx 输入通道那段说明）。
+    void (async () => {
+      try {
+        await sessionWrite(session.id, bytesToB64(new TextEncoder().encode(text)));
+        if (submit) {
+          await new Promise((r) => setTimeout(r, 40));
+          await sessionWrite(session.id, bytesToB64(new TextEncoder().encode("\r")));
+        }
+      } catch (e) {
+        // 不许静默：写失败要让人看见（这条兜底路走到的都是"终端没挂载"的怪状态）
+        notify("这条会话的输入送不进去：" + String(e));
+      }
+    })();
     return true;
   }
 
@@ -3576,7 +4422,7 @@ export default function App() {
         }
       }
     } catch (e) {
-      notify("SSH 连接失败：" + String(e));
+      notify(connErrorText("SSH 连接失败", e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
     return id;
@@ -3712,7 +4558,7 @@ export default function App() {
         s.user ?? null,
       );
     } catch (e) {
-      notify("重连失败：" + String(e));
+      notify(connErrorText("重连失败", e));
       setSessions((prev) => prev.map((x) => (x.id === s.id ? { ...x, state: "error" } : x)));
     }
   }
@@ -3729,8 +4575,10 @@ export default function App() {
       group: form.group.trim() || "默认",
       ssh: {
         host: form.host.trim(),
-        port: Number(form.port) || 22,
-        user: form.user.trim() || "root",
+        // 留空的端口/用户 = "没说"：后端不传 -p、只给 host，让 ~/.ssh/config 生效
+        // （显式填了仍然是我们说了算）。类型仍是 u16 / String，不用改 store。
+        port: portOrZero(form.port),
+        user: form.user.trim(),
         authKind: "key",
         keyPath: form.keyPath.trim() || undefined,
         tmuxEnabled: settings.tmuxDefault,
@@ -3783,8 +4631,9 @@ export default function App() {
         group: "默认",
         ssh: {
           host: "",
-          port: 22,
-          user: "root",
+          // 留空 = "没说"（见 EMPTY_PROFILE 上那段说明：填了就顶掉 ~/.ssh/config）
+          port: 0,
+          user: "",
           authKind: "key",
           tmuxEnabled: settings.tmuxDefault,
           tmuxTemplate: "{host}-{user}",
@@ -4874,7 +5723,7 @@ export default function App() {
       setTmuxWinList([]);
       return;
     }
-    void refreshTmuxWindows();
+    deferUntilIdle(() => void refreshTmuxWindows());
     const timer = window.setInterval(() => void refreshTmuxWindows(), 10000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5748,10 +6597,6 @@ export default function App() {
     return out;
   }, [gitState]);
 
-  /** 面板上要显示的"没在用"和"可清理"（只读计算，不产生任何副作用） */
-  const herdrOrphanList = herdrOrphans();
-  const herdrCleanList = herdrCleanable();
-
   /**
    * 把「管理 herdr 工作区」面板的两份数据合起来：**每个工作区一行**。
    *
@@ -5920,8 +6765,10 @@ export default function App() {
             >
               <IconSpark size={22} />
               {/* 有"要你处理/新消息"没看过时显示数字（设置里可关） */}
-              {settings.aiNotifyBadge && aiUnread > 0 && (
-                <span className="act-badge">{aiUnread > 9 ? "9+" : aiUnread}</span>
+              {/* 红点只在两件事上亮（§10.6）：需要你（亮到你处理）、跑完停下（点开就消）。
+                  两条规则各有一个开关，所以这里不能再拿一个"总开关"去盖。 */}
+              {aiBadgeCount > 0 && (
+                <span className="act-badge">{aiBadgeCount > 9 ? "9+" : aiBadgeCount}</span>
               )}
             </button>
             <button
@@ -6185,7 +7032,7 @@ export default function App() {
                       名称
                       <input
                         value={form.name}
-                        placeholder="可留空"
+                        placeholder="只是标签，不参与连接"
                         onChange={(e) => setForm({ ...form, name: e.target.value })}
                       />
                     </label>
@@ -6193,7 +7040,7 @@ export default function App() {
                       主机
                       <input
                         value={form.host}
-                        placeholder="例如 203.0.113.10"
+                        placeholder="IP 或 ~/.ssh/config 里的别名（填别名才能带上 config 里的密钥/端口/用户）"
                         onChange={(e) => setForm({ ...form, host: e.target.value })}
                       />
                     </label>
@@ -6201,14 +7048,20 @@ export default function App() {
                       <label className="grow">
                         端口
                         <input
+                          type="number"
+                          min={0}
                           value={form.port}
-                          onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                          // 留空送 0（= "没说"）：后端不传 -p，交给 config。
+                          // 这里存字符串就是为了"能空着"；`Number("")` 是 0，不会变成 NaN。
+                          placeholder="留空则用 ~/.ssh/config 里的值（默认 22）"
+                          onChange={(e) => setForm({ ...form, port: e.target.value })}
                         />
                       </label>
                       <label className="grow">
                         用户
                         <input
                           value={form.user}
+                          placeholder="留空则用 ~/.ssh/config 里的值（默认当前用户名）"
                           onChange={(e) => setForm({ ...form, user: e.target.value })}
                         />
                       </label>
@@ -7738,10 +8591,22 @@ export default function App() {
                 type="button"
                 className="mini-x"
                 style={{ opacity: 1 }}
-                title="刷新"
-                onClick={() => void refreshAi()}
+                title="重新扫描（远端 tmux 窗格 + ps；本机进程表；herdr 第一手状态）"
+                onClick={() => void refreshBoard()}
               >
                 ⟳
+              </button>
+              {/* 探测这台机器有没有 herdr —— 承载健康那一行的落点。
+                  以前它挂在常驻的"状态来源"行上；§10.2 要求正常时不常驻，
+                  所以入口收进标题栏这一个按钮里（探测明细仍在承载健康那一行的悬停中）。 */}
+              <button
+                type="button"
+                className="mini-x"
+                style={{ opacity: 1 }}
+                title="重新探测状态来源（herdr / 本机进程 + 日志）"
+                onClick={() => void refreshAiSource(true)}
+              >
+                ◎
               </button>
               <button
                 type="button"
@@ -7755,58 +8620,261 @@ export default function App() {
             </div>
 
             {/* ---------- AI 任务看板：多环境汇总 ---------- */}
-            {/* 状态是从哪来的：装了 herdr 就是它的 agent 状态机（第一手），
-                没装就是我们自己的进程扫描 + 日志解析（第二手）。不标清楚用户没法判断准不准。 */}
-            {aiSource ? (
-              <div
-                className="ai-source-line"
-                role="button"
-                onClick={() => void refreshAiSource(true)}
-                title={
-                  aiSource.herdrVersion
-                    ? `${aiSource.herdrPath}\n协议 ${aiSource.protocol} · schema v${aiSource.schemaVersion} · 指纹 ${aiSource.schemaFingerprint || "—"}\nherdr 当前认识 ${aiSource.agents} 个 agent\n点击重新探测`
-                    : `这台机器上没探到 herdr。AI 状态仍然照常工作，只是来自我们自己的进程探测与日志解析。\n远端原话：${(aiSource.raw || "（空）").slice(0, 200)}\n点击重新探测。`
-                }
-              >
-                {aiSourceProbing
-                  ? "正在重新探测…"
-                  : aiSource.herdrVersion
-                  ? aiSource.compat === "too_old"
-                    ? `herdr ${aiSource.herdrVersion} 太旧（协议 ${aiSource.protocol} < 20）→ 已回退到本机探测`
-                    : aiSource.compat === "untested"
-                      ? `状态来源：herdr ${aiSource.herdrVersion}（协议 ${aiSource.protocol} · 未实测，保守模式）`
-                      : `状态来源：herdr ${aiSource.herdrVersion}（协议 ${aiSource.protocol} · 已实测）`
-                  : "状态来源：本机探测（这台机器没装 herdr）"}
+            {/* 口径 §10.2：**承载健康只在异常时出现**。
+                "herdr 服务：运行中 · 3 个窗格"这种正常状态看一眼就再也不需要了，
+                常驻等于每一层都在抢同一块注意力 —— 所以没异常时整块不渲染，
+                能查的东西（服务 / 工作区 / 来源明细）都在下面的折叠行与悬停里。 */}
+            <div className="ai-section">需要你 {boardNeedsYou.length}</div>
+            {boardNeedsYou.length === 0 && boardWorking.length === 0 ? (
+              <div className="hint" style={{ padding: "2px 12px 8px" }}>
+                没有需要你的事，也没有在跑的 agent。
               </div>
-            ) : (
-              // 探测**失败**（连不上/超时）和"确实没装"是两回事：以前失败时这里什么都不显示，
-              // 用户只看到别处的"没装"，就会以为服务器上没装（实际是这次没连上）。
-              aiSourceProbing ? null : (
-                <div
-                  className="ai-source-line warn"
-                  role="button"
-                  title="探测这台服务器时没连上（可能是网络/sshd 一时拥塞）。点击重试。"
-                  onClick={() => void refreshAiSource(true)}
-                >
-                  状态来源：探测失败（没连上，不代表没装）· 点一下重试
-                </div>
-              )
+            ) : null}
+            {boardNeedsYou.length > 0 && (
+              <div className="ai-board">{boardNeedsYou.map((i) => boardCard(i))}</div>
             )}
-            {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
-                scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
-            {/* herdr **服务**的生命周期做成可见 + 可控：
-                "装了"和"在跑"是两件事；停止会关掉它管着的所有窗格 —— 所以二段确认，不弹窗。 */}
-            {aiSource?.herdrVersion && activeSession?.profileId ? (
-              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
-                <span className="hint">
-                  {herdrServer?.running
-                    ? `herdr 服务：运行中 · ${herdrServer.panes} 个窗格`
-                    : herdrServer
-                      ? "herdr 服务：没在跑（用到时会自动启动）"
-                      : "herdr 服务：状态未知"}
+
+            <div className="ai-section">运行中 {boardWorking.length}</div>
+            {boardWorking.length > 0 && (
+              <div className="ai-board">{boardWorking.map((i) => boardCard(i))}</div>
+            )}
+
+            {/* 「最近完成」「空闲」各折成一行（§10.1 / §10.2）：点开才渲染明细。
+                数据一直落盘（`ai_turns.json`），不显示 ≠ 丢掉。 */}
+            {boardFinished.length > 0 && (
+              <button
+                type="button"
+                className="ai-fold"
+                title="最近完成的实例：谁 / 什么时候 / 有什么产物（点开才看）"
+                onClick={() => setFinishedOpen((v) => !v)}
+              >
+                {finishedOpen ? "▾" : "▸"} 最近完成 {boardFinished.length} 项
+              </button>
+            )}
+            {finishedOpen &&
+              boardFinished.map((i) => (
+                <div className="ai-board" key={i.id}>
+                  {boardCard(i)}
+                </div>
+              ))}
+
+            {boardIdle.length > 0 && (
+              <button
+                type="button"
+                className="ai-fold"
+                title="空闲 / 状态未知的实例：它们是现状，不是任务（点开才看）"
+                onClick={() => setIdleOpen((v) => !v)}
+              >
+                {idleOpen ? "▾" : "▸"} 空闲 {boardIdle.length} 项
+              </button>
+            )}
+            {idleOpen &&
+              boardIdle.map((i) => (
+                <div className="ai-board" key={i.id}>
+                  {boardCard(i)}
+                </div>
+              ))}
+
+            {/* ---------- L4 承载健康：**只在异常时出现**（§10.2 / §10.5） ----------
+                为什么只在异常时：`herdr 服务：运行中 · 3 个窗格` 这种正常状态用户看一眼就
+                再也不需要了，常驻等于每一层都在抢同一块注意力。
+                进这一块的条件只有三类：探测失败 / herdr 太旧 / 有工作区要清理。
+                （服务没在跑由 herdr 自己按需拉起，所以不算异常。）
+                没跑 agent 的承载（CMD 这类空承载，§10.5 **不上板**）也在这块的悬停里查。 */}
+            {aiSourceProbing ? null : !aiSource ? (
+              <div
+                className="ai-source-line warn"
+                role="button"
+                title="探测这台服务器时没连上（可能是网络/sshd 一时拥塞）。点击重试。"
+                onClick={() => void refreshAiSource(true)}
+              >
+                承载健康 · 探测失败（没连上，不代表没装）· 点一下重试
+              </div>
+            ) : aiSource.herdrVersion && aiSource.compat === "too_old" ? (
+              <div
+                className="ai-source-line warn"
+                role="button"
+                title={`herdr ${aiSource.herdrVersion} 的协议是 ${aiSource.protocol}（< 20），太旧 → 已回退到本机探测。点击重新探测。`}
+                onClick={() => void refreshAiSource(true)}
+              >
+                承载健康 · herdr {aiSource.herdrVersion} 太旧（协议 {aiSource.protocol} &lt; 20）
+                → 已回退到本机探测
+              </div>
+            ) : herdrCleanList.length > 0 ? (
+              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
+                <span
+                  className="hint"
+                  title={
+                    // 「我开了哪些承载」查得到的落点（§10.5）：
+                    // 服务器上所有 herdr 工作区 + 没在用的 + 能安全清理的 + 空承载清单
+                    `服务器上的工作区：${herdrScan?.workspaces.join("、") || "（没有）"}\n` +
+                    `没在用（不在任何已打开/历史会话里）：${herdrOrphanList.join("、") || "（没有）"}\n` +
+                    `其中是空壳（只停在提示符上，可以安全清理）：${herdrCleanList.join("、")}\n` +
+                    `承载与状态来源（没跑 agent 的不上看板，§10.5）：${
+                      boardInstances
+                        .map((i) => `${aiAgentLabel(i.agent)}@${aiCarrierLabel(i.carrier)}`)
+                        .join("、") || "（无）"
+                    }`
+                  }
+                >
+                  承载健康 · herdr 工作区：{herdrScan?.workspaces.length ?? 0} 个
+                  {herdrOrphanList.length ? `（${herdrOrphanList.length} 个没在用）` : "（都在用）"}
                 </span>
-                {herdrServer?.running ? (
-                  herdrStopArmed ? (
+                {herdrCleanArmed ? (
+                  <>
+                    <button
+                      type="button"
+                      className="mini-btn danger"
+                      title={`会关掉：${herdrCleanList.join("、")}\n（都是停在提示符上的空壳工作区；里面正跑着东西的一个都不会碰）`}
+                      onClick={() => void cleanHerdrOrphans()}
+                    >
+                      确认清理（{herdrCleanList.join("、")}）
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => setHerdrCleanArmed(false)}
+                    >
+                      取消
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    title="只关掉「不属于任何已打开/历史会话」而且「里面只停着 shell」的工作区"
+                    onClick={() => setHerdrCleanArmed(true)}
+                  >
+                    清理空壳（{herdrCleanList.length}）…
+                  </button>
+                )}
+              </div>
+            ) : null}
+            {/* ---------- 承载健康 · 本机 AI CLI（第三档） ----------
+                「装了但起不来 / 正在自更新」是**本机**的承载异常，和上面 herdr 那条并列。
+                三条口径：
+                - **只在异常时出现**（§10.2）：正常的不占位置，`not-installed` 只是"没装这个
+                  可选工具"，不冒红（冒红 = 把"我没装 Aider"说成"出故障了"，用户会去修一个
+                  不存在的问题）；
+                - 一行的 `summary` 直接显示，`detail`（含 stderr 原文）**放进悬停** ——
+                  排查时能拿到证据，平时不占地方；
+                - 「重装」**必须先给用户看命令原文**（这个组件里的确认行），
+                  点确认才真的跑；跑完把 stdout/stderr 摘要留在下面。 */}
+            <div ref={cliHealthRef} id="cli-health-block">
+              {cliList.filter(cliHealthAnomaly).map((h) => {
+                const action = cliFixAction(h);
+                const pending = cliConfirm?.agent === h.agent;
+                return (
+                  <div key={h.agent + h.command} className="ai-cli-health">
+                    <div
+                      className="ai-source-line warn"
+                      title={`${h.detail || h.summary}\n\n（判据在后端：where + 跑一次 ${h.command} --version，证据原文就是上面这段）`}
+                    >
+                      {`承载健康 · ${h.command} ${cliStatusWord(h.status)} · ${h.summary}`}
+                    </div>
+                    <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
+                      {action === "reinstall" && (
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          disabled={cliFixing}
+                          title="先给你看要跑的那条命令，确认之后我才跑；跑完把输出摘要留在这里"
+                          onClick={() => void askCliReinstall(h.command)}
+                        >
+                          重装…
+                        </button>
+                      )}
+                      {action === "add-flag" && (
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          disabled={cliFixing}
+                          title={
+                            "只把「以 --no-daemon 启动」记进这个工具的启动参数：\n" +
+                            "下次我们从这里替你启动它时会带上。不动你的全局配置，\n" +
+                            "在别的终端里还是原来的用法。"
+                          }
+                          onClick={() => void applyCliFlag(h.command, cliFlagOf(h))}
+                        >
+                          以 {cliFlagOf(h)} 启动
+                        </button>
+                      )}
+                    </div>
+                    {pending && cliConfirm && (
+                      <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
+                        <span className="hint" title="这就是确认后真正会执行的那条命令">
+                          将执行：{cliConfirm.execCmd}
+                        </span>
+                        <button
+                          type="button"
+                          className="mini-btn danger"
+                          onClick={() => void runCliReinstall()}
+                        >
+                          确认执行
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => setCliConfirm(null)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {cliFixing && (
+                <div className="ai-source-line" title="安装要几分钟，装完会自动重新探测">
+                  承载健康 · 正在跑重装命令，装完自动重新探测…
+                </div>
+              )}
+              {cliFixResult && (
+                <div className="ai-cli-fix-result">
+                  <div className="ai-tl-line">
+                    <span className="grow ellipsis" title={cliFixResult.message}>
+                      {cliFixResult.command} 重装：{cliFixResult.ok ? "成功" : "失败"}
+                      {cliFixResult.exitCode !== null && cliFixResult.exitCode !== undefined
+                        ? `（退出码 ${cliFixResult.exitCode}）`
+                        : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="mini-x"
+                      style={{ opacity: 1 }}
+                      title="收起这段输出"
+                      onClick={() => setCliFixResult(null)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="ai-cli-fix-cmd" title="这次实际执行的那条命令">
+                    {cliFixResult.execCmd}
+                  </div>
+                  {cliFixResult.output.trim() ? (
+                    <pre className="ai-cli-fix-out">{cliFixResult.output.trim().slice(0, 2000)}</pre>
+                  ) : (
+                    <div className="hint">
+                      {cliFixResult.refused ? "没有执行（我们不代跑这条命令）" : "这条命令没有输出"}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 装了 herdr 时：服务的生命周期（停止会关掉它管着的所有窗格 → 二段确认）。
+                只在"当前会话那台机器"上给这个开关；正常运行时它是折叠的。
+                注意和上面那条互斥：有工作区要清理时先让用户清理（两行挤一起就不是"只在异常时出现"了）。 */}
+            {aiSource?.herdrVersion &&
+            herdrServer?.running &&
+            herdrCleanList.length === 0 &&
+            (activeSession?.profileId || herdrScan) ? (
+              <details className="ai-health" open={false}>
+                <summary title="承载健康：herdr 服务 / 工作区 / 探测明细（正常时不占位置）">
+                  herdr 服务：运行中 · {herdrServer.panes} 个窗格
+                </summary>
+                <div className="modal-inline-action" style={{ padding: "6px 0 2px" }}>
+                  {herdrStopArmed ? (
                     <>
                       <button
                         type="button"
@@ -7814,7 +8882,7 @@ export default function App() {
                         title={
                           "停止 herdr 服务 —— 它管着的所有窗格都会关掉，" +
                           "里面正在跑的 AI 也会一起没；看板上这些窗格的卡片会跟着变准不了。\n" +
-                          "（只想腾地方的话，用「管理 herdr 工作区」一个个关更稳）"
+                          "（只想腾地方的话，用「清理空壳工作区」一个个关更稳）"
                         }
                         onClick={() => void stopHerdrServer()}
                       >
@@ -7836,69 +8904,16 @@ export default function App() {
                     >
                       停止服务…
                     </button>
-                  )
-                ) : (
-                  <button type="button" className="mini-btn" onClick={() => void startHerdrServer()}>
-                    启动服务
-                  </button>
-                )}
-              </div>
+                  )}
+                </div>
+              </details>
             ) : null}
-            {/* herdr **工作区**的生命周期：我们是"每开一个会话就建一个工作区"，
-                但关掉标签页不会回收它 —— 把没在用的一次列出来，让用户自己决定清不清。 */}
-            {aiSource?.herdrVersion && activeSession?.profileId && herdrScan ? (
-              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
-                <span
-                  className="hint"
-                  title={
-                    `服务器上的工作区：${herdrScan.workspaces.join("、") || "（没有）"}\n` +
-                    `没在用（不在任何已打开/历史会话里）：${herdrOrphanList.join("、") || "（没有）"}\n` +
-                    `其中是空壳（只停在提示符上，可以安全清理）：${herdrCleanList.join("、") || "（没有）"}`
-                  }
-                >
-                  herdr 工作区：{herdrScan.workspaces.length} 个
-                  {herdrOrphanList.length
-                    ? `（${herdrOrphanList.length} 个没在用）`
-                    : "（都在用）"}
-                </span>
-                {herdrCleanList.length ? (
-                  herdrCleanArmed ? (
-                    <>
-                      <button
-                        type="button"
-                        className="mini-btn danger"
-                        title={`会关掉：${herdrCleanList.join("、")}\n（都是停在提示符上的空壳工作区；里面正跑着东西的一个都不会碰）`}
-                        onClick={() => void cleanHerdrOrphans()}
-                      >
-                        确认清理（{herdrCleanList.join("、")}）
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => setHerdrCleanArmed(false)}
-                      >
-                        取消
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="只关掉「不属于任何已打开/历史会话」而且「里面只停着 shell」的工作区"
-                      onClick={() => setHerdrCleanArmed(true)}
-                    >
-                      清理空壳（{herdrCleanList.length}）…
-                    </button>
-                  )
-                ) : null}
-              </div>
-            ) : null}
+            {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
+                scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
             {aiSource && !aiSource.herdrVersion && activeSession?.profileId ? (
-              <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
+              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
                 {herdrInstalling[activeSession.profileId] ? (
-                  <span className="hint">
-                    正在装 herdr：{herdrInstalling[activeSession.profileId]}
-                  </span>
+                  <span className="hint">正在装 herdr：{herdrInstalling[activeSession.profileId]}</span>
                 ) : (
                   <button
                     type="button"
@@ -7913,227 +8928,20 @@ export default function App() {
                 )}
               </div>
             ) : null}
-            <div className="ai-section">
-              任务卡片
-              <button
-                type="button"
-                className="mini-x"
-                style={{ marginLeft: "auto", opacity: 1 }}
-                title="重新扫描（远端 tmux 窗格 + ps；本机进程表）"
-                onClick={() => void refreshBoard()}
-              >
-                ⟳
-              </button>
-            </div>
-            {boardActive.length === 0 ? (
-              <div className="hint" style={{ padding: "2px 12px 8px" }}>
-                暂无运行中的 AI
-              </div>
-            ) : null}
-            {/* 「空闲 / 已完成」的窗格收成一行：它们是窗格现状，不是任务。
-                （本来还想"超过 30 分钟没动静就不显示"，但 herdr 的 agent list 不给最后活动时间，
-                 拿不到就不假装有 —— 一律折叠，要看点开。） */}
-            {boardInactive.length > 0 ? (
-              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  title="「空闲 / 已完成」是窗格现状、不是任务，所以默认不占卡片位；点开只是看看"
-                  onClick={() => setInactiveOpen((v) => !v)}
-                >
-                  {inactiveOpen
-                    ? "收起不活跃的窗格"
-                    : `另有 ${boardInactive.length} 个不活跃的窗格`}
-                </button>
-              </div>
-            ) : null}
-            {boardVisible.length > 0 ? (
-              <div className="ai-board">
-                {boardVisible.map((t, i) => {
-                  // 会话日志只有"当前会话"这一份，所以就把它挂在第一张运行中的卡片上
-                  const snapIndex = boardVisible.findIndex((x) => x.state === "running");
-                  const snap = i === snapIndex ? aiSnapshot : null;
-                  const state = snap?.state ?? t.state;
-                  // 进程还活着但这一轮说完了 ≠ 任务结束 —— 分开说，别让看板自相矛盾
-                  const processAlive = t.state === "running";
-                  const label =
-                    // herdr 那边认出来的状态优先（它是第一手：working / blocked / done / idle）
-                    t.agentStatus
-                      ? herdrStateLabel(t.agentStatus)
-                      : state === "needs-approval"
-                        ? "等你批准"
-                        : state === "waiting-user"
-                          ? "等你回话"
-                          : state === "running"
-                            ? "运行中"
-                            : processAlive
-                              ? "这一轮完成"
-                              : "已结束";
-                  // "等你处理"要显眼：红点 + 卡片红边（她的 blocked = 在等人批准/回话）
-                  const attention = !!t.attention || state === "needs-approval";
-                  const project = dirBase(t.cwd || snap?.cwd || "");
-                  // 这张卡对着的**终端标签**（看板 ↔ 标签栏的对应关系）。
-                  // 分开两个概念：
-                  // - `linkedControl`：这个窗格已经**可写**地开着 → 按钮变成"切到标签"，
-                  //   点了就走过去，而不是再开一条（再开一条会跟它抢输入和尺寸）；
-                  // - `linkedAny`：只读观察窗也算"已经开在标签里"，用来告诉用户卡和标签的对应。
-                  const same = (s: OpenSession) =>
-                    s.profileId === t.herdrProfileId && s.herdrPane === t.herdrPane;
-                  const linkedControl = t.herdrPane
-                    ? sessions.find((s) => same(s) && s.herdrMode === "control")
-                    : undefined;
-                  const linkedAny = t.herdrPane
-                    ? linkedControl ?? sessions.find(same)
-                    : undefined;
-                  const usage = snap?.usage;
-                  const pct =
-                    usage && usage.contextWindow > 0
-                      ? Math.min(100, Math.round((usage.total / usage.contextWindow) * 100))
-                      : 0;
-                  return (
-                    <div
-                      className={"ai-task " + (attention ? "needs-approval" : state)}
-                      key={t.id}
-                    >
-                      <div className="ai-task-line">
-                        <span
-                          className={
-                            "dot " + (attention ? "warn" : state === "running" ? "ok" : "idle")
-                          }
-                        />
-                        <span className="grow ellipsis">{aiToolLabel(t.tool)}</span>
-                        <span className="ai-tag">{aiEnvLabel(t.env)}</span>
-                        <span className={"ai-state " + state}>{label}</span>
-                      </div>
-                      {/* 第二行只给"在哪台机器、哪个项目"；完整命令行放悬停提示 */}
-                      <div className="ai-task-meta ellipsis">
-                        {t.server}
-                        {/* 项目名跟服务器名一样时别重复一遍：远端窗格的 cwd 常常就是 /home/<user>，
-                            目录名正好等于服务器名，卡片上就出现 `lz · lz · w1Q:p1`（用户报过的脏标签） */}
-                        {project && project !== t.server ? ` · ${project}` : ""}
-                        {t.herdrPane ? ` · ${t.herdrPane}` : t.pane ? ` · ${t.pane}` : ""}
-                        {linkedAny
-                          ? ` · 已开在「${linkedAny.title}」${linkedControl ? "" : "（只读）"}`
-                          : ""}
-                      </div>
-                      {snap && usage ? (
-                        <div className="ai-task-meta">
-                          token {tokenM(usage.total)}
-                          {pct >= 1 ? ` · 上下文 ${pct}%` : ""}
-                          {snap.lastTurnDurationMs > 0
-                            ? ` · 上一轮 ${aiDurationText(snap.lastTurnDurationMs)}`
-                            : ""}
-                        </div>
-                      ) : null}
-                      {snap?.lastAction ? (
-                        <div className="ai-task-cmd ellipsis" title={snap.lastAction}>
-                          {snap.lastAction}
-                        </div>
-                      ) : null}
-                      {/* G-02：shell 集成报上来的退出码（只有注入过 PROMPT_COMMAND 的会话才有；
-                          tmux 会话拿不到，那一侧受限于老 tmux，见 core/ssh.rs 里的说明） */}
-                      {snap && activeId && cmdExit[activeId] ? (
-                        <div
-                          className="ai-task-meta"
-                          title={new Date(cmdExit[activeId].at).toLocaleString("zh-CN")}
-                        >
-                          最近一条命令退出码 {cmdExit[activeId].exit}
-                          {cmdExit[activeId].exit === 0 ? "（成功）" : "（失败）"}
-                        </div>
-                      ) : null}
-                      <div
-                        className="ai-task-meta ellipsis"
-                        title={`${t.command || "（拿不到命令行）"}\npid ${t.pid} · ${aiSourceLabel(
-                          t.source,
-                        )}`}
-                      >
-                        耗时 {aiDurationText(t.durationMs)} · {aiSourceLabel(t.source)}
-                      </div>
-                      {/* herdr 卡片能直接开观察窗：只看那个窗格的实时画面，不抢它的尺寸、
-                          也不会像 attach TUI 那样退出时花屏（见 core/herdr.rs 顶部说明） */}
-                      {t.herdrPane ? (
-                        <div className="ai-task-actions">
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            onClick={() =>
-                              void openHerdrPane(
-                                t.herdrProfileId ?? "",
-                                t.herdrPane ?? "",
-                                t.tool,
-                              )
-                            }
-                            title="开一个只读观察窗（不会影响窗格本身的尺寸）"
-                          >
-                            查看窗格
-                          </button>
-                          {/* 「接管」只在"这确实是个活任务"或"已经开着标签"时才给。
-                              空闲 / 已完成摆两个看起来都能点的按钮，用户实测会以为"点了能过去"
-                              （其实切不过去）—— 那种卡只留「查看窗格」。 */}
-                          {(isActiveBoardTask(t) || linkedControl) && (
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            onClick={() =>
-                              linkedControl
-                                ? // 这个窗格已经作为标签开着了：**切过去**，
-                                  // 而不是再开一个（再开一个会跟它抢输入/尺寸）
-                                  setActiveId(linkedControl.id)
-                                : void openHerdrPane(
-                                    t.herdrProfileId ?? "",
-                                    t.herdrPane ?? "",
-                                    t.tool,
-                                    null,
-                                    "control",
-                                  )
-                            }
-                            title={
-                              linkedControl
-                                ? `这张卡对应的终端标签已经开着了：「${linkedControl.title}」`
-                                : "接管这个窗格：可读可写，能直接回答它的选择题（会抢过输入；关掉标签就交还，窗格留在服务器上）"
-                            }
-                          >
-                            {linkedControl ? "切到标签" : "接管"}
-                          </button>
-                          )}
-                        </div>
-                      ) : null}
-                      {/* 这一轮产出的文件：点一下直接看（远端走应用内预览，本地用资源管理器） */}
-                      {snap && aiArtifacts.length > 0 && activeSession ? (
-                        <div className="ai-artifacts">
-                          {aiArtifacts.map((a) => (
-                            <button
-                              key={a.path}
-                              type="button"
-                              className="ai-artifact"
-                              title={`${a.path} · ${humanSize(a.size)}`}
-                              onClick={() => void openArtifact(activeSession, snap.cwd, a)}
-                            >
-                              📄 {a.name}
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-                {boardTasks.some((t) => t.state === "done") && (
-                  <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      onClick={() => void clearFinishedTasks()}
-                    >
-                      清掉已结束的卡片
-                    </button>
-                  </div>
-                )}
-              </div>
-            ) : null}
 
             {/* ---------- AI 任务时间线（G-01）：落盘的历史，应用重启后还在 ---------- */}
+            {/* 口径 docs/design-ai-board-v2.md §10.1：不要再有常驻列表，
+                只留折叠一行（默认收起，点开才看明细；记录一直落盘） */}
             <div className="ai-section">
-              最近任务{timeline.length > 0 ? `（${timeline.length}）` : ""}
+              <button
+                type="button"
+                className="mini-btn"
+                style={{ opacity: 1 }}
+                title="点开看明细（记录一直落盘，重启应用也还在）"
+                onClick={() => setTimelineAll((v) => !v)}
+              >
+                {timelineAll ? "▾" : "▸"} 最近完成 {timeline.length} 项
+              </button>
               <button
                 type="button"
                 className="mini-x"
@@ -8160,7 +8968,7 @@ export default function App() {
                 </button>
               )}
             </div>
-            {timeline.length === 0 ? (
+            {!timelineAll ? null : timeline.length === 0 ? (
               <div className="hint" style={{ padding: "2px 12px 8px" }}>
                 还没有记录。AI 跑完一轮会记在这里（重启应用也还在）。
               </div>
@@ -8210,7 +9018,6 @@ export default function App() {
                             title={`切到「${target.title}」`}
                             onClick={() => {
                               setActiveId(target.id);
-                              setAiUnread(0);
                               notify(`已切到「${target.title}」`);
                             }}
                           >
@@ -8222,17 +9029,6 @@ export default function App() {
                   );
                 })}
               </div>
-              {(timeline.length > 3 || timelineAll) && (
-                <div className="modal-inline-action" style={{ padding: "0 12px 8px" }}>
-                  <button
-                    type="button"
-                    className="mini-btn"
-                    onClick={() => setTimelineAll((v) => !v)}
-                  >
-                    {timelineAll ? "收起" : `展开全部（${timeline.length}）`}
-                  </button>
-                </div>
-              )}
               </>
             )}
 
@@ -8337,7 +9133,12 @@ export default function App() {
         </div>
       )}
 
-      <div className="statusbar">
+      {/* 口径 docs/design-ai-board-v2.md §10.3：技术标识（编码 / 终端类型）收进悬停，
+          状态栏只留：会话 · 连通性 · 需要你 · 传输 */}
+      <div
+        className="statusbar"
+        title="终端编码 UTF-8 · 终端类型 xterm-256color（右键终端可看「会话信息」）"
+      >
         <span className="stat">
           <IconActivity size={14} />
           {activeSession
@@ -8348,27 +9149,56 @@ export default function App() {
         {statusMsg && (
           <span
             className={"status-notice " + statusMsg.kind}
-            title={statusMsg.text}
+            // 悬停给**完整原文**：状态栏只显示中文短句（后端返回的是
+            // 「中文短句｜原始信息：<英文>」，英文那段太长，挤在状态栏里没人读得下去）
+            title={statusMsg.detail || statusMsg.text}
             onClick={() => setStatusMsg(null)}
           >
             {statusMsg.text}
           </span>
         )}
         {activeFile && <span className="stat">{activeFile.path}</span>}
-        {/* AI 干完活了：状态栏上闪一条，点一下直接切过去（哪个模块下都看得到） */}
-        {aiAlerts.length > 0 && (
+        {/* 状态栏只留四件事：会话 · 连通性 · 「需要你 N」· 传输（§10.3）。
+            所以这里**只有**「需要你」那一个 chip —— "AI 已完成" 不再单独占一个
+            （完成已经在面板的「最近完成 N 项」里，三处各说一遍是这轮要收掉的乱）。
+            点它 = 打开面板；needs-you 是唯一真正值得打断用户的事。 */}
+        {/* 承载健康 · 本机 CLI 异常：**状态栏也要说一句**，而且点得动。
+            为什么状态栏也要有：用户不一定开着看板 —— "codex 起不来"这种事
+            等他去翻面板就等于没人告诉他。`not-installed` 不算异常（§10.2），
+            所以这里只有"起不来 / 正在自更新"两种。 */}
+        {cliAnomalies.length > 0 && (
           <button
             type="button"
-            className="stat ai-status-chip"
-            title={aiAlerts.map((a) => a.text).join("\n")}
+            className="stat ai-need-chip"
+            title={
+              // 悬停给**完整证据**（detail 里有 stderr 原文 / 找到的路径）——
+              // 状态栏那一行只有几个字，排查时全靠这个悬停
+              `${cliAnomalies
+                .map((h) => `${h.command} ${cliStatusWord(h.status)} · ${h.summary}\n${h.detail || ""}`)
+                .join("\n\n")}\n\n点这里打开看板并定位到「承载健康」（能一键重装）`
+            }
             onClick={() => {
-              const a = aiAlerts[0];
-              setAiUnread(0);
-              if (a.sessionId) setActiveId(a.sessionId);
-              setAiAlerts((prev) => prev.slice(1));
+              setAiPanelOpen(true);
+              // 面板下一帧才渲染出来，滚到那块靠这个 tick（见上面那个 effect）
+              setCliFocusTick(Date.now());
             }}
           >
-            {aiAlerts.length > 1 ? `AI 完成 ${aiAlerts.length} 项 ⟶` : "AI 已完成，点这里切过去 ⟶"}
+            {cliAnomalies.length === 1
+              ? `${cliAnomalies[0].command} ${cliStatusWord(cliAnomalies[0].status)} · 查看`
+              : `本机 AI 工具异常 ${cliAnomalies.length} 个 · 查看`}
+          </button>
+        )}
+        {aiNeedIds.length > 0 && (
+          <button
+            type="button"
+            className="stat ai-need-chip"
+            title={`${boardInstances
+              .filter((i) => i.state === "needs-you")
+              .map((i) => `${aiAgentLabel(i.agent)} · ${aiInstanceWhere(i)} · ${i.badge}`)
+              .join("\n")}\n\n点这里打开看板（红点亮到你处理为止）`}
+            onClick={() => setAiPanelOpen(true)}
+          >
+            需要你 {aiNeedIds.length}
           </button>
         )}
         {isAdminMode && (
@@ -8379,8 +9209,6 @@ export default function App() {
             🛡 管理员
           </span>
         )}
-        <span className="stat">UTF-8</span>
-        <span className="stat">xterm-256color</span>
       </div>
 
       {transfers.length > 0 && (
@@ -9411,7 +10239,7 @@ export default function App() {
                     </div>
                     <div className="srv-meta">
                       {p.ssh
-                        ? `${p.ssh.user}@${p.ssh.host}:${p.ssh.port}`
+                        ? sshTargetLabel(p.ssh)
                         : p.type.toUpperCase()}
                       {p.group ? ` · ${p.group}` : ""}
                       {p.ssh
@@ -9510,7 +10338,7 @@ export default function App() {
                 名称
                 <input
                   value={editDialog.draft.name}
-                  placeholder="显示名，如 生产 Web"
+                  placeholder="只是标签，不参与连接"
                   onChange={(e) => patchDraft({ name: e.target.value })}
                 />
               </label>
@@ -9578,7 +10406,7 @@ export default function App() {
                 主机
                 <input
                   value={editDialog.draft.ssh?.host ?? ""}
-                  placeholder="IP 或域名"
+                  placeholder="IP 或 ~/.ssh/config 里的别名（填别名才能带上 config 里的密钥/端口/用户）"
                   onChange={(e) => patchDraft({}, { host: e.target.value })}
                 />
               </label>
@@ -9586,22 +10414,27 @@ export default function App() {
                 <label className="modal-field">
                   端口
                   <input
-                    value={editDialog.draft.ssh?.port ?? 22}
-                    onChange={(e) =>
-                      patchDraft({}, { port: Number(e.target.value) || 22 })
-                    }
+                    type="number"
+                    min={0}
+                    // 0 显示成空：0 是"没说"（后端不传 -p），不是"端口 0"
+                    value={editDialog.draft.ssh?.port || ""}
+                    placeholder="留空则用 ~/.ssh/config 里的值（默认 22）"
+                    // 以前这里 `Number(...) || 22` 会把清空**打回 22** —— 用户想留空反而被填上，
+                    // 于是 config 里的 Port 被 22 顶掉（"我明明配了别名"就是这么坏掉的）。
+                    onChange={(e) => patchDraft({}, { port: portOrZero(e.target.value) })}
                   />
                 </label>
                 <label className="modal-field">
                   用户名
                   <input
                     value={editDialog.draft.ssh?.user ?? ""}
+                    placeholder="留空则用 ~/.ssh/config 里的值（默认当前用户名）"
                     onChange={(e) => patchDraft({}, { user: e.target.value })}
                   />
                 </label>
               </div>
               <label className="modal-field">
-                私钥路径（可选，留空则用 ~/.ssh 默认密钥）
+                私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
                 <input
                   value={editDialog.draft.ssh?.keyPath ?? ""}
                   placeholder="C:\Users\me\.ssh\id_ed25519"
@@ -9994,14 +10827,35 @@ export default function App() {
                   窗口不在前台时闪 Windows 任务栏
                 </span>
               </label>
+              {/* 红点只为两种情况亮（docs/design-ai-board-v2.md §10.6）。
+                  以前这里是一条"跑完了就点红点"的总开关 —— 那样每次轮询都可能让它冒出来，
+                  用户的原话是"红点别吵"，所以拆成下面两条独立规则。 */}
               <label className="form-check">
                 <input
                   type="checkbox"
-                  checked={settings.aiNotifyBadge}
-                  onChange={(e) => void updateSettings({ aiNotifyBadge: e.target.checked })}
+                  checked={settings.aiNotifyNeedsYouBadge}
+                  onChange={(e) =>
+                    void updateSettings({ aiNotifyNeedsYouBadge: e.target.checked })
+                  }
                 />
-                <span>在左侧活动栏的 AI 星号上显示红点/数字</span>
+                <span>需要你处理时提醒（红点亮到你处理为止）</span>
               </label>
+              <label className="form-check">
+                <input
+                  type="checkbox"
+                  checked={settings.aiNotifyFinishedBadge}
+                  onChange={(e) =>
+                    void updateSettings({ aiNotifyFinishedBadge: e.target.checked })
+                  }
+                />
+                <span>跑完一轮并停下时提醒（点开面板就消，当未读）</span>
+              </label>
+              <div className="hint" style={{ padding: "2px 14px 8px" }}>
+                红点规则：<b>需要你 → 亮到你处理；跑完停下 → 点开就消</b>。
+                <br />
+                其它情况不提醒：运行中、空闲、超过 10 分钟没动静、只产出文件但还在跑、探测不到
+                —— 一个都不点红点。
+              </div>
               <div className="hint" style={{ padding: "2px 14px 8px" }}>
                 提醒只进底部状态栏（不会在窗口中间弹浮层）；点状态栏那条可以直接切过去。
               </div>

@@ -1191,6 +1191,51 @@ body {
   color: var(--yellow);
 }
 
+/* ---------- 承载健康 · 本机 AI CLI（异常时才出现，§10.2） ---------- */
+
+/*
+ * 每一条异常自带"结论 + 一两个按钮"。
+ * `:first-child` 给一条上边距：它紧挨着上面 herdr 那一块，不加就贴在一起分不清谁是谁。
+ */
+.ai-cli-health:first-child {
+  margin-top: 4px;
+}
+
+/*
+ * 「一键修」跑完之后的输出回显。
+ *
+ * 为什么要给最大高度 + 自己滚：npm 装失败时能吐几百行（`npm ERR!` 一堆栈），
+ * 整段铺开会把看板挤没 —— 但用户排查时又必须能看到原文。
+ */
+.ai-cli-fix-result {
+  padding: 4px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* 这次实际执行的那条命令（等宽字体：命令原文里空格/参数要看得清） */
+.ai-cli-fix-cmd {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: inherit;
+  padding: 2px 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.ai-cli-fix-out {
+  max-height: 160px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 8px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .ai-timeline {
   display: flex;
   flex-direction: column;
@@ -1343,6 +1388,13 @@ body {
   font-weight: 600;
 }
 
+/* 裸 SSH 那句「运行中（进程推断，可能已卡住）」比别的状态长得多：
+   允许它换行、但不许把状态挤没了（§10.4 要求这句话必须看得见）。 */
+.ai-task-line .ai-state {
+  flex: 0 1 auto;
+  text-align: right;
+}
+
 .ai-state.running {
   color: var(--green);
 }
@@ -1371,6 +1423,59 @@ body {
 
 .ai-section-toggle:hover {
   color: var(--fg);
+}
+
+/* 「▸ 最近完成 N 项」/「▸ 空闲 N 项」：各占一行，点开才渲染明细（§10.1 / §10.2）。
+   做成整行一条（不是按钮条），展开/收起的状态一眼能看出来。 */
+.ai-fold {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 2px 12px 6px;
+  padding: 3px 6px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ai-fold:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+/* 卡片上的来源徽标：写清"谁说的 / 多久前 / 能证明什么"，悬停给完整推导。
+   虚线框 + 灰字 = "这是推断/二手"，和第一手的实心标签分得开（§3.3）。 */
+.ai-badge-owner {
+  border-bottom: 1px dotted var(--border);
+  cursor: help;
+}
+
+/* 「承载健康」那一行：正常时完全不出现，出现时是可折叠的（§10.2） */
+.ai-health {
+  margin: 2px 12px 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.ai-health > summary {
+  cursor: pointer;
+}
+
+/* 状态栏上的「需要你 N」：唯一值得打断用户的那件事（§10.3 / §10.6） */
+.statusbar .ai-need-chip {
+  border: 0;
+  background: transparent;
+  color: var(--amber);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.statusbar .ai-need-chip:hover {
+  text-decoration: underline;
 }
 
 /* 状态栏上的「AI 已完成」提示：闪一下 + 强调色，点一下切到那个会话 */
