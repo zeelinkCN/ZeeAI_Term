@@ -393,7 +393,7 @@ const resolveCmd = (cmd, args, opts) => {
     case "session_log_dir": return "C:\\\\Temp\\\\zeeai-logs";
     case "session_log_start": return "C:\\\\Temp\\\\zeeai-logs\\\\mock.log";
     case "session_log_stop": case "session_log_status": return null;
-    case "ai_timeline_list": return [];
+    case "ai_timeline_list": return S.timeline || [];
     case "ai_timeline_add": return false;
     // herdrProbePending = "探测一直不返回"（用来验证勾选框不会被禁用）
     case "ai_source_probe":
@@ -2231,6 +2231,74 @@ check(
     v2.badgeTitle.every((t) => t.includes("怎么得出的") && t.includes("谁说的") && t.includes("能证明什么")),
   `徽标=${JSON.stringify(v2.badgeText)} 悬停=${JSON.stringify(v2.badgeTitle[0] || "").slice(0, 90)}`,
 );
+
+// ---------- (F0b) 「最近完成」默认收起：哪怕落盘历史有 23 条，明细也不许先画出来 ----------
+// 用户截图里就是「▸ 最近完成 23 项」下面跟着一堆明细。这里钉住两件事：
+// ① 初始 / 刷新后都保持收起（.ai-timeline 与明细行都不存在）；
+// ② 只有点标题才展开（▾ + 23 行）。
+const timelineRows = Array.from({ length: 23 }, (_, i) => ({
+  id: `tl-${i}`,
+  env: "remote",
+  server: "lz",
+  sessionTitle: "lz · codex",
+  cwd: "/srv/app",
+  tool: "codex",
+  completedAt: 1_760_000_000 + i * 60,
+  durationMs: 60_000 + i * 1000,
+  message: `第 ${i + 1} 轮完成`,
+  tokensTotal: 1000 + i,
+  artifacts: [],
+}));
+await setScenario({ timeline: timelineRows });
+await reload();
+await openAiPanelAndRefresh();
+const readTimelineFold = () =>
+  evaluate(`(() => {
+    const p = document.querySelector(".ai-panel");
+    if (!p) return { missing: true };
+    const b = [...p.querySelectorAll(".ai-section button.mini-btn")].find((x) =>
+      (x.innerText || "").includes("最近完成"));
+    return {
+      text: b ? (b.innerText || "").trim() : "",
+      hasTimeline: !!p.querySelector(".ai-timeline"),
+      rows: p.querySelectorAll(".ai-timeline .ai-tl-row").length,
+    };
+  })()`);
+const timelineClosed = await readTimelineFold();
+check(
+  "「最近完成」默认收起：23 条历史只显示一行标题，明细不渲染",
+  timelineClosed.text.startsWith("▸ 最近完成 23 项") &&
+    timelineClosed.hasTimeline === false &&
+    timelineClosed.rows === 0,
+  JSON.stringify(timelineClosed),
+);
+// 点「刷新」再读一次：刷新不能把折叠状态顺手改成展开。
+await refreshAiPanel();
+const timelineAfterRefresh = await readTimelineFold();
+check(
+  "点「刷新」后「最近完成」仍然是收起的",
+  timelineAfterRefresh.text.startsWith("▸ 最近完成 23 项") &&
+    timelineAfterRefresh.hasTimeline === false,
+  JSON.stringify(timelineAfterRefresh),
+);
+await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  const b = [...p.querySelectorAll(".ai-section button.mini-btn")].find((x) =>
+    (x.innerText || "").includes("最近完成"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(400);
+const timelineExpanded = await readTimelineFold();
+check(
+  "点「最近完成」标题才展开：箭头变 ▾ 并渲染出 23 条明细",
+  timelineExpanded.text.startsWith("▾ 最近完成 23 项") &&
+    timelineExpanded.hasTimeline === true &&
+    timelineExpanded.rows === 23,
+  JSON.stringify(timelineExpanded),
+);
+// 场景里的 23 条只服务这一块，清掉，别让后面的面板断言读到它。
+await setScenario({ timeline: null });
 
 // ---------- (F1) mock 裸 SSH 会话：永不出现「需要你」；CMD 空承载不上板（§10.4 / §10.5） ----------
 await clearBoardTasks();
