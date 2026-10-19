@@ -160,28 +160,61 @@ enum Last {
     ApprovalDone,
 }
 
-/// 解析 rollout 日志（可以是 tail 出来的片段，开头被截断也没关系）
-pub fn parse_rollout(text: &str) -> AiSessionSnapshot {
-    let mut snap = AiSessionSnapshot {
-        state: "idle".into(),
-        ..Default::default()
-    };
-    let mut last = Last::None;
-    let mut turn_open = false;
+/// rollout 日志的**增量解析器**：一行一行喂，随时取当前快照。
+///
+/// 为什么要有它：本机日志监视（`core/ai_log_watch.rs`）每 2.5 秒只看**新增的字节**，
+/// 不能每次从文件头重新解析几 MB。但它必须和 `parse_rollout` 共用**同一套**判定
+/// （`task_complete` / `*approval_request` / `request_user_input` 这些口径只能有一份），
+/// 否则"看板说的"和"红点说的"会不一致 —— 所以 `parse_rollout` 就是它的批量包装。
+pub struct RolloutParser {
+    snap: AiSessionSnapshot,
+    last: Last,
+    turn_open: bool,
+}
 
-    for line in text.lines() {
+impl Default for RolloutParser {
+    fn default() -> Self {
+        Self {
+            snap: AiSessionSnapshot {
+                state: "idle".into(),
+                ..Default::default()
+            },
+            last: Last::None,
+            turn_open: false,
+        }
+    }
+}
+
+impl RolloutParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂**一整段**文本（按行拆），返回认下来的记录条数。
+    pub fn feed_text(&mut self, text: &str) -> usize {
+        let mut n = 0;
+        for line in text.lines() {
+            if self.feed(line) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 喂一行；返回它是不是一条被认下来的 JSON 记录（空行/被截断的半行返回 false）。
+    pub fn feed(&mut self, line: &str) -> bool {
         let line = line.trim();
         // tail 出来的第一行通常是被截断的，跳过
         if !line.starts_with('{') {
-            continue;
+            return false;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return false;
         };
-        snap.lines_seen += 1;
+        self.snap.lines_seen += 1;
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str) {
             if let Some(secs) = parse_ts(ts) {
-                snap.updated_at = secs;
+                self.snap.updated_at = secs;
             }
         }
         let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
@@ -190,62 +223,91 @@ pub fn parse_rollout(text: &str) -> AiSessionSnapshot {
         match kind {
             "session_meta" => {
                 if let Some(id) = payload.get("session_id").and_then(Value::as_str) {
-                    snap.session_id = id.to_string();
+                    self.snap.session_id = id.to_string();
                 }
                 if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
-                    snap.cwd = cwd.to_string();
+                    self.snap.cwd = cwd.to_string();
                 }
             }
             "turn_context" => {
                 if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
-                    snap.cwd = cwd.to_string();
+                    self.snap.cwd = cwd.to_string();
                 }
                 if let Some(p) = payload.get("approval_policy").and_then(Value::as_str) {
-                    snap.approval_policy = p.to_string();
+                    self.snap.approval_policy = p.to_string();
                 }
             }
             "event_msg" => {
                 let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                parse_event(sub, &payload, &mut snap, &mut last, &mut turn_open);
+                parse_event(
+                    sub,
+                    &payload,
+                    &mut self.snap,
+                    &mut self.last,
+                    &mut self.turn_open,
+                );
             }
             "response_item" => {
                 let sub = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                parse_item(sub, &payload, &mut snap, &mut last, &mut turn_open);
+                parse_item(
+                    sub,
+                    &payload,
+                    &mut self.snap,
+                    &mut self.last,
+                    &mut self.turn_open,
+                );
             }
             "token_usage_record" => {
                 // 老一点/另一种写法：payload 直接带 usage
                 if let Some(u) = payload.get("usage") {
-                    apply_usage(&mut snap, u);
+                    apply_usage(&mut self.snap, u);
                 }
             }
             _ => {}
         }
+        true
     }
 
-    // 状态推断：先看"是不是在等我们"，再看"是不是在干活"
-    snap.state = match last {
-        Last::ApprovalRequest => "needs-approval",
-        Last::UserInputRequest => "waiting-user",
-        _ => {
-            let busy = turn_open
-                || matches!(last, Last::TaskStarted | Last::ToolCall | Last::Reasoning);
-            if busy {
-                "running"
-            } else {
-                "idle"
+    /// 按当前累积的状态收尾：填 `state` 与默认的 `last_action`。
+    ///
+    /// 可以反复调用（增量监视每轮都会调一次）—— 只依据 `last` / `turn_open` 重算，不累加。
+    pub fn finish(&mut self) {
+        // 状态推断：先看"是不是在等我们"，再看"是不是在干活"
+        self.snap.state = match self.last {
+            Last::ApprovalRequest => "needs-approval",
+            Last::UserInputRequest => "waiting-user",
+            _ => {
+                let busy = self.turn_open
+                    || matches!(self.last, Last::TaskStarted | Last::ToolCall | Last::Reasoning);
+                if busy {
+                    "running"
+                } else {
+                    "idle"
+                }
             }
         }
+        .to_string();
+        if self.snap.last_action.is_empty() {
+            self.snap.last_action = match self.snap.state.as_str() {
+                "needs-approval" => "等你批准一个操作".into(),
+                "waiting-user" => "等你回话".into(),
+                "running" => "运行中".into(),
+                _ => String::new(),
+            };
+        }
     }
-    .to_string();
-    if snap.last_action.is_empty() {
-        snap.last_action = match snap.state.as_str() {
-            "needs-approval" => "等你批准一个操作".into(),
-            "waiting-user" => "等你回话".into(),
-            "running" => "运行中".into(),
-            _ => String::new(),
-        };
+
+    pub fn snapshot(&self) -> AiSessionSnapshot {
+        self.snap.clone()
     }
-    snap
+}
+
+/// 解析 rollout 日志（可以是 tail 出来的片段，开头被截断也没关系）
+pub fn parse_rollout(text: &str) -> AiSessionSnapshot {
+    let mut p = RolloutParser::new();
+    p.feed_text(text);
+    p.finish();
+    p.snapshot()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -267,6 +329,13 @@ fn parse_event(
         return;
     }
     if sub.contains("approval") && (sub.contains("approved") || sub.contains("denied")) {
+        *last = Last::ApprovalDone;
+        return;
+    }
+    // 实际日志里"批准/拒绝"的回包叫 `exec_approval_response` / `apply_patch_approval_response`
+    // （带 `decision: approved|denied`），事件名里并没有 `approved` 这个词。
+    // 不认它的话，状态会一直停在 needs-approval —— 红点就"亮到你处理完了也不消"。
+    if sub.contains("approval") && (sub.contains("response") || sub.contains("resolved")) {
         *last = Last::ApprovalDone;
         return;
     }
@@ -931,7 +1000,7 @@ fn newest_user_rollout(root: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// 读文件**开头** n 字节（几十 MB 的日志不能整个读进来）
-fn read_head(path: &std::path::Path, n: u64) -> Option<String> {
+pub(crate) fn read_head(path: &std::path::Path, n: u64) -> Option<String> {
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
@@ -946,7 +1015,7 @@ fn read_related_tail(path: &std::path::Path, window: u64) -> Option<String> {
 }
 
 /// 列出 `sessions/年/月/日/` 下所有 `rollout-*.jsonl`，按修改时间**从新到旧**，最多 keep 条
-fn rollouts_by_mtime(root: &std::path::Path, keep: usize) -> Vec<std::path::PathBuf> {
+pub(crate) fn rollouts_by_mtime(root: &std::path::Path, keep: usize) -> Vec<std::path::PathBuf> {
     let mut all: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     collect_rollouts(root, 0, &mut all);
     all.sort_by(|a, b| b.0.cmp(&a.0));
@@ -984,7 +1053,7 @@ fn collect_rollouts(
 }
 
 /// 读文件最后 n 字节（大文件不要整个读进来）
-fn read_tail(path: &std::path::Path, n: u64) -> Option<String> {
+pub(crate) fn read_tail(path: &std::path::Path, n: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -1055,6 +1124,47 @@ mod tests {
         let s = parse_rollout(text);
         assert_eq!(s.last_message, "好了");
         assert_eq!(s.lines_seen, 1, "只应认出一行合法 JSON");
+    }
+
+    /// `RolloutParser` 是增量版：分几次喂进去，结果必须和一次性 `parse_rollout` 一样。
+    /// 本机日志监视（`ai_log_watch`）就是靠它只读新增字节的。
+    #[test]
+    fn incremental_parser_matches_one_shot_parse() {
+        let raw = sample();
+        let lines: Vec<&str> = raw.lines().collect();
+        let mut p = RolloutParser::new();
+        // 故意在"半行"的位置断开喂：feed 一行一行吃，未完成的 JSON 不该改变状态
+        for line in &lines[..3] {
+            p.feed(line);
+        }
+        p.finish();
+        assert_eq!(p.snapshot().state, "running");
+        for line in &lines[3..] {
+            p.feed(line);
+        }
+        // 再喂一次垃圾/半行：不应改变已经累积的状态
+        assert!(!p.feed("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_comp"));
+        p.finish();
+        let one_shot = parse_rollout(&sample());
+        let inc = p.snapshot();
+        assert_eq!(inc.state, one_shot.state);
+        assert_eq!(inc.last_message, one_shot.last_message);
+        assert_eq!(inc.last_turn_completed_at, one_shot.last_turn_completed_at);
+        assert_eq!(inc.lines_seen, one_shot.lines_seen);
+        assert_eq!(inc.cwd, one_shot.cwd);
+    }
+
+    /// 日志里"批准/拒绝"的回包叫 `*_approval_response`（带 decision 字段）。
+    /// 认不出来的话，needs-approval 会一直挂着 —— 红点就永远不消。
+    #[test]
+    fn approval_response_clears_waiting_state() {
+        let text = r#"{"type":"session_meta","payload":{"session_id":"x","cwd":"/root/proj"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","payload":{"type":"exec_approval_request","turn_id":"t1","command":"rm -rf build"}}
+{"type":"event_msg","payload":{"type":"exec_approval_response","turn_id":"t1","decision":"approved"}}"#;
+        let s = parse_rollout(text);
+        assert_ne!(s.state, "needs-approval", "回了 response 就不该再算等你");
+        assert_eq!(s.state, "running", "这一轮还在跑（turn_open）");
     }
 
     #[test]

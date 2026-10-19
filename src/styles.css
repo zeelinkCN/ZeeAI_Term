@@ -1408,6 +1408,18 @@ body {
   cursor: help;
 }
 
+/* 卡片上的「推断 · 输出活动」：虚线框 + 灰字，和第一手的来源徽标一眼分开 ——
+   推断不许装成事实（§10.4）。悬停里写清它只证明"终端还在刷输出"。 */
+.ai-infer-badge {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 10.5px;
+  cursor: help;
+}
+
 /* 「承载健康」那一行：正常时完全不出现，出现时是可折叠的（§10.2） */
 .ai-health {
   margin: 2px 12px 6px;

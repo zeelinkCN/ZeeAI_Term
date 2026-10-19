@@ -113,6 +113,21 @@ pub enum AiState {
 }
 
 impl AiState {
+    /// 统一状态 → 前端那个词（§3.1 的五个词，和 serde 的 kebab-case 完全一致）。
+    ///
+    /// 为什么要有它：自动来源的信号（`ai_log_watch::AiLogSignal`、herdr 的卡片快照）
+    /// 用的是**普通字符串字段**（前端类型也一样），直接写 `"needs-you"` 会多出第二份字面量；
+    /// 这里给一个出口，让"状态词"只有一处定义。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiState::NeedsYou => "needs-you",
+            AiState::Working => "working",
+            AiState::Finished => "finished",
+            AiState::Idle => "idle",
+            AiState::Unknown => "unknown",
+        }
+    }
+
     /// 面板排序：需要你 → 运行中 → 最近完成 → 空闲/未知。
     fn panel_rank(self) -> u8 {
         match self {
@@ -505,6 +520,29 @@ fn human_age(ms: u64) -> String {
     } else {
         format!("{} 小时前", s / 3600)
     }
+}
+
+/// 卡片上"最后一句 / 最后一个动作"最多留这么多**字符**（不是字节）。
+///
+/// 240 字足够覆盖"一句话结论 + 它刚跑的那条命令"；再长就会把卡片撑成一整屏。
+pub const ACTIVITY_MAX_CHARS: usize = 240;
+
+/// 把一段文本截到最多 `max` 个字符（超了用 `…` 结尾）。
+///
+/// 为什么按**字符**切而不是按字节切：中文一句话几百字很常见，按字节切会劈出半个
+/// UTF-8 序列（Rust 的 `String` 根本存不了；前端也会显示成 `�`）。截断只影响卡片上
+/// 那句"最后动作"，不参与任何状态判定 —— 所以宁可少显示几个字，也不能改结论。
+pub fn clip_chars(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// 承载能力闸门：**推断绝不说成事实**（§3.3 / §10.4 / §10.5）。

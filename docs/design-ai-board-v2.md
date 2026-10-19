@@ -371,6 +371,40 @@ herdr 服务、连通性这类"健康信息"平时不出现，**只在出问题�
 - **验收断言**：① `needs-you` → 红点出现且**打开面板后仍亮**，直到该实例不再是 needs-you；② `finished` → 红点出现、**打开面板即清**；③ 同一轮重复轮询 → **只发生一次**；④ `working` / `idle` / 仅产物事件 → **红点不变**；⑤ 设置页恰有这两个开关、默认都开。
 - **不能回退什么**：不能为了"降噪"把**需要你**漏掉 —— 那是唯一真正值得打断用户的事。
 
+**实现口径（2026-10-20 落地，用户当场拍板）**：红点只允许来自"能**直接读**"的来源，
+**手动刷新得到的任何数据都不算**（用户原话："手动刷新出现红点这种宁可不要"）。
+
+| 来源 | 自动亮？ | 怎么拿到 |
+|---|---|---|
+| 本机 codex rollout 日志 | ✅ | `core/ai_log_watch.rs`：2.5 秒 `stat` 一次，只读**新增字节**，**不启动子进程**；→ `zeeai://ai-log` |
+| 本应用启动的任务（账本） | ⚠️ 本机算 / 远端不算 | 本机 codex 走上面那条日志；远端账本没有"进程结束"事件，不探测就不知道 |
+| herdr 接管窗格 | ✅（2026-10-20 用户批准） | `core/ai_herdr_dots.rs`：**每台 `herdrEnabled` 的服务器每 60 秒**跑一次已有的 `commands::herdr_agents`（→ `run_remote_capture` → `proc::hidden_command_async`，带 `CREATE_NO_WINDOW`，不弹黑框）；启动后先等 12 秒，失败静默（只 `log::warn`）；→ `zeeai://ai-log` |
+| 进程扫描 / `ssh ps` / tmux / 裸 SSH / CMD | ❌ | 只证明"存在"，不产生红点 |
+| 手动「刷新」 | ❌ | `refreshAiPanel` / `refreshBoard` **只更新卡片/看板**，不设置红点 |
+
+herdr 那一路的判定：`blocked` = **状态**（亮到它不再是 blocked，那一次发 `resolved`）；
+`done` = **事件**（只在"进入 done"的那一次亮，用每个窗格上一轮的状态做边沿检测；
+持续 done / 第一次看见就是 done 都不亮）；`working` / `idle` 不亮；
+状态回退（done → working）之后再 done 可以再亮一次。没有 `herdrEnabled` 的服务器
+**一个请求都不发**。
+
+**卡片也自动更新（2026-10-20 第二轮，用户拍板）**：红点之外，上面两路"能直接读"的
+来源同时驱动**卡片**，这样没点「刷新」也能看到正在跑的 AI：
+
+| 事件 | 谁发 | 带什么 | 前端怎么用 |
+|---|---|---|---|
+| `zeeai://ai-log` | `core/ai_log_watch.rs`（+ herdr 红点信号） | 原红点字段 + `instanceKey` / `state` / `activity` | 红点逻辑不变；带 `instanceKey` 的那条再按**实例身份**更新/创建卡片 |
+| `zeeai://herdr-agents` | `core/ai_herdr_dots.rs`（60 秒那轮的副产品） | 该服务器每个窗格的 `pane/status/agent/cwd/workspace/tab/title` + 统一 `state` | 就地更新/创建 herdr 卡片；不碰红点 |
+
+三条边界：① 两个事件都**不调** `ai_instances`（那等于把「刷新」自动点一遍，会起进程 / ssh）；
+② 对已有卡片只改 `state` / `activity` / 时间 / 徽标，`where` / 证据 / 产物等
+"刷新拿到的完整字段"不动；③ 点「刷新」后一律以 `ai_instances` 的全量结果为准
+（自动建的卡被替换，徽标末尾那个「自动更新」也会消失）。
+
+去重键：本机日志 = `log|<rollout 文件名>|<turn_id>`；herdr = `herdr|<服务器配置 id>|<窗格>`。
+`needs-you` 与 `resolved` 用同一个 key 配对；本机日志的 `finished` 只在该轮的
+`completed_at` 往前走时发一次，herdr 的 `finished` 只在进入 done 的那一次发一次。
+
 ### 10.7 OSC 7501：暂缓（**有触发条件**，不是放弃）
 
 - **触发条件**：**codex / claude 发布支持 OSC 7501 的版本**（行业正在跟进：Claude Code、Codex 已宣布/跟进，Gradle、Tuist、Qwen Code、hermes 也在提 PR）。

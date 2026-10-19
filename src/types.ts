@@ -229,14 +229,21 @@ export type AiAgentKind = "codex" | "claude" | "gemini" | "aider" | { other: str
 /** 界面只用这五个词（§3.1） */
 export type AiState = "needs-you" | "working" | "finished" | "idle" | "unknown";
 
-/** 这条结论是谁说的（悬停里要写清"怎么得出的"） */
+/**
+ * 这条结论是谁说的（悬停里要写清"怎么得出的"）。
+ *
+ * `terminal-activity` 是**前端独有**的一条：看板卡片按"该会话最近还有终端输出"
+ * 推断出来的运行中（见 `boardActivity.ts`）。它只会以 `confidence: "inferred"`
+ * 出现，后端不会产生它 —— 加进这个联合类型是为了让徽标/悬停能如实写出"这是推断"。
+ */
 export type AiEvidenceSource =
   | "herdr-agent-list"
   | "remote-tmux-ps"
   | "local-process-table"
   | "wsl-ps"
   | "app-ledger"
-  | "rollout";
+  | "rollout"
+  | "terminal-activity";
 
 export type AiConfidence = "first-hand" | "inferred";
 
@@ -305,6 +312,96 @@ export interface AiLedgerGroup {
   cwd?: string | null;
   sessionId?: string | null;
   items: AiLedgerItem[];
+}
+
+/**
+ * 红点信号：后端**自动来源**推来的一条"要亮 / 要清"。
+ *
+ * 现在有两条自动来源，走**同一个事件名** `zeeai://ai-log`、同一个 `applyAiLogSignal`
+ * 入口（前端只能有一个地方写红点状态）：
+ * - 本机 codex rollout 日志（`core/ai_log_watch.rs`，只读文件、不启动进程）；
+ * - herdr 窗格的 agent 状态（`core/ai_herdr_dots.rs`，每台勾了 herdr 的服务器 60 秒查一次
+ *   `herdr agent list`；`source === "herdr"`，key 形如 `herdr|<服务器>|<窗格>`）。
+ *
+ * 三个 kind：
+ * - `needs-you`：等你批准/回话 → 亮到你处理为止（打开面板不清）；
+ * - `resolved`：不再等你了 → 清掉同一个 `key` 的红点；
+ * - `finished`：这一轮跑完并停下 → 当"未读"，点开面板即清。
+ *
+ * `key` 是后端算好的去重键（本机日志 `log|<文件>|<轮次>`；herdr `herdr|<服务器>|<窗格>`）；
+ * 前端不要再拼别的键，否则 `resolved` 就对不上 `needs-you` 了。
+ */
+export interface AiLogSignal {
+  kind: "needs-you" | "resolved" | "finished";
+  agent: string;
+  sessionId: string;
+  cwd: string;
+  turn: string;
+  key: string;
+  atMs: number;
+  message: string;
+  /**
+   * 这条信号从哪来：`"herdr"` = herdr 红点轮询；缺省 / `"log"` = 本机 codex 日志。
+   * 只影响提示文案（要不要带上服务器名），**不影响**红点判定。
+   */
+  source?: "log" | "herdr";
+  /** herdr 信号带的服务器配置 id（本机日志信号没有） */
+  server?: string;
+  /** herdr 信号带的服务器显示名（提示里写"哪台机器"，省得前端再查 profiles） */
+  serverName?: string;
+  /**
+   * 卡片级：这条信号对应的**实例标识**，跨轮不变（本机日志 = `local|codex|<cwd>`；
+   * herdr 红点 = `herdr|<服务器>|<窗格>`，和它的 `key` 一样）。
+   *
+   * 为什么除了 `key` 还要它：`key` 是"这一轮"的去重键（`log|<文件>|<轮次>`），下一轮就变了；
+   * 卡片是实例级，要按一个稳定的东西去找同一张卡。缺省（老 payload）就只走红点、不碰卡片。
+   */
+  instanceKey?: string;
+  /** 卡片级：这条信号想让卡片显示成什么（措辞同 `AiState`；缺省就不更新卡片状态） */
+  state?: AiState;
+  /** 卡片级：最后一句 / 最后一个动作（后端已按字符截断；拿不到是空串） */
+  activity?: string;
+}
+
+/** herdr 卡片快照里的一个窗格（后端 `core/ai_herdr_dots.rs::HerdrAgentSnapshot`） */
+export interface HerdrAgentSnapshot {
+  /** 窗格号（形如 `w1:p1`）—— 卡片锚点，也是红点 key 的第三段 */
+  pane: string;
+  /** 原始状态词：working / blocked / done / idle / unknown */
+  status: string;
+  /** agent 种类（codex / claude / …） */
+  agent: string;
+  cwd: string;
+  /** 工作区号（形如 `w1`） */
+  workspace: string;
+  /** 标签页号（形如 `w1:t1`） */
+  tab: string;
+  title: string;
+  focused: boolean;
+  /** 在等你（= blocked） */
+  attention: boolean;
+  /** 统一模型的状态词（后端已经映射好，前端别再自己判一遍） */
+  state: AiState;
+  /** 最后动作（herdr 只有窗格标题；标题就是目录时后端留空） */
+  activity: string;
+}
+
+/**
+ * herdr 轮询每一轮推来的一份**全量**卡片快照（`zeeai://herdr-agents`）。
+ *
+ * 为什么和红点信号分开一个事件名：红点是"变了才发"的**边沿**，快照是每轮都发的
+ * **状态**；混在一个事件里，前端分不清"该去重还是该整体覆盖"，迟早两套判定打架。
+ * 它只是那次 `herdr agent list` 的副产品 —— 没有多一次 ssh。
+ */
+export interface HerdrAgentsSnapshot {
+  source: "herdr";
+  /** 服务器配置 id（卡片上的「查看窗格 / 接管」要靠它开观察窗） */
+  server: string;
+  /** 服务器显示名（卡片 `where` 的第一段） */
+  serverName: string;
+  atMs: number;
+  /** 按窗格号排序（后端保证顺序稳定） */
+  agents: HerdrAgentSnapshot[];
 }
 
 /** 一台机器/本机的一组 herdr agent */

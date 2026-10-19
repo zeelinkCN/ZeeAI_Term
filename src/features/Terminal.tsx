@@ -7,6 +7,7 @@ import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "..
 import { runAfterFirstPaint, startupMark } from "../startup";
 import { bytesToB64 } from "../util";
 import { rememberTerminalSize } from "./terminalSize";
+import { clearOutput, markOutput } from "../activity";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
 import type { TermPalette } from "../termThemes";
@@ -498,6 +499,19 @@ export default function TerminalView({
     });
 
     /**
+     * 输出活动：xterm 每解析完一次写入就记一笔"这条会话刚刚还有输出"。
+     *
+     * 为什么挂在 `onWriteParsed` 而不是 `bus.attach` 的回调里：开了关键字高亮时字节要先过
+     * Highlighter 才进 term（见上面那段），写进 xterm 的那一刻才是"用户真的看到东西了"；
+     * 而且 `onWriteParsed` 是 xterm 按帧合并后的回调，刷屏时它天然就比"每条 IPC 数据回调一次"
+     * 稀疏 —— 一个 Map 的 set，不引入任何定时器。
+     *
+     * 用途：看板卡片**按输出活动推断**"还在跑"（见 `src/activity.ts`）。
+     * 这是推断，不是第一手状态：真正的运行/结束仍以后端事件为准。
+     */
+    const writeParsedSub = term.onWriteParsed(() => markOutput(sessionId));
+
+    /**
      * 输入通道：上层（AI 输入窗）要往这条终端"打字"时走它。
      *
      * 为什么用 `term.paste()` 而不是直接 `session_write`：xterm 知道**远端有没有开
@@ -711,6 +725,10 @@ export default function TerminalView({
       if (selTimer !== null) window.clearTimeout(selTimer);
       selSub.dispose();
       sub.dispose();
+      writeParsedSub.dispose();
+      // 终端真的没了：这条会话的"最后输出时间"也就没有意义了（卡片要靠它推断"还在跑"，
+      // 留着一个不会再更新的时间戳只会让卡片一直装作在跑）
+      clearOutput(sessionId);
       osc7.dispose();
       osc133.dispose();
       bus.detach(sessionId);

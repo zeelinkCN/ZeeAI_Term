@@ -11,7 +11,8 @@ import { lastTerminalSize } from "./features/terminalSize";
 import TermThemeDialog from "./features/TermThemeDialog";
 import HighlightDialog from "./features/HighlightDialog";
 import { SessionBus } from "./sessionBus";
-import { deferUntilIdle, startupMark } from "./startup";
+import { activityEvidenceOf, withOutputActivity } from "./boardActivity";
+import { deferUntilIdle } from "./startup";
 import {
   adbDevices,
   adbVersion,
@@ -373,6 +374,10 @@ function isActiveInstance(i: AiInstance): boolean {
  * 「运行中（进程推断，可能已卡住）」。其它承载照旧只写状态词，推断与否交给来源徽标说。
  */
 function aiStateLabelOf(i: AiInstance): string {
+  // 输出活动推断出来的 working：状态词就写「运行中」，**推断这件事由卡片上的
+  // 「推断 · 输出活动」标负责**（见 boardCard）。这里不能再套「进程推断，可能已卡住」——
+  // 那句说的是"进程表只看到有这么个进程"，和"终端还在刷输出"是两回事，混着写等于说错原因。
+  if (activityEvidenceOf(i)) return "运行中";
   const firstHand = i.evidence.some((e) => e.confidence === "first-hand");
   if (i.carrier === "ssh-bare" && i.state === "working" && !firstHand) {
     return "运行中（进程推断，可能已卡住）";
@@ -491,16 +496,28 @@ function aiBadgeTitle(i: AiInstance): string {
         `${aiEvidenceSourceLabel(e.source)}（${e.confidence === "first-hand" ? "第一手" : "推断"}）`,
     )
     .join("、");
+  const activity = activityEvidenceOf(i);
   return (
     `${aiInstanceWhere(i)}\n` +
     `${aiAgentLabel(i.agent)} · ${aiCarrierLabel(i.carrier)}\n` +
     `怎么得出的：${i.badge}\n` +
+    // 卡片上那枚徽标末尾带「自动更新」= 这条是自动事件直接改的（没点刷新）；
+    // 手动刷新后整份数据来自后端 `ai_instances`，不再带这个后缀。
+    (i.badge.includes("自动更新")
+      ? "来源方式：自动事件（本机日志 / herdr 轮询）直接更新，不是点「刷新」拿到的\n"
+      : "来源方式：「刷新」时后端合并出来的全量数据\n") +
     `谁说的：${source || "（没有证据）"} · 共 ${i.evidence.length} 条\n` +
     `能证明什么：${
       i.evidence.some((e) => e.confidence === "first-hand")
         ? "对面自己报的状态"
         : "只能说明有这么个进程在跑，说不了它在等谁 / 跑完没"
-    }`
+    }` +
+    // 推断必须自己说清楚"能证明到哪一步"。这一段只在卡片是按输出活动补成运行中时出现。
+    (activity
+      ? "\n其中「终端输出活动」是推断：最近 5 秒这条会话的终端还有输出 —— " +
+        "只能说明界面在动，看不出它是跑完了在收尾、还是卡在等你按回车。" +
+        "所以只在 5 秒内显示成「运行中」，herdr / 日志 / 刷新给出状态就立刻让位。"
+      : "")
   );
 }
 
@@ -517,7 +534,8 @@ function aiBadgeCoversSource(i: AiInstance): boolean {
 }
 
 /** 证据来源的中文短语（和后端 `EvidenceSource::label()` 对齐；认不出就写"未知来源"） */
-function aiEvidenceSourceLabel(s: string): string {  switch (s) {
+function aiEvidenceSourceLabel(s: string): string {
+  switch (s) {
     case "herdr-agent-list":
       return "herdr 第一手";
     case "app-ledger":
@@ -530,6 +548,9 @@ function aiEvidenceSourceLabel(s: string): string {  switch (s) {
       return "本机进程表";
     case "wsl-ps":
       return "WSL 进程扫描";
+    // 前端独有（后端不会出这一条）：按终端输出活动推断的运行中，见 boardActivity.ts
+    case "terminal-activity":
+      return "终端输出活动";
     default:
       return "未知来源";
   }
@@ -1045,6 +1066,76 @@ function parentOf(path: string): string {
   return i <= 0 ? "/" : trimmed.slice(0, i);
 }
 
+/** herdr 原始状态 → 统一状态词（和后端 `ai_instance::state_of_herdr` 对齐）。 */
+function herdrStateOf(status: string): AiState {
+  switch ((status || "").trim().toLowerCase()) {
+    case "working":
+      return "working";
+    case "blocked":
+      return "needs-you";
+    case "done":
+      return "finished";
+    case "idle":
+      return "idle";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * 1 秒的**纯 UI 时钟**：只用来重算看板标签，不是探测。
+ *
+ * 为什么要有：卡片要显示"这个会话最近还有没有输出"，而输出活动（`src/activity.ts`）
+ * 是一个内存 Map，`markOutput` 只写时间戳、不触发 React 更新 —— 没有时钟，界面就会
+ * 一直停在"上一帧"的推断上。所以这里每秒把 `Date.now()` 放进 state，逼着渲染重算一次。
+ *
+ * 三条纪律：
+ * - **回调里只有 `setNow(Date.now())`**：不 I/O、不发 IPC、不起子进程（也不是定时探测）；
+ * - **只在 AI 面板打开时走**：看不见的卡片不需要每秒重算，面板一关就 `clearInterval`，
+ *   不给主线程留一个永远在跳的定时器；
+ * - 打开那一刻先对齐一次时间：否则会拿"上次关闭时"的旧值去判断"最近 5 秒有没有输出"，
+ *   卡片会先闪一下"空闲"，再被 tick 纠正 —— 那是界面在说谎。
+ */
+function useUiClock(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return now;
+}
+
+/**
+ * 一条"自动事件"归一之后的样子（本机日志信号 / herdr 卡片快照都先转成它）。
+ *
+ * 为什么先归一：两路事件字段形状不一样（日志给 cwd/turn，herdr 给 server/pane），
+ * 但"更新哪张卡、改成什么状态"这件事**只能有一套实现** —— 否则迟早出现
+ * "日志那条会把 herdr 的卡改坏"这种互相打架。
+ */
+interface AutoCardEvent {
+  /** 来源：日志 = 只读本机 rollout；herdr = 轮询 `herdr agent list` */
+  source: "log" | "herdr";
+  /** 实例标识（跨轮不变）：日志 `local|codex|<cwd>`；herdr `herdr|<服务器>|<窗格>` */
+  key: string;
+  carrier: AiCarrier;
+  agent: AiAgentKind;
+  /** `where` 的第一段：`本机` / 服务器显示名 */
+  env: string;
+  cwd: string;
+  state: AiState;
+  activity: string;
+  atMs: number;
+  /** herdr 专用：窗格号 / 服务器配置 id / 原始状态词 */
+  pane?: string;
+  profileId?: string;
+  status?: string;
+  attention?: boolean;
+  /** 本机 codex 日志带会话 id（点卡片能切过去） */
+  sessionId?: string | null;
+}
+
 export default function App() {
   const busRef = useRef(new SessionBus());
   const bus = busRef.current;
@@ -1163,9 +1254,14 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   // 右侧 AI Agent 面板
   const [aiPanelOpen, setAiPanelOpen] = useState(false);
-  const [aiState, setAiState] = useState<AiProbe | null>(null);
+  /**
+   * 看板卡片的 1 秒重算时钟（只在面板打开时走）。
+   *
+   * 它**不是探测**：只把 `Date.now()` 放进 state，让"最近 5 秒还有没有终端输出"
+   * 这件事被重新算一遍（见 `useUiClock` 与 `boardActivity.ts`）。
+   */
+  const aiUiNow = useUiClock(aiPanelOpen);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
-  const aiWasRunning = useRef(false);
   // AI 任务看板（v2）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片。
   //
   // ⚠️ `boardTasks` 是**渲染用的扁平形状**（沿用老卡片样式，界面先不大改），
@@ -1309,22 +1405,22 @@ export default function App() {
    */
   const [boardInstances, setBoardInstances] = useState<AiInstance[]>([]);
   /**
-   * 红点规则 ①（§10.6）：当前**还在等你**的实例 —— 红点亮到它们不再是 needs-you 为止。
+   * 红点规则 ①（§10.6）：当前**还在等你**的实例（存的是后端算好的去重 `key`）。
    *
-   * 存下来是为了让红点在"轮询刷新"之间保持稳定（不能靠一次差量累加：那样一刷新就没了）。
+   * 只由**自动来源**写入：本机 codex 日志的 `needs-you`（key `log|…`）、
+   * herdr 红点轮询的 `blocked`（key `herdr|<服务器>|<窗格>`）；收到同一 key 的
+   * `resolved` 才清 —— 所以"打开面板"不会把它清掉（亮到你处理为止）。
+   * ⚠️ 手动点「刷新」**不碰它**（见 `refreshBoard` 里的说明）。
    */
   const [aiNeedIds, setAiNeedIds] = useState<string[]>([]);
   /**
-   * 红点规则 ②（§10.6）：**跑完并停下**、你还没点开面板看的那几轮（按实例 + 轮次去重）。
-   * 打开面板即清 —— 它是一条"未读"。
+   * 红点规则 ②（§10.6）：**跑完并停下**、你还没点开面板看的那几轮（按 key 去重）。
+   * 打开面板即清 —— 它是一条"未读"。同样只由自动来源写入（本机日志的 `finished`；
+   * herdr 的 done **只在"进入 done"的那一次**发，后端做边沿检测）。
    */
   const [aiPendingFinish, setAiPendingFinish] = useState<string[]>([]);
-  /// 上面两条规则的去重集合（同一实例同一轮只亮一次；反复轮询不该再冒出来）
-  const aiFinishedSeen = useRef<Set<string>>(new Set());
-  /** 已经为哪些"需要你"的实例打扰过一次（离开 needs-you 之后再进会重新提醒） */
-  const aiNeedsNotified = useRef<Set<string>>(new Set());
-  /** 第一次拿到看板之前不补报（否则"一开应用就红点"，那不是"这一轮跑完并停下"） */
-  const aiBoardSeeded = useRef(false);
+  /** AI 面板是否开着 —— 给事件回调读（effect 的依赖是 []，不能用 state 闭包） */
+  const aiPanelOpenRef = useRef(false);
   /**
    * 这一轮刚采集到的 herdr agent（profileId → agents）。
    *
@@ -1717,48 +1813,387 @@ export default function App() {
   }
 
   /**
-   * 红点 / 通知（口径 docs/design-ai-board-v2.md §10.6）。
+   * 红点（口径 docs/design-ai-board-v2.md §10.6，以及用户 2026-10-20 的原话）。
    *
-   * **只有两件事值得亮**：
-   * ① 有实例进了 `needs-you` → 亮到**你处理为止**（所以它每次刷新都重算，不是差量累加）；
-   * ② 某一轮跑完**而且停下**（`finished`）→ 当"未读"，**点开面板即清**。
+   * **只有两件事值得亮**，而且都只能来自**自动来源**：
+   * ① `needs-you` → 亮到**你处理为止**（后端看到"不再等你"才发 `resolved`）；
+   * ② `finished`（这一轮跑完**而且停下**）→ 当"未读"，**点开面板即清**。
    *
-   * **不亮**：运行中、空闲、陈旧（unknown）、只产出文件还没停、探测不到。
-   * **去重**：同一实例、同一轮只亮一次 —— 反复轮询不能让它又冒出来。
+   * **不亮**：运行中、空闲、陈旧、只产出文件还没停、探测不到，以及
+   * **手动点「刷新」得到的任何东西** —— 用户明确说"手动刷新出现红点这种宁可不要"。
+   *
+   * 现在有**两条**自动来源，共用这一个入口（所以红点状态只有一份、判定只有一套）：
+   * - `core/ai_log_watch.rs`：本机 codex rollout 日志（只读文件）；
+   * - `core/ai_herdr_dots.rs`：herdr 窗格的 agent 状态（用户 2026-10-20 批准：
+   *   每台勾了 herdr 的服务器 60 秒查一次 `herdr agent list`）。它的信号带
+   *   `source: "herdr"`，key 是 `herdr|<服务器>|<窗格>`；`needs-you` 的提示文案
+   *   因此要写"哪台机器 · 哪个 agent"。
+   * 两条的**红点**判定都只在这一处；卡片是另一条路径（见下面 `applySignalCard` /
+   * `applyHerdrSnapshot`，只更新卡片、不碰红点），两边互不影响。
+   * ⚠️ 手动「刷新」永远不进这里（见 `refreshBoard` 的说明）。
+   *
+   * 去重：`key` 由后端算好（日志 `log|<文件>|<轮次>`；herdr `herdr|<服务器>|<窗格>`），
+   * 同一 key 重复送达不会让数字往上涨；后端自己也跨轮去重。
    */
-  function applyBoardAlerts(list: AiInstance[]) {
-    // ① 需要你：直接看当前快照里还有几个 needs-you —— 它天然"亮到你处理为止"
-    const needs = list.filter((i) => i.state === "needs-you").map((i) => i.id);
-    setAiNeedIds(needs);
-    // ② 这一轮跑完并停下：按「实例 + 轮次」去重。
-    //    轮次 = 实例 id + 最后一次证据的时间（后端把 activity.startedAtMs / 证据时间都带了回来）
-    const fresh: string[] = [];
-    for (const i of list) {
-      if (i.state !== "finished") continue;
-      const round = `${i.id}@${i.evidence.map((e) => e.atMs).reduce((a, b) => Math.max(a, b), 0)}`;
-      if (aiFinishedSeen.current.has(round)) continue;
-      aiFinishedSeen.current.add(round);
-      fresh.push(round);
+  function applyAiLogSignal(sig: AiLogSignal) {
+    if (!sig || typeof sig.key !== "string" || !sig.key) return;
+    if (sig.kind === "needs-you") {
+      if (!settingsRef.current.aiNotifyNeedsYouBadge) return;
+      setAiNeedIds((prev) => (prev.includes(sig.key) ? prev : [...prev, sig.key]));
+      // "需要你"是唯一真正值得打断用户的事（§10.6）：除了红点，也在面板通知列表里
+      // 留一句"是哪台机器 / 哪个目录 / 在等什么"。同一轮由后端去重；`resolved` 之后
+      // 再次进入等待（同一轮里又要批准）会重新发一次 —— 这时候应该再提醒一次。
+      if (settingsRef.current.aiNotifyNeedsYou) {
+        // herdr 的 blocked 只有第一手状态、没有"最后一段话"，所以文案用
+        // 「服务器 · agent + cwd」；本机日志保持原来的 codex 文案。
+        const who =
+          sig.source === "herdr"
+            ? `${sig.serverName || sig.server || "服务器"} · ${herdrAgentLabel(sig.agent)}`
+            : aiAgentLabel("codex");
+        raiseAiAttention(
+          `${who} 在等你处理${sig.cwd ? `（${sig.cwd}）` : ""}${
+            sig.message ? "：" + sig.message : ""
+          }`,
+        );
+      }
+      return;
     }
-    if (fresh.length) setAiPendingFinish((prev) => [...prev, ...fresh]);
-    // 第一次拿到看板时不"补报"历史完成项吗？——**不特地处理**：
-    // 上面那个 `aiFinishedSeen` 只对"看过一次快照之后新出现的轮次"计数，
-    // 而这第一份快照里的 finished 本来就该算你还没看过的那一轮。
-    // ⚠️ 曾经在这里 `setAiPendingFinish([])` 清一次，结果把"需要你"那条也一起抹了
-    //（它独立于历史，是"亮到你处理为止"的）—— 别再那么写。
-    if (!aiBoardSeeded.current) aiBoardSeeded.current = true;    // "需要你"要打扰（状态栏 + 任务栏闪一下），同一实例只提醒一次
-    for (const i of list) {
-      if (i.state !== "needs-you") continue;
-      if (aiNeedsNotified.current.has(i.id)) continue;
-      aiNeedsNotified.current.add(i.id);
-      raiseAiAttention(
-        `${aiAgentLabel(i.agent)} 在等你处理（${aiInstanceWhere(i)}）· 点开看板可接管`,
-      );
+    if (sig.kind === "resolved") {
+      // 只清"需要你"那一条：它表示这一轮 / 这个窗格已经不再等你了
+      // （herdr 的 blocked 消失、窗格被关、服务器被取消勾选，后端都会发同一个 key）
+      setAiNeedIds((prev) => prev.filter((k) => k !== sig.key));
+      return;
     }
-    for (const id of Array.from(aiNeedsNotified.current)) {
-      if (!needs.includes(id)) aiNeedsNotified.current.delete(id);
+    if (sig.kind === "finished") {
+      if (!settingsRef.current.aiNotifyFinishedBadge) return;
+      // 面板开着**而且窗口在前台** = 你正在看这一块，不必再记一条"未读"
+      // （等价于"点开面板即清"；窗口在后台时照常亮，免得你回来才发现）。
+      if (aiPanelOpenRef.current && document.hasFocus()) return;
+      setAiPendingFinish((prev) => (prev.includes(sig.key) ? prev : [...prev, sig.key]));
     }
   }
+
+  // ==========================================================================
+  // 自动事件 → 卡片（2026-10-20：卡片也接上，不再只靠手动「刷新」）
+  //
+  // 用户拍板的最终形态：本机 codex 日志 / herdr 轮询这两路"能直接读"的来源
+  // **红点和卡片都自动**；进程扫描 / 远程 ps / 裸 SSH / tmux / 手动刷新只更新卡片、
+  // **永不产生红点**。所以下面这些函数只碰卡片，**不碰** `aiNeedIds` / `aiPendingFinish`
+  // （红点仍归上面的 `applyAiLogSignal`，通知仍按原规则）。
+  //
+  // 三条铁律：
+  // - **不调 `ai_instances`**：那等于把「刷新」按钮自动点一遍（会起进程 / ssh），
+  //   用户明确反对隐形轮询 —— 事件里带的字段够画卡，就不该再探测；
+  // - 对**已有卡片**只改 `state` / `activity` / 时间 / 徽标，`where` / 载体 / 证据 /
+  //   产物这些"刷新拿到的完整字段"一律不动（事件里没有，编不出来）；
+  // - 卡片不存在时建一张**最小卡** —— 这就是"没点刷新也能看到正在跑的本地 AI"。
+  // ==========================================================================
+
+  /** 毫秒 →「N 秒前 / N 分钟前 / N 小时前」（和后端 `human_age` 一个口径：徽标里那个"多久前"） */
+  function autoAgeText(ms: number): string {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return `${s} 秒前`;
+    if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+    return `${Math.floor(s / 3600)} 小时前`;
+  }
+
+  /**
+   * 自动更新/自动创建时那张卡的来源徽标。
+   *
+   * 为什么前端要自己拼：徽标里的"多久前"是后端 `badge()` 在合并那一刻算的；被动事件
+   * 不经过后端，原样留着旧徽标就会出现"卡片刚更新、徽标却写 17 分钟前"。
+   * 口径（谁说的 + 多久前 + 能不能说成事实）和后端 `AiInstance::badge()` 一致；
+   * 末尾那句「自动更新」就是"这条是自动来的、不是点「刷新」拿到的"标记 ——
+   * 手动刷新后后端徽标会整段覆盖，不再带这个后缀。
+   */
+  function autoBadgeText(source: "log" | "herdr", atMs: number): string {
+    const age = autoAgeText(Date.now() - atMs);
+    return source === "herdr"
+      ? `herdr 第一手 · ${age} · 自动更新`
+      : `rollout 日志 · ${age}，只能说明它在跑 · 自动更新`;
+  }
+
+  /** tool 名 → 统一 agent；认不出来的用 `{ other }` **保留原名**（和后端 `agent_of_tool` 一致）。 */
+  function aiAgentOfTool(tool: string): AiAgentKind {
+    const t = (tool || "").trim();
+    if (!t) return "unknown";
+    const k = t.toLowerCase();
+    if (k === "codex" || k === "claude" || k === "gemini" || k === "aider") {
+      return k as AiAgentKind;
+    }
+    return { other: t };
+  }
+
+  /**
+   * 承载能力闸门（只给"被动事件建/改的卡"用）。
+   *
+   * 口径和后端 `ai_instance::sanitize_state` **一致**：推断绝不说成事实。
+   * 本机 PowerShell 承载看不到"需要你"（§10.4，只有 herdr 有第一手状态机），
+   * 所以日志说"在等你"时卡片只能显示"运行中"，原值记进 `downgradedFrom` 让界面如实提示。
+   * ⚠️ 红点不受这条影响：日志说等你，红点照样亮 —— 那是另一条规则。
+   */
+  function autoGate(
+    carrier: AiCarrier,
+    state: AiState,
+  ): { state: AiState; downgradedFrom: AiState | null } {
+    if (carrier === "local-cmd") {
+      return { state: "unknown", downgradedFrom: state === "unknown" ? null : state };
+    }
+    if (state === "needs-you" && carrier !== "herdr") {
+      return { state: "working", downgradedFrom: "needs-you" };
+    }
+    if (state === "finished" && carrier === "ssh-bare") {
+      return { state: "unknown", downgradedFrom: "finished" };
+    }
+    return { state, downgradedFrom: null };
+  }
+
+  /** `where`（`环境 · 目录 · 锚`）按后端那三段拆开（只拆，不改） */
+  function whereOf(where: string): string[] {
+    return (where || "").split(" · ");
+  }
+
+  /** 这条事件说的实例，是不是就是这张卡（按"跨轮不变的身份"比，不按 id 比） */
+  function autoMatchesInstance(i: AiInstance, ev: AutoCardEvent): boolean {
+    if (ev.carrier === "herdr") {
+      if (i.carrier !== "herdr" || !ev.pane) return false;
+      const parts = whereOf(i.where);
+      // 后端 `AiInstance.where` 的形状：`<服务器名> · <cwd> · herdr:<窗格>`
+      return parts[0] === ev.env && parts[2] === `herdr:${ev.pane}`;
+    }
+    // 本机 codex 日志：只有"本机 + codex + 同一目录"才算同一个实例
+    //（和后端认领 rollout 观测的条件一字不差）。
+    if (i.carrier !== "local-powershell") return false;
+    if (aiAgentLabel(i.agent) !== "codex") return false;
+    return !!ev.cwd && whereOf(i.where)[1] === ev.cwd;
+  }
+
+  /** 渲染用的扁平行（AiTask）和实例的对应：先认自己建的那张，再按身份认 */
+  function autoMatchesTask(t: AiTask, ev: AutoCardEvent): boolean {
+    if (t.id === `auto|${ev.key}`) return true;
+    if (ev.carrier === "herdr") {
+      return !!ev.pane && t.server === ev.env && (t.herdrPane ?? t.pane) === ev.pane;
+    }
+    return t.env === "local" && t.cwd === ev.cwd && t.tool === "codex";
+  }
+
+  /** 用事件里的信息建一张**最小卡**：只填事件确实带来的字段，其它留空（**不编**） */
+  function autoInstance(ev: AutoCardEvent, atMs: number): AiInstance {
+    const parts = [ev.env];
+    if (ev.cwd) parts.push(ev.cwd);
+    if (ev.carrier === "herdr" && ev.pane) parts.push(`herdr:${ev.pane}`);
+    const gated = autoGate(ev.carrier, ev.state);
+    // 证据来源按现有模型口径：herdr 是它自己报的（第一手），rollout 日志是推断。
+    const source: AiEvidence["source"] = ev.source === "herdr" ? "herdr-agent-list" : "rollout";
+    const evidence: AiEvidence = {
+      source,
+      atMs,
+      confidence: ev.source === "herdr" ? "first-hand" : "inferred",
+    };
+    return {
+      // id 只用来做 React key / 找渲染行：点「刷新」之后会整份换成后端算的 id，
+      // 所以这里用"auto + 事件标识"就够（同一实例每轮都稳定，不会闪出两张卡）。
+      id: `auto|${ev.key}`,
+      carrier: ev.carrier,
+      agent: ev.agent,
+      where: parts.join(" · "),
+      state: gated.state,
+      evidence: [evidence],
+      activity: {
+        lastLine: ev.activity || null,
+        startedAtMs: null,
+        durationMs: null,
+        tokens: null,
+        artifacts: [],
+      },
+      sessionId: ev.sessionId ?? null,
+      downgradedFrom: gated.downgradedFrom,
+      ageMs: Math.max(0, Date.now() - atMs),
+      badge: autoBadgeText(ev.source, atMs),
+    };
+  }
+
+  /**
+   * 把一条自动事件应用到看板：已有卡片就地改，没有就建最小卡。
+   *
+   * ⚠️ 这条路径**只碰卡片**：不写红点、不弹通知、不发任何探测命令。
+   */
+  function applyAutoCard(ev: AutoCardEvent) {
+    if (!ev?.key) return;
+    const at = ev.atMs > 0 ? ev.atMs : Date.now();
+    const gated = autoGate(ev.carrier, ev.state);
+    setBoardInstances((prev) => {
+      const idx = prev.findIndex((i) => autoMatchesInstance(i, ev));
+      if (idx < 0) return [...prev, autoInstance(ev, at)];
+      const cur = prev[idx];
+      const next: AiInstance = {
+        ...cur,
+        state: gated.state,
+        downgradedFrom: gated.downgradedFrom,
+        activity: {
+          ...cur.activity,
+          lastLine: ev.activity || cur.activity.lastLine || null,
+        },
+        ageMs: Math.max(0, Date.now() - at),
+        badge: autoBadgeText(ev.source, at),
+      };
+      const out = prev.slice();
+      out[idx] = next;
+      return out;
+    });
+    setBoardTasks((prev) => {
+      const idx = prev.findIndex((t) => autoMatchesTask(t, ev));
+      const running = gated.state === "needs-you" || gated.state === "working";
+      if (idx < 0) {
+        // 用同一份"实例 → 扁平行"映射（`instanceTasks`）建行：这样卡片上的
+        // 「查看窗格 / 接管」拿得到 herdrPane / herdrProfileId，不会因为少字段失效。
+        const mapped = instanceTasks([autoInstance(ev, at)])[0];
+        if (!mapped) return prev;
+        // 事件本身就知道服务器 id / 窗格号 —— 直接钉上：服务器改过名时
+        // `instanceTasks` 按名字反查会落空，按钮就点不动了（这条兜底不改变任何判定）。
+        const row: AiTask = {
+          ...mapped,
+          herdrPane: ev.pane ?? mapped.herdrPane ?? null,
+          herdrProfileId: ev.profileId ?? mapped.herdrProfileId ?? null,
+          agentStatus: ev.status ?? mapped.agentStatus ?? null,
+        };
+        return [...prev, row];
+      }
+      const cur = prev[idx];
+      const next: AiTask = {
+        ...cur,
+        state: running ? "running" : "done",
+        attention: gated.state === "needs-you",
+        agentStatus: ev.status ?? cur.agentStatus ?? null,
+        herdrPane: ev.pane ?? cur.herdrPane ?? null,
+        herdrProfileId: ev.profileId ?? cur.herdrProfileId ?? null,
+        command: ev.activity || cur.command,
+        activityLastLine: ev.activity || cur.activityLastLine || null,
+      };
+      const out = prev.slice();
+      out[idx] = next;
+      return out;
+    });
+  }
+
+  /**
+   * `zeeai://ai-log` 里带卡片字段的那几条（本机日志）→ 更新/创建卡片。
+   *
+   * 老的 herdr 红点信号 / 更早的 payload 没有 `instanceKey`，这里直接跳过：
+   * 它们只影响红点，绝不能凭"猜"去建卡。红点逻辑仍在 `applyAiLogSignal` 里，原样不动。
+   */
+  function applySignalCard(sig: AiLogSignal) {
+    if (!sig || typeof sig.instanceKey !== "string" || !sig.instanceKey) return;
+    if (!sig.state) return;
+    const isHerdr = sig.source === "herdr";
+    applyAutoCard({
+      source: isHerdr ? "herdr" : "log",
+      key: sig.instanceKey,
+      carrier: isHerdr ? "herdr" : "local-powershell",
+      agent: isHerdr ? aiAgentOfTool(sig.agent) : "codex",
+      env: isHerdr ? sig.serverName || sig.server || "服务器" : "本机",
+      cwd: sig.cwd || "",
+      state: sig.state,
+      activity: sig.activity || "",
+      atMs: sig.atMs,
+      pane: isHerdr ? sig.turn : undefined,
+      profileId: isHerdr ? sig.server : undefined,
+      sessionId: sig.sessionId,
+    });
+  }
+
+  /**
+   * `zeeai://herdr-agents`：herdr 每一轮的全量卡片快照 → 更新/创建 herdr 卡片。
+   *
+   * 只读数据，不调任何命令（这份快照是后端 60 秒那次 `herdr agent list` 的副产品）。
+   * 空列表**不删卡**：一张卡消失通常意味着"窗格被关了"，但网络抖动 / 服务刚重启也会
+   * 暂时读不到；凭一次"没看见"删卡会让用户以为任务没了 —— 状态交给下一轮快照与红点信号。
+   */
+  function applyHerdrSnapshot(snap: HerdrAgentsSnapshot) {
+    if (!snap || !Array.isArray(snap.agents) || !snap.server) return;
+    // 先记一份 agent 索引：卡片上的「查看窗格 / 接管」要凭 profileId 才能开观察窗，
+    // 而后端 `AiInstance.where` 里只有服务器显示名（前端 `instanceTasks` 靠这张表找回 id）。
+    lastHerdrAgents.current = {
+      ...lastHerdrAgents.current,
+      [snap.server]: snap.agents.map((a) => ({
+        kind: a.agent,
+        status: a.status,
+        cwd: a.cwd,
+        paneId: a.pane,
+        tabId: a.tab,
+        workspaceId: a.workspace,
+        title: a.title,
+        focused: !!a.focused,
+        attention: !!a.attention,
+      })),
+    };
+    const at = snap.atMs > 0 ? snap.atMs : Date.now();
+    const env = snap.serverName || snap.server;
+    for (const a of snap.agents) {
+      // 没有窗格 / 没有 agent 的条目连卡片都画不出来（也点不了「查看窗格」）—— 跳过。
+      if (!a || !a.pane || !a.agent) continue;
+      applyAutoCard({
+        source: "herdr",
+        key: `herdr|${snap.server}|${a.pane}`,
+        carrier: "herdr",
+        agent: aiAgentOfTool(a.agent),
+        env,
+        cwd: a.cwd || "",
+        state: a.state || herdrStateOf(a.status),
+        activity: a.activity || "",
+        atMs: at,
+        pane: a.pane,
+        profileId: snap.server,
+        status: a.status,
+        attention: !!a.attention,
+        sessionId: "",
+      });
+    }
+  }
+
+  /**
+   * 自动来源的事件入口（前端**没有任何定时器**，全部由 Rust 侧推）。
+   *
+   * 两个事件，各管一件事：
+   * - `zeeai://ai-log`：本机 codex 日志（2.5 秒 stat，只读文件）与 herdr 红点轮询
+   *   （每台勾了 herdr 的服务器 60 秒一次，走隐藏窗口的 `commands::herdr_agents`）。
+   *   → **红点**仍归 `applyAiLogSignal`（判定只有那一份）；同一 payload 里如果带了
+   *   `instanceKey` / `state`（本机日志那一路），再顺手更新/创建卡片（`applySignalCard`）。
+   * - `zeeai://herdr-agents`：herdr 每轮那份 `agent list` 的**全量快照** →
+   *   更新/创建 herdr 卡片（`applyHerdrSnapshot`）。它不碰红点。
+   *
+   * 为什么不用前端定时器：用户对"短周期探测"极其敏感（0.1.12 的真机报障就是每 20 秒
+   * 拉子进程弹黑框），而且 herdr 那条要起 ssh —— 定时器、失败重试、跨轮去重都必须
+   * 留在 Rust 侧（那边有状态机），前端只负责"收到什么就画什么"。
+   * ⚠️ App.tsx 里**不要**再为红点/卡片加 setInterval / setTimeout 轮询。
+   */
+  useEffect(() => {
+    let disposed = false;
+    const unlistens: (() => void)[] = [];
+    /** 挂一个监听（页面卸载时统一摘掉；事件通道坏了不该影响界面） */
+    const on = <T,>(event: string, handler: (payload: T) => void) => {
+      void listen<T>(event, (ev) => handler(ev.payload))
+        .then((u) => {
+          if (disposed) u();
+          else unlistens.push(u);
+        })
+        .catch(() => {
+          // 事件通道坏了不该影响界面（红点/卡片只是锦上添花）
+        });
+    };
+    on<AiLogSignal>("zeeai://ai-log", (sig) => {
+      // ① 红点：原样（两条自动来源共用这一个入口、一套判定）
+      applyAiLogSignal(sig);
+      // ② 卡片：只认带卡片字段的信号（本机日志）；herdr 的全量快照走下面那个事件
+      applySignalCard(sig);
+    });
+    on<HerdrAgentsSnapshot>("zeeai://herdr-agents", (snap) => applyHerdrSnapshot(snap));
+    return () => {
+      disposed = true;
+      for (const u of unlistens) u();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * 采集一份 `BoardSources` 用的原始数据（**只采不管**）。
@@ -1929,7 +2364,15 @@ export default function App() {
       setBoardInstances(list);
       setBoardTasks(out);
       boardTasksRef.current = out;
-      applyBoardAlerts(list);
+      // ⚠️ 这里**绝不碰红点**（§10.6 + 用户 2026-10-20 的原话）。
+      //
+      // 红点只允许来自"能直接读"的自动来源（本机 codex rollout 日志 + herdr 窗格状态，
+      // 见 `applyAiLogSignal` / `core/ai_log_watch.rs` / `core/ai_herdr_dots.rs`）。
+      // 手动点「刷新」得到的数据是**一次性快照**：把它变成红点就是伪信号 ——
+      // 用户原话："手动刷新出现红点这种宁可不要"。
+      // 所以 `refreshBoard` 只负责卡片/看板；以前这里那句 `applyBoardAlerts(list)`
+      // 已经删掉了，别再加回来。
+      // （卡片自动更新走的是事件那条路，和这里无关；刷新后卡片以 `ai_instances` 为准。）
     } finally {
       boardBusy.current = false;
       // 这一轮里"探测 herdr 完事"是异步回来的：等当前这轮真的结束再补刷，避免互相顶掉
@@ -2658,10 +3101,9 @@ export default function App() {
   /**
    * 打扰用户一下：进面板里的通知列表 + 按设置闪任务栏。
    *
-   * ⚠️ **不在这里动红点**（§10.6）：红点只认「需要你 / 跑完停下」两条规则 ——
-   * 第一条"亮到你处理为止"（每次刷新按当前快照重算，不是差量累加），
-   * 第二条"点开面板即清"（当未读）。两件事的差别化处理在 `applyBoardAlerts`
-   * 与"打开面板"那个 effect 里，这里只负责"响一声"。
+   * ⚠️ **不在这里动红点**（§10.6）：红点只认「需要你 / 跑完停下」两条规则，
+   * 而且只由自动来源（`applyAiLogSignal`：本机日志 / herdr 轮询）写入；
+   * 这里只负责"响一声"（面板通知 + 按设置闪任务栏）。
    */
   function raiseAiAttention(text: string) {
     pushAiNotice(text);
@@ -3263,10 +3705,21 @@ export default function App() {
       : undefined;
   // 看板只摆两个区：**需要你** + **运行中**（§10.2）。
   // 「最近完成」「空闲」各折成一行，点开才渲染明细；承载健康只在异常时出现。
-  const boardNeedsYou = boardInstances.filter((i) => i.state === "needs-you");
-  const boardWorking = boardInstances.filter((i) => i.state === "working");
-  const boardFinished = boardInstances.filter((i) => i.state === "finished");
-  const boardIdle = boardInstances.filter((i) => i.state === "idle" || i.state === "unknown");
+  //
+  // `boardShown` 是"渲染用的那一份"：在 `boardInstances`（刷新 / 日志 / herdr 给的状态）之上，
+  // 由 `withOutputActivity` 补一层**推断**（该会话最近 5 秒还有终端输出 → 运行中）。
+  // 为什么单独一份、不改 `boardInstances`：推断必须能随时**消失**（输出一停就回落），
+  // 而第一手状态永远是原值；`aiUiNow` 每秒变一次，这里就每秒重算一次 —— 纯内存计算。
+  const boardShown = withOutputActivity(boardInstances, {
+    sessions,
+    // 后端 `where` 第一段用的是服务器显示名；profileId → 名字的对应关系只有前端知道
+    profileName: (id) => profiles.find((p) => p.id === id)?.name,
+    nowMs: aiUiNow,
+  });
+  const boardNeedsYou = boardShown.filter((i) => i.state === "needs-you");
+  const boardWorking = boardShown.filter((i) => i.state === "working");
+  const boardFinished = boardShown.filter((i) => i.state === "finished");
+  const boardIdle = boardShown.filter((i) => i.state === "idle" || i.state === "unknown");
   /** 卡片渲染用的扁平行（保序：后端的排序就是需要你 → 运行中 → …） */
   const taskOfInstance = new Map(boardTasks.map((t) => [t.id, t]));
   /**
@@ -3336,6 +3789,21 @@ export default function App() {
           <span className="ai-badge-owner" title={aiBadgeTitle(i)}>
             {i.badge}
           </span>
+          {/* 输出活动推断出来的「运行中」：**必须自己承认是推断**。
+              文案不写"正在执行"、只写"输出活动"，悬停写清它证明不了什么
+              （见 `aiBadgeTitle` 最后那段）—— 推断绝不说成事实。 */}
+          {activityEvidenceOf(i) ? (
+            <span
+              className="ai-infer-badge"
+              title={
+                "推断，不是事实：这条卡对应的终端最近 5 秒内还有输出。\n" +
+                "输出只能说明界面在动 —— 看不出它是跑完了在收尾、还是卡在等你按回车；\n" +
+                "所以只在 5 秒内显示成「运行中」，一旦 herdr / 日志 / 刷新给出状态就以那边为准。"
+              }
+            >
+              推断 · 输出活动
+            </span>
+          ) : null}
           {i.downgradedFrom ? (
             <span
               title={
@@ -3372,6 +3840,14 @@ export default function App() {
         {withSnap && aiSnapshot?.lastAction ? (
           <div className="ai-task-cmd ellipsis" title={aiSnapshot.lastAction}>
             {aiSnapshot.lastAction}
+          </div>
+        ) : null}
+        {/* 自动事件更新/建出来的卡：把"最后一句 / 最后一个动作"直接显示出来。
+            为什么只给这类卡：刷新来的卡沿用老版式（命令行只在悬停里），
+            这一行只为"没点刷新也能看到它在干什么"服务，不改既有卡片的布局。 */}
+        {i.badge.includes("自动更新") && t.activityLastLine ? (
+          <div className="ai-task-cmd ellipsis" title={t.activityLastLine}>
+            {t.activityLastLine}
           </div>
         ) : null}
         {/* G-02：shell 集成报上来的退出码（只有注入过 PROMPT_COMMAND 的会话才有；

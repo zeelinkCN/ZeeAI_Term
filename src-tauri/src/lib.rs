@@ -158,6 +158,24 @@ pub fn run() {
         }
         let _ = builder.build(app);
       }
+      // 本机 codex 日志 → 红点（§10.6 唯一允许"自动亮"的本机来源之一）。
+      //
+      // **只读文件、不起子进程**：线程里只有 `std::fs::metadata` + 读取新增字节，
+      // 没有任何 `Command` / `ssh` / `ps`。用户明确反对的是"短周期自动探测子进程"
+      // （那会弹控制台窗口、耗 CPU）；读自己的日志文件不属于探测，而且这也是用户
+      // 2026-10-20 亲口确认的口径（"本地 codex 的日志文件也算可以直接读"）。
+      // ⚠️ 别往这条线程里加任何命令；要加探测必须先问用户（见 docs/design-ai-board-v2.md §10.8）。
+      crate::core::ai_log_watch::spawn(app.handle().clone());
+      // herdr 红点轮询（用户 2026-10-20 明确批准）：每台**勾了 herdr 的**服务器
+      // 每 60 秒查一次 `herdr agent list`，只用来驱动红点。
+      //
+      // 为什么不和上面那条并在一起：这条**要起 ssh**（herdr 的状态只能这么拉），
+      // 所以它必须有自己的间隔（60 秒，用户批的下限）、自己的失败静默策略，
+      // 以及一个应用退出时能置位的停止位；读本机日志那条 2.5 秒一轮、不碰网络。
+      // 探测本身复用 `commands::herdr_agents`（→ `run_remote_capture` →
+      // `proc::hidden_command_async`，带 CREATE_NO_WINDOW），不会弹黑框。
+      // ⚠️ 不要往这条线程里塞第二个探测 / 改小间隔；见 core/ai_herdr_dots.rs 模块头。
+      crate::core::ai_herdr_dots::spawn(app.handle().clone());
       // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
       // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
       //
@@ -727,6 +745,9 @@ pub fn run() {
     .run(|app_handle, event| {
       // 退出前把所有会话进程收干净（Job Object 也会兜底，但显式做更清晰）
       if let tauri::RunEvent::Exit = event {
+        // herdr 红点轮询：先置停止位，让它在下一个分片睡眠（≤500ms）里收尾，
+        // 不会在退出路径上再多发一次 ssh。
+        crate::core::ai_herdr_dots::stop();
         let registry = app_handle.state::<SessionRegistry>();
         // 先把句柄取出来再 kill，避免在持有 map 锁的同时去碰子进程
         let handles: Vec<_> = match registry.sessions.lock() {

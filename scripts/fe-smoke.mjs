@@ -503,19 +503,39 @@ const resolveCmd = (cmd, args, opts) => {
     case "plugin:dialog|open": return "C:/Temp/zeeai-paste/picker-shot.png";
     case "open_external_url": case "open_in_explorer": return null;
     case "secret_has": return false;
-    case "open_ssh": return {
-      id: "mock-1", profileId: (window.__ZEEAI_SESSION__.sessions[0] || {}).profileId || "",
-      // 跟真实后端一样：herdr 会话的标题里带上窗格号（用户要能一眼分清是哪个窗格）
-      title:
-        (args && (args.backend === "herdr-control" || args.backend === "herdr-pane") && args.tmuxName)
-          ? "lz · herdr " + args.tmuxName
-          : "lz · codex",
-      kind: "ssh", tmuxSession: null, user: "lz", host: "192.0.2.45",
-    };
-    case "open_local": return { id: "mock-1", profileId: "", title: "PowerShell", kind: "local", tmuxSession: null, user: null, host: null };
+    case "open_ssh": {
+      // 记下这条会话的 Channel id：测试要用它模拟"终端真的收到输出"（见 __ZEEAI_TERM_DATA__）。
+      if (args && args.id && args.onEvent) window.__ZEEAI_SESSION_CHANNELS__[args.id] = args.onEvent.id;
+      return {
+        id: "mock-1", profileId: (window.__ZEEAI_SESSION__.sessions[0] || {}).profileId || "",
+        // 跟真实后端一样：herdr 会话的标题里带上窗格号（用户要能一眼分清是哪个窗格）
+        title:
+          (args && (args.backend === "herdr-control" || args.backend === "herdr-pane") && args.tmuxName)
+            ? "lz · herdr " + args.tmuxName
+            : "lz · codex",
+        kind: "ssh", tmuxSession: null, user: "lz", host: "192.0.2.45",
+      };
+    }
+    case "open_local": {
+      if (args && args.id && args.onEvent) window.__ZEEAI_SESSION_CHANNELS__[args.id] = args.onEvent.id;
+      return { id: "mock-1", profileId: "", title: "PowerShell", kind: "local", tmuxSession: null, user: null, host: null };
+    }
     case "session_write": case "session_resize": case "session_close": return null;
-    case "plugin:event|listen": return 1;
-    case "plugin:event|unlisten": return null;
+    case "plugin:event|listen": {
+      // 事件通道要**真的记住 handler**：红点那条链路的自动来源就是后端事件，
+      // 测试里用 window.__ZEEAI_EMIT__ 模拟"后端推来一条 zeeai://ai-log"。
+      // tauri 的 listen() 走 invoke('plugin:event|listen', {event, handler: <callback id>})，
+      // handler 已经被 transformCallback 存进 window["_"+id]。
+      const ev = (args && args.event) || "";
+      const set = window.__ZEEAI_LISTENERS__[ev] || (window.__ZEEAI_LISTENERS__[ev] = new Set());
+      set.add(args && args.handler);
+      return 1;
+    }
+    case "plugin:event|unlisten": {
+      const set = window.__ZEEAI_LISTENERS__[(args && args.event) || ""];
+      if (set) set.clear();
+      return null;
+    }
     default: return null;
   }
 };
@@ -533,45 +553,54 @@ window.__TAURI_INTERNALS__ = {
   convertFileSrc: (p) => p,
   metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main", windowLabel: "main" } },
 };
+// 模拟"后端 emit 了一条事件"（红点断言用）。
+// 走的是和真 Tauri 一样的回调形状：{event, id, payload}。
+window.__ZEEAI_LISTENERS__ = {};
+window.__ZEEAI_EMIT__ = (event, payload) => {
+  const set = window.__ZEEAI_LISTENERS__[event];
+  if (!set) return 0;
+  let n = 0;
+  for (const id of Array.from(set)) {
+    const cb = window["_" + id];
+    if (typeof cb === "function") {
+      try {
+        cb({ event, id: 1, payload });
+        n++;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }
+  return n;
+};
+// ---------- 模拟"终端真的收到输出"（给"按输出活动推断运行中"那组断言用） ----------
+//
+// 真链路上会话的输出是 Rust 侧通过 Channel<SessionEvent> 推过来的；这里拿到的是
+// open_local / open_ssh 的 onEvent Channel 对象，它的 id 由 transformCallback 登记过，
+// 所以可以直接按 Channel 的协议形状（{index, message}）回调 —— 数据会走
+// bus.push → xterm.write → onWriteParsed → markOutput，和用户终端里一模一样。
+// 注意：**不直接调 markOutput**，否则测的就不是"输出真的进了终端"这条链路了。
+window.__ZEEAI_SESSION_CHANNELS__ = {};
+window.__ZEEAI_CHANNEL_INDEX__ = {};
+window.__ZEEAI_TERM_EVENT__ = (sessionId, message) => {
+  const channelId = window.__ZEEAI_SESSION_CHANNELS__[sessionId];
+  const cb = channelId !== undefined ? window["_" + channelId] : null;
+  if (typeof cb !== "function") return false;
+  const index = window.__ZEEAI_CHANNEL_INDEX__[channelId] || 0;
+  window.__ZEEAI_CHANNEL_INDEX__[channelId] = index + 1;
+  cb({ index, message });
+  return true;
+};
+window.__ZEEAI_TERM_DATA__ = (sessionId, text) => {
+  const bytes = new TextEncoder().encode(String(text || ""));
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return window.__ZEEAI_TERM_EVENT__(sessionId, { type: "data", data: btoa(bin) });
+};
+window.__ZEEAI_TERM_CWD__ = (sessionId, path) =>
+  window.__ZEEAI_TERM_EVENT__(sessionId, { type: "cwd", path });
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: noop };
 `;
-
-// ---------- 本机 AI CLI 健康（承载健康第三档）的场景数据 ----------
-// 为什么长这样：用户本机 codex 真实踩过的四种坏法见 core/cli_health.rs，
-// 这里取三种最典型的 —— ①「装了但起不来（缺平台二进制）」要冒异常；
-// ②「没装」不算异常；③「守护进程起不来」的修法是换启动参数，不是重装。
-//
-// ⚠️ 这一个坑真踩过：数据里**别出现反斜杠**（路径写成正斜杠）。
-//    这份数据是模块作用域的，但 `setScenario` 会把它 JSON.stringify 进注入脚本，
-//    而注入脚本本身又是模板字符串 —— 少一层转义注入脚本就会当场语法错，
-//    整份假后端失效、页面白屏（报的是 SyntaxError: Invalid or unexpected token）。
-//    换行用**模板字符串里的真换行**（别写转义序列，理由同上）。
-// 它在**模块作用域**（不在上面那个注入脚本里）：`setScenario({ cliHealth: [...] })` 要用它。
-const MOCK_CLI_BROKEN = {
-  agent: "codex", command: "codex", status: "installed-but-broken",
-  summary: "装了但起不来：缺平台二进制（安装没装完，最常见的是一次被打断的自动更新）",
-  detail: `C:/Users/a/AppData/Roaming/npm/codex.cmd
----
-Error: Missing optional dependency @openai/codex-win32-x64`,
-  fix: { label: "重装：npm install -g @openai/codex@latest", kind: { kind: "reinstall" } },
-  runCmd: "codex",
-};
-const MOCK_CLI_NOT_INSTALLED = {
-  agent: "claude", command: "claude", status: "not-installed",
-  summary: "没找到这个命令（PATH 和 npm 全局目录里都没有）",
-  detail: "",
-  fix: { label: "安装：npm install -g @anthropic-ai/claude-code@latest", kind: { kind: "reinstall" } },
-  runCmd: "claude",
-};
-const MOCK_CLI_NO_DAEMON = {
-  agent: "gemini", command: "gemini", status: "installed-but-broken",
-  summary: "装了但起不来：启动被系统拒绝（后台守护进程起不来）",
-  detail: `C:/Users/a/AppData/Roaming/npm/gemini.cmd
----
-Error: 拒绝访问。 (os error 5)`,
-  fix: { label: "以 gemini --no-daemon 启动", kind: { kind: "add-flag", value: "--no-daemon" } },
-  runCmd: "gemini",
-};
 
 try {
   rmSync(OUT, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -2109,31 +2138,6 @@ check(
 // 清掉上一块场景留下的"进程扫描结果"（herdrTasks 是跨块累积的：注入脚本只覆盖
 // 它显式写到的键，不写就等于沿用上一块 —— 不显式清会让卡片数一直涨）。
 const clearBoardTasks = () => setScenario({ herdrTasks: null, herdrScan: null });
-/**
- * 等"看板真的拉过一轮"。
- *
- * 为什么要等而不是固定 sleep：首屏那一下要等 index.html 起来 + deferUntilIdle 之后才发
- * `ai_instances`，固定等 1.2 秒有时候会读到"还没拉"的状态 —— 红点那几条断言就是被它坑过。
- */
-/** 活动栏 AI 图标上的红点（没有就是空串） */
-const readDot = async () =>
-  evaluate(`(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`);
-/**
- * 轮询等红点变成期望的样子。
- *
- * 为什么不固定 sleep、也不等"ai_instances 调用次数"：reload 会把页面里的调用记录清空，
- * 而"看板拉完 → 红点出现"这一步本身要等首帧 + deferUntilIdle + 一次 IPC，
- * 固定 1.2 秒有时候只读到"还没拉"。直接轮询 DOM 最稳。
- */
-const waitDot = async (want, timeoutMs = 25000) => {
-  const t0 = Date.now();
-  for (;;) {
-    const v = await readDot();
-    const hit = want === "" ? v === "" : v !== "";
-    if (hit || Date.now() - t0 > timeoutMs) return v;
-    await sleep(250);
-  }
-};
 
 // ---------- (F0) 看板 v2 §10：两区 + 折叠行 + 徽标 + 闸门（界面照 docs/mockups/ai-board-v2.html） ----------
 //
@@ -2277,99 +2281,153 @@ check(
   `卡片数=${bare.cardCount} ${JSON.stringify(bare.cards).slice(0, 160)}`,
 );
 
-// ---------- (F2) 红点规则（§10.6）：只有"需要你 / 跑完停下"亮 ----------
-// ② 只是"运行中" → 不亮
+// ---------- (F2) 红点规则（§10.6 + 用户 2026-10-20 的口径） ----------
+//
+// 用户定的规则（原话）：
+//   「还是只在 herdr tmux 等等可以**直接读** AI 的情况下**自动显示**红点，
+//     手动刷新出现红点这种宁可不要」
+// 可以自动亮的来源：herdr 接管窗格 / 本应用启动的任务 / **本机 codex 的 rollout 日志**；
+// 进程扫描 / ssh ps / tmux / 裸 SSH / CMD 一律不亮。
+// 本实现里 herdr 目前不自动（它的状态只能靠 `agent list` 新起一条 ssh 拉，见交付说明），
+// 所以这一段验的就是：**手动刷新绝不产生红点**；本机日志事件（后端 emit `zeeai://ai-log`）
+// 自动亮 / 自动清。
+const readAiDot = async () =>
+  evaluate(`(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`);
+/** 读 AI 面板里的分区标题与卡片（判断"卡片出来了没有"） */
+const readPanelBoard = async () =>
+  evaluate(`(() => {
+    const p = document.querySelector(".ai-panel");
+    if (!p) return { missing: true, secs: [], cards: [] };
+    return {
+      secs: [...p.querySelectorAll(".ai-section")].map((e) => (e.innerText || "").trim()),
+      cards: [...p.querySelectorAll(".ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / ")),
+    };
+  })()`);
+/** 模拟"后端推来一条本机日志红点信号"（真链路由 core/ai_log_watch.rs emit） */
+const emitAiLog = async (payload) =>
+  evaluate(`window.__ZEEAI_EMIT__("zeeai://ai-log", ${JSON.stringify(payload)})`);
+
+// ① 手动点「刷新」：卡片照常出来，但**红点一个都不许亮**。
+// 场景里故意放一个 herdr `blocked`（第一手"需要你"）—— 即便这样，刷新也不亮：
+// 那是"这一次快照"的结果，不是自动来源推来的信号。
 await clearBoardTasks();
-await setScenario({
-  herdrScan: { workspaces: [], panes: [] },
-  herdrAgents: [
-    { kind: "codex", status: "working", cwd: "/home/user/proj", paneId: "w7:p1",
-      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: false },
-  ],
-});
-await reload();
-const dotWorking = await waitDot("");
-check(
-  "运行中不点红点（§10.6：只有「需要你 / 跑完停下」值得亮）",
-  dotWorking === "",
-  `红点="${dotWorking}"`,
-);
-
-// ② 跑完并停下 → 亮一个未读；点开面板即清
-await setScenario({
-  herdrScan: { workspaces: [], panes: [] },
-  herdrAgents: [
-    { kind: "codex", status: "done", cwd: "/home/user/proj", paneId: "w7:p1",
-      tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: false },
-  ],
-});
-await reload();
-const dotFinished = await waitDot("1");
-check(
-  "跑完一轮并停下 → 红点亮；点开面板即清（当未读）（§10.6）",
-  dotFinished !== "",
-  `点开前红点="${dotFinished}"`,
-);
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(1500);
-const dotAfterOpen = await evaluate(
-  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
-);
-check(
-  "「跑完停下」那条未读点开面板就消（§10.6）",
-  dotAfterOpen === "",
-  `点开后红点="${dotAfterOpen}"`,
-);
-
-// ① 需要你 → 亮；而且**打开面板后仍然亮**（亮到你处理为止），反复轮询也只亮一次
 await setScenario({
   herdrScan: { workspaces: [], panes: [] },
   herdrAgents: [
     { kind: "codex", status: "blocked", cwd: "/home/user/proj", paneId: "w7:p1",
       tabId: "w7:t1", workspaceId: "w7", title: "proj", focused: true, attention: true },
+    { kind: "claude", status: "done", cwd: "/home/user/proj", paneId: "w7:p2",
+      tabId: "w7:t2", workspaceId: "w7", title: "proj2", focused: false, attention: false },
   ],
 });
 await reload();
-const dotNeeds0 = await waitDot("1");
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(1400);
-const dotNeeds1 = await evaluate(
-  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
-);
-// 面板里那两个 20 秒周期的刷新会再拉几次看板：数字不许自己往上涨（同一实例同一轮只亮一次）
-const beforeCalls = await evaluate(
-  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
-);
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".ai-panel button")].find((x) => (x.title || "").includes("重新扫描"));
-  if (b) b.click();
-  return true;
-})()`);
-await sleep(2000);
-const dotNeeds2 = await evaluate(
-  `(() => { const b = document.querySelector(".act-badge"); return b ? (b.innerText || "").trim() : ""; })()`,
-);
-const afterCalls = await evaluate(
-  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
-);
+const dotBeforeRefresh = await readAiDot();
+await openAiPanelAndRefresh();
+const dotAfterRefresh = await readAiDot();
+const refreshedPanel = await readPanelBoard();
 check(
-  "需要你 → 红点亮；打开面板后**仍然亮**（亮到你处理为止）（§10.6）",
-  dotNeeds0 !== "" && dotNeeds0 === dotNeeds1,
-  `点开前=${dotNeeds0} 点开后=${dotNeeds1}`,
-);
-check(
-  "反复轮询不会让红点自己往上涨（同一实例同一轮只亮一次）（§10.6）",
-  dotNeeds0 === dotNeeds2 && afterCalls > beforeCalls,
-  `${dotNeeds0} → ${dotNeeds2}（ai_instances ${beforeCalls} → ${afterCalls} 次）`,
+  "① 点「刷新」：卡片出来了，但红点**不亮**（手动刷新不产生红点，用户明确否掉）",
+  dotBeforeRefresh === "" && dotAfterRefresh === "" &&
+    refreshedPanel.secs.some((s) => s.startsWith("需要你 1")) &&
+    refreshedPanel.cards.length >= 1,
+  `刷新前="${dotBeforeRefresh}" 刷新后="${dotAfterRefresh}" 分区=${JSON.stringify(refreshedPanel.secs)} 卡片=${refreshedPanel.cards.length}`,
 );
 
-// ③ 只产出文件但还在跑 → 不亮（"产物"不是点红点的理由，跑完停下才是）
+// ② 本机日志"这一轮跑完并停下" → 红点**自动**亮，中间没有点任何刷新。
+// 先把面板收起：否则"已经看到"了，按规则不该记未读。
+await closeAiPanel();
+const callsBeforeLog = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+const deliveredFinish = await emitAiLog({
+  kind: "finished", agent: "codex", sessionId: "s-log-1", cwd: "/work/proj",
+  turn: "t1", key: "log|rollout-2026-10-20-t1.jsonl|t1",
+  atMs: Date.now(), message: "我把报告写好了",
+});
+await sleep(500);
+const dotFinished = await readAiDot();
+const callsAfterLog = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+check(
+  "② 本机日志新增一条「跑完并停下」→ 红点自动亮（没点刷新、没起探测）",
+  deliveredFinish > 0 && dotFinished === "1" && callsAfterLog === callsBeforeLog,
+  `送达=${deliveredFinish} 红点="${dotFinished}" ai_instances ${callsBeforeLog}→${callsAfterLog}`,
+);
+
+// 同一条事件再送一次：同一实例同一轮只亮一次（后端与前端各有一道去重）。
+await emitAiLog({
+  kind: "finished", agent: "codex", sessionId: "s-log-1", cwd: "/work/proj",
+  turn: "t1", key: "log|rollout-2026-10-20-t1.jsonl|t1",
+  atMs: Date.now(), message: "我把报告写好了",
+});
+await sleep(400);
+const dotFinishedDup = await readAiDot();
+check(
+  "③ 同一实例同一轮重复送达 → 红点不叠加（去重键 = 日志文件 + 轮次）",
+  dotFinishedDup === "1",
+  `重复送达后红点="${dotFinishedDup}"`,
+);
+
+// ④ 点开面板 → "跑完"那条未读即清（§10.6 规则②）
+await openAiPanel();
+await sleep(600);
+const dotAfterOpen = await readAiDot();
+check(
+  "④ 点开面板 → 「跑完停下」那条红点即清（当未读处理）",
+  dotAfterOpen === "",
+  `点开后红点="${dotAfterOpen}"`,
+);
+
+// ⑤ "需要你"是状态不是未读：亮到你处理为止 —— 打开/关闭面板都不清，只有日志说
+//    "不再等你"（resolved）才清。
+const deliveredNeeds = await emitAiLog({
+  kind: "needs-you", agent: "codex", sessionId: "s-log-2", cwd: "/work/proj",
+  turn: "t2", key: "log|rollout-2026-10-20-t2.jsonl|t2",
+  atMs: Date.now(), message: "等你批准：rm -rf build",
+});
+await sleep(500);
+const dotNeeds1 = await readAiDot();
+await closeAiPanel();
+await openAiPanel();
+await sleep(500);
+const dotNeeds2 = await readAiDot();
+check(
+  "⑤ 「需要你」事件 → 红点亮；打开面板**仍然亮**（亮到你处理为止）",
+  deliveredNeeds > 0 && dotNeeds1 === "1" && dotNeeds2 === "1",
+  `送达=${deliveredNeeds} 亮起="${dotNeeds1}" 点开后="${dotNeeds2}"`,
+);
+
+// ⑥ 「需要你」亮着时点刷新：既不能被清掉、也不能涨 —— 手动刷新与红点彻底解耦。
+const callsBeforeRefresh2 = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+const refreshed2 = await refreshAiPanel();
+const dotNeeds3 = await readAiDot();
+const callsAfterRefresh2 = await evaluate(
+  `window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`,
+);
+check(
+  "⑥ 需要你亮着时点「刷新」：红点不被清、也不涨（刷新只更新卡片）",
+  refreshed2.found && dotNeeds3 === dotNeeds1 && callsAfterRefresh2 > callsBeforeRefresh2,
+  `刷新前后="${dotNeeds1}"→"${dotNeeds3}"（ai_instances ${callsBeforeRefresh2}→${callsAfterRefresh2}）`,
+);
+
+// ⑦ 后端说"不再等你"（resolved）→ 同一个 key 的红点被清掉
+await emitAiLog({
+  kind: "resolved", agent: "codex", sessionId: "s-log-2", cwd: "/work/proj",
+  turn: "t2", key: "log|rollout-2026-10-20-t2.jsonl|t2",
+  atMs: Date.now(), message: "",
+});
+await sleep(400);
+const dotResolved = await readAiDot();
+check(
+  "⑦ 日志里出现「不再等你」→ 同一个 key 的红点自动清掉（不用点刷新）",
+  dotResolved === "",
+  `resolved 后红点="${dotResolved}"`,
+);
+
+// ⑧ 运行中 / 只产出文件但还没停 → 不亮（刷新也不亮）
 await clearBoardTasks();
 await setScenario({
   herdrScan: { workspaces: [], panes: [] },
@@ -2380,12 +2438,440 @@ await setScenario({
   ],
 });
 await reload();
-const dotDocs = await waitDot("");
+await openAiPanelAndRefresh();
+const dotDocs = await readAiDot();
 check(
-  "只产出文件但还没停 → 不亮红点（§10.6 / §10.9 冲突清单）",
+  "⑧ 运行中 / 只产出文件但还没停 → 不亮红点（刷新也不亮，§10.6 / §10.9）",
   dotDocs === "",
   `红点="${dotDocs}"`,
 );
+
+// ---------- (F2b) herdr 红点轮询（用户 2026-10-20 批准的新自动来源） ----------
+//
+// 真链路在 Rust：`core/ai_herdr_dots.rs` 每 60 秒对**勾了 herdr 的服务器**查一次
+// `herdr agent list`，把 blocked / done 翻成和本机日志**同形状**的事件
+// （`source: "herdr"`，key = `herdr|<服务器>|<窗格>`），走同一个 `zeeai://ai-log`。
+// 这里注入的就是那个形状（不启应用、不连网）。要验的四件事：
+//   ① blocked 是**状态**：亮到你处理为止 —— 打开面板**不清**；
+//   ② done 是**事件**：亮一次、当未读 —— 点开面板即清；
+//   ③ 同一事件重复送达不叠加（前端按 key 去重；后端还有边沿检测/跨轮去重）；
+//   ④ 手动「刷新」仍然不产生红点（上一段①已用 herdr blocked 场景验过，这里再确认解耦没被破坏）。
+await closeAiPanel();
+/** 模拟"herdr 红点轮询推来一条信号"（真链路由 core/ai_herdr_dots.rs emit） */
+const emitHerdrDot = async (payload) =>
+  emitAiLog({
+    source: "herdr",
+    agent: "claude",
+    sessionId: "",
+    cwd: "/home/user/proj",
+    message: "",
+    server: "p-lz",
+    serverName: "lz",
+    ...payload,
+  });
+
+// ① herdr blocked → needs-you 红点亮；打开面板后**仍然亮**。
+const deliveredHerdrNeeds = await emitHerdrDot({
+  kind: "needs-you",
+  key: "herdr|p-lz|w7:p1",
+  turn: "w7:p1",
+});
+await sleep(500);
+const dotHerdrNeeds1 = await readAiDot();
+await openAiPanel();
+await sleep(500);
+const dotHerdrNeeds2 = await readAiDot();
+check(
+  "⑨ herdr「blocked」→ needs-you 红点；打开面板**仍然亮**（状态，亮到不再是 blocked）",
+  deliveredHerdrNeeds > 0 && dotHerdrNeeds1 === "1" && dotHerdrNeeds2 === "1",
+  `送达=${deliveredHerdrNeeds} 亮起="${dotHerdrNeeds1}" 点开后="${dotHerdrNeeds2}"`,
+);
+
+// herdr 那边不再是 blocked → 后端按同一个 key 发 resolved，红点必须清掉。
+await emitHerdrDot({ kind: "resolved", key: "herdr|p-lz|w7:p1", turn: "w7:p1" });
+await sleep(400);
+const dotHerdrResolved = await readAiDot();
+check(
+  "⑩ herdr 不再 blocked（resolved）→ 同一个 key 的红点自动清掉",
+  dotHerdrResolved === "",
+  `resolved 后红点="${dotHerdrResolved}"`,
+);
+
+// ② herdr done → finished 红点亮；③ 同一事件重复送达不涨；② 点开面板即清。
+await closeAiPanel();
+await emitHerdrDot({ kind: "finished", key: "herdr|p-lz|w7:p2", turn: "w7:p2" });
+await sleep(500);
+const dotHerdrFinish = await readAiDot();
+await emitHerdrDot({ kind: "finished", key: "herdr|p-lz|w7:p2", turn: "w7:p2" });
+await sleep(400);
+const dotHerdrFinishDup = await readAiDot();
+await openAiPanel();
+await sleep(500);
+const dotHerdrFinishOpen = await readAiDot();
+check(
+  "⑪ herdr「done」→ finished 红点亮、重复送达不叠加（不涨）；点开面板即清",
+  dotHerdrFinish === "1" && dotHerdrFinishDup === "1" && dotHerdrFinishOpen === "",
+  `亮起="${dotHerdrFinish}" 重复后="${dotHerdrFinishDup}" 点开后="${dotHerdrFinishOpen}"`,
+);
+
+// ④ 手动「刷新」仍然不产生红点：清空之后点刷新（场景里还有 herdr 卡片），红点必须还是空。
+await closeAiPanel();
+const herdrRefresh = await openAiPanelAndRefresh();
+const dotAfterHerdrRefresh = await readAiDot();
+check(
+  "⑫ 清空后再点「刷新」：卡片照常出来，但红点仍是空（手动刷新与红点解耦没被破坏）",
+  herdrRefresh.refreshed.ok && dotAfterHerdrRefresh === "",
+  `刷新 ok=${herdrRefresh.refreshed.ok} 红点="${dotAfterHerdrRefresh}"`,
+);
+
+// ---------- (F2c) 自动事件 → 卡片（不点刷新、也不多调一次 ai_instances） ----------
+//
+// 用户 2026-10-20 拍板的最终形态：本机 codex 日志 / herdr 轮询这两路"能直接读"的来源
+// **卡片也自动更新**；进程扫描 / 远程 ps / 裸 SSH / tmux / 手动刷新只更新卡片、永不亮红点。
+// 真链路：
+//   · `core/ai_log_watch.rs` 每 2.5 秒把带 `instanceKey` / `state` / `activity` 的信号
+//     emit 到 `zeeai://ai-log`；
+//   · `core/ai_herdr_dots.rs` 每 60 秒把 `herdr agent list` 的结果额外 emit 一份
+//     `zeeai://herdr-agents` 全量快照（没有多一次 ssh）。
+// 这里注入的就是这两个形状（不启应用、不连网）。要钉住四件事：
+//   ① 日志事件带卡片字段 → 卡片自动出现/更新，且**没有**多调一次 `ai_instances`；
+//   ② herdr 快照 → herdr 卡片自动出现，状态跟着 blocked → working 就地变；
+//   ③ 不点刷新时卡片状态随事件变化（同一实例不会多出一张）；
+//   ④ 点「刷新」后以 `ai_instances` 全量数据为准（自动建的卡被替换、徽标不再带「自动更新」）；
+//   ⑤ 手动刷新仍然**不产生红点**（既有断言之外再确认一遍，红点没有被卡片这条路径带出来）。
+const callsAiInstances = () =>
+  evaluate(`window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "ai_instances").length`);
+/** 读看板：分区标题 + 折叠行 + 已渲染卡片 + 来源徽标 */
+const readAutoBoard = async () =>
+  evaluate(`(() => {
+    const p = document.querySelector(".ai-panel");
+    if (!p) return { missing: true, secs: [], folds: [], cards: [], badges: [], emptyHint: false };
+    return {
+      secs: [...p.querySelectorAll(".ai-section")].map((e) => (e.innerText || "").trim()),
+      folds: [...p.querySelectorAll(".ai-fold")].map((e) => (e.innerText || "").trim()),
+      cards: [...p.querySelectorAll(".ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / ")),
+      badges: [...p.querySelectorAll(".ai-badge-owner")].map((b) => (b.innerText || "").trim()),
+      emptyHint: (p.innerText || "").includes("点「刷新」看看本机"),
+    };
+  })()`);
+/** 模拟"herdr 轮询推来一份卡片快照"（真链路由 core/ai_herdr_dots.rs emit） */
+const emitHerdrSnapshot = async (payload) =>
+  evaluate(`window.__ZEEAI_EMIT__("zeeai://herdr-agents", ${JSON.stringify(payload)})`);
+
+await clearBoardTasks();
+await setScenario({
+  herdrAgents: [
+    { kind: "codex", status: "blocked", cwd: "/home/user/proj", paneId: "w7:p1",
+      tabId: "w7:t1", workspaceId: "w7", title: "改登录", focused: true, attention: true },
+  ],
+  herdrScan: { workspaces: [], panes: [] },
+});
+await reload();
+await openAiPanel(); // 只看，**不点刷新**
+const autoCalls0 = await callsAiInstances();
+const autoBefore = await readAutoBoard();
+
+// ① 本机日志事件（带卡片字段）→ 卡片出现；ai_instances 一次都没多调。
+const autoLogCwd = "C:/work/zeeai-auto";
+const autoLogBase = {
+  agent: "codex", sessionId: "s-auto-1", cwd: autoLogCwd,
+  instanceKey: "local|codex|C:/work/zeeai-auto",
+};
+const deliveredAutoLog = await emitAiLog({
+  ...autoLogBase,
+  kind: "needs-you",
+  turn: "t-auto-1",
+  key: "log|rollout-auto-1.jsonl|t-auto-1",
+  atMs: Date.now(),
+  message: "等你批准：npm test",
+  state: "needs-you",
+  activity: "等你批准：npm test",
+});
+await sleep(700);
+const autoAfterLog = await readAutoBoard();
+const autoCalls1 = await callsAiInstances();
+check(
+  "① 没点刷新时收到本机日志事件（带卡片字段）→ 卡片自动出现，且没有因此多调一次 ai_instances",
+  deliveredAutoLog > 0 &&
+    autoBefore.cards.length === 0 &&
+    autoCalls1 === autoCalls0 &&
+    autoAfterLog.cards.length === 1 &&
+    autoAfterLog.cards[0].includes("zeeai-auto") &&
+    autoAfterLog.badges.some((b) => b.includes("rollout 日志") && b.includes("自动更新")) &&
+    autoAfterLog.cards[0].includes("该承载看不到「需要你」"),
+  `送达=${deliveredAutoLog} ai_instances ${autoCalls0}→${autoCalls1} 卡片=${JSON.stringify(autoAfterLog.cards).slice(0, 200)} 徽标=${JSON.stringify(autoAfterLog.badges)}`,
+);
+
+// ③ 同一实例再来一条"跑完停下" → 卡片状态跟着变（进「最近完成」折叠行），仍然没有 ai_instances。
+await emitAiLog({
+  ...autoLogBase,
+  kind: "finished",
+  turn: "t-auto-2",
+  key: "log|rollout-auto-1.jsonl|t-auto-2",
+  atMs: Date.now(),
+  message: "报告写好了",
+  state: "finished",
+  activity: "报告写好了",
+});
+await sleep(700);
+const autoAfterFinish = await readAutoBoard();
+const autoCalls2 = await callsAiInstances();
+check(
+  "③ 不点刷新时卡片状态随事件变化：同一实例从运行中挪进「最近完成」，ai_instances 仍然没涨",
+  autoCalls2 === autoCalls0 &&
+    autoAfterFinish.secs.some((s) => s === "运行中 0") &&
+    autoAfterFinish.folds.some((f) => f.includes("最近完成 1 项")),
+  `分区=${JSON.stringify(autoAfterFinish.secs)} 折叠=${JSON.stringify(autoAfterFinish.folds)} ai_instances ${autoCalls0}→${autoCalls2}`,
+);
+
+// ② herdr 快照（新事件）→ 该窗格的卡片自动出现；再发一次 working → 就地更新，不多一张卡。
+const herdrSnap = {
+  source: "herdr",
+  server: "p-lz",
+  serverName: "lz",
+  atMs: Date.now(),
+  agents: [
+    { pane: "w7:p3", status: "blocked", agent: "claude", cwd: "/home/user/herdr-auto",
+      workspace: "w7", tab: "w7:t1", title: "改登录", focused: true, attention: true,
+      state: "needs-you", activity: "改登录" },
+  ],
+};
+const deliveredHerdrSnap = await emitHerdrSnapshot(herdrSnap);
+await sleep(700);
+const autoAfterHerdr = await readAutoBoard();
+const autoCalls3 = await callsAiInstances();
+check(
+  "② herdr 轮询快照 → 没点刷新就出现该窗格的卡片（需要你、带「查看窗格」），ai_instances 没涨",
+  deliveredHerdrSnap > 0 &&
+    autoCalls3 === autoCalls0 &&
+    autoAfterHerdr.secs.some((s) => s === "需要你 1") &&
+    autoAfterHerdr.cards.some((c) => c.includes("w7:p3") && c.includes("herdr-auto") && c.includes("查看窗格")) &&
+    autoAfterHerdr.badges.some((b) => b.includes("herdr 第一手") && b.includes("自动更新")),
+  `送达=${deliveredHerdrSnap} 分区=${JSON.stringify(autoAfterHerdr.secs)} 卡片=${JSON.stringify(autoAfterHerdr.cards).slice(0, 220)} 徽标=${JSON.stringify(autoAfterHerdr.badges)}`,
+);
+
+await emitHerdrSnapshot({
+  ...herdrSnap,
+  atMs: Date.now(),
+  agents: [{ ...herdrSnap.agents[0], status: "working", state: "working", attention: false }],
+});
+await sleep(700);
+const autoHerdrMoved = await readAutoBoard();
+const autoCalls4 = await callsAiInstances();
+check(
+  "③b herdr 快照把同一个窗格从 blocked 改成 working → 卡片就地更新（没多出第二张卡）",
+  autoCalls4 === autoCalls0 &&
+    autoHerdrMoved.secs.some((s) => s === "需要你 0") &&
+    autoHerdrMoved.secs.some((s) => s === "运行中 1") &&
+    autoHerdrMoved.cards.filter((c) => c.includes("w7:p3")).length === 1,
+  `分区=${JSON.stringify(autoHerdrMoved.secs)} 卡片=${JSON.stringify(autoHerdrMoved.cards).slice(0, 200)}`,
+);
+
+// ④ 点「刷新」→ 以 ai_instances 的全量数据为准：自动建的卡被替换、徽标不再带「自动更新」。
+// ⚠️ 这里必须改**当前页面**的场景对象（`setScenario` 只对下一次 navigate 生效 ——
+//    我第一版就写错在这里，刷新拿到的是上一段场景的 blocked，看起来像"刷新没覆盖"）。
+await evaluate(`(() => {
+  window.__ZEEAI_SCENARIO__.herdrAgents = [
+    { kind: "codex", status: "idle", cwd: "/home/user/from-refresh", paneId: "w9:p1",
+      tabId: "w9:t1", workspaceId: "w9", title: "刷新来的", focused: false, attention: false },
+  ];
+  return true;
+})()`);
+const autoRefresh = await refreshAiPanel();
+await sleep(700);
+const autoAfterRefresh = await readAutoBoard();
+const autoCalls5 = await callsAiInstances();
+check(
+  "④ 点「刷新」后以 ai_instances 全量数据为准：自动建的卡被替换、徽标不再带「自动更新」",
+  autoRefresh.ok &&
+    autoCalls5 > autoCalls4 &&
+    autoAfterRefresh.secs.some((s) => s === "需要你 0") &&
+    autoAfterRefresh.secs.some((s) => s === "运行中 0") &&
+    autoAfterRefresh.folds.some((f) => f.includes("空闲 1 项")) &&
+    autoAfterRefresh.badges.every((b) => !b.includes("自动更新")),
+  `刷新 ok=${autoRefresh.ok} ai_instances ${autoCalls4}→${autoCalls5} 分区=${JSON.stringify(autoAfterRefresh.secs)} 折叠=${JSON.stringify(autoAfterRefresh.folds)} 徽标=${JSON.stringify(autoAfterRefresh.badges)}`,
+);
+
+// ⑤ 卡片自动更新接上之后，手动「刷新」仍然**不产生红点**（干净场景重来一遍）。
+await closeAiPanel();
+await setScenario({
+  herdrAgents: [
+    { kind: "codex", status: "blocked", cwd: "/home/user/proj", paneId: "w8:p1",
+      tabId: "w8:t1", workspaceId: "w8", title: "proj", focused: true, attention: true },
+  ],
+});
+await reload();
+await openAiPanelAndRefresh();
+const dotAfterAutoRefresh = await readAiDot();
+check(
+  "⑤ 自动卡片接上之后，手动「刷新」仍然不产生红点（刷到 blocked 也不亮）",
+  dotAfterAutoRefresh === "",
+  `刷新后红点="${dotAfterAutoRefresh}"`,
+);
+
+// ---------- (F2d) 实时推断：终端"还有输出" → 卡片运行中（推断，不是探测） ----------
+//
+// 用户原话：「点击刷新探测AI的执行状态不太好，根本不够实时」。
+// 解法不是加一个更快的定时探测，而是用**本来就在收的终端输出流**：
+// `Terminal.tsx` 的 `onWriteParsed` 把"最后一次输出时间"记进内存 Map（`src/activity.ts`），
+// `App.tsx` 一个 1 秒的**纯 UI 时钟**只重算标签（不 IPC / 不起进程）。
+// 这一段从"真的往终端送字节"开始 —— 测的就是用户那条链路，而不是直接改内存。
+await clearBoardTasks();
+await setScenario({
+  herdrAgents: [],
+  herdrScan: { workspaces: [], panes: [] },
+  herdrTasks: [],
+  // 本机进程扫描这条路的假数据（真后端由 `ai_tasks_local` 返回）。
+  // 两张卡：只有 `C:/work/infer` 这张对应得上一条真实终端会话；另一张故意对不上。
+  localTasks: [
+    { id: "winproc:infer", env: "local", server: "本机 PowerShell", tool: "codex",
+      command: "codex", cwd: "C:/work/infer", pane: "", source: "winproc", state: "unknown",
+      durationMs: 0, pid: 6101, startedAt: null, exitCode: null },
+    { id: "winproc:no-session", env: "local", server: "本机 PowerShell", tool: "claude",
+      command: "claude", cwd: "C:/work/no-session", pane: "", source: "winproc", state: "unknown",
+      durationMs: 0, pid: 6102, startedAt: null, exitCode: null },
+  ],
+});
+await reload();
+// 先热一次刷新（这时还没有本地会话）：herdr 的"第一次探测"会在这一轮里排队补刷一次，
+// 补刷会跳过 60 秒一次的本机进程扫描。把它消化掉，后面那次刷新才是"一次就够"，
+// 不会出现"第一轮有本机卡片、第二轮被补刷覆盖掉"的假失败。
+await openAiPanelAndRefresh();
+await sleep(1500);
+// 开一个本地 PowerShell（真终端）：输出活动必须来自挂着的 xterm，不能靠测试伪造。
+await evaluate(`(() => {
+  const nav = [...document.querySelectorAll("button")].find((b) => (b.title || "").includes("PowerShell"));
+  if (nav) nav.click();
+  return !!nav;
+})()`);
+await sleep(700);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".local-module .side-actions button")]
+    .find((x) => (x.innerText || "").includes("PowerShell 7"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1400);
+const inferSession = await evaluate(`(() => {
+  const calls = (window.__ZEEAI_CALLARGS__ || []).filter((c) => c.cmd === "open_local");
+  const last = calls.length ? calls[calls.length - 1].args : null;
+  return last ? { id: last.id, channel: !!window.__ZEEAI_SESSION_CHANNELS__[last.id] } : null;
+})()`);
+// 会话上报 cwd：卡片 → 会话只认"where 里的 cwd 与某个已开终端**唯一**相等"。
+// 对不上 / 对上多个都不推断 —— 这就是"不瞎猜"。
+await evaluate(
+  `window.__ZEEAI_TERM_CWD__(${JSON.stringify(inferSession && inferSession.id)}, "C:/work/infer")`,
+);
+await sleep(700);
+// 面板已经开着（上面热刷新时打开的），这里只需要再刷一次让本机扫描的卡片进来。
+const inferRefresh = await refreshAiPanel();
+await sleep(700);
+const inferCalls0 = await callsAiInstances();
+const dotInfer = await readAiDot();
+const inferBase = await readAutoBoard();
+check(
+  "④ 手动刷新仍然不产生红点（推断这条链路不碰红点）",
+  inferRefresh.ok && dotInfer === "" && inferBase.folds.some((f) => f.includes("空闲 2 项")),
+  `刷新 ok=${inferRefresh.ok} 红点="${dotInfer}" 折叠=${JSON.stringify(inferBase.folds)} ai_instances=${inferCalls0}`,
+);
+
+// ① 给这条会话送一段真实输出 → 1 秒时钟重算 → 对应的卡变成「运行中」+「推断 · 输出活动」。
+const injected = await evaluate(
+  `window.__ZEEAI_TERM_DATA__(${JSON.stringify(inferSession && inferSession.id)}, "codex> thinking...")`,
+);
+await sleep(1500);
+const inferOn = await readAutoBoard();
+const inferCalls1 = await callsAiInstances();
+check(
+  "① 会话刚有输出（≤5 秒）→ 对应卡片显示运行中，并如实标「推断 · 输出活动」",
+  injected === true &&
+    !!inferSession &&
+    inferSession.channel === true &&
+    inferOn.secs.some((s) => s === "运行中 1") &&
+    inferOn.cards.some(
+      (c) => c.includes("infer") && c.includes("运行中") && c.includes("推断 · 输出活动"),
+    ),
+  `送字节=${injected} 会话=${JSON.stringify(inferSession)} 分区=${JSON.stringify(inferOn.secs)} 卡片=${JSON.stringify(inferOn.cards).slice(0, 280)}`,
+);
+check(
+  "①b 1 秒时钟只重算标签：没有因此多调 ai_instances / 发任何探测",
+  inferCalls1 === inferCalls0,
+  `ai_instances ${inferCalls0}→${inferCalls1}`,
+);
+check(
+  "⑤ 没有对应会话的卡片不参与推断（不瞎猜）：它仍在「空闲」里，也没有推断标",
+  !inferOn.cards.some((c) => c.includes("no-session")) &&
+    inferOn.folds.some((f) => f.includes("空闲 1 项")) &&
+    !inferOn.cards.some((c) => c.includes("no-session") && c.includes("推断")),
+  `折叠=${JSON.stringify(inferOn.folds)} 卡片=${JSON.stringify(inferOn.cards).slice(0, 220)}`,
+);
+
+// ② 输出停了超过阈值 → 不再显示运行中；回落成原来的「空闲/未知」，
+//    **不会**推断成跑完（最近完成）或需要你。这里同时再等几秒，确认时钟自己在走。
+await sleep(6200);
+const inferOff = await readAutoBoard();
+const inferCalls2 = await callsAiInstances();
+check(
+  "② 输出停下（>5 秒）→ 不再显示运行中；回落到原来的空闲/未知，**不会**变成跑完 / 需要你",
+  inferOff.secs.some((s) => s === "运行中 0") &&
+    inferOff.secs.every((s) => !s.startsWith("需要你 1")) &&
+    inferOff.folds.some((f) => f.includes("空闲 2 项")) &&
+    !inferOff.folds.some((f) => f.includes("最近完成")) &&
+    inferOff.cards.every((c) => !c.includes("推断 · 输出活动")) &&
+    inferCalls2 === inferCalls0,
+  `分区=${JSON.stringify(inferOff.secs)} 折叠=${JSON.stringify(inferOff.folds)} 卡片=${JSON.stringify(inferOff.cards)}`,
+);
+
+// ③ 再让输出"活"一次，然后在它还新鲜（≤5 秒）时送一条第一手事件：
+//    事件必须立刻覆盖推断（卡片变「已完成」，推断标消失），而不是等 5 秒过期。
+const reinjected = await evaluate(
+  `window.__ZEEAI_TERM_DATA__(${JSON.stringify(inferSession && inferSession.id)}, "done, summarizing")`,
+);
+await sleep(1400);
+const inferBack = await readAutoBoard();
+await emitAiLog({
+  agent: "codex",
+  sessionId: inferSession && inferSession.id,
+  cwd: "C:/work/infer",
+  instanceKey: "local|codex|C:/work/infer",
+  kind: "finished",
+  turn: "t-infer",
+  key: "log|rollout-infer.jsonl|t-infer",
+  atMs: Date.now(),
+  message: "这一轮结束了",
+  state: "finished",
+  activity: "这一轮结束了",
+});
+await sleep(1500);
+const inferEvent = await readAutoBoard();
+// 展开「最近完成」确认那张卡的文字（完成态默认折叠，不展开就看不到明细）
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ai-panel .ai-fold")]
+    .find((x) => (x.innerText || "").includes("最近完成"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(500);
+const inferEventOpen = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  return [...p.querySelectorAll(".ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / "));
+})()`);
+check(
+  "③ 第一手事件（本机日志：这一轮结束）到达 → 覆盖推断：卡片变「已完成」、推断标消失",
+  reinjected === true &&
+    inferBack.cards.some((c) => c.includes("推断 · 输出活动")) &&
+    inferEvent.secs.every((s) => !s.startsWith("运行中 1")) &&
+    inferEvent.folds.some((f) => f.includes("最近完成 1 项")) &&
+    inferEventOpen.some(
+      (c) => c.includes("infer") && c.includes("已完成") && !c.includes("推断 · 输出活动"),
+    ),
+  `注入=${reinjected} 覆盖前=${JSON.stringify(inferBack.cards).slice(0, 160)} 分区=${JSON.stringify(inferEvent.secs)} 折叠=${JSON.stringify(inferEvent.folds)} 卡片=${JSON.stringify(inferEventOpen).slice(0, 260)}`,
+);
+
+// 这一段的两张本机卡只服务上面的断言；清掉（含当前页面那份），别让后面的用例
+// 在打开 AI 面板刷新时凭空多出两张卡。
+await evaluate(`if (window.__ZEEAI_SCENARIO__) window.__ZEEAI_SCENARIO__.localTasks = [];`);
+await setScenario({ localTasks: [] });
 
 // ---------- (F3) 状态栏只留四件事：不含 UTF-8 / xterm-256color（§10.3） ----------
 const statusLine = await evaluate(
