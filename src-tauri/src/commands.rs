@@ -5,7 +5,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::core::{
-    adb, ai, ai_sessions, ai_tasks, elevate, git, herdr, highlight, paste as paste_core, pty,
+    adb, ai, ai_sessions, ai_tasks, elevate, git, herdr, highlight, paste as paste_core, proc, pty,
     remote_fs, serial, sftp, ssh, tmux, AiTaskRegistry, HerdrPaneRegistry, SessionEvent,
     SessionRegistry,
 };
@@ -783,7 +783,8 @@ async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
 /// 跑一次 scp，失败时把 stderr 原样带出来（方便前端显示为什么没传上去）。
 async fn run_scp(args: &[String]) -> Result<(), String> {
     let exe = ssh::scp_exe();
-    let mut cmd = tokio::process::Command::new(&exe);
+    // 统一收口：带 CREATE_NO_WINDOW，后台 scp 不闪控制台（见 core/proc.rs）
+    let mut cmd = proc::hidden_command_async(&exe);
     cmd.args(args);
     // 见 run_capture 上面的说明：一次性进程必须能"跟着未来一起被杀掉"
     cmd.kill_on_drop(true);
@@ -793,11 +794,6 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd
         .spawn()
         .map_err(|e| format!("启动 scp 失败（本机需要 OpenSSH 客户端）: {e}"))?;
@@ -832,7 +828,8 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
 /// 它们一直挂在服务器上占着连接，最后把 sshd 拖到"新连接被排队/丢弃"，
 /// 表现就是**点「新建 herdr 窗格」一直卡着**（用户截图那次）。
 async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new(program);
+    // 统一收口：带 CREATE_NO_WINDOW，一次性 ssh/git 不闪控制台（见 core/proc.rs）
+    let mut cmd = proc::hidden_command_async(program);
     cmd.args(args);
     cmd.kill_on_drop(true);
     // ★ 见上：spawn + wait_with_output 不会自动接管，必须显式 pipe，
@@ -840,12 +837,6 @@ async fn run_capture(program: &std::path::Path, args: &[String]) -> Result<Strin
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
-    // 关键：一次性 ssh 命令不能弹出控制台窗口（否则界面上会闪一个黑框甚至挡住操作）
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
     // 挂进 Job Object：App 退出/被强杀时不会留下孤儿 ssh
     if let Some(pid) = child.id() {
@@ -867,17 +858,12 @@ async fn run_capture_checked(
     program: &std::path::Path,
     args: &[String],
 ) -> Result<(bool, String), String> {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = proc::hidden_command_async(program);
     cmd.args(args);
     cmd.kill_on_drop(true);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd.spawn().map_err(|e| format!("执行命令失败: {e}"))?;
     if let Some(pid) = child.id() {
         crate::core::job::assign(pid);
@@ -2309,6 +2295,8 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     log::info!("ipc: open_in_explorer {path}");
     #[cfg(windows)]
     {
+        // 故意保留裸 Command::new：explorer.exe 就是要**显示窗口**的，
+        // 不属于"后台探测/查询"，不能套 hidden_command（见 core/proc.rs 的例外说明）。
         std::process::Command::new("explorer.exe")
             .arg(&path)
             .spawn()
@@ -2332,8 +2320,10 @@ pub fn open_external_url(url: String) -> Result<(), String> {
     log::info!("ipc: open_external_url {trimmed}");
     #[cfg(windows)]
     {
-        // 用 cmd 的 start 走默认浏览器；空标题参数是为了防止带引号的 URL 被当成窗口标题
-        std::process::Command::new("cmd")
+        // 用 cmd 的 start 走默认浏览器；空标题参数是为了防止带引号的 URL 被当成窗口标题。
+        // 这是"用户主动点开链接"，浏览器窗口该出来；但 cmd 自己不能闪一下控制台，
+        // 所以同样走 hidden_command（CREATE_NO_WINDOW 不影响 start 拉起浏览器）。
+        proc::hidden_command_quiet("cmd")
             .args(["/C", "start", "", trimmed])
             .spawn()
             .map_err(|e| format!("打开浏览器失败: {e}"))?;
@@ -2575,8 +2565,10 @@ fn system_proxy() -> Option<String> {
 }
 
 /// `reg query <key> /v <name>` 取最后一个字段（值）
+///
+/// 后台查询，统一走 `proc::hidden_command`（否则注册表探测会闪控制台）。
 fn reg_value(key: &str, name: &str) -> Option<String> {
-    let out = std::process::Command::new("reg")
+    let out = proc::hidden_command("reg")
         .args(["query", key, "/v", name])
         .output()
         .ok()?;
@@ -2600,17 +2592,12 @@ fn reg_value(key: &str, name: &str) -> Option<String> {
 /// 用它的场景：用户点了「PowerShell 7」但我们本机没装 `pwsh.exe` —— 那种情况下
 /// ConPTY 只会甩一句 "spawn failed"，不如提前说清"你没装 PowerShell 7"。
 fn program_on_path(name: &str) -> bool {
-    let mut cmd = std::process::Command::new("where");
-    cmd.arg(name);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    // 后台查询，统一走 `proc::hidden_command_quiet`（stdout/stderr 也丢掉，不闪控制台）
+    proc::hidden_command_quiet("where")
+        .arg(name)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 找系统的 curl.exe：先看 System32，再看 PATH。
@@ -2675,7 +2662,7 @@ fn run_curl_download(
     };
     let _ = std::fs::remove_file(&err_path);
 
-    let mut cmd = std::process::Command::new(curl);
+    let mut cmd = proc::hidden_command(curl);
     cmd.arg("-L")
         .arg("--fail")
         .arg("--silent")
@@ -2706,11 +2693,6 @@ fn run_curl_download(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
 
     on_progress(have, expected_size.max(have));
     let mut child = cmd.spawn().map_err(|e| format!("启动 curl 失败: {e}"))?;
@@ -2742,7 +2724,7 @@ fn run_curl_download(
 
 /// 用系统自带的 certutil 算 sha256（不引第三方加密库；certutil 从 Win7 起就有）
 fn sha256_of(path: &std::path::Path) -> Result<String, String> {
-    let out = std::process::Command::new("certutil")
+    let out = proc::hidden_command("certutil")
         .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
         .output()
         .map_err(|e| format!("调用 certutil 失败: {e}"))?;
@@ -3007,14 +2989,10 @@ pub async fn update_download_install(
     let script = apply_update_script(&kind, &dest, &log, &exe_path, pid);
     std::fs::write(&helper, script).map_err(|e| format!("写升级脚本失败: {e}"))?;
 
-    let mut cmd = std::process::Command::new("cmd");
+    // 升级脚本也是后台进程：统一走 proc::hidden_command_quiet（不闪黑框、输出丢掉；
+    // 脚本自己会写 apply_update.log）
+    let mut cmd = proc::hidden_command_quiet("cmd");
     cmd.args(["/C", &helper.to_string_lossy()]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：升级过程不闪黑框
-        cmd.creation_flags(0x0800_0000);
-    }
     let child = cmd.spawn().map_err(|e| format!("启动升级脚本失败: {e}"))?;
     log::info!("update: 升级脚本已启动 pid={}", child.id());
     // ★ 千万别把升级脚本挂进 Job Object。
@@ -3419,17 +3397,12 @@ pub fn herdr_pane_input_start(
     );
     // 用**标准库**的 Command：它的 ChildStdin 实现了 std::io::Write，
     // 这样"敲一个字"就是一次同步的小写入，不用为了几字节去 await 一个异步管道。
-    let mut c = std::process::Command::new(ssh::ssh_exe());
+    // 统一走 proc::hidden_command：常驻输入泵也不许弹控制台窗口。
+    let mut c = proc::hidden_command(ssh::ssh_exe());
     c.args(&args);
     c.stdin(std::process::Stdio::piped());
     c.stdout(std::process::Stdio::null());
     c.stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
     let mut child = c.spawn().map_err(|e| format!("启动输入通道失败: {e}"))?;
     // 跟着应用生命周期走：App 退出/被强杀时不会留下孤儿 ssh
     crate::core::job::assign(child.id());
@@ -3835,7 +3808,7 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
 
 /// 用 curl 取一小段文本（清单文件只有几十 KB）。失败时带出 curl 的原话。
 fn curl_text(curl: &std::path::Path, url: &str, timeout_secs: u64) -> Result<String, String> {
-    let out = std::process::Command::new(curl)
+    let out = proc::hidden_command(curl)
         .args([
             "-fsSL",
             "--connect-timeout",

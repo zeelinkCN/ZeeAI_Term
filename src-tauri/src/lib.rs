@@ -544,7 +544,8 @@ pub fn run() {
                         &format!("herdr workspace close '{ws}'"),
                         None,
                       );
-                      let _ = std::process::Command::new(crate::core::ssh::ssh_exe())
+                      // 后台探针：统一走 hidden_command，别让自检闪控制台
+                      let _ = crate::core::proc::hidden_command(crate::core::ssh::ssh_exe())
                         .args(&args)
                         .output();
                     }
@@ -587,13 +588,9 @@ pub fn run() {
               .join("platform-tools")
               .join("adb.exe");
             if adb.exists() {
-              let mut c = std::process::Command::new(&adb);
+              // 后台收尾命令：同样走 hidden_command（CREATE_NO_WINDOW）
+              let mut c = crate::core::proc::hidden_command(&adb);
               c.arg("kill-server");
-              #[cfg(windows)]
-              {
-                use std::os::windows::process::CommandExt;
-                c.creation_flags(0x0800_0000);
-              }
               let _ = c.output();
               log::info!("SELFTEST: 已顺手关掉 adb 守护进程（免得占着构建要用的 DLL）");
             }

@@ -16,7 +16,7 @@ use std::thread;
 use base64::Engine as _;
 
 use super::session::{SessionEvent, SessionHandle};
-use super::{herdr, job, pty, session_log::LogRegistry};
+use super::{herdr, job, proc, pty, session_log::LogRegistry};
 
 /// 起一条 herdr 流（观察窗 / 可写控制流共用）：ssh 跑在**管道**里，
 /// stdout 上的 JSON 帧解码后交给 `sink`；stdin 就是给 herdr 发指令的入口。
@@ -32,17 +32,13 @@ pub fn spawn<F>(
 where
     F: Fn(SessionEvent) + Send + Sync + 'static,
 {
-    let mut cmd = std::process::Command::new(program);
+    // 一次性/长驻的 ssh 都不该弹控制台窗口：统一走带 CREATE_NO_WINDOW 的入口
+    // （裸 Command::new 在 Windows 上会让 GUI 进程多一个黑窗，见 core/proc.rs）
+    let mut cmd = proc::hidden_command(program);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // 一次性/长驻的 ssh 都不该弹控制台窗口
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let mut child = cmd.spawn().map_err(|e| format!("启动 herdr 流失败: {e}"))?;
     // 跟着应用生命周期走：App 退出/被强杀时不留下孤儿 ssh
     job::assign(child.id());

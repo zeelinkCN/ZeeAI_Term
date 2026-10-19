@@ -94,6 +94,9 @@ where
         })
         .map_err(|e| format!("openpty failed: {e}"))?;
 
+    // 故意不走 core::proc::hidden_command：这里起的是**用户自己的终端**（ConPTY 里的
+    // shell / ssh），不是后台探测；它由我们的标签页承载。portable-pty 直接走 ConPTY，
+    // 本来也不经过 std/tokio 的 Command。
     let mut cmd = CommandBuilder::new(program);
     for a in args {
         cmd.arg(a);

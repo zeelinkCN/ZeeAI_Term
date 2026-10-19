@@ -16,6 +16,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::proc;
+
 /// 扫描窗口：只读文件最后这么多字节。
 ///
 /// 为什么不再用"截最后 40 万字节"：实测某条会话最后一次 `task_complete` 距文件尾已经有
@@ -611,9 +613,15 @@ pub fn parse_source(out: &str) -> AiSourceInfo {
 }
 
 /// 本机（Windows）探测：`where herdr` + `--version`
+///
+/// ⚠️ **这三个进程必须用 `proc::hidden_command` 起，不要改回裸 `Command::new`。**
+/// 这条探测属于"看板/面板轮询"的一部分（`ai_source_probe` 会被反复调用），
+/// 而我们是个没有控制台的 GUI 进程：Windows 上每起一个 console 子进程，只要少一个
+/// `CREATE_NO_WINDOW`，用户就会看到一次控制台黑窗 —— 这正是 0.1.12
+/// "启动后一直在弹本地终端"的根因之一（2026-10 真机报障）。
 pub fn local_source() -> AiSourceInfo {
     let mut info = AiSourceInfo::default();
-    let out = std::process::Command::new("where")
+    let out = proc::hidden_command("where")
         .arg("herdr")
         .output()
         .ok()
@@ -631,7 +639,7 @@ pub fn local_source() -> AiSourceInfo {
         return info;
     }
     info.herdr_path = first.clone();
-    if let Ok(v) = std::process::Command::new(&first).arg("--version").output() {
+    if let Ok(v) = proc::hidden_command(&first).arg("--version").output() {
         let text = String::from_utf8_lossy(&v.stdout);
         info.herdr_version = text
             .lines()
@@ -643,7 +651,11 @@ pub fn local_source() -> AiSourceInfo {
             .to_string();
     }
     // 协议号 / schema 指纹（和远端同一套判据）
-    if let Ok(out) = std::process::Command::new(&first).arg("api").arg("schema").output() {
+    if let Ok(out) = proc::hidden_command(&first)
+        .arg("api")
+        .arg("schema")
+        .output()
+    {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let l = line.trim();
