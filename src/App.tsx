@@ -278,15 +278,6 @@ const AI_TOOL_LABEL: Record<string, string> = {
   gemini: "Gemini CLI",
 };
 
-/**
- * 默认就摆出来的两个 AI 命令行工具。
- *
- * 用户反馈：面板上默认列了四种，后两种（Aider / Gemini CLI）他压根没听过，看着像噪音。
- * 所以**没装的、又不在这个名单里的就不显示**；真装了才出现 —— 那时候它代表
- * "你这台机器上确实有这个东西"，是有用的信息，不是噪音。
- */
-const DEFAULT_AI_TOOLS = new Set(["codex", "claude"]);
-
 function aiToolLabel(name: string): string {
   return AI_TOOL_LABEL[name] ?? name;
 }
@@ -1384,8 +1375,6 @@ export default function App() {
   const aiHandledTurns = useRef<Set<string>>(new Set());
   /// 这一轮跑完之后的产物（卡片下面那排文件名）
   const [aiArtifacts, setAiArtifacts] = useState<AiArtifact[]>([]);
-  /// 「AI 命令行工具」那段默认收起（上面看板才是主角）
-  const [toolListOpen, setToolListOpen] = useState(false);
   /// 「最近任务」默认只露 3 条，想看全部点一下展开（不在那小框里上下拖）
   const [timelineAll, setTimelineAll] = useState(false);
   /**
@@ -3172,29 +3161,6 @@ export default function App() {
   }, []);
 
   /** 在当前会话的终端里启动 AI（就是把命令敲进去，你能看到它跑） */
-  function aiStartTool(tool: string, isRun: boolean) {
-    const cur = sessionsRef.current.find((s) => s.id === activeId);
-    if (!cur) {
-      notify("先打开一个会话");
-      return;
-    }
-    // 注意：Windows 的 PowerShell / CMD 需要回车 \r 才会执行命令，
-    // 发 \n 只会得到续行提示符（Linux 下 \r 一样能提交）。统一用 \r。
-    void sessionWrite(cur.id, bytesToB64(new TextEncoder().encode(`${tool}\r`)));
-    aiWasRunning.current = true;
-    if (isRun) {
-      // 记一笔"App 自己启动的"——看板里这一层最准（开始时间/跑完与否都由 App 判）
-      const { env, server } = boardEnvOf(cur);
-      void aiTaskNoteStart(env, server, tool.trim(), tool.trim())
-        .then(() => {
-          void refreshBoard();
-        })
-        .catch(() => {});
-    }
-    // 启动只在状态栏留一行 —— 以前这里会弹一条通知，等于"每启动一次就打扰一次"
-    notify(`已在「${cur.title}」里启动 ${tool}（跑完/需要你时我才会提醒）`);
-  }
-
   /**
    * 干掉 WebView2 / Edge **自带的**右键菜单。
    * 用户看到的那些"刷新""从左到右书写""从右到左书写""语音"全都是浏览器菜单，
@@ -4218,14 +4184,17 @@ export default function App() {
     // 这条路上没有 bracketed paste，多行会被当成多次回车 —— 总比什么都不发生强。
     // 注意两点：
     //   1) 回车**必须一起写**（以前这里只写文本，于是"消息发出去了但没执行"）；
-    //   2) 正文与回车**分两次写、中间隔 40ms**：本地 ConPTY 会把挨着的两次写入合成
+    //   2) 正文与回车**分两次写、中间隔 200ms**：本地 ConPTY 会把挨着的两次写入合成
     //      同一次 read（真机实测：假 TUI 只收到一段 `正文 + \r`），远程 ssh 却是分开到的。
     //      隔开一点，本地和远程就一样了（见 Terminal.tsx 输入通道那段说明）。
+    //      为什么是 200ms：2026-10-20 在真 codex TUI v0.162.1 上实测，40ms / 80ms 一次都没提交
+    //      （回车被当成粘贴内容里的换行），200ms 连机器忙的时候也 4/4 稳定提交；
+    //      这条兜底路和 Terminal.tsx 的输入通道必须用同一个间隔，否则两条路行为不一致。
     void (async () => {
       try {
         await sessionWrite(session.id, bytesToB64(new TextEncoder().encode(text)));
         if (submit) {
-          await new Promise((r) => setTimeout(r, 40));
+          await new Promise((r) => setTimeout(r, 200));
           await sessionWrite(session.id, bytesToB64(new TextEncoder().encode("\r")));
         }
       } catch (e) {
@@ -6963,15 +6932,6 @@ export default function App() {
     return herdrMgrRows(profile, mgr).filter((r) => r.idle).length;
   }
 
-  /**
-   * 「AI 命令行工具」里要列哪些。
-   *
-   * 只默认摆 Codex CLI / Claude Code，别的**装了才显示**（见 DEFAULT_AI_TOOLS 的说明）。
-   */
-  function aiToolsVisible(tools: AiTool[]): AiTool[] {
-    return tools.filter((t) => t.installed || DEFAULT_AI_TOOLS.has(t.name));
-  }
-
   // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
   // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
   // 同一台机器来回切标签不会反复 ssh。
@@ -7052,7 +7012,7 @@ export default function App() {
             <button
               type="button"
               className={"act" + (aiPanelOpen ? " active" : "")}
-              title="AI Agent（探测/安装/启动 AI 命令行工具）"
+              title="AI 任务看板（需要你 / 运行中 / 最近完成）"
               onClick={() => setAiPanelOpen((v) => !v)}
             >
               <IconSpark size={22} />
@@ -9237,72 +9197,6 @@ export default function App() {
           </aside>
         )}
       </div>
-
-      {/* 「AI 命令行工具」不再占着整块空间：收成右下角一个小按钮，点了才展开。
-          展开的面板贴着右下角（不挡中间），再点一次或点空白就收起。 */}
-      {aiPanelOpen && activeSession?.profileId && (
-        <div className={"tool-dock" + (toolListOpen ? " open" : "")}>
-          {toolListOpen && (
-            <div className="tool-dock-body">
-              <div className="tool-dock-head">
-                <span className="grow">AI 命令行工具</span>
-                <span className="dim">
-                  {(aiState?.tools ?? []).filter((t) => t.installed).length} 个已安装
-                </span>
-              </div>
-              {aiToolsVisible(aiState?.tools ?? []).map((t) => {
-                    const running = aiState?.running.includes(t.name) ?? false;
-                    return (
-                      <div className="ai-tool" key={t.name}>
-                      <div className="ai-tool-line">
-                        <span className={"dot " + (running ? "ok" : t.installed ? "idle" : "off")} />
-                        <span className="grow ellipsis">{t.label}</span>
-                        <span className="dim">
-                          {running ? "运行中" : t.installed ? "已安装" : "未安装"}
-                        </span>
-                      </div>
-                      <div className="ai-tool-meta ellipsis" title={t.version || t.installCmd}>
-                        {t.version || t.installCmd}
-                      </div>
-                      <div className="ai-tool-actions">
-                        {!t.installed && (
-                          <span className="ai-install-hint">未安装 —— 先装</span>
-                        )}
-                        <button
-                          type="button"
-                          className={"mini-btn" + (t.installed ? " primary" : "")}
-                          title={
-                            t.installed
-                              ? "把启动命令敲进当前终端并回车，AI 跑完会通知你"
-                              : "把安装命令敲进当前终端并回车，进度你自己看"
-                          }
-                          disabled={!activeSession}
-                          onClick={() =>
-                            aiStartTool(t.installed ? t.runCmd : t.installCmd, t.installed)
-                          }
-                        >
-                          {t.installed ? "在终端启动" : "在终端安装"}
-                        </button>
-                      </div>
-                      </div>
-                    );
-                  })}
-              {!aiState && <div className="hint">正在探测这台服务器…</div>}
-            </div>
-          )}
-          <button
-            type="button"
-            className="tool-dock-btn"
-            title="AI 命令行工具（安装与在终端启动）"
-            onClick={() => setToolListOpen((v) => !v)}
-          >
-            {toolListOpen ? "▾" : "▴"} AI 工具
-            <span className="dim">
-              {(aiState?.tools ?? []).filter((t) => t.installed).length}
-            </span>
-          </button>
-        </div>
-      )}
 
       {/* 口径 docs/design-ai-board-v2.md §10.3：技术标识（编码 / 终端类型）收进悬停，
           状态栏只留：会话 · 连通性 · 需要你 · 传输 */}

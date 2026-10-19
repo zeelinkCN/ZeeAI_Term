@@ -2053,30 +2053,23 @@ if (process.env.ZEEAI_FE_DEBUG_BOARD) {
   );
   console.log("---- [debug] 假后端这一轮合出来的看板 ----\n" + dbg);
 }
-// 「AI 命令行工具」现在收在右下角：默认只剩一个小按钮，点开才展开
-const dockClosed = await evaluate(`(() => {
-  const b = document.querySelector(".tool-dock-btn");
-  return { found: !!b, open: !!document.querySelector(".tool-dock-body"), text: b ? (b.innerText || "").trim() : "" };
+// 右下角的「AI 工具 / AI 命令行工具」坞已经整体删掉：按钮、浮层、悬停提示都不该再出现。
+// 为什么要在真实渲染里查：这类入口很容易只删了 JSX、样式或状态里还留着一半。
+const dockGone = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  const titles = [...document.querySelectorAll("button")]
+    .map((b) => b.getAttribute("title") || "")
+    .filter((t) => t.includes("AI 工具") || t.includes("命令行工具"));
+  return {
+    dock: !!document.querySelector(".tool-dock, .tool-dock-btn, .tool-dock-body, .ai-tool, .ai-tool-line"),
+    text: (p ? p.innerText : document.body.innerText).includes("AI 工具"),
+    titles,
+  };
 })()`);
 check(
-  "「AI 命令行工具」默认收成右下角一个小按钮（不占看板空间）",
-  dockClosed.found && !dockClosed.open,
-  JSON.stringify(dockClosed),
-);
-await evaluate(`(() => {
-  const b = document.querySelector(".tool-dock-btn");
-  if (b) b.click();
-})()`);
-await sleep(400);
-const dockOpen = await evaluate(`(() => {
-  const body = document.querySelector(".tool-dock-body");
-  if (!body) return { open: false, tools: [] };
-  return { open: true, tools: [...body.querySelectorAll(".ai-tool-line .grow")].map((x) => (x.innerText || "").trim()) };
-})()`);
-check(
-  "点开后列出工具，且没装的 Aider / Gemini 不再摆出来",
-  dockOpen.open && !dockOpen.tools.some((t) => t.includes("Aider") || t.includes("Gemini")),
-  JSON.stringify(dockOpen),
+  "界面上找不到 AI 工具坞（右下角按钮 / 浮层 / 悬停提示都不存在）",
+  !dockGone.dock && !dockGone.text && dockGone.titles.length === 0,
+  JSON.stringify(dockGone),
 );
 
 const mgrOpened = await evaluate(`(() => {

@@ -300,7 +300,7 @@ export async function workspaceLoad(): Promise<string | null> {
   return invoke<string | null>("workspace_load");
 }
 
-/** 探测服务器上的 AI 命令行工具 */
+/** 探测服务器上的 AI CLI 进程 */
 export async function aiProbe(
   profileId: string,
   userOverride?: string | null,
@@ -333,7 +333,7 @@ export async function openAdminShell(shell: "powershell" | "cmd"): Promise<void>
 }
 
 /**
- * 记一笔「App 自己在某个会话里启动了某个 AI 工具」。
+ * 记一笔「App 自己在某个会话里启动了某个 AI 进程」。
  * 这是 AI 任务看板里最精确的一层信号（开始时间、跑完没跑完都由 App 自己判）。
  */
 export async function aiTaskNoteStart(
