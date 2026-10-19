@@ -32,9 +32,6 @@ import {
   aiTimelineClear,
   aiTimelineList,
   aiSourceProbe,
-  cliHealth,
-  cliHealthFix,
-  cliHealthSetFlag,
   herdrAgents,
   herdrInstall,
   herdrPanes,
@@ -120,29 +117,28 @@ import {
 import type {
   AdbDevice,
   AdbFile,
-  AiProbe,
-  AiTool,
   AiSessionSnapshot,
   AiArtifact,
   AiTask,
   AiActivity,
   AiAgentKind,
   AiCarrier,
+  AiEvidence,
   AiHerdrGroup,
   AiInstance,
   AiLedgerGroup,
+  AiLogSignal,
   AiRolloutGroup,
   AiState,
   BoardSources,
   HerdrAgent,
+  HerdrAgentsSnapshot,
   HerdrPane,
   HerdrServerStatus,
   HerdrWorkspaceScan,
   AiTurnRecord,
   AiSourceInfo,
   AppSettings,
-  CliFixReport,
-  CliHealth,
   ConnectionProfile,
   GitBranch,
   GitCommit,
@@ -464,60 +460,24 @@ function aiAgentLabel(a: AiAgentKind): string {
 }
 
 /**
+ * herdr 报的 agent 种类 → 界面文字。
+ *
+ * herdr 会给出我们枚举里没有的种类（opencode / qwen / …）。认不出来时**把 herdr 的原名
+ * 写出来**，而不是像看板卡片那样兜底成"未知工具" —— 红点提示里"哪台机器上的谁在等你"
+ * 必须能一眼认出来，写"未知工具"等于把这条信息丢了。
+ */
+function herdrAgentLabel(agent: string): string {
+  const known = aiAgentLabel(agent as AiAgentKind);
+  return known === "未知工具" && agent.trim() ? agent.trim() : known;
+}
+
+/**
  * 后端 `AiInstance.badge` 里已经带了"谁说的 / 多久前 / 能不能证明"，
  * 但没带"在哪儿" —— 悬停写"怎么得出的"时，第一句要能回答"这是哪台机器 / 哪个目录"。
  */
 function aiInstanceWhere(i: AiInstance): string {
   const parts = i.where.split(" · ");
   return parts.slice(0, 2).filter(Boolean).join(" · ");
-}
-
-/**
- * 承载健康（本机 CLI 那一档）**只在异常时出现**。
- *
- * 口径 §10.2 的原话是"承载健康只在异常时出现"，而这里的"异常"只有两种：
- * `installed-but-broken`（装了但起不来）和 `updating`（正在自更新，期间不接受输入）。
- *
- * 为什么 **`not-installed` 不算异常**：它只是"这台机器没装这个可选工具"，
- * 冒红点等于把"我没装 Aider"说成"出故障了" —— 用户会去修一个根本不存在的问题。
- * `unknown`（探测超时 / 没探）同理不冒：**没法证明的，不许说成事实**。
- */
-function cliHealthAnomaly(h: CliHealth): boolean {
-  return h.status === "installed-but-broken" || h.status === "updating";
-}
-
-/** 异常状态的短词（状态栏那一行 + 看板那一行的前缀） */
-function cliStatusWord(s: CliHealth["status"]): string {
-  switch (s) {
-    case "installed-but-broken":
-      return "起不来";
-    case "updating":
-      return "正在自更新";
-    case "not-installed":
-      return "没装";
-    default:
-      return "状态未知";
-  }
-}
-
-/** 这一条要不要给「重装」按钮（后端 `fix.kind` 说了算，前端不自己判症状） */
-function cliFixAction(h: CliHealth): "reinstall" | "add-flag" | null {
-  const k = h.fix?.kind;
-  if (!k) return null;
-  if (k.kind === "reinstall") return "reinstall";
-  if (k.kind === "add-flag") return "add-flag";
-  return null;
-}
-
-/**
- * 「换个启动参数」那个按钮要加的**参数原文**。
- *
- * 参数值来自后端（`fix.kind.value`，例如 `--no-daemon`）—— 前端**不写死**，
- * 免得以后后端换参数时界面还在显示旧的（那种"界面和实际不一致"最难查）。
- */
-function cliFlagOf(h: CliHealth): string {
-  const k = h.fix?.kind;
-  return k && k.kind === "add-flag" ? k.value : "--no-daemon";
 }
 
 /**
@@ -1390,41 +1350,6 @@ export default function App() {
   >([]);
   const [composerBusy, setComposerBusy] = useState(false);
 
-  // ---------- 本机 AI CLI 的承载健康（装了没 / 装了但坏了 / 正在自更新） ----------
-  /**
-   * 本机四个 agent 的探测结果。
-   *
-   * 判据全在后端（`core/cli_health.rs`，带 5 秒缓存）：前端只负责显示 —— 尤其
-   * **不许在这里自己判"这个报错算不算坏"**，那是同一件事的第二份实现。
-   */
-  const [cliList, setCliList] = useState<CliHealth[]>([]);
-  /** 正在探测（界面显示"正在探测本机 AI CLI…"，而不是显示上一次的旧结论） */
-  const [cliProbing, setCliProbing] = useState(false);
-  /** 「一键修」：等用户确认的那一条（`execCmd` 是**后端算出来的真正会跑的命令**） */
-  const [cliConfirm, setCliConfirm] = useState<CliFixReport | null>(null);
-  /** 「一键修」正在跑（安装要几分钟，期间按钮要禁用并说明在等什么） */
-  const [cliFixing, setCliFixing] = useState(false);
-  /** 「一键修」的结果（命令原文 + stdout/stderr 摘要），显示在承载健康那块里 */
-  const [cliFixResult, setCliFixResult] = useState<CliFixReport | null>(null);
-  /**
-   * 本机 CLI 的**异常**（起不来 / 正在自更新）—— 看板那块和状态栏那条都用它。
-   *
-   * 算一次、两处共用：状态栏那条文案（"一个"还是"N 个"）和看板那块的条数
-   * 必须是同一份事实，两处各 filter 一次迟早会不一致。
-   * `not-installed` **不在里面**（§10.2：没装只是"可选安装"，不是异常）。
-   */
-  const cliAnomalies = cliList.filter(cliHealthAnomaly);
-  /**
-   * 承载健康那一块（本机 CLI）的 DOM 锚点。
-   *
-   * 为什么要它：状态栏那条提示点一下要"**打开/定位到**承载健康那块" ——
-   * 面板可能没开、也可能已经开在很下面（时间线很长），光 `setAiPanelOpen(true)`
-   * 用户还是看不到那块。所以先开面板，下一帧再把它滚进视野。
-   */
-  const cliHealthRef = useRef<HTMLDivElement | null>(null);
-  /** 状态栏那条提示被点过：等面板渲染出来就去滚（见下面的 effect） */
-  const [cliFocusTick, setCliFocusTick] = useState(0);
-
   /**
    * Ctrl+Alt+A：展开 / 收起底部的 AI 输入窗（键盘党的入口）。
    * 用捕获阶段 + preventDefault：免得这个组合键被别处（终端/浏览器）先吃掉。
@@ -1692,90 +1617,6 @@ export default function App() {
     setAiNotices((prev) => [item, ...prev].slice(0, 20));
     // 只进状态栏 + AI 面板的列表，不弹中央 toast（那玩意儿挡视线）
     notify(text);
-  }
-
-  /**
-   * 收下后端探测的本机 CLI 健康结果。
-   *
-   * 为什么统一从这里进 state：`cli_health` 和"一键修跑完之后的重新探测"都要更新它，
-   * 而 `cli_health_fix` 的返回值里就带着新的 `health` —— 用同一个入口，
-   * 免得修完显示的还是旧结论（"点了没反应"那种）。
-   * 非数组一律忽略：宁可少一次刷新，也不能让面板渲染时炸掉。
-   */
-  function applyCliHealth(list: unknown) {
-    if (Array.isArray(list)) setCliList(list as CliHealth[]);
-  }
-
-  /** 探一次本机 CLI 健康（探测要起进程，后端有 5 秒缓存，20 秒轮询不心疼） */
-  async function refreshCliHealth() {
-    setCliProbing(true);
-    try {
-      applyCliHealth(await cliHealth());
-    } catch (e) {
-      // 探测失败**不清空**上一次结果：清空会让"异常那一块"忽闪忽闪的，比旧数据更烦人
-      console.warn("cli_health 失败：" + String(e));
-    } finally {
-      setCliProbing(false);
-    }
-  }
-
-  /**
-   * 「一键修」第一步：**只问"将要执行什么"，不起任何进程**。
-   *
-   * 界面上那句「将执行：<命令>」用的就是后端回给我们的 `execCmd` ——
-   * 显示的和真正会跑的是**同一个字符串**，不是前端自己拼的近似文案。
-   */
-  async function askCliReinstall(agent: string) {
-    if (cliFixing) return;
-    setCliFixResult(null);
-    try {
-      const r = await cliHealthFix(agent, false);
-      if (r.refused) {
-        // 白名单外（例如 aider 的 pip 命令）：我们不代跑，只把命令原文给他
-        setCliFixResult(r);
-        notify(r.message);
-        return;
-      }
-      setCliConfirm(r);
-    } catch (e) {
-      notify("取重装命令失败：" + String(e));
-    }
-  }
-
-  /** 「一键修」第二步：用户点过确认了，才真的跑（跑完顺手重新探测 + 刷新面板） */
-  async function runCliReinstall() {
-    const c = cliConfirm;
-    if (!c || cliFixing) return;
-    setCliFixResult(null);
-    setCliConfirm(null);
-    setCliFixing(true);
-    try {
-      const r = await cliHealthFix(c.agent, true);
-      setCliFixResult(r);
-      applyCliHealth(r.health);
-      // 状态栏只说结论；命令原文和 stdout/stderr 留在承载健康那块里给人看
-      notify(`${r.command} 重装：${r.ok ? "成功" : "失败"}（退出码 ${r.exitCode ?? "?"}）`);
-    } catch (e) {
-      notify("重装失败：" + String(e));
-    } finally {
-      setCliFixing(false);
-    }
-  }
-
-  /**
-   * 「以 `--no-daemon` 启动」：**只写设置，不跑安装、不动全局配置**。
-   *
-   * 存进去之后，下次由我们启动这个 CLI 时会带上这个参数（`run_cmd` 由后端拼好）。
-   */
-  async function applyCliFlag(agent: string, flag: string) {
-    try {
-      const r = await cliHealthSetFlag(agent, flag);
-      notify(`${r.command} 启动参数已记下：${r.flag}（下次我们从这里启动它时会带上）`);
-      // 立刻重探：`run_cmd` 变了，界面要让用户马上看见（后端这条路径不走 5 秒缓存）
-      await refreshCliHealth();
-    } catch (e) {
-      notify("记启动参数失败：" + String(e));
-    }
   }
 
   /** 会话 → 看板上的「环境 + 服务器」 */
@@ -8750,118 +8591,6 @@ export default function App() {
                 )}
               </div>
             ) : null}
-            {/* ---------- 承载健康 · 本机 AI CLI（第三档） ----------
-                「装了但起不来 / 正在自更新」是**本机**的承载异常，和上面 herdr 那条并列。
-                三条口径：
-                - **只在异常时出现**（§10.2）：正常的不占位置，`not-installed` 只是"没装这个
-                  可选工具"，不冒红（冒红 = 把"我没装 Aider"说成"出故障了"，用户会去修一个
-                  不存在的问题）；
-                - 一行的 `summary` 直接显示，`detail`（含 stderr 原文）**放进悬停** ——
-                  排查时能拿到证据，平时不占地方；
-                - 「重装」**必须先给用户看命令原文**（这个组件里的确认行），
-                  点确认才真的跑；跑完把 stdout/stderr 摘要留在下面。 */}
-            <div ref={cliHealthRef} id="cli-health-block">
-              {cliList.filter(cliHealthAnomaly).map((h) => {
-                const action = cliFixAction(h);
-                const pending = cliConfirm?.agent === h.agent;
-                return (
-                  <div key={h.agent + h.command} className="ai-cli-health">
-                    <div
-                      className="ai-source-line warn"
-                      title={`${h.detail || h.summary}\n\n（判据在后端：where + 跑一次 ${h.command} --version，证据原文就是上面这段）`}
-                    >
-                      {`承载健康 · ${h.command} ${cliStatusWord(h.status)} · ${h.summary}`}
-                    </div>
-                    <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                      {action === "reinstall" && (
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          disabled={cliFixing}
-                          title="先给你看要跑的那条命令，确认之后我才跑；跑完把输出摘要留在这里"
-                          onClick={() => void askCliReinstall(h.command)}
-                        >
-                          重装…
-                        </button>
-                      )}
-                      {action === "add-flag" && (
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          disabled={cliFixing}
-                          title={
-                            "只把「以 --no-daemon 启动」记进这个工具的启动参数：\n" +
-                            "下次我们从这里替你启动它时会带上。不动你的全局配置，\n" +
-                            "在别的终端里还是原来的用法。"
-                          }
-                          onClick={() => void applyCliFlag(h.command, cliFlagOf(h))}
-                        >
-                          以 {cliFlagOf(h)} 启动
-                        </button>
-                      )}
-                    </div>
-                    {pending && cliConfirm && (
-                      <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                        <span className="hint" title="这就是确认后真正会执行的那条命令">
-                          将执行：{cliConfirm.execCmd}
-                        </span>
-                        <button
-                          type="button"
-                          className="mini-btn danger"
-                          onClick={() => void runCliReinstall()}
-                        >
-                          确认执行
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => setCliConfirm(null)}
-                        >
-                          取消
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {cliFixing && (
-                <div className="ai-source-line" title="安装要几分钟，装完会自动重新探测">
-                  承载健康 · 正在跑重装命令，装完自动重新探测…
-                </div>
-              )}
-              {cliFixResult && (
-                <div className="ai-cli-fix-result">
-                  <div className="ai-tl-line">
-                    <span className="grow ellipsis" title={cliFixResult.message}>
-                      {cliFixResult.command} 重装：{cliFixResult.ok ? "成功" : "失败"}
-                      {cliFixResult.exitCode !== null && cliFixResult.exitCode !== undefined
-                        ? `（退出码 ${cliFixResult.exitCode}）`
-                        : ""}
-                    </span>
-                    <button
-                      type="button"
-                      className="mini-x"
-                      style={{ opacity: 1 }}
-                      title="收起这段输出"
-                      onClick={() => setCliFixResult(null)}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <div className="ai-cli-fix-cmd" title="这次实际执行的那条命令">
-                    {cliFixResult.execCmd}
-                  </div>
-                  {cliFixResult.output.trim() ? (
-                    <pre className="ai-cli-fix-out">{cliFixResult.output.trim().slice(0, 2000)}</pre>
-                  ) : (
-                    <div className="hint">
-                      {cliFixResult.refused ? "没有执行（我们不代跑这条命令）" : "这条命令没有输出"}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
             {/* 装了 herdr 时：服务的生命周期（停止会关掉它管着的所有窗格 → 二段确认）。
                 只在"当前会话那台机器"上给这个开关；正常运行时它是折叠的。
                 注意和上面那条互斥：有工作区要清理时先让用户清理（两行挤一起就不是"只在异常时出现"了）。 */}
@@ -9162,32 +8891,6 @@ export default function App() {
             所以这里**只有**「需要你」那一个 chip —— "AI 已完成" 不再单独占一个
             （完成已经在面板的「最近完成 N 项」里，三处各说一遍是这轮要收掉的乱）。
             点它 = 打开面板；needs-you 是唯一真正值得打断用户的事。 */}
-        {/* 承载健康 · 本机 CLI 异常：**状态栏也要说一句**，而且点得动。
-            为什么状态栏也要有：用户不一定开着看板 —— "codex 起不来"这种事
-            等他去翻面板就等于没人告诉他。`not-installed` 不算异常（§10.2），
-            所以这里只有"起不来 / 正在自更新"两种。 */}
-        {cliAnomalies.length > 0 && (
-          <button
-            type="button"
-            className="stat ai-need-chip"
-            title={
-              // 悬停给**完整证据**（detail 里有 stderr 原文 / 找到的路径）——
-              // 状态栏那一行只有几个字，排查时全靠这个悬停
-              `${cliAnomalies
-                .map((h) => `${h.command} ${cliStatusWord(h.status)} · ${h.summary}\n${h.detail || ""}`)
-                .join("\n\n")}\n\n点这里打开看板并定位到「承载健康」（能一键重装）`
-            }
-            onClick={() => {
-              setAiPanelOpen(true);
-              // 面板下一帧才渲染出来，滚到那块靠这个 tick（见上面那个 effect）
-              setCliFocusTick(Date.now());
-            }}
-          >
-            {cliAnomalies.length === 1
-              ? `${cliAnomalies[0].command} ${cliStatusWord(cliAnomalies[0].status)} · 查看`
-              : `本机 AI 工具异常 ${cliAnomalies.length} 个 · 查看`}
-          </button>
-        )}
         {aiNeedIds.length > 0 && (
           <button
             type="button"

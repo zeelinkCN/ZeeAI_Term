@@ -111,12 +111,9 @@ window.__ZEEAI_SCENARIO__ = {
     tabId: "w2:t1", workspaceId: "w2", title: "proj", focused: true, attention: true,
   }],
   tasks: [],
-  // 本机 CLI 健康：默认一条都没有（没异常 → 承载健康那块不出现，§10.2）
-  cliHealth: [],
-  cliLaunchArgs: {},
+  // 默认不拖慢；只有验「刷新」按钮的「探测中…」状态时才临时打开（见下面的 resolveCmd）
+  slowAi: false,
 };
-window.__ZEEAI_CLI_FIXED__ = [];
-window.__ZEEAI_CLI_FLAGS__ = [];
 window.__ZEEAI_SESSION__ = ${JSON.stringify({
   version: 1,
   savedAt: Date.now(),
@@ -453,50 +450,9 @@ const resolveCmd = (cmd, args) => {
       window.__ZEEAI_LAST_SOURCES__ = args && args.sources ? args.sources : {};
       return merged;
     }
-    // 本机 CLI 健康检查：**按场景回数据**（默认空 = 没有异常）。
-    // 真后端那份判据在 core/cli_health.rs（有单测兜着），这里只回它会给的形状。
-    case "cli_health": return S.cliHealth || [];
-    /**
-     * 一键修。
-     * - 没确认 → 只回"将执行什么"（一个进程都不起）——界面拿它显示确认框；
-     * - 确认了 → 模拟"装好了"：把那一项的状态改成 ok，并回新的 health。
-     * 另外把**真正执行过的命令**记到 __ZEEAI_CLI_FIXED__：断言"确认之后才跑、跑的是哪条"。
-     */
-    case "cli_health_fix": {
-      const agent = (args && args.agent) || "";
-      const want = (S.cliHealth || []).find((h) => h.command === agent) || { runCmd: agent };
-      const execCmd = agent === "aider"
-        ? "python -m pip install -U aider-chat"
-        : "npm install -g " + (agent === "codex" ? "@openai/codex" : agent === "claude" ? "@anthropic-ai/claude-code" : agent === "gemini" ? "@google/gemini-cli" : agent) + "@latest";
-      if (!(args && args.confirm)) {
-        if (agent === "aider") {
-          return { agent: agent, command: agent, execCmd: execCmd, ok: false, exitCode: null,
-            output: "", health: [], refused: true, needsConfirm: false,
-            message: "这条命令我们不代跑（" + execCmd + "）：它不在我们的白名单里，请把上面这条命令自己粘进终端执行。" };
-        }
-        return { agent: agent, command: agent, execCmd: execCmd, ok: false, exitCode: null,
-          output: "", health: [], refused: false, needsConfirm: true,
-          message: "将执行：" + execCmd + "（还没跑，等你确认）" };
-      }
-      window.__ZEEAI_CLI_FIXED__.push(execCmd);
-      const rest = (S.cliHealth || []).filter((h) => h.command !== agent);
-      S.cliHealth = rest;
-      return { agent: agent, command: agent, execCmd: execCmd, ok: true, exitCode: 0,
-        output: "added 1 package in 6s", health: rest, refused: false, needsConfirm: false,
-        message: execCmd + " 跑完了（退出码 0）" };
-    }
-    // 「以 --no-daemon 启动」：**只写设置**（真后端就是写进 settings.json 的 agentLaunchArgs），
-    // 不跑任何安装命令 —— 断言会看这里有没有被调用、以及 cli_health_fix 有没有被误调
-    case "cli_health_set_flag": {
-      const cmd = (args && args.agent) || "";
-      const flag = (args && args.flag) || "";
-      window.__ZEEAI_CLI_FLAGS__.push({ cmd: cmd, flag: flag });
-      const runCmd = flag ? cmd + " " + flag : cmd;
-      if (S.cliHealth) S.cliHealth = S.cliHealth.map((h) => (h.command === cmd ? Object.assign({}, h, { runCmd: runCmd }) : h));
-      return { agent: cmd, command: cmd, flag: flag, runCmd: runCmd,
-        note: "只影响我们从这里启动它的方式（下次用它启动时会带上）；没动你的全局配置，在别的终端里还是原来的用法。" };
-    }
-    case "ai_tasks_local": return [];
+    // 本机进程扫描：和真后端一样返回 AiTask[]。默认空 —— 需要验"本机卡片"的用例
+    // （例如按输出活动推断运行中）显式放 localTasks，和远端那条路分开，互不污染。
+    case "ai_tasks_local": return S.localTasks || [];
     case "ai_tasks_clear_finished": return null;
     case "ai_session_snapshot": return null;
     case "ai_task_artifacts": return [];
@@ -788,10 +744,9 @@ const setScenario = async (flags) => {
     // 覆盖设置（例如强制浅色主题）。**必须显式写 null**：注入脚本是累积的，
     // 少了这一条，下一个场景会继承上一个场景的主题。
     settingsPatch: null,
-    // 本机 CLI 健康（承载健康第三档）：**每轮显式重置成空数组** ——
-    // 注入脚本是累积的，上一个场景塞进去的"codex 起不来"会污染下一个场景
-    //（那种污染在这份文件里踩过不止一次：herdrNotInstalled / herdrScan 都栽过）。
-    cliHealth: [],
+    // 把一次 AI 探测拖慢（只给「刷新」按钮的中间态用例用）；每个场景显式归零，
+    // 否则下一段会一直慢 1.2 秒。
+    slowAi: false,
     // 看板 v2 的场景数据（前端只采集、后端合并 —— 假后端那份合并见 mockMergeBoard）。
     // ⚠️ herdrTasks / herdrScan **故意不在这里重置**：注入脚本是累积的，每轮都写 null
     //    会把前面场景放进去的任务清空（我踩过一次：D2 那条用例的卡片突然只剩 herdr 的）。
@@ -3492,205 +3447,6 @@ check(
     afterEsc.tabs.some((t) => t.includes(renamedTo)) &&
     !afterEsc.tabs.some((t) => t.includes("不该保存的名字")),
   JSON.stringify(afterEsc.tabs),
-);
-
-// ---------- (Z) 本机 AI CLI 的承载健康 + 一键修 ----------
-// 口径：承载健康**只在异常时出现**（§10.2）；`not-installed` 不算异常（不冒红）。
-// 这三段验的是前端那一侧：异常时看不看得见、状态栏那条点不点得动、
-// 「重装」是不是**先给命令原文再执行**、「换启动参数」是不是**只写设置**。
-const openAiPanel = async () => {
-  await evaluate(`(() => {
-    const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-    if (b) b.click();
-    return !!b;
-  })()`);
-  await sleep(2200);
-};
-
-// ① 异常（装了但起不来）→ 看板那块出现 + 状态栏有一条可点的提示
-await setScenario({ cliHealth: [MOCK_CLI_BROKEN] });
-await reload();
-const statusChip = await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
-    (x.innerText || "").includes("codex"));
-  return {
-    found: !!b,
-    text: b ? (b.innerText || "").trim() : "",
-    title: b ? (b.title || "") : "",
-    cli: JSON.stringify(window.__ZEEAI_SCENARIO__.cliHealth || null),
-  };
-})()`);
-check(
-  "本机 CLI 起不来时，状态栏出现一条可点的提示（例如「codex 起不来 · 查看」）",
-  statusChip.found && statusChip.text.includes("codex") && statusChip.text.includes("查看"),
-  JSON.stringify(statusChip).slice(0, 200),
-);
-check(
-  "那条提示的悬停里带着证据原文（stderr / 命令），点开看板就能重装",
-  statusChip.title.includes("Missing optional dependency") && statusChip.title.includes("点这里打开看板"),
-  JSON.stringify(statusChip),
-);
-// 点它 = 打开看板并定位到承载健康那块
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
-    (x.innerText || "").includes("codex"));
-  if (b) b.click();
-  return !!b;
-})()`);
-await sleep(1500);
-const panelHealth2 = await evaluate(`(() => {
-  const p = document.querySelector(".ai-panel");
-  if (!p) return { open: false, text: "" };
-  const line = [...p.querySelectorAll(".ai-cli-health .ai-source-line")].map((x) => (x.innerText || "").trim());
-  const anchor = document.getElementById("cli-health-block");
-  return {
-    open: true,
-    line: line,
-    lineTitle: anchor && anchor.querySelector(".ai-source-line") ? anchor.querySelector(".ai-source-line").title : "",
-    scrolled: anchor && anchor.closest(".ai-panel") ? anchor.closest(".ai-panel").scrollTop : -1,
-  };
-})()`);
-check(
-  "点状态栏那条 → 打开看板并出现「承载健康」那一块（异常才出现）",
-  panelHealth2.open && panelHealth2.line.length === 1 && panelHealth2.line[0].includes("codex 起不来"),
-  JSON.stringify(panelHealth2.line).slice(0, 200),
-);
-check(
-  "那一行的悬停里是证据原文（含 stderr）",
-  panelHealth2.lineTitle.includes("Missing optional dependency"),
-  panelHealth2.lineTitle.slice(0, 140),
-);
-check(
-  "没有异常时「承载健康」不出现（这里是异常场景，所以它必须出现）",
-  panelHealth2.line.length === 1 && panelHealth2.line[0].includes("承载健康"),
-  JSON.stringify(panelHealth2.line).slice(0, 160),
-);
-const cliShot = await shot("23-cli-health.png");
-
-// ② `not-installed` 不算异常：不冒红、不进承载健康
-await setScenario({ cliHealth: [MOCK_CLI_NOT_INSTALLED] });
-await reload();
-const notInstalled = await evaluate(`(() => {
-  const chip = [...document.querySelectorAll(".statusbar .ai-need-chip")].find((x) =>
-    (x.innerText || "").includes("claude"));
-  return { chip: !!chip, body: document.body.innerText.includes("承载健康 · claude 没装") };
-})()`);
-await openAiPanel();
-const panelNotInstalled = await evaluate(`(() => {
-  const p = document.querySelector(".ai-panel");
-  if (!p) return { open: false, cli: [] };
-  return { open: true, cli: [...p.querySelectorAll(".ai-cli-health")].length };
-})()`);
-check(
-  "「没装」不算异常：状态栏不冒红、看板里也没有承载健康那一块（§10.2）",
-  !notInstalled.chip && !notInstalled.body && panelNotInstalled.open && panelNotInstalled.cli === 0,
-  JSON.stringify(notInstalled) + " " + JSON.stringify(panelNotInstalled),
-);
-
-// ③ 「重装」：**先显示「将执行：<命令>」**，确认之后才真的调用执行命令
-await setScenario({ cliHealth: [MOCK_CLI_BROKEN] });
-await reload();
-await openAiPanel();
-const beforeFix = await evaluate(`(() => {
-  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
-    (x.innerText || "").includes("重装"));
-  return { btn: btn ? (btn.innerText || "").trim() : "", fixed: window.__ZEEAI_CLI_FIXED__.length };
-})()`);
-check(
-  "异常那条旁边有「重装」按钮（文案来自后端 fix.label 的语义）",
-  beforeFix.btn.includes("重装") && beforeFix.fixed === 0,
-  JSON.stringify(beforeFix),
-);
-await evaluate(`(() => {
-  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
-    (x.innerText || "").includes("重装"));
-  if (btn) btn.click();
-  return !!btn;
-})()`);
-await sleep(900);
-const fixArmed = await evaluate(`(() => {
-  const el = [...document.querySelectorAll(".ai-panel .ai-cli-health .hint")].find((x) =>
-    (x.innerText || "").includes("将执行"));
-  const hasConfirm = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].some((x) =>
-    (x.innerText || "").includes("确认执行"));
-  return {
-    text: el ? (el.innerText || "").trim() : "",
-    hasConfirm: hasConfirm,
-    fixed: window.__ZEEAI_CLI_FIXED__.length,
-    calls: window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "cli_health_fix").map((c) => c.args),
-  };
-})()`);
-check(
-  "点「重装」**先显示「将执行：<命令>」并且这一趟没有真的执行**（不得静默安装）",
-  fixArmed.text.includes("将执行") &&
-    fixArmed.text.includes("npm install -g @openai/codex@latest") &&
-    fixArmed.hasConfirm &&
-    fixArmed.fixed === 0 &&
-    fixArmed.calls.some((a) => a && a.confirm === false && a.agent === "codex"),
-  JSON.stringify(fixArmed).slice(0, 260),
-);
-await shot("24-cli-fix-confirm.png");
-await evaluate(`(() => {
-  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
-    (x.innerText || "").includes("确认执行"));
-  if (btn) btn.click();
-  return !!btn;
-})()`);
-await sleep(1400);
-const afterFix = await evaluate(`(() => {
-  const out = document.querySelector(".ai-panel .ai-cli-fix-out");
-  return {
-    fixed: window.__ZEEAI_CLI_FIXED__.slice(),
-    confirmCalls: window.__ZEEAI_CALLARGS__.filter((c) => c.cmd === "cli_health_fix" && c.args && c.args.confirm === true).map((c) => c.args.agent),
-    output: out ? (out.innerText || "").trim() : "",
-    stillBroken: [...document.querySelectorAll(".ai-panel .ai-cli-health")].length,
-  };
-})()`);
-check(
-  "确认之后才真的执行，跑完把输出回显、并重新探测刷新状态",
-  afterFix.fixed.includes("npm install -g @openai/codex@latest") &&
-    afterFix.confirmCalls.includes("codex") &&
-    afterFix.output.includes("added 1 package") &&
-    afterFix.stillBroken === 0,
-  JSON.stringify(afterFix).slice(0, 300),
-);
-await shot("25-cli-fix-done.png");
-
-// ④ 「以 --no-daemon 启动」：**只写设置，不跑安装**
-await setScenario({ cliHealth: [MOCK_CLI_NO_DAEMON] });
-await reload();
-await openAiPanel();
-const beforeFlag = await evaluate(`(() => {
-  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
-    (x.innerText || "").includes("--no-daemon"));
-  return {
-    btn: btn ? (btn.innerText || "").trim() : "",
-    title: btn ? (btn.title || "") : "",
-    flags: window.__ZEEAI_CLI_FLAGS__.length,
-  };
-})()`);
-await evaluate(`(() => {
-  const btn = [...document.querySelectorAll(".ai-panel .ai-cli-health button")].find((x) =>
-    (x.innerText || "").includes("--no-daemon"));
-  if (btn) btn.click();
-  return !!btn;
-})()`);
-await sleep(1200);
-const afterFlag = await evaluate(`(() => ({
-  flags: window.__ZEEAI_CLI_FLAGS__.slice(),
-  fixed: window.__ZEEAI_CLI_FIXED__.slice(),
-  called: window.__ZEEAI_CALLS__.filter((c) => c === "cli_health_set_flag").length,
-  fixCalled: window.__ZEEAI_CALLS__.filter((c) => c === "cli_health_fix").length,
-}))()`);
-check(
-  "「以 --no-daemon 启动」只写设置（cli_health_set_flag），不跑任何安装命令",
-  beforeFlag.btn.includes("--no-daemon") &&
-    beforeFlag.title.includes("不动你的全局配置") &&
-    afterFlag.called > 0 &&
-    afterFlag.fixCalled === 0 &&
-    afterFlag.flags.some((f) => f.cmd === "gemini" && f.flag === "--no-daemon") &&
-    afterFlag.fixed.length === 0,
-  JSON.stringify(afterFlag).slice(0, 260),
 );
 
 // ---------- (Z2) SSH 表单：留空 = 交给 ~/.ssh/config，文案要说清 ----------

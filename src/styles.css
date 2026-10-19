@@ -1191,51 +1191,6 @@ body {
   color: var(--yellow);
 }
 
-/* ---------- 承载健康 · 本机 AI CLI（异常时才出现，§10.2） ---------- */
-
-/*
- * 每一条异常自带"结论 + 一两个按钮"。
- * `:first-child` 给一条上边距：它紧挨着上面 herdr 那一块，不加就贴在一起分不清谁是谁。
- */
-.ai-cli-health:first-child {
-  margin-top: 4px;
-}
-
-/*
- * 「一键修」跑完之后的输出回显。
- *
- * 为什么要给最大高度 + 自己滚：npm 装失败时能吐几百行（`npm ERR!` 一堆栈），
- * 整段铺开会把看板挤没 —— 但用户排查时又必须能看到原文。
- */
-.ai-cli-fix-result {
-  padding: 4px 12px 8px;
-  border-bottom: 1px solid var(--border);
-}
-
-/* 这次实际执行的那条命令（等宽字体：命令原文里空格/参数要看得清） */
-.ai-cli-fix-cmd {
-  font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 11px;
-  color: inherit;
-  padding: 2px 0 4px;
-  overflow-wrap: anywhere;
-}
-
-.ai-cli-fix-out {
-  max-height: 160px;
-  overflow: auto;
-  margin: 0;
-  padding: 6px 8px;
-  font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--muted);
-  background: var(--panel-2);
-  border-radius: 4px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
 .ai-timeline {
   display: flex;
   flex-direction: column;

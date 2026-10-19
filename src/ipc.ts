@@ -22,9 +22,6 @@ import type {
   AiArtifact,
   AiInstance,
   BoardSources,
-  CliHealth,
-  CliFixReport,
-  CliFlagReport,
   HighlightRule,
   HerdrAgent,
   HerdrPane,
@@ -386,35 +383,6 @@ export async function aiTasksClearFinished(env: string, server: string): Promise
  */
 export async function aiInstances(sources: BoardSources): Promise<AiInstance[]> {
   return invoke<AiInstance[]>("ai_instances", { sources });
-}
-
-/**
- * 本机 AI CLI 的健康检查（装了没 / 装了但坏了 / 正在自更新）。
- *
- * 判据全在后端（`core/cli_health.rs`）：前端只显示 `summary` 和 `fix.label`，
- * 不自己判"这个 stderr 是什么意思"——同一件事两份实现必然走偏。
- */
-export async function cliHealth(): Promise<CliHealth[]> {
-  return invoke<CliHealth[]>("cli_health");
-}
-
-/**
- * 「一键修」：重装一个本机 agent CLI。
- *
- * `confirm = false` 时**只回"将要执行什么"**（一个进程都不起）—— 界面拿它来显示
- * 「将执行：<命令>」那个确认框；用户点了确认再带 `confirm = true` 调一次。
- * 命令原文由后端按白名单拼，前端没有传命令的入口。
- */
-export async function cliHealthFix(agent: string, confirm: boolean): Promise<CliFixReport> {
-  return invoke<CliFixReport>("cli_health_fix", { agent, confirm });
-}
-
-/**
- * 「以 `--no-daemon` 启动」：只把参数记进设置（存在后端），**不跑安装、不动全局配置**。
- * 下次由我们启动这个 CLI 时会带上它。
- */
-export async function cliHealthSetFlag(agent: string, flag: string): Promise<CliFlagReport> {
-  return invoke<CliFlagReport>("cli_health_set_flag", { agent, flag });
 }
 
 /**

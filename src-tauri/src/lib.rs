@@ -691,11 +691,6 @@ pub fn run() {
       commands::ai_task_artifacts,
       // 看板 v2 §10：统一「AI 实例」模型（前端把已采集的数据送进来，合并/判状态在后端做）
       commands::ai_instances,
-      commands::cli_health,
-      // 本机 CLI 的「一键修」：重装（二次确认 + 白名单 + 输出回显）/
-      // 只把「以 --no-daemon 启动」记进设置（不跑安装、不动全局配置）
-      commands::cli_health_fix,
-      commands::cli_health_set_flag,
       commands::ai_timeline_list,
       commands::ai_timeline_add,
       commands::ai_timeline_clear,

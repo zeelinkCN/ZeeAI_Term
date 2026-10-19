@@ -331,16 +331,6 @@ pub struct Settings {
     /// 默认开：那样"我粘对了没有"不用靠猜 —— 粘贴的语义就是"现在就发"，
     /// 发错了得能立刻看出来。走输入窗时不需要它（那边附件是常驻缩略图）。
     pub paste_toast: bool,
-    /// 本机 agent CLI 的**额外启动参数**（命令名 → 参数表，例如 `codex` → `["--no-daemon"]`）。
-    ///
-    /// 为什么存在这里：cli_health 认出"守护进程起不来（os error 5）"时官方建议 `--no-daemon`，
-    /// 但我们**不去改用户的全局配置**（那会影响他所有终端里的用法）—— 只记住
-    /// "**我们自己**启动这个 CLI 时**多带一个参数**"，并在界面上说清这一点。
-    ///
-    /// 值只能是白名单里的参数（见 `commands::cli_health_set_flag`），
-    /// 因为它最终会被拼进"在终端里启动"那条命令。
-    #[serde(default)]
-    pub agent_launch_args: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -399,9 +389,6 @@ impl Default for Settings {
             // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
             // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
             paste_toast: false,
-            // 一个都没有：我们默认**不动**用户装好的 CLI 的启动方式，
-            // 只有他点了「以 --no-daemon 启动」才记进去
-            agent_launch_args: std::collections::HashMap::new(),
         }
     }
 }
