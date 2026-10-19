@@ -20,8 +20,6 @@ import {
   adbPush,
   adbRm,
   adbMkdir,
-  aiProbe,
-  aiTaskNoteStart,
   aiTasksClearFinished,
   aiTasksLocal,
   aiTasksRemote,
@@ -1181,7 +1179,8 @@ export default function App() {
    * 最近一次采集到的**原始来源**（rollout 快照 / 这一轮的产物）。
    *
    * 为什么要留一份：`refreshBoard` 把它们当 `BoardSources` 送回后端（那边才能算陈旧、
-   * 才能把 rollout 认领到某个实例上）；而快照是 10 秒一采、看板是 20 秒一刷，两者不同步。
+   * 才能把 rollout 认领到某个实例上）；而快照和看板是**同一次手动刷新里先后采集**的
+   * （先快照、后看板，见 `refreshAiPanel`），时间上对得上。
    */
   const snapshotRef = useRef<{
     session: OpenSession;
@@ -1195,11 +1194,26 @@ export default function App() {
   /** 正在探测（点那行来源时要给反馈，否则"没变化"会被当成"没生效"） */
   const [aiSourceProbing, setAiSourceProbing] = useState(false);
   /**
+   * 手动点「刷新」后这一整轮探测是否还在跑（按钮上显示「探测中…」）。
+   *
+   * 注意它只是**一次点击的进度**，不是定时器：跑完立刻恢复成「刷新」。
+   */
+  const [aiRefreshing, setAiRefreshing] = useState(false);
+  /** 防连点（state 更新是异步的，连点两下会在同一个 tick 里各跑一遍） */
+  const aiRefreshBusy = useRef(false);
+  /**
+   * 有没有真的探测过「状态来源」。
+   *
+   * 为什么要单独记：以前面板一打开就自动探，所以「aiSource === null」可以等同于
+   * "探了但没连上"；现在只在用户点「刷新」时才探 —— 没点过就显示「探测失败」是在冤枉人。
+   */
+  const [aiSourceProbed, setAiSourceProbed] = useState(false);
+  /**
    * 每台机器探测一次就记住（key = profileId / 本地终端类型）。
    *
-   * 为什么不用定时节流：这台机器装没装 herdr 不会自己变，而"装/不装"只有三种触发时机 ——
-   * 打开面板、切到另一台服务器、用户自己点了重探。所以**缓存就够了，不需要时间窗口**：
-   * 换会话、重开面板都不会再 ssh 一次；想刷新就点那行来源。
+   * 为什么不用定时节流：这台机器装没装 herdr 不会自己变，而"装/不装"只在
+   * 用户打开「新建会话」、点「刷新」、或点「重试/重探」时才需要知道。
+   * 所以**缓存就够了，不需要时间窗口**：换会话、重开面板都不会再 ssh 一次。
    */
   const aiSourceCache = useRef<Map<string, AiSourceInfo>>(new Map());
   /** 各服务器有没有可用的 herdr（「新建会话」里据此决定 herdr 能不能勾） */
@@ -1207,7 +1221,8 @@ export default function App() {
   /**
    * `herdrAvail` 的 ref 镜像。
    *
-   * 为什么必须有：`refreshBoard` 是"定时器里跑起来的长流程"，它读到的是**那一次渲染的闭包**。
+   * 为什么必须有：`refreshBoard` 会在「刷新」和启动 AI 等多个异步流程里跑，
+   * 它读到的是**那一次渲染的闭包**。
    * 只用 state 的话，探针刚回来的结果它看不见 —— 于是会**反复**去探、反复排队重刷
    * （我第一版就是这样，直接把界面刷成死循环；无头测试当场抓住了）。
    * 探测/缓存/安装都同时更新这份 ref，读的人永远看到最新值。
@@ -1589,29 +1604,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settingsReady]);
 
-  // ---------- 右侧 AI 面板：探测 / 安装 / 启动 / 完成通知 ----------
-  async function refreshAi() {
-    const cur = sessionsRef.current.find((s) => s.id === activeId);
-    if (!cur?.profileId) {
-      setAiState(null);
-      return;
-    }
-    try {
-      const probe = await aiProbe(cur.profileId, cur.user ?? null);
-      setAiState(probe);
-      // 进程消失只是"粗信号"：现在只写一行状态栏，不再当通知弹（真正的"跑完了"
-      // 由会话日志里的 task_complete 负责，见 refreshSnapshot）
-      const running = probe.running.length > 0;
-      if (aiWasRunning.current && !running) {
-        notify(`「${cur.title}」的 AI 进程已经退出`);
-      }
-      aiWasRunning.current = running;
-    } catch (e) {
-      setAiState(null);
-      console.warn("ai_probe 失败：" + String(e));
-    }
-  }
-
+  // ---------- 右侧 AI 面板：看板 / 完成通知 ----------
   function pushAiNotice(text: string) {
     const item = { id: uid(), text, time: Date.now() };
     setAiNotices((prev) => [item, ...prev].slice(0, 20));
@@ -1635,7 +1628,7 @@ export default function App() {
    * 本机进程表。几条必须守住的取舍：
    * - WSL 里的进程从 Windows 侧看不见（只有 wslhost/vmmem），所以交给后端**进 WSL 里查**；
    * - CMD 没有脚本钩子 → 只给「仅状态」，不为它扫全进程表；
-   * - Windows 全进程表扫描偏重 → 只有真有本机会话时才调，而且 20 秒才一次；
+   * - Windows 全进程表扫描偏重 → 只有真有本机会话时才调，而且手动刷新最多 60 秒一次；
    * - 卡片上只给「运行中 / 已结束 + 耗时」，**不做进度条**（TUI 没有百分比可拿）。
    */
   /**
@@ -1798,7 +1791,7 @@ export default function App() {
         const src = herdrAvailRef.current[s.profileId];
         if (src === undefined) {
           // 第一次遇到这台机器：探测是异步的，这一轮看板还拿不到 herdr 的 agent。
-          // 探完再补刷一次，不然用户要盯着"暂无运行中的 AI"等下一个 20 秒周期。
+          // 探完再补刷一次，不然这一次「刷新」里就少一台机器的 herdr 状态。
           const pid0 = s.profileId;
           jobs.push(
             probeHerdrFor(s.profileId, s.user).then(() => {
@@ -1973,7 +1966,7 @@ export default function App() {
    * 第一手），没装就用我们自己的进程扫描 + 日志解析（第二手）。
    *
    * 只读探测（跑 `herdr --version` / `agent list`），**不启动、不安装、不改远程任何东西**。
-   * 装没装这种事不会天天变，所以 5 分钟最多探一次。
+   * 装没装这种事不会天天变，所以按机器缓存（同一进程内不重复 ssh；点「刷新」时强制重探）。
    */
   async function refreshAiSource(force = false) {
     const cur = sessionsRef.current.find((s) => s.id === activeId);
@@ -2008,6 +2001,8 @@ export default function App() {
       if (cur.profileId) rememberHerdrAvail(cur.profileId, null);
       if (force) notify("探测 herdr 失败，已按「没有 herdr」处理");
     } finally {
+      // 探过（不管成没成）才允许界面说"探测失败"；没点过刷新时这块不出现
+      setAiSourceProbed(true);
       setAiSourceProbing(false);
     }
   }
@@ -2384,7 +2379,7 @@ export default function App() {
         null,
       );
       setAiSnapshot(snap);
-      // 留给 `refreshBoard` 当 rollout 观测（看板 20 秒一刷、快照 10 秒一采，两者不同步）
+      // 留给 `refreshBoard` 当 rollout 观测（手动刷新时先采快照、再刷看板）
       if (snap) snapshotRef.current = { session: cur, snapshot: snap, artifacts: [] };
       else snapshotRef.current = null;
       // 同样要"算到真正在跑 AI 的那个窗口头上"：当前窗口可能是普通 shell，
@@ -2453,7 +2448,7 @@ export default function App() {
   }
 
   /**
-   * 顺带盯一下**其它开着的会话**（30 秒一次）。
+   * 顺带看一眼**其它开着的会话**（只在手动刷新时跑一次）。
    * 这样你切到 ADB / CMD / 别的服务器上干活时，一样能收到"那个 AI 已经干完了"的提示。
    */
   async function refreshOtherSnapshots() {
@@ -2477,6 +2472,47 @@ export default function App() {
       } catch {
         // 单个会话读不到（没跑过 Codex / 网络抖动）不影响其它
       }
+    }
+  }
+
+  /**
+   * 手动刷新 AI 面板：**只有用户点「刷新」时才跑这一遍**。
+   *
+   * 用户明确要求「把这个功能去掉算了，不探测了，影响电脑性能」，最后确认的口径是
+   * 「保留手动刷新，按钮就叫做刷新」。所以原来挂在 App 里的四个常驻定时器
+   * （8s 的 ai_probe、10s + 30s 的会话快照、20s 的看板扫描）全部删掉了 ——
+   * 以前面板关着也每个周期起子进程（本机枚举进程 / 远端 ps、tmux / herdr agent list），
+   * 那正是用户感觉"影响电脑性能"的来源。
+   *
+   * 顺序：先刷当前会话的 rollout 快照（`refreshBoard` 会把它当 rollouts 来源），
+   * 再刷看板；状态来源 / 服务状态 / 时间线互不依赖，并行跑，失败互不影响。
+   * 这里不做任何自动触发（面板打开、启动应用、切会话都不会自动走到这里）。
+   *
+   * ⚠️ **红点与手动刷新彻底解耦**（§10.6 + 用户 2026-10-20 的口径）：
+   * 这条路径只更新卡片/看板，**不得**调用任何"设置红点"的代码 —— 手动刷新得到的是
+   * 一次性快照，把它变成红点就是伪信号（用户原话："手动刷新出现红点这种宁可不要"）。
+   * 红点由本机日志信号（`applyAiLogSignal`）独立驱动。
+   *
+   * ⚠️ 以后真要加新的探测命令：后端一律走 `core/proc.rs` 的 `hidden_command`
+   * （CREATE_NO_WINDOW），别再改回裸 `Command::new` —— 那会反复弹控制台黑框。
+   */
+  async function refreshAiPanel() {
+    if (aiRefreshBusy.current) return;
+    aiRefreshBusy.current = true;
+    setAiRefreshing(true);
+    try {
+      await Promise.all([
+        // true = 用户这次点刷新就**强制重探**，不吃"同一进程内只探一次"的缓存
+        refreshAiSource(true),
+        refreshHerdrServer(),
+        loadTimeline(),
+      ]);
+      await refreshSnapshot();
+      await refreshOtherSnapshots();
+      await refreshBoard();
+    } finally {
+      aiRefreshBusy.current = false;
+      setAiRefreshing(false);
     }
   }
 
@@ -2524,7 +2560,7 @@ export default function App() {
     // 两个标签拿到的是**同一份** rollout 快照（快照是"那台机器上最新的 rollout"，跟标签无关），
     // 而"处理过没有"如果按标签记，两个标签就会各记一条 —— 时间线上出现两条一模一样的记录
     // （用户实测截图证实：两条只差 sessionTitle 一个字段）。
-    // 同一个毛病还会让"等你批准"每 10 秒重复提醒一次（红点数字自己往上涨的老问题）。
+    // 同一个毛病还会让"等你批准"在以前每 10 秒重复提醒一次（那是定时器时代红点数字自己往上涨的老问题）。
     const server = boardEnvOf(cur).server;
     const turnKey = `${snap.sessionId || server}|${snap.lastTurnCompletedAt}|${snap.lastMessage.length}`;
     // 第一次拿到**这个会话**的快照时只记下来，不提醒（否则一开应用就会把上一轮翻出来弹）
@@ -2637,48 +2673,37 @@ export default function App() {
     }
   }
 
-  // 面板打开时探测一次，之后每 8 秒刷一次（既看安装状态，也看有没有跑完）
-  useEffect(() => {
-    if (!aiPanelOpen) return;
-    void refreshAi();
-    // 不带 force：命中缓存就不再 ssh（同一台机器一个进程里只探一次）
-    void refreshAiSource();
-    // herdr 服务状态（装了 ≠ 在跑），面板打开时一起刷
-    void refreshHerdrServer();
-    // 本机 CLI 健康（承载健康那一块的第三档：装了但坏了 / 正在自更新）。
-    // 跟着面板一起刷：异常要能自己冒出来，不能等用户去点刷新。
-    void refreshCliHealth();
-    // 时间线是**重活**（读落盘文件），跟首帧抢主线程不值得 —— 推迟到主线程空下来再做。
-    deferUntilIdle(() => {
-      void loadTimeline();
-    });
-    const t = window.setInterval(() => void refreshAi(), 8000);
-    return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aiPanelOpen, activeId]);
+  // ---------- AI 探测：没有任何定时器，只有手动「刷新」 ----------
+  //
+  // 用户明确要求「把这个功能去掉算了，不探测了，影响电脑性能」，最后确认的口径是
+  // 「保留手动刷新，按钮就叫做刷新」。这里以前挂着四个常驻定时器：
+  //   · 8s 的 `refreshAi`（ai_probe：本机/远端有没有 AI 进程在跑）
+  //   · 10s 的 `refreshSnapshot` + 30s 的 `refreshOtherSnapshots`（读 rollout / 日志）
+  //   · 20s 的 `refreshBoard`（远端 ps、tmux + 本机进程表枚举）
+  // 它们每一轮都会起子进程，而且面板关着也照跑 —— 那正是"影响电脑性能"的来源。
+  //
+  // 现在全部删掉：AI 面板/看板只在用户点标题栏「刷新」时走一次 `refreshAiPanel`。
+  // 启动应用、打开面板都不会自动探测；切会话时那次 herdr 服务状态探测是状态条
+  // 要用的另一条链路（见下面切 herdr 会话的 effect），不属于看板轮询。
+  //
+  // **保留的自动链路只有两条**，而且都在 Rust 侧（前端一个定时器都没有）：
+  //   ① 本机 codex rollout 日志：`core/ai_log_watch.rs`，2.5 秒 stat 一次、只读文件、
+  //      不起子进程 → `zeeai://ai-log`（红点 + 卡片增量）；
+  //   ② herdr 窗格状态：`core/ai_herdr_dots.rs`，只对勾了 herdr 的服务器、60 秒一轮
+  //      查 `herdr agent list`（用户 2026-10-20 批准），失败静默 →
+  //      `zeeai://ai-log`（红点）+ `zeeai://herdr-agents`（卡片全量快照）。
+  // 两条都**不会多起探测**：用的就是上面那几个既有命令的结果，前端只负责画。
+  // ⚠️ 不要在这里加回任何 setInterval / 启动时自动探测；要加探测先问用户（§10.8）。
 
   // 打开 AI 面板 = 你已经看到了 → 清掉「跑完停下」那几条未读（§10.6 规则②）。
   // ⚠️ 只清这一种：**「需要你」的红点亮到你处理为止**，打开面板不算处理
-  // （那条由 `applyBoardAlerts` 按当前快照重算，这里碰它就会变成"点开就消失"）。
+  // （那条由后端的 `resolved` 信号清，这里碰它就会变成"点开就消失"）。
+  // 清的是整个 `aiPendingFinish`，所以本机日志和 herdr 两条来源的 `finished` **一起清** ——
+  // 对用户来说"面板打开了"就是看过了，不需要分来源记两套未读。
   useEffect(() => {
+    aiPanelOpenRef.current = aiPanelOpen;
     if (aiPanelOpen) setAiPendingFinish([]);
   }, [aiPanelOpen, activeId]);
-
-  /**
-   * 状态栏那条「codex 起不来 · 查看」被点过之后，把承载健康那一块滚进视野。
-   *
-   * 为什么不用 `scrollIntoView`：那会把**整页**一起滚（我们要的是"面板里滚到那块"），
-   * `block: "nearest"` 也会带动外层滚动容器。所以直接改面板自己的 `scrollTop`，只动它一个。
-   * `cliFocusTick` 是触发器：点的那一帧才 setAiPanelOpen(true)，下一帧 DOM 里才有那块。
-   */
-  useEffect(() => {
-    if (!cliFocusTick || !aiPanelOpen) return;
-    const el = cliHealthRef.current;
-    const panel = el?.closest(".ai-panel") as HTMLElement | null;
-    if (!el || !panel) return;
-    // 往上留 60px 余量：正好贴顶反而看不到"这一块是从哪开始的"
-    panel.scrollTop = Math.max(0, el.offsetTop - 60);
-  }, [cliFocusTick, aiPanelOpen]);
 
   /**
    * 「新建会话」对话框里**只要选中了某台服务器**就探一下她那台机器有没有 herdr。
@@ -2694,56 +2719,6 @@ export default function App() {
     void probeHerdrFor(pid, newDialog?.user);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newDialog?.profileId]);
-
-  /**
-   * 盯当前会话的日志 —— **面板关着也要盯**。
-   * 之前这个轮询挂在"面板打开"的 effect 里，所以你收起面板跑任务时，
-   * "跑完了/有新消息/产出文件"根本没人提醒（这就是"为什么没提示我看那个 Markdown"的主因之一）。
-   */
-  useEffect(() => {
-    // 首次快照（通知的主判据）也挪到首帧之后：它要读 rollout 文件，压首屏不值当。
-    deferUntilIdle(() => {
-      void refreshSnapshot();
-      startupMark("idle tasks done");
-    });
-    const t = window.setInterval(() => void refreshSnapshot(), 10000);
-    const t2 = window.setInterval(() => void refreshOtherSnapshots(), 30000);
-    return () => {
-      window.clearInterval(t);
-      window.clearInterval(t2);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
-
-  /**
-   * 盯看板 —— **面板关着也要盯**（§10.6 的前提）。
-   *
-   * 为什么必须常驻：红点的两条规则都建立在"看板一直在刷"上 ——
-   *  ① 「需要你」要亮到你处理为止；② 「这一轮跑完并停下」要在你没开面板时也亮出来。
-   * 以前这段轮询挂在"面板打开"那个 effect 里（面板一关就没人刷看板），
-   * 于是"跑完了但面板没开 → 红点永远不亮"，§10.6 就成了空话。
-   *
-   * 代价就是那点扫描开销，所以：看板 20 秒一次（远端要跑 ps、本机要枚举进程表）；
-   * 第一次照旧推迟到主线程空下来（首屏优先，见 src/startup.ts）。
-   */
-  useEffect(() => {
-    deferUntilIdle(() => {
-      void refreshBoard();
-      void refreshSnapshot();
-      // 本机 CLI 健康也**面板关着就探**：异常要在状态栏自己冒出来，
-      // 不能等用户先想起去看板才告诉他"codex 起不来"
-      void refreshCliHealth();
-    });
-    const t = window.setInterval(() => {
-      void refreshBoard();
-      void refreshSnapshot();
-      // 本机探测比远端便宜得多（where + --version，各带 5 秒超时、后端还有 5 秒缓存），
-      // 所以跟看板同一个 20 秒节奏就够了
-      void refreshCliHealth();
-    }, 20000);
-    return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
 
   // 回到窗口时把任务栏闪烁停掉（闪的目的就是叫你回来）
   useEffect(() => {
@@ -5555,9 +5530,11 @@ export default function App() {
   }
 
   /**
-   * 切到别的 tmux 会话、或者把面板展开时，读一次窗口列表；
-   * 之后每 10 秒对一次表，这样你在终端里自己按 Ctrl+B 切了窗口，面板也能跟上。
-   * （只在面板展开时才轮询，收起就完全不打扰服务器。）
+   * 切到别的 tmux 会话、或者把面板展开时，读一次窗口列表。
+   *
+   * 以前这里每 10 秒对一次表（"你在终端里自己按 Ctrl+B 切了窗口，面板也能跟上"），
+   * 但那等于每分钟 6 次 ssh + tmux 子进程，属于用户明确要砍掉的"周期性探测"。
+   * 现在只在用户动作（切会话 / 展开面板）时读一次；想手动同步就点列表右边那个 ↻。
    */
   useEffect(() => {
     if (!curTmuxSession || !tmuxDockOpen) {
@@ -5565,8 +5542,6 @@ export default function App() {
       return;
     }
     deferUntilIdle(() => void refreshTmuxWindows());
-    const timer = window.setInterval(() => void refreshTmuxWindows(), 10000);
-    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curTmuxSession, curTmuxProfileId, tmuxDockOpen]);
 
@@ -8430,24 +8405,13 @@ export default function App() {
               </span>
               <button
                 type="button"
-                className="mini-x"
+                className="mini-btn"
                 style={{ opacity: 1 }}
-                title="重新扫描（远端 tmux 窗格 + ps；本机进程表；herdr 第一手状态）"
-                onClick={() => void refreshBoard()}
+                title="探测一次：本机 / 服务器上现在有没有 AI 在跑（只在你点的时候查，不会自动探测）"
+                disabled={aiRefreshing}
+                onClick={() => void refreshAiPanel()}
               >
-                ⟳
-              </button>
-              {/* 探测这台机器有没有 herdr —— 承载健康那一行的落点。
-                  以前它挂在常驻的"状态来源"行上；§10.2 要求正常时不常驻，
-                  所以入口收进标题栏这一个按钮里（探测明细仍在承载健康那一行的悬停中）。 */}
-              <button
-                type="button"
-                className="mini-x"
-                style={{ opacity: 1 }}
-                title="重新探测状态来源（herdr / 本机进程 + 日志）"
-                onClick={() => void refreshAiSource(true)}
-              >
-                ◎
+                {aiRefreshing ? "探测中…" : "刷新"}
               </button>
               <button
                 type="button"
@@ -8466,9 +8430,9 @@ export default function App() {
                 常驻等于每一层都在抢同一块注意力 —— 所以没异常时整块不渲染，
                 能查的东西（服务 / 工作区 / 来源明细）都在下面的折叠行与悬停里。 */}
             <div className="ai-section">需要你 {boardNeedsYou.length}</div>
-            {boardNeedsYou.length === 0 && boardWorking.length === 0 ? (
+            {boardInstances.length === 0 ? (
               <div className="hint" style={{ padding: "2px 12px 8px" }}>
-                没有需要你的事，也没有在跑的 agent。
+                点「刷新」看看本机 / 服务器上现在有没有 AI 在跑
               </div>
             ) : null}
             {boardNeedsYou.length > 0 && (
@@ -8522,7 +8486,9 @@ export default function App() {
                 进这一块的条件只有三类：探测失败 / herdr 太旧 / 有工作区要清理。
                 （服务没在跑由 herdr 自己按需拉起，所以不算异常。）
                 没跑 agent 的承载（CMD 这类空承载，§10.5 **不上板**）也在这块的悬停里查。 */}
-            {aiSourceProbing ? null : !aiSource ? (
+            {/* 没点过「刷新」就不显示承载健康：`aiSource === null` 现在也可能是"还没探"，
+                直接写"探测失败"会冤枉一台好好的机器。 */}
+            {!aiSourceProbed ? null : aiSourceProbing ? null : !aiSource ? (
               <div
                 className="ai-source-line warn"
                 role="button"

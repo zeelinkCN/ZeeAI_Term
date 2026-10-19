@@ -333,9 +333,19 @@ const mockMergeBoard = (src, nowMs) => {
 };
 
 const noop = () => {};
-const resolveCmd = (cmd, args) => {
+const resolveCmd = (cmd, args, opts) => {
   const M = window.__ZEEAI_MOCK__;
   const S = window.__ZEEAI_SCENARIO__;
+  // slowAi：把一次探测拖慢 1.2 秒，用来验证「刷新」按钮的「探测中…」状态。
+  // 真后端这些命令都要 ssh / 枚举进程，绝不止几毫秒；mock 默认是瞬时返回，看不到中间态。
+  // opts.fast 是内部重入标记，避免自己递归自己。
+  if (
+    S.slowAi &&
+    !(opts && opts.fast) &&
+    ["ai_probe", "ai_source_probe", "ai_tasks_remote", "ai_instances"].includes(cmd)
+  ) {
+    return new Promise((r) => setTimeout(() => r(resolveCmd(cmd, args, { fast: true })), 1200));
+  }
   switch (cmd) {
     case "list_profiles": return M.profiles;
     case "settings_get": return Object.assign({}, M.settings, S.settingsPatch || {});
@@ -764,6 +774,71 @@ const check = (name, ok, extra = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  | " + extra : ""}`);
 };
 
+// ---------- 手动「刷新」小工具（这一轮把 AI 面板的定时探测全删了） ----------
+// 以前面板打开后数据是定时器自动刷进来的，测试只要 sleep 一下；现在必须自己点「刷新」。
+// 这样也顺便保证测试走的就是用户的那条路：打开面板 → 点刷新 → 看结果。
+/** 打开 AI 面板（已经开着就不动），**不触发任何探测** */
+const openAiPanel = async () => {
+  if (await evaluate(`!!document.querySelector(".ai-panel")`)) return true;
+  await evaluate(`(() => {
+    const btns = [...document.querySelectorAll("button")];
+    const b = btns.find((x) => (x.title || "").includes("AI")) || btns.find((x) => x.className.includes("ai"));
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+  await sleep(300);
+  return await evaluate(`!!document.querySelector(".ai-panel")`);
+};
+/** 收起 AI 面板（红点那条"点开即清"的断言要重新走一次打开动作） */
+const closeAiPanel = async () => {
+  await evaluate(`(() => {
+    const b = document.querySelector(".ai-panel .ai-head .mini-x");
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(250);
+};
+/** 读标题栏那个「刷新」按钮的当前文字 / 是否禁用 */
+const readRefreshButton = async () =>
+  evaluate(`(() => {
+    const p = document.querySelector(".ai-panel");
+    const b = p && [...p.querySelectorAll(".ai-head button")].find((x) =>
+      ["刷新", "探测中…"].includes((x.textContent || "").trim()));
+    return b ? { text: (b.textContent || "").trim(), disabled: !!b.disabled } : { text: "", disabled: false };
+  })()`);
+/** 点标题栏的「刷新」（只找文字**正好**是「刷新」的那个按钮） */
+const clickRefreshButton = async () =>
+  evaluate(`(() => {
+    const p = document.querySelector(".ai-panel");
+    if (!p) return { found: false };
+    const b = [...p.querySelectorAll(".ai-head button")].find((x) => (x.textContent || "").trim() === "刷新");
+    if (!b) return { found: false, head: [...p.querySelectorAll(".ai-head button")].map((x) => (x.textContent || "").trim()) };
+    b.click();
+    return { found: true };
+  })()`);
+/** 点「刷新」并等这一轮探测跑完（按钮从「探测中…」恢复成「刷新」） */
+const refreshAiPanel = async (timeoutMs = 25000) => {
+  const clicked = await clickRefreshButton();
+  if (!clicked.found) return clicked;
+  // 先给 React 一个渲染「探测中…」的机会；mock 快时可能已经跑完，所以下面按文字判断
+  await sleep(150);
+  const t0 = Date.now();
+  for (;;) {
+    const st = await readRefreshButton();
+    if (st.text === "刷新") return { ...clicked, ok: true };
+    if (Date.now() - t0 > timeoutMs) return { ...clicked, ok: false, state: st };
+    await sleep(100);
+  }
+};
+/** 打开面板 + 手动刷新一次 + 等卡片渲染完 */
+const openAiPanelAndRefresh = async () => {
+  const opened = await openAiPanel();
+  const refreshed = await refreshAiPanel();
+  await sleep(500);
+  return { opened, refreshed };
+};
+
 const shot1 = await shot("01-default.png");
 const text1 = await evaluate("document.body.innerText");
 const buttons = await evaluate(
@@ -784,26 +859,101 @@ if (consoleMsgs.length) {
 const calls = await evaluate("window.__ZEEAI_CALLS__");
 check("启动时的后端调用都在预期内", calls.includes("list_profiles") && calls.includes("settings_get"), [...new Set(calls)].join(","));
 
-// 打开 AI 面板（点左侧活动栏的 AI 按钮）
-const opened = await evaluate(`(() => {
-  const btns = [...document.querySelectorAll("button")];
-  const b = btns.find((x) => (x.title || "").includes("AI")) || btns.find((x) => x.className.includes("ai"));
-  if (!b) return "no-button";
-  b.click();
-  return "clicked";
+// ================= 手动「刷新」：这一轮把 AI 面板的定时探测全删了 =================
+// 用户原话：「把这个功能去掉算了，不探测了，影响电脑性能」→ 确认后：「保留手动刷新，
+// 按钮就叫做刷新」。所以下面先钉住反面：不点刷新时 AI 探测命令一次都不许自己跑。
+const AI_PROBE_CMDS = [
+  "ai_probe", "ai_source_probe", "ai_session_snapshot", "ai_task_artifacts",
+  "ai_tasks_remote", "ai_tasks_local", "ai_instances", "ai_timeline_list",
+  "herdr_agents", "herdr_server_status", "herdr_workspace_scan",
+];
+const countAiProbes = () =>
+  evaluate(`(() => {
+    const want = ${JSON.stringify(AI_PROBE_CMDS)};
+    return (window.__ZEEAI_CALLARGS__ || []).filter((c) => want.includes(c.cmd)).length;
+  })()`);
+const probesAtStart = await countAiProbes();
+// 等 12 秒：以前的 8s / 10s 定时器在这个窗口里至少会跑一轮
+await sleep(12000);
+const probesAfterIdle = await countAiProbes();
+check(
+  "不点「刷新」：12 秒内 AI 探测命令一次都没被调用（8s/10s/20s/30s 定时器已删）",
+  probesAfterIdle === probesAtStart,
+  `${probesAtStart} → ${probesAfterIdle}`,
+);
+
+// 打开面板本身也不探测 —— "点了才查一次"
+const panelOpened = await openAiPanel();
+await sleep(1200);
+const probesAfterOpen = await countAiProbes();
+const panelEmpty = await evaluate(`(() => {
+  const p = document.querySelector(".ai-panel");
+  if (!p) return null;
+  const b = [...p.querySelectorAll(".ai-head button")].find((x) => ["刷新", "探测中…"].includes((x.textContent || "").trim()));
+  return { text: p.innerText, button: b ? (b.textContent || "").trim() : "" };
 })()`);
-await new Promise((r) => setTimeout(r, 2500));
+check(
+  "打开 AI 面板本身不触发探测（只有点「刷新」才查一次）",
+  panelOpened && probesAfterOpen === probesAtStart,
+  `open=${panelOpened} 探测调用 ${probesAtStart} → ${probesAfterOpen}`,
+);
+check(
+  "面板没数据时提示「点「刷新」看看本机 / 服务器上现在有没有 AI 在跑」",
+  !!panelEmpty && panelEmpty.text.includes("点「刷新」看看本机 / 服务器上现在有没有 AI 在跑"),
+  panelEmpty ? panelEmpty.text.split("\n").slice(0, 8).join(" / ") : "(面板没打开)",
+);
+check(
+  "标题栏那个按钮文字就是「刷新」",
+  !!panelEmpty && panelEmpty.button === "刷新",
+  panelEmpty ? `按钮=${panelEmpty.button}` : "",
+);
+
+// ③ 点刷新后的「探测中…」状态：用 slowAi 把 mock 探测拖慢 1.2 秒才看得到中间态。
+await setScenario({ slowAi: true });
+await reload();
+await openAiPanel();
+const beforeSlow = await countAiProbes();
+const slowClicked = await clickRefreshButton();
+await sleep(250);
+const slowDuring = await readRefreshButton();
+check(
+  "点「刷新」后按钮变成「探测中…」且不可再点",
+  slowClicked.found && slowDuring.text === "探测中…" && slowDuring.disabled,
+  JSON.stringify(slowDuring),
+);
+await sleep(4600);
+const slowAfter = await readRefreshButton();
+const afterSlow = await countAiProbes();
+check(
+  "探测跑完后按钮恢复成「刷新」，而且探测命令确实被调用了",
+  slowAfter.text === "刷新" && afterSlow > beforeSlow,
+  `按钮=${slowAfter.text} 探测调用 ${beforeSlow} → ${afterSlow}`,
+);
+
+// 回到正常 mock：手动刷新一次，把面板数据拉出来（原来自动轮询会给的那份）
+await setScenario({ slowAi: false });
+await reload();
+await openAiPanelAndRefresh();
 const shot2 = await shot("02-ai-panel.png");
 const panel = await evaluate("document.querySelector('.ai-panel') ? document.querySelector('.ai-panel').innerText : ''");
-check("AI 面板能打开", opened === "clicked" && panel.length > 0, `打开方式=${opened}`);
+check("AI 面板能打开并刷出数据", panel.length > 0, `面板 ${panel.length} 字`);
 check(
   "面板第一眼只有「需要你」「运行中」两个区（§10.2）",
   panel.includes("需要你 1") && panel.includes("运行中 0"),
   panel.split("\n").slice(0, 6).join(" / "),
 );
+// 卡片本身要显示"需要你"（不是靠面板顶部那条通知文字）：
+// 用 `.ai-task.needs-approval` 直接看那一张卡，标签写的是 "OpenAI Codex CLI"。
+const needsCardText = await evaluate(`(() => {
+  const cards = [...document.querySelectorAll(".ai-panel .ai-task.needs-approval")];
+  return cards.map((c) => (c.innerText || "").replace(/\\n/g, " / "));
+})()`);
 check(
   "herdr 卡片显示「需要你」（§10.6 唯一值得亮红点的那件事）",
-  panel.includes("需要你 1") && panel.includes("codex"),
+  needsCardText.length === 1 &&
+    needsCardText[0].includes("OpenAI Codex CLI") &&
+    needsCardText[0].includes("需要你"),
+  JSON.stringify(needsCardText).slice(0, 220),
 );
 check("herdr 卡片带「查看窗格」入口", panel.includes("查看窗格"));
 check(
@@ -816,14 +966,10 @@ check("装了 herdr 时不显示一键安装", !panel.includes("一键安装"));
 // ---------- herdr 服务生命周期：可见 + 可控（停止要二段确认） ----------
 // 承载健康那一块只在"有异常"时出现（上面默认场景里有 3 个工作区没在用 / 2 个空壳）。
 // 这里把工作区扫成"一个都没有"，健康块就回到正常态：只剩服务那一行。
-// 注意 setScenario 只对**下一次加载**生效，所以必须 reload 再重新打开面板。
+// 注意 setScenario 只对**下一次加载**生效，所以必须 reload 再重新打开面板 + 手动刷新。
 await setScenario({ herdrScan: { workspaces: [], panes: [] } });
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2800);
+await openAiPanelAndRefresh();
 const panelHealth = await evaluate("document.querySelector('.ai-panel') ? document.querySelector('.ai-panel').innerText : ''");
 check(
   "没有异常时「承载健康」不常驻：面板里不再有「herdr 工作区」「探测失败」这些行（§10.2）",
@@ -848,15 +994,11 @@ await setScenario({
     ],
   },
 });
-// 恢复只对**下一次加载**生效，所以这里 reload 一次并重新打开面板。
+// 恢复只对**下一次加载**生效，所以这里 reload 一次、重新打开面板并手动刷新。
 // 这一步顺带验证"承载健康只在异常时出现"的**互斥**：有工作区要清理时，
 // 面板上只给清理入口（不把"停止服务"也堆出来 —— 那正是它要收掉的乱）。
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2800);
+await openAiPanelAndRefresh();
 const healthRowNow = await evaluate(`(() => {
   const p = document.querySelector(".ai-panel");
   const all = [...p.querySelectorAll("button")];
@@ -997,33 +1139,30 @@ check(
   `文本=${JSON.stringify(typed.text)} 按键=${typed.keys.join(",")} 本地写入=${typed.writes}`,
 );
 
-// 切成"没装 herdr"，再看安装入口是否出现
+// 切成"没装 herdr"，再点一次「刷新」（只有手动刷新会重探状态来源）
 await evaluate(`window.__ZEEAI_SCENARIO__.herdr = { herdrVersion: "", herdrPath: "", agents: 0, protocol: 0, schemaVersion: 0, schemaFingerprint: "", compat: "unknown" };`);
-await evaluate(`(() => {
-  const p = document.querySelector(".ai-panel");
-  const b = [...p.querySelectorAll("button")].find((x) => (x.title || "").includes("重新探测") || (x.title || "").includes("刷新"));
-  const src = p.querySelector(".ai-source-line");
-  if (src) src.click(); else if (b) b.click();
-  return true;
-})()`);
-await new Promise((r) => setTimeout(r, 2000));
+const missingRefresh = await refreshAiPanel();
+await sleep(400);
 const panel2 = await evaluate("document.querySelector('.ai-panel').innerText");
 const shot3 = await shot("03-herdr-missing.png");
-check("没装 herdr 时给出「一键安装 herdr」", panel2.includes("一键安装 herdr"), panel2.split("\n").find((l) => l.includes("herdr")) ?? "");
+check(
+  "没装 herdr 时给出「一键安装 herdr」",
+  missingRefresh.ok && panel2.includes("一键安装 herdr"),
+  panel2.split("\n").find((l) => l.includes("herdr")) ?? "",
+);
 
 // 新建会话对话框：herdr 那行不该再有"代替 tmux"的勾
 // 先把场景切回"这台机器装了 herdr"（上面为了验证"没装时给安装入口"临时改成过没装），
-// 并点一次"状态来源"强制重探，让应用里那份按服务器缓存的结果也刷新过来。
+// 并再点一次「刷新」强制重探，让应用里那份按服务器缓存的结果也刷新过来。
 await evaluate(`(() => {
   window.__ZEEAI_SCENARIO__.herdr = {
     herdrVersion: "0.9.1", herdrPath: "/home/user/.local/bin/herdr", agents: 1,
     protocol: 22, schemaVersion: 1, schemaFingerprint: "226d4ecb", compat: "ok",
   };
-  const src = document.querySelector(".ai-panel .ai-source-line");
-  if (src) src.click();
   return true;
 })()`);
-await new Promise((r) => setTimeout(r, 1800));
+await refreshAiPanel();
+await sleep(400);
 const dialog = await evaluate(`(() => {
   const btns = [...document.querySelectorAll("button")];
   const b = btns.find((x) => (x.innerText || "").trim() === "新建会话");
@@ -1670,12 +1809,7 @@ const shot11 = await shot("11-create-fail.png");
 
 // ---------- (B) 看板卡片上的「接管」 ----------
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-  return !!b;
-})()`);
-await sleep(2600);
+await openAiPanelAndRefresh();
 const cardButtons = await evaluate(`[...document.querySelectorAll(".ai-panel .ai-task-actions button")].map((b) => (b.innerText || "").trim())`);
 await evaluate(`(() => {
   const b = [...document.querySelectorAll(".ai-panel .ai-task-actions button")].find((x) => (x.innerText || "").trim() === "接管");
@@ -1776,12 +1910,7 @@ await setScenario({
   ],
 });
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-  return !!b;
-})()`);
-await sleep(2600);
+await openAiPanelAndRefresh();
 const twoCards = await evaluate(
   `[...document.querySelectorAll(".ai-panel .ai-task")].map((c) => (c.innerText || "").replace(/\\n/g, " / "))`,
 );
@@ -1834,12 +1963,7 @@ await setScenario({
   ],
 });
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-  return !!b;
-})()`);
-await sleep(2600);
+await openAiPanelAndRefresh();
 const board2 = await evaluate(`(() => {
   const head = (document.querySelector(".ai-panel .ai-head")?.innerText || "").trim();
   const cards = [...document.querySelectorAll(".ai-panel .ai-task")].map((c) =>
@@ -1891,13 +2015,8 @@ check(
 // ---------- (E) 服务器右键 → 管理 herdr 工作区 ----------
 await setScenario({});
 await reload();
-// 先打开 AI 面板（工具坞挂在它上面）
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-  return !!b;
-})()`);
-await sleep(2200);
+// 先打开 AI 面板（工具坞挂在它上面）并手动刷新一次
+await openAiPanelAndRefresh();
 // 诊断开关：假后端这一轮到底合出了什么（排查"卡片的断言挂了"时很有用）
 if (process.env.ZEEAI_FE_DEBUG_BOARD) {
   const dbg = await evaluate(
@@ -2046,11 +2165,7 @@ await setScenario({
   ],
 });
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2600);
+await openAiPanelAndRefresh();
 const v2 = await evaluate(`(() => {
   const p = document.querySelector(".ai-panel");
   if (!p) return { missing: true };
@@ -2134,11 +2249,7 @@ await setScenario({
   ],
 });
 await reload();
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2800);
+await openAiPanelAndRefresh();
 const bare = await evaluate(`(() => {
   const p = document.querySelector(".ai-panel");
   const cards = [...p.querySelectorAll(".ai-task")];
@@ -2325,12 +2436,7 @@ await setScenario({
   herdrScan: { workspaces: [], panes: [] },
 });
 await reload();
-await sleep(1400);
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2800);
+await openAiPanelAndRefresh();
 const mixed = await evaluate(`(() => {
   const p = document.querySelector(".ai-panel");
   const secs = [...p.querySelectorAll(".ai-section")].map((e) => (e.innerText || "").trim());
@@ -2359,12 +2465,7 @@ check(
 const shotMixedDark = await shot("24-board-mixed-dark.png");
 await setScenario({ settingsPatch: { theme: "light" } });
 await reload();
-await sleep(1400);
-await evaluate(`(() => {
-  const b = [...document.querySelectorAll("button")].find((x) => (x.title || "").includes("AI"));
-  if (b) b.click();
-})()`);
-await sleep(2800);
+await openAiPanelAndRefresh();
 const shotMixedLight = await shot("25-board-mixed-light.png");
 await setScenario({ settingsPatch: { theme: "dark" } });
 check(
