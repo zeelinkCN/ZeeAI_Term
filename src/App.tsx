@@ -897,11 +897,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   // **默认关**：用户明确要求"图片上传/粘贴不要在右下角弹消息"——要确认粘对了没有，
   // 看输入行里那串路径就够了（想开的人可以在设置里打开）。
   pasteToast: false,
-  // 一个"额外启动参数"都没有：默认不动用户装好的 CLI 的启动方式
-  agentLaunchArgs: {},
 };
 
-const APP_VERSION = "0.1.12";
+const APP_VERSION = "0.1.13";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
