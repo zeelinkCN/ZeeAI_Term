@@ -37,8 +37,8 @@
 | **本地终端** | PowerShell 5.1 / PowerShell 7 / CMD / WSL，可单开管理员窗口或整个应用提权 |
 | **设备侧** | 串口（每条连接独立参数）、ADB logcat + 文件管理 + Fastboot 设备探测（看设备与版本，**不刷机**；内置 platform-tools，免装） |
 | **Git** | 打开本地仓库、暂存 / 提交 / 历史与 diff / 分支切换；每个工作空间可单独开终端 |
-| **AI 面板** | 看板分「需要你 / 运行中」两区（最近完成与空闲各折一行），每张卡写明**谁说的**（来源徽标 + 悬停证据）；卡片能对应到终端标签 |
-| **看板与标签对得上** | 卡片写明它对着哪个终端标签，已经开着时按钮变「切到标签」 |
+| **AI 面板** | **本版暂停用**：点活动栏星号只打开一块灰色空容器，面板内容不渲染（看板 v2 的代码原样保留，等后续重构；恢复只需把 `App.tsx` 里的 `AI_PANEL_DISABLED` 改成 `false`） |
+| **连接诊断** | 编辑服务器或连接失败提示里点「连接诊断」：只读跑一次 `ssh -G`，显示**实际生效的**主机 / 端口 / 用户 / 每个候选密钥是否存在 / 跳板机，并给一句人话结论 |
 | **观感** | 14 套界面主题 + 15 套终端配色（可粘贴 Windows Terminal 配色 JSON）、四种分屏、侧栏可拖宽、`Ctrl+滚轮` 随手缩放字号 |
 | **留档** | 终端日志（剥掉颜色转义，记事本可读）、关键字高亮（仅界面生效）、回滚行数可调 |
 | **启动** | 深色底 + 静态启动屏（不闪白、不重影），扫描 / 快照 / WebGL 挂载一律等首帧之后 |
@@ -47,11 +47,11 @@
 
 到 [**Releases**](https://github.com/zeelinkCN/ZeeAI_Term/releases/latest) 取最新版，四个产物任选一个：
 
-| 产物（当前 **0.1.13**） | 适合谁 | 体积 |
+| 产物（当前 **0.1.14**） | 适合谁 | 体积 |
 |---|---|---|
-| `ZeeAI_Term_0.1.13_x64-setup.exe` | 大多数人：双击安装，带开始菜单与卸载 | ~6.5 MB |
-| `ZeeAI_Term_0.1.13_x64_en-US.msi` | 需要走组策略 / 批量部署 | ~9.7 MB |
-| `ZeeAI_Term-0.1.13-portable.zip` | 不想安装：解压即用，**内含 platform-tools** | ~9.3 MB |
+| `ZeeAI_Term_0.1.14_x64-setup.exe` | 大多数人：双击安装，带开始菜单与卸载 | ~6.5 MB |
+| `ZeeAI_Term_0.1.14_x64_en-US.msi` | 需要走组策略 / 批量部署 | ~9.7 MB |
+| `ZeeAI_Term-0.1.14-portable.zip` | 不想安装：解压即用，**内含 platform-tools** | ~9.3 MB |
 | `ZeeAI_Term.exe` | 已经有安装目录，只想换主程序 | ~9 MB |
 
 > 便携版：解压后 `resources/` 目录**必须和 exe 放在一起**（ADB 在里面）。
@@ -84,7 +84,8 @@ npm run fe:smoke                     # 界面功能测试：无头 Edge 真点�
 ## 文档
 
 - [技术设计与里程碑](docs/design.md) · [决策与待确认事项](docs/decisions.md)
-- [发版说明](docs/release-notes-v0.1.13.md) —— 每版都写清改了什么、为什么、已知限制（上一版：[v0.1.12](docs/release-notes-v0.1.12.md)）
+- [发版说明](docs/release-notes-v0.1.14.md) —— 每版都写清改了什么、为什么、已知限制（上一版：[v0.1.13](docs/release-notes-v0.1.13.md)）
+- [架构审查](docs/architecture-review.md) —— 选型评价、主要债、问题清单与路线（v0.1.13 基线）
 - [AI 看板 v2 设计口径](docs/design-ai-board-v2.md)（§10 是最终口径）· [样品页](docs/mockups/ai-board-v2.html)
 - 实现日志：[herdr](docs/impl-log-2026-09-29-herdr.md) · [herdr 会话](docs/impl-log-2026-09-29-herdr-session.md) · [其它](docs/impl-log-2026-09-27.md)
 

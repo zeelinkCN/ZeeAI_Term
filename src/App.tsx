@@ -1299,7 +1299,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   pasteToast: false,
 };
 
-const APP_VERSION = "0.1.13";
+const APP_VERSION = "0.1.14";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
