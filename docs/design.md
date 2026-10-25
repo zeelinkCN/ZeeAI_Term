@@ -155,6 +155,17 @@ sequenceDiagram
 - 终端实例启用 **WebGL addon**，并在前端对 `term.write` 做背压（依据 `onWriteParsed` 回调节流）。
 - 尺寸变化：前端 `fit` → `invoke session_resize` → `pty.resize()` / `channel.request_pty` 参数更新。
 
+> **实现现状（v0.1.14，以代码为准）**：上面三条已经落地两条，第三条只落了一半 ——
+> - ✅ **16ms 合并**：`core/pty.rs` 的 `BatchBuffer`（64KB / 16ms，遇换行/CR/ESC 收窄到 5ms，
+>   1MB 硬上限）；300k 行大输出实测 IPC 次数 −95.5%。
+> - ⚠️ **仍是 JSON + base64**：`SessionEvent::Data{data: String}` 没改成 `Channel<Vec<u8>>`
+>   （改它会同时动前端 `ipc.ts` 的事件形状），这一条留到下一版；base64 体积代价 +33%。
+> - ✅ **背压**：但不是按 `onWriteParsed` 节流 —— 改成**批次 seq + 累积 ack**：
+>   后端最多 2 批未确认就暂停读 PTY（1s 超时兜底），前端积压 >4MB 再降频让出一帧。
+>   用 `term.write` 的回调而不是 `onWriteParsed`，因为后者按帧合并、可能提前确认还没解析的批次。
+>
+> 另：`perf:` 每 10 秒一行吞吐日志（bytes/s、ipc/s、backlog），是排查"越用越卡"的入口。
+
 ### 3.3 应用启动流程
 
 1. 单实例检查（`tauri-plugin-single-instance`）：已有实例则聚焦并转发参数。
