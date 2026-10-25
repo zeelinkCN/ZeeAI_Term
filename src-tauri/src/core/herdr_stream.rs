@@ -86,7 +86,7 @@ where
             }
             logs.write(&sid, bytes);
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            sink_out(SessionEvent::Data { data });
+            sink_out(SessionEvent::Data { data, seq: None });
         };
         loop {
             match reader.read(&mut buf) {

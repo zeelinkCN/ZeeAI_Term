@@ -11,7 +11,16 @@ use serde::Serialize;
 #[serde(tag = "type", rename_all = "camelCase")]
 #[allow(dead_code)]
 pub enum SessionEvent {
-    Data { data: String },
+    Data {
+        data: String,
+        /// PTY 输出泵的批次号（从 1 开始，单调递增）。前端写进 xterm 后用
+        /// `session_output_ack` 回传，后端据此维持「最多 2 个未确认批次」的背压。
+        ///
+        /// 串口 / herdr 这类不走 PTY 输出泵的流没有批次号，所以是 Option。
+        /// 不改变 data 的字节内容（仍是原始 PTY 字节的 base64）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+    },
     State { state: String },
     Error { message: String },
     Title { title: String },

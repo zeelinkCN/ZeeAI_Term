@@ -2,7 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { sessionResize, sessionWrite } from "../ipc";
+import {
+  sessionOutputAck,
+  sessionResize,
+  sessionWrite,
+  takeOutputSeq,
+} from "../ipc";
 import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "../ipc";
 import { runAfterFirstPaint, startupMark } from "../startup";
 import { bytesToB64 } from "../util";
@@ -178,6 +183,24 @@ const MOUSE_MODES: number[] = [1000, 1002, 1003, 1006];
  */
 const RESIZE_DEBOUNCE_MS = 150;
 
+/**
+ * 前端积压阈值：已经在本地排队、还没被 xterm 解析完的**原始输出字节数**。
+ *
+ * 后端已经用「最多 2 个未确认批次」把正常积压压在 ~128KB；这个 4MB 阈值是
+ * 第二次兜底（例如高亮规则特别多、渲染线程被其他面板占住）。超过它不会丢字节，
+ * 只是把下一批 term.write 推迟一帧，让 xterm / WebGL 先追上。
+ */
+const OUTPUT_BACKLOG_LIMIT = 4 * 1024 * 1024;
+const OUTPUT_BACKLOG_YIELD_MS = 16;
+
+/** 本地待写批次。rawBytes 是原始 PTY 字节数（不是高亮后的字符串长度），用于积压统计。 */
+type PendingTermWrite = {
+  data: string | Uint8Array;
+  rawBytes: number;
+  /** 后端输出泵的批次号；串口/herdr 没有 */
+  seq?: number;
+};
+
 /** 这台机器能不能用 WebGL2（不能就别挂 WebglAddon，原因见上面那段说明） */
 function webgl2Available(): boolean {
   try {
@@ -328,6 +351,31 @@ export default function TerminalView({
   rightClickRef.current = rightClick;
   const copyKeyRef = useRef(copyKey);
   copyKeyRef.current = copyKey;
+
+  /**
+   * 「选择/复制模式」。
+   *
+   * 背景：SSH + tmux（以及 vim / less 这类全屏程序）会打开 xterm 的鼠标上报，拖拽被当成
+   * 鼠标事件发给远端，本地选不中文字。
+   *
+   * 两层兜底：
+   * 1. xterm 5.x 原生支持**按住 Shift 拖拽 = 强制本地选择**（SelectionService 里
+   *    `shouldForceSelection` 就是 `event.shiftKey`，Windows 上直接可用），所以不拦事件；
+   * 2. 再给一个显式的选择模式：让**本地 xterm** 解析 `?1000l…` 退出鼠标模式，同时把
+   *    同一串字节镜像给会话；退出时只把进入前真的开着的 mode 用 `h` 恢复。
+   */
+  const [selectMode, setSelectMode] = useState(false);
+  /** 选择模式提示条里第二行：已选中/已复制的字数 */
+  const [selectionInfo, setSelectionInfo] = useState("");
+  /** 有没有程序正在要鼠标（右键菜单据此显示 Shift 提示） */
+  const [mouseReporting, setMouseReporting] = useState(false);
+  /** 进入前各 mouse mode 的开关（按 1000/1002/1003/1006 分开记） */
+  const mouseModesRef = useRef<Record<number, boolean>>({});
+  /** 进入那一刻算好的恢复序列 —— 本地关掉之后才退出，也能按"进入前"恢复 */
+  const restoreSeqRef = useRef("");
+  const selectModeRef = useRef(false);
+  const enterSelectModeRef = useRef<() => void>(() => {});
+  const exitSelectModeRef = useRef<() => void>(() => {});
   /**
    * 可写 herdr 流的输入通道是否已经断了。
    *
@@ -915,6 +963,11 @@ export default function TerminalView({
       for (const s of mouseModeSubs) s.dispose();
       sub.dispose();
       writeParsedSub.dispose();
+      // 终端真的没了：停止本地写入队列（还没写的批次不 ack，让后端 1s 超时兜底；
+      // 不能在这里假装确认，否则数据丢了后端还会继续发）。
+      outClosed = true;
+      outQueue = [];
+      outBacklog = 0;
       // 终端真的没了：这条会话的"最后输出时间"也就没有意义了（卡片要靠它推断"还在跑"，
       // 留着一个不会再更新的时间戳只会让卡片一直装作在跑）
       clearOutput(sessionId);
@@ -1066,8 +1119,154 @@ export default function TerminalView({
     }
   }
 
+  /** 把字节镜像给会话本身（herdr 窗格不写 session_write；它的输入有自己的通道） */
+  function mirrorSessionBytes(seq: string) {
+    if (herdrPaneRef.current) return;
+    void sessionWrite(sessionId, bytesToB64(new TextEncoder().encode(seq)));
+  }
+
+  /**
+   * 进入「选择/复制模式」：本地 xterm 先退出鼠标上报，再把同一串字节镜像给会话。
+   *
+   * 只镜像、不靠它生效：会话 stdin 是**输入**流，tmux 不会把它当"终端控制序列"执行；
+   * 真正让 xterm 停止上报的是下面那句 `term.write(MOUSE_OFF_SEQ)`。镜像那份是为了让
+   * 远端程序看到同样的状态变化（也方便无头测试按原始字节断言）。
+   */
+  function enterSelectMode() {
+    const term = termRef.current;
+    if (!term || selectModeRef.current) return;
+    // 按逐位记录算恢复；万一某条开启序列在挂 handler 之前就到了，再从 term.modes 补一次。
+    const bits: Record<number, boolean> = { ...mouseModesRef.current };
+    const tracking = term.modes.mouseTrackingMode;
+    if (tracking !== "none") {
+      bits[1000] = true;
+      if (tracking === "drag") bits[1002] = true;
+      if (tracking === "any") bits[1003] = true;
+    }
+    const restore = MOUSE_MODES.filter((n) => bits[n])
+      .map((n) => `\x1b[?${n}h`)
+      .join("");
+    restoreSeqRef.current = restore;
+    selectModeRef.current = true;
+    setSelectMode(true);
+    setSelectionInfo("");
+    try {
+      term.clearSelection();
+    } catch {
+      /* ignore */
+    }
+    if (restore) {
+      try {
+        term.write(MOUSE_OFF_SEQ);
+      } catch {
+        /* ignore */
+      }
+      mirrorSessionBytes(MOUSE_OFF_SEQ);
+    }
+    term.focus();
+  }
+
+  /** 退出选择模式：只恢复**进入前真的开着**的那些 mouse mode（没开就不发 h，避免凭空打开） */
+  function exitSelectMode() {
+    if (!selectModeRef.current) return;
+    selectModeRef.current = false;
+    setSelectMode(false);
+    setSelectionInfo("");
+    const restore = restoreSeqRef.current;
+    restoreSeqRef.current = "";
+    const term = termRef.current;
+    if (!restore || !term) return;
+    try {
+      term.write(restore);
+    } catch {
+      /* ignore */
+    }
+    mirrorSessionBytes(restore);
+    term.focus();
+  }
+
+  enterSelectModeRef.current = enterSelectMode;
+  exitSelectModeRef.current = exitSelectMode;
+
+  // 选择模式快捷键：Ctrl+Shift+Space 进入/退出，Esc 退出。
+  //
+  // 挂在 window 的 **capture** 阶段：焦点在 xterm 的 textarea 里时也先于它拿到按键 ——
+  // 所以 Esc 只退出模式、不会被当成转义序列发给远端；右键菜单打开/焦点不在终端时也能退。
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (
+        e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey &&
+        (e.code === "Space" || e.key === " " || e.key === "Spacebar")
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (selectModeRef.current) exitSelectModeRef.current();
+        else enterSelectModeRef.current();
+        return;
+      }
+      if (selectModeRef.current && e.key === "Escape" &&
+          !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        exitSelectModeRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [active]);
+
   return (
     <>
+      {selectMode && (
+        <div
+          className="term-select-bar"
+          role="status"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flex: "none",
+            padding: "3px 10px",
+            fontSize: 11,
+            color: "var(--fg)",
+            background: "var(--accent-soft)",
+            borderBottom: "1px solid var(--accent)",
+          }}
+        >
+          <span
+            className="tag"
+            style={{ background: "var(--accent)", color: "var(--bg)", fontWeight: 700 }}
+          >
+            选择模式
+          </span>
+          <span>
+            {copyKey === "select"
+              ? "拖选即可复制，Esc 退出"
+              : "拖选后按 Ctrl+Shift+C 复制，Esc 退出"}
+          </span>
+          {selectionInfo && <span className="dim">{selectionInfo}</span>}
+          <span style={{ flex: 1 }} />
+          <button
+            type="button"
+            className="term-select-exit"
+            title="退出选择模式（Esc）"
+            style={{
+              flex: "none",
+              padding: "1px 8px",
+              fontSize: 11,
+              color: "var(--fg)",
+              background: "transparent",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              cursor: "pointer",
+            }}
+            onClick={() => exitSelectModeRef.current()}
+          >
+            退出
+          </button>
+        </div>
+      )}
       <div
         className="terminal-host"
         ref={hostRef}
@@ -1122,7 +1321,32 @@ export default function TerminalView({
             >
               粘贴
             </button>
+            <button
+              type="button"
+              className="menu-item"
+              onClick={() => {
+                setMenu(null);
+                if (selectModeRef.current) exitSelectModeRef.current();
+                else enterSelectModeRef.current();
+              }}
+            >
+              {selectMode ? "退出选择模式" : "选择/复制模式"}
+            </button>
             <div className="menu-sep" />
+            {mouseReporting && !selectMode && (
+              <div
+                className="menu-note"
+                style={{
+                  maxWidth: 300,
+                  padding: "6px 12px",
+                  fontSize: 11,
+                  lineHeight: 1.45,
+                  color: "var(--muted)",
+                }}
+              >
+                程序正在占用鼠标（tmux / vim 等）。按住 <b>Shift</b> 拖拽可强制本地选择。
+              </div>
+            )}
             <button
               type="button"
               className="menu-item"

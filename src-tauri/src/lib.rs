@@ -638,6 +638,7 @@ pub fn run() {
       commands::open_local,
       commands::open_ssh,
       commands::session_write,
+      commands::session_output_ack,
       commands::session_resize,
       commands::session_close,
       commands::tmux_list,

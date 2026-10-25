@@ -167,7 +167,10 @@ pub fn open(
                     // 串口日志（用户点名要的：设备打印的东西也存下来）
                     logs.write(&sid, &buf[..n]);
                     let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    if ch.send(SessionEvent::Data { data }).is_err() {
+                    if ch
+                        .send(SessionEvent::Data { data, seq: None })
+                        .is_err()
+                    {
                         break;
                     }
                 }

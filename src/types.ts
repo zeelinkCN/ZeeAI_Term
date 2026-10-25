@@ -67,7 +67,9 @@ export interface SessionInfo {
 }
 
 export type SessionEvent =
-  | { type: "data"; data: string } // base64 编码的字节流
+  // base64 编码的字节流。seq 只有 PTY 输出泵会带：前端写进 xterm 后要
+  // 用 sessionOutputAck 回传，后端据此做「最多 2 批未确认」的背压。
+  | { type: "data"; data: string; seq?: number }
   | { type: "state"; state: SessionState }
   | { type: "error"; message: string }
   | { type: "cwd"; path: string }

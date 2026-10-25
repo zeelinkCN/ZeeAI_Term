@@ -384,6 +384,19 @@ pub async fn session_write(
     .map_err(|e| format!("写入线程失败: {e}"))?
 }
 
+/// 前端「这一批 PTY 输出已经写进 xterm」的确认。
+///
+/// 背压协议的另一半在 `core::pty::run_output_pump`：
+/// 后端最多发 2 批未确认数据，超过就暂停读 PTY；收到这个 ack 再继续。
+/// 1 秒收不到会由后端记 warn 并推进窗口（防一次丢 ack 永久卡死）。
+///
+/// `seq` 是**累积**语义：确认 seq 及之前的所有批次。串口 / herdr 没有输出泵，
+/// 调用到这里是空操作。
+#[tauri::command]
+pub fn session_output_ack(session_id: String, seq: u64) {
+    crate::core::pty::ack_output(&session_id, seq);
+}
+
 #[tauri::command]
 pub async fn session_resize(
     id: String,
@@ -3141,7 +3154,10 @@ pub async fn herdr_pane_resize(
 
     // 2) 擦掉旧画面再铺新的：新流是按**新的宽度**渲染的，不擦会和上面的残影叠在一起
     let clear = base64::engine::general_purpose::STANDARD.encode(b"\x1b[2J\x1b[H");
-    let _ = channel.send(SessionEvent::Data { data: clear });
+    let _ = channel.send(SessionEvent::Data {
+        data: clear,
+        seq: None,
+    });
 
     // 3) 开一条新的观察者
     let cmd = herdr::observe_command(&pane_id, cols, rows);

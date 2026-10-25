@@ -31,6 +31,60 @@ import type {
   SshDiagnosis,
 } from "./types";
 
+/**
+ * PTY 输出批次的 seq 旁路队列。
+ *
+ * 为什么需要它：`SessionEvent.data` 里带了 seq，但 App.tsx 的 handleEvent 只把
+ * `e.data` 解码成字节后 `bus.push`，没有把 seq 传给终端。我们不改 App（并行开发），
+ * 所以在**创建 Channel 的地方**先把 seq 按到达顺序排进队列；Terminal 的 bus sink
+ * 每收到一片字节就取一个 seq。队列和 bus 的字节顺序严格一一对应，而且终端晚挂载
+ * / 卸载再挂载也不会错位（bus 会缓冲字节，这里同样保留 seq）。
+ *
+ * 数据事件一定是「先入队 seq，再调用原 onEvent」，所以 Terminal 在 bus sink 里
+ * 同步取 seq 时一定拿得到。
+ */
+const outputSeqs = new Map<string, number[]>();
+
+function makeSessionChannel(
+  id: string,
+  onEvent: (e: SessionEvent) => void,
+): Channel<SessionEvent> {
+  const ch = new Channel<SessionEvent>();
+  ch.onmessage = (e) => {
+    if (e.type === "data" && typeof e.seq === "number") {
+      const q = outputSeqs.get(id) ?? [];
+      q.push(e.seq);
+      outputSeqs.set(id, q);
+    }
+    onEvent(e);
+  };
+  return ch;
+}
+
+/** Terminal 收到一片输出时取走它的批次号；没有（串口/herdr）返回 undefined。 */
+export function takeOutputSeq(id: string): number | undefined {
+  const q = outputSeqs.get(id);
+  if (!q || q.length === 0) return undefined;
+  const seq = q.shift();
+  if (q.length === 0) outputSeqs.delete(id);
+  return seq;
+}
+
+/** 会话关闭时丢掉还没消费的批次号，避免 Map 里留下一条永远不用的队列。 */
+export function dropOutputSeq(id: string): void {
+  outputSeqs.delete(id);
+}
+
+/**
+ * 告诉后端「seq 及之前的输出已经写进 xterm」。
+ *
+ * 累积语义：一次 ack 可以同时确认之前所有批次。失败可以忽略（例如会话已经关了）——
+ * 后端有 1 秒 ack 超时兜底，不会永久卡住。
+ */
+export async function sessionOutputAck(id: string, seq: number): Promise<void> {
+  return invoke("session_output_ack", { sessionId: id, seq });
+}
+
 export async function listProfiles(): Promise<ConnectionProfile[]> {
   return invoke<ConnectionProfile[]>("list_profiles");
 }
@@ -43,6 +97,17 @@ export async function deleteProfile(id: string): Promise<void> {
   return invoke("delete_profile", { id });
 }
 
+/**
+ * SSH 连接诊断：让后端跑一次只读的 `ssh -G`，看本机*实际*会用的
+ * hostname / port / user / IdentityFile / ProxyJump，以及每个候选密钥是否存在。
+ *
+ * **不会连接服务器**、不改任何配置；系统没装 OpenSSH 客户端会抛出明确中文错误。
+ * 参数是**已保存**的服务器 id（后端按 id 读配置），所以新建未保存的服务器不能诊断。
+ */
+export async function sshDiagnose(profileId: string): Promise<SshDiagnosis> {
+  return invoke<SshDiagnosis>("ssh_diagnose", { profileId });
+}
+
 /** 打开本地终端（powershell / cmd / wsl）。id 由前端生成，便于事件在终端挂载前就能正确路由。 */
 export async function openLocal(
   id: string,
@@ -53,8 +118,7 @@ export async function openLocal(
   rows?: number,
   cwd?: string,
 ): Promise<SessionInfo> {
-  const ch = new Channel<SessionEvent>();
-  ch.onmessage = onEvent;
+  const ch = makeSessionChannel(id, onEvent);
   return invoke<SessionInfo>("open_local", {
     id,
     shell,
@@ -85,8 +149,7 @@ export async function openSsh(
    */
   backend?: "tmux" | "herdr" | "herdr-pane" | "herdr-control" | null,
 ): Promise<SessionInfo> {
-  const ch = new Channel<SessionEvent>();
-  ch.onmessage = onEvent;
+  const ch = makeSessionChannel(id, onEvent);
   return invoke<SessionInfo>("open_ssh", {
     id,
     profileId,
@@ -136,8 +199,7 @@ export async function openAdbShell(
   rows?: number,
   mode?: "shell" | "logcat",
 ): Promise<SessionInfo> {
-  const ch = new Channel<SessionEvent>();
-  ch.onmessage = onEvent;
+  const ch = makeSessionChannel(id, onEvent);
   return invoke<SessionInfo>("open_adb_shell", {
     id,
     serial,
@@ -193,8 +255,7 @@ export async function openSerial(
     flowControl?: string;
   },
 ): Promise<SessionInfo> {
-  const ch = new Channel<SessionEvent>();
-  ch.onmessage = onEvent;
+  const ch = makeSessionChannel(id, onEvent);
   return invoke<SessionInfo>("open_serial", {
     id,
     path,
@@ -614,7 +675,12 @@ export async function sessionResize(
 }
 
 export async function sessionClose(id: string): Promise<void> {
-  return invoke("session_close", { id });
+  try {
+    return await invoke("session_close", { id });
+  } finally {
+    // 会话没了，seq 队列也不可能再被消费（终端卸载时也会自己清理一次）
+    dropOutputSeq(id);
+  }
 }
 
 /** 开始记录某个会话的终端日志，返回日志文件路径 */
