@@ -4239,6 +4239,150 @@ check(
 );
 
 console.log("\n--- 页面控制台里的 error/warning ---");
+// ================= (NEW) 每个会话独立草稿：切换 / 发送 / 附件都不串 =================
+const clickSessionTab = (needle) =>
+  evaluate(`(() => {
+    const t = [...document.querySelectorAll(".session-tab")].find((x) => (x.innerText || "").includes(${JSON.stringify(needle)}));
+    if (!t) return false;
+    t.click();
+    return true;
+  })()`);
+const openComposerNow = () =>
+  evaluate(`(() => {
+    if (document.querySelector(".composer-input")) return true;
+    const b = document.querySelector(".composer-bar");
+    if (b) b.click();
+    return !!b;
+  })()`);
+const typeComposer = (text) =>
+  evaluate(`(() => {
+    const ta = document.querySelector(".composer-input");
+    if (!ta) return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(ta, ${JSON.stringify(text)});
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+const composerState = () =>
+  evaluate(`(() => ({
+    value: (document.querySelector(".composer-input") || {}).value ?? "",
+    open: !!document.querySelector(".composer-input"),
+    cards: [...document.querySelectorAll(".composer-card")].map((c) => (c.innerText || "").trim()),
+  }))()`);
+await clickSessionTab("S 纯 SSH");
+await sleep(300);
+await openComposerNow();
+await sleep(250);
+await typeComposer("S 的草稿");
+await sleep(200);
+const sDraftBase = await composerState();
+check(
+  "输入窗草稿：先在纯 SSH 会话写一半（这一条只是基线）",
+  sDraftBase.open && sDraftBase.value === "S 的草稿",
+  JSON.stringify(sDraftBase),
+);
+await clickSessionTab("T tmux");
+await sleep(450);
+const tDraftEmpty = await composerState();
+check(
+  "输入窗草稿：切到另一个会话是空的（不把上一个会话的半句话带过来）",
+  tDraftEmpty.open && tDraftEmpty.value === "" && tDraftEmpty.cards.length === 0,
+  JSON.stringify(tDraftEmpty),
+);
+await typeComposer("T 的草稿");
+await sleep(200);
+await clickSessionTab("S 纯 SSH");
+await sleep(450);
+const sDraftBack = await composerState();
+check(
+  "输入窗草稿：切回原来的会话，刚才写的半句还在（按会话存住了）",
+  sDraftBack.value === "S 的草稿" && sDraftBack.cards.length === 0,
+  JSON.stringify(sDraftBack),
+);
+const beforeComposerSend = await evaluate("window.__ZEEAI_CALLARGS__.length");
+await evaluate(`(() => {
+  const b = document.querySelector(".composer-actions .btn.primary");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(900);
+const sTabId = await evaluate(`(() => {
+  const t = [...document.querySelectorAll(".session-tab")].find((x) => (x.innerText || "").includes("S 纯 SSH"));
+  return t ? t.getAttribute("data-tab-id") : "";
+})()`);
+const afterComposerSend = await evaluate(`(() => {
+  const dec = (b64) => { try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch { return ""; } };
+  const writes = (window.__ZEEAI_CALLARGS__ || []).slice(${beforeComposerSend})
+    .filter((c) => c.cmd === "session_write")
+    .map((c) => ({ id: (c.args || {}).id, text: dec((c.args || {}).dataB64 || "") }));
+  return {
+    writes: writes,
+    value: (document.querySelector(".composer-input") || {}).value ?? "",
+  };
+})()`);
+check(
+  "输入窗草稿：发送后只清当前会话（正文与回车都真的写给 S，输入框清空）",
+  afterComposerSend.value === "" &&
+    afterComposerSend.writes.some((w) => w.id === sTabId && w.text.includes("S 的草稿")) &&
+    afterComposerSend.writes.some((w) => w.id === sTabId && w.text.includes("\r")),
+  `id=${sTabId} writes=${JSON.stringify(afterComposerSend.writes).slice(0, 160)}`,
+);
+await clickSessionTab("T tmux");
+await sleep(450);
+const tDraftAfterSend = await composerState();
+check(
+  "输入窗草稿：S 发送完切到 T，T 的草稿原样还在（发送只清自己那一格）",
+  tDraftAfterSend.value === "T 的草稿" && tDraftAfterSend.cards.length === 0,
+  JSON.stringify(tDraftAfterSend),
+);
+// 附件也按会话隔离：给 T 加一个文件，切到 S 看不见，切回来还在
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".composer-actions button")].find((x) => (x.innerText || "").includes("添加图片"));
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1400);
+const tWithFile = await composerState();
+check(
+  "输入窗草稿：T 会话加的附件挂在 T 上（卡片有文件名 / 缩略图）",
+  tWithFile.cards.length === 1 && tWithFile.cards[0].includes("paste-adopted.png"),
+  JSON.stringify(tWithFile),
+);
+await clickSessionTab("S 纯 SSH");
+await sleep(450);
+const sAfterFile = await composerState();
+check(
+  "输入窗草稿：附件也按会话隔离（切到 S 看不到 T 的附件）",
+  sAfterFile.value === "" && sAfterFile.cards.length === 0,
+  JSON.stringify(sAfterFile),
+);
+await clickSessionTab("T tmux");
+await sleep(450);
+const tBack = await composerState();
+check(
+  "输入窗草稿：切回 T，草稿和附件都还在（没被 S 的切换 / 发送清掉）",
+  tBack.value === "T 的草稿" && tBack.cards.length === 1,
+  JSON.stringify(tBack),
+);
+// 关会话时清理它的草稿：关掉带草稿的 T，自动落到 H，H 那里不许出现 T 的字和附件
+await evaluate(`(() => {
+  const t = [...document.querySelectorAll(".session-tab")].find((x) => (x.innerText || "").includes("T tmux"));
+  if (!t) return false;
+  const x = t.querySelector(".tab-x");
+  if (x) x.click();
+  return !!x;
+})()`);
+await sleep(900);
+const afterCloseTmux = await composerState();
+const herdrTabStill = await evaluate(
+  `[...document.querySelectorAll(".session-tab")].some((t) => (t.innerText || "").includes("H herdr"))`,
+);
+check(
+  "关会话清理草稿：关掉带草稿的 T 后，H 不会显示 T 的字 / 附件",
+  herdrTabStill && afterCloseTmux.value === "" && afterCloseTmux.cards.length === 0,
+  JSON.stringify(afterCloseTmux),
+);
+
 // ---------- (Z3) SSH 连接诊断 ----------
 //
 // 用户报障：「~/.ssh/config 里明明配了别名和密钥，界面填别名就是连不上」——

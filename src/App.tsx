@@ -217,6 +217,21 @@ interface OpenSession {
   activeTab: string; // "terminal" 或文件名
 }
 
+/** 「发给 AI」输入窗里的一个附件（图片 / 文件）：发送时只把远端路径拼进正文 */
+interface ComposerFile {
+  name: string;
+  local: string;
+  remote: string;
+  thumb?: string;
+  size?: number;
+}
+
+/** 一个会话自己的输入窗草稿（正文 + 附件）—— 切标签时按会话保存 / 恢复，互不串 */
+interface ComposerDraft {
+  text: string;
+  files: ComposerFile[];
+}
+
 /** 工作区快照里存的一个会话（只存"怎么把它开回来"，不存文件内容） */
 interface SavedSession {
   kind: ModuleKey;
@@ -1772,15 +1787,30 @@ export default function App() {
    * 终端才是主角，输入窗是"要用时才拿出来的工具"。
    */
   const [composerOpen, setComposerOpen] = useState(false);
+  /**
+   * 每个会话**各自**的草稿（正文 + 附件）。
+   *
+   * 用户报障：切终端标签时输入框内容共用 —— 在 A 标签写了一半的话会跑到 B 标签下面，
+   * 甚至被当成 B 的内容发出去。现在按会话 id 存一份：
+   * - `composerDrafts` 是持久层（ref，不需要额外渲染）；
+   * - `composerViewId` 记着 `composerText/composerFiles` 当前镜像的是哪个会话；
+   * - 切换标签时先把编辑框写回旧会话，再把新会话的草稿换进来（见下面的 effect）；
+   * - 发送 / 关会话只清**这一格**（发送后不清别的会话的草稿）。
+   */
+  const composerDrafts = useRef<Map<string, ComposerDraft>>(new Map());
+  /** 当前编辑框镜像的会话 id（null = 没有会话） */
+  const composerViewId = useRef<string | null>(null);
+  /**
+   * 每个会话各自的"正在上传"标记：A 会话上传中切到 B，B 不许显示「正在上传…」，
+   * 上传结果也只能落回 A 的草稿（见 `composerAttachPaths` / `appendComposerFiles`）。
+   */
+  const [composerBusyIds, setComposerBusyIds] = useState<string[]>([]);
   const [composerText, setComposerText] = useState("");
   /**
    * 已上传的附件：显示名 + 远端绝对路径（发送时把路径拼进正文）
    * + 本地临时路径（用完删）+ 缩略图 data URL（只用于"发送前确认粘对了没有"）。
    */
-  const [composerFiles, setComposerFiles] = useState<
-    { name: string; local: string; remote: string; thumb?: string; size?: number }[]
-  >([]);
-  const [composerBusy, setComposerBusy] = useState(false);
+  const [composerFiles, setComposerFiles] = useState<ComposerFile[]>([]);
 
   /**
    * Ctrl+Alt+A：展开 / 收起底部的 AI 输入窗（键盘党的入口）。
@@ -3995,6 +4025,22 @@ export default function App() {
   const activeSession = sessions.find((s) => s.id === activeId) ?? null;
   // 拖拽回调只订阅一次，所以"当前会话"要放进 ref（见下面的 onDragDropEvent）
   activeSessionRef.current = activeSession;
+  /** 当前会话有没有附件正在上传（别的会话在上传不影响这一格） */
+  const composerBusy = !!activeSession && composerBusyIds.includes(activeSession.id);
+  /**
+   * 切会话：先把编辑框写回旧会话，再把目标会话自己的草稿换进来。
+   *
+   * 只依赖会话 id —— 打字（composerText 变化）不会触发它，否则每敲一个字都会"恢复"一次。
+   * `composerViewId` 是同步 ref：effect 里先落旧稿、再换新稿，中间不会错位。
+   */
+  useEffect(() => {
+    const next = activeSession?.id ?? null;
+    const prev = composerViewId.current;
+    if (prev === next) return;
+    saveComposerDraft(prev);
+    loadComposerDraft(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession?.id]);
   /**
    * 终端画布的底色 —— 跟**终端配色**（那个 16 色板）走，而不是界面主题。
    *
@@ -4754,6 +4800,83 @@ export default function App() {
     }
   }
 
+  /** 取某个会话的草稿（还没写过就是空稿） */
+  function composerDraftOf(id: string): ComposerDraft {
+    return composerDrafts.current.get(id) ?? { text: "", files: [] };
+  }
+
+  /**
+   * 把编辑框当前内容写回 `id` 这个会话。
+   *
+   * 会话已经被关掉（不在 `sessionsRef` 里）时**只删不写**：关会话走的是
+   * "先删草稿 → 再 setSessions/setActiveId"，随后切换 effect 还会跑一次，
+   * 不挡住的话刚删掉的草稿又会被这一笔写回来（用户下次会看到已经关掉的会话的草稿复活）。
+   */
+  function saveComposerDraft(id: string | null) {
+    if (!id) return;
+    if (!sessionsRef.current.some((s) => s.id === id)) {
+      composerDrafts.current.delete(id);
+      return;
+    }
+    composerDrafts.current.set(id, { text: composerText, files: composerFiles });
+  }
+
+  /** 把某个会话的草稿换进编辑框（null = 清空编辑框） */
+  function loadComposerDraft(id: string | null) {
+    const d = id ? composerDraftOf(id) : { text: "", files: [] };
+    setComposerText(d.text);
+    setComposerFiles(d.files);
+    composerViewId.current = id;
+  }
+
+  /** 输入框打字：立刻写回当前会话，切标签 / 附件异步回来都不会把字冲掉 */
+  function changeComposerText(value: string) {
+    setComposerText(value);
+    const id = composerViewId.current;
+    if (id) {
+      const d = composerDraftOf(id);
+      composerDrafts.current.set(id, { ...d, text: value });
+    }
+  }
+
+  /**
+   * 附件上传完 → 只落回**发起上传时那个会话**的草稿。
+   *
+   * 用户可能已经切到别的标签（甚至关掉了那个会话）：在前台就更新编辑框，
+   * 不在前台就只写草稿表，等切回去再显示。
+   */
+  function appendComposerFiles(sessionId: string, cards: ComposerFile[]) {
+    // 上传期间会话已经被关掉：结果直接丢弃，别给一个不存在的会话留草稿
+    if (!sessionsRef.current.some((s) => s.id === sessionId)) return;
+    if (composerViewId.current === sessionId) {
+      setComposerFiles((prev) => {
+        const next = [...prev, ...cards];
+        const d = composerDraftOf(sessionId);
+        composerDrafts.current.set(sessionId, { ...d, files: next });
+        return next;
+      });
+      return;
+    }
+    const d = composerDraftOf(sessionId);
+    composerDrafts.current.set(sessionId, { ...d, files: [...d.files, ...cards] });
+  }
+
+  /** 移除某个会话草稿里的一个附件 */
+  function removeComposerFile(sessionId: string, remote: string) {
+    const drop = (files: ComposerFile[]) => files.filter((x) => x.remote !== remote);
+    if (composerViewId.current === sessionId) {
+      setComposerFiles((prev) => {
+        const next = drop(prev);
+        const d = composerDraftOf(sessionId);
+        composerDrafts.current.set(sessionId, { ...d, files: next });
+        return next;
+      });
+      return;
+    }
+    const d = composerDraftOf(sessionId);
+    composerDrafts.current.set(sessionId, { ...d, files: drop(d.files) });
+  }
+
   /**
    * 输入窗：把文件上传后只加"附件"（不插进终端 —— 用户还没点发送）。
    *
@@ -4766,7 +4889,8 @@ export default function App() {
     alreadyLocal = false,
   ) {
     if (!paths.length) return;
-    setComposerBusy(true);
+    const sid = session.id;
+    setComposerBusyIds((prev) => (prev.includes(sid) ? prev : [...prev, sid]));
     try {
       const locals: string[] = [];
       for (const p of paths) {
@@ -4791,12 +4915,12 @@ export default function App() {
         cards.push({ name, local: locals[i], remote: remotes[i], thumb });
         void pasteDiscardFile(locals[i]).catch(() => {});
       }
-      setComposerFiles((prev) => [...prev, ...cards]);
+      appendComposerFiles(sid, cards);
       notify(`附件已就绪：${remotes[0]}${remotes.length > 1 ? " 等" : ""}`);
     } catch (e) {
       notify("附件上传失败：" + String(e));
     } finally {
-      setComposerBusy(false);
+      setComposerBusyIds((prev) => prev.filter((x) => x !== sid));
     }
   }
 
@@ -4834,8 +4958,10 @@ export default function App() {
     const body = composerFiles.length ? (text ? `${text}\n\n${paths}` : paths) : text;
     // 文本与回车**在同一个 await 里一次做完**（herdr 那条通道顺序敏感，见 insertText 的说明）
     if (!(await insertText(session, body, true))) return; // 只读观察窗之类：别接着敲回车
+    // 只清**当前会话**这一格：别的会话的草稿原样留着（用户切回去还要接着写）
     setComposerText("");
     setComposerFiles([]);
+    composerDrafts.current.set(session.id, { text: "", files: [] });
   }
 
   /**
@@ -5210,7 +5336,13 @@ export default function App() {
           /* 已经断开 */
         }
         bus.drop(s.id);
+        // 批量关会话同样清掉各自的「发给 AI」草稿
+        composerDrafts.current.delete(s.id);
       }
+      setComposerBusyIds((prev) => {
+        const gone = new Set(list.map((s) => s.id));
+        return prev.filter((x) => !gone.has(x));
+      });
       const ids = new Set(list.map((s) => s.id));
       const remaining = sessionsRef.current.filter((s) => !ids.has(s.id));
       setSessions(remaining);
@@ -9178,7 +9310,7 @@ export default function App() {
                         title="移除这个附件（顺手删掉本地临时文件）"
                         onClick={() => {
                           void pasteDiscardFile(f.local).catch(() => {});
-                          setComposerFiles((prev) => prev.filter((x) => x.remote !== f.remote));
+                          removeComposerFile(activeSession.id, f.remote);
                         }}
                       >
                         ✕
@@ -9192,7 +9324,7 @@ export default function App() {
                 placeholder="写给 AI 的话…（Enter 发送 / Shift+Enter 换行；可直接 Ctrl+V 粘图片，或把文件拖进来）"
                 value={composerText}
                 autoFocus
-                onChange={(e) => setComposerText(e.target.value)}
+                onChange={(e) => changeComposerText(e.target.value)}
                 onPaste={(e) => {
                   const files = Array.from(e.clipboardData?.files ?? []);
                   if (!files.length) return; // 纯文本：照旧粘进编辑框，不拦
