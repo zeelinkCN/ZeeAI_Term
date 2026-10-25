@@ -8,12 +8,27 @@
 //
 // 用法：node scripts/check-docs.mjs      （全过 exit 0，有漂移 exit 1）
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(join(ROOT, p), "utf8");
+
+// 2026-10 结构重构后，以前"一个文件装一个产品"的写法没了：
+// `src/App.tsx` 拆成了 src/features + src/lib，`src-tauri/src/commands.rs` 拆成了 commands/ 目录。
+// 所以这里不能再读单个文件 —— 递归拼成一个"虚拟源码"，正则检查才不会因为文件搬家而假失败。
+const walk = (rel) => {
+  const out = [];
+  for (const name of readdirSync(join(ROOT, rel))) {
+    const p = `${rel}/${name}`;
+    if (statSync(join(ROOT, p)).isDirectory()) out.push(...walk(p));
+    else if (/\.(ts|tsx|rs)$/.test(name)) out.push(read(p));
+  }
+  return out;
+};
+const srcAll = walk("src").join("\n");
+const commands = walk("src-tauri/src/commands").join("\n");
 const results = [];
 const check = (name, ok, extra = "") => {
   results.push({ name, ok });
@@ -21,8 +36,7 @@ const check = (name, ok, extra = "") => {
 };
 
 const readme = read("README.md");
-const app = read("src/App.tsx");
-const commands = read("src-tauri/src/commands.rs");
+const app = srcAll; // 结构重构后前端源码分散在 src/features + src/lib：用合并后的源码做文本断言
 
 // ---------- 1) 套数：README 说的 == 代码里真有的 ----------
 const m = /(\d+)\s*套界面主题\s*\+\s*(\d+)\s*套终端配色/.exec(readme);
