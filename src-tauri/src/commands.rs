@@ -11,6 +11,17 @@ use crate::core::{
 };
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
+/// herdr 的 stderr 是原样透到状态栏的（core::herdr_stream 的设计）。
+/// 在 commands 这一层统一收口，保证 SSH / herdr 的英文报错也不会裸奔。
+fn friendly_herdr_event(event: SessionEvent) -> SessionEvent {
+    match event {
+        SessionEvent::Error { message } => SessionEvent::Error {
+            message: ssh::friendly_ssh_error_context("herdr 连接错误", &message),
+        },
+        other => other,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
@@ -219,12 +230,13 @@ pub fn open_ssh(
             {
                 let ch = on_event.clone();
                 move |ev| {
-                    let _ = ch.send(ev);
+                    let _ = ch.send(friendly_herdr_event(ev));
                 }
             },
             logs.inner().clone(),
             close_flag.clone(),
-        )?;
+        )
+        .map_err(|e| ssh::friendly_ssh_error_context("打开 herdr 观察流失败", &e))?;
         registry
             .sessions
             .lock()
@@ -321,7 +333,8 @@ pub fn open_ssh(
         on_event,
         logs.inner().clone(),
         pty::SpawnOpts::default(),
-    )?;
+    )
+    .map_err(|e| ssh::friendly_ssh_error_context("打开 SSH 终端失败", &e))?;
     registry
         .sessions
         .lock()
@@ -525,6 +538,27 @@ pub async fn fastboot_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevic
 
 // ---------- ADB 文件管理 ----------
 
+/// ADB 的 `shell` 只接受**一整条命令字符串**（不像 `exec` 那样有 argv 分隔），
+/// 所以路径必须按远端 shell 的规则做单引号转义。
+///
+/// 复用 `core::remote_fs::sq`（和 SSH 文件面板同一套规则）：以前这里是
+/// `format!("ls -la '{dir}'")`，路径里带一个 `'` 就能闭合引号、在设备上执行任意命令。
+fn adb_ls_command(dir: &str) -> String {
+    format!("ls -la {}", remote_fs::sq(dir))
+}
+
+fn adb_rm_command(path: &str, is_dir: bool) -> String {
+    if is_dir {
+        format!("rm -rf {}", remote_fs::sq(path))
+    } else {
+        format!("rm -f {}", remote_fs::sq(path))
+    }
+}
+
+fn adb_mkdir_command(path: &str) -> String {
+    format!("mkdir -p {}", remote_fs::sq(path))
+}
+
 /// 列设备上的目录（默认 /sdcard）
 #[tauri::command]
 pub async fn adb_ls(
@@ -542,7 +576,7 @@ pub async fn adb_ls(
         "-s".to_string(),
         serial,
         "shell".to_string(),
-        format!("ls -la '{dir}'"),
+        adb_ls_command(&dir),
     ];
     let out = run_capture(&exe, &args).await?;
     Ok(adb::parse_ls(&out))
@@ -624,11 +658,7 @@ pub async fn adb_rm(
 ) -> Result<(), String> {
     log::info!("ipc: adb_rm {serial}:{path}");
     let exe = adb_exe(&app);
-    let cmd = if is_dir.unwrap_or(false) {
-        format!("rm -rf '{path}'")
-    } else {
-        format!("rm -f '{path}'")
-    };
+    let cmd = adb_rm_command(&path, is_dir.unwrap_or(false));
     let args = vec!["-s".to_string(), serial, "shell".to_string(), cmd];
     let (ok, text) = run_capture_checked(&exe, &args).await?;
     if ok {
@@ -650,7 +680,7 @@ pub async fn adb_mkdir(
         "-s".to_string(),
         serial,
         "shell".to_string(),
-        format!("mkdir -p '{path}'"),
+        adb_mkdir_command(&path),
     ];
     let (ok, text) = run_capture_checked(&exe, &args).await?;
     if ok {
@@ -775,9 +805,29 @@ fn ssh_config_for(
     Ok(cfg)
 }
 
+/// SSH 连接诊断：跑一次只读的 `ssh -G`，把本机最终生效的 hostname/port/user/
+/// IdentityFile/ProxyJump 等交给前端，并标出每个候选密钥是否存在。
+///
+/// 不会连接服务器、不会改任何配置；系统没有 OpenSSH 客户端会返回明确中文 Err。
+#[tauri::command]
+pub async fn ssh_diagnose(profile_id: String) -> Result<ssh::SshDiagnosis, String> {
+    log::info!("ipc: ssh_diagnose profile_id={profile_id}");
+    let cfg = ssh_config(&profile_id)?;
+    ssh::diagnose(
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        cfg.key_path.as_deref(),
+        cfg.jump.as_deref(),
+    )
+    .await
+}
+
 async fn run_ssh_capture(args: &[String]) -> Result<String, String> {
     let exe = ssh::ssh_exe();
-    run_capture(std::path::Path::new(&exe), args).await
+    run_capture(std::path::Path::new(&exe), args)
+        .await
+        .map_err(|e| ssh::friendly_ssh_error_context("执行 SSH 命令失败", &e))
 }
 
 /// 跑一次 scp，失败时把 stderr 原样带出来（方便前端显示为什么没传上去）。
@@ -794,16 +844,15 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdin(std::process::Stdio::null());
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("启动 scp 失败（本机需要 OpenSSH 客户端）: {e}"))?;
+    let child = cmd.spawn().map_err(|e| {
+        ssh::friendly_ssh_error_context("启动 scp 失败（本机需要 OpenSSH 客户端）", &e.to_string())
+    })?;
     if let Some(pid) = child.id() {
         crate::core::job::assign(pid);
     }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("等待 scp 失败: {e}"))?;
+    let out = child.wait_with_output().await.map_err(|e| {
+        ssh::friendly_ssh_error_context("等待 scp 失败", &e.to_string())
+    })?;
     if out.status.success() {
         return Ok(());
     }
@@ -812,9 +861,12 @@ async fn run_scp(args: &[String]) -> Result<(), String> {
         msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
     }
     if msg.is_empty() {
-        msg = format!("scp 退出码 {:?}", out.status.code());
+        return Err(format!(
+            "scp 传输失败（退出码 {:?}，没有更多错误信息）",
+            out.status.code()
+        ));
     }
-    Err(msg)
+    Err(ssh::friendly_ssh_error_context("scp 传输失败", &msg))
 }
 
 /// 跑一个外部命令并拿到输出（隐藏控制台窗口）。
@@ -3116,14 +3168,15 @@ pub async fn herdr_pane_resize(
             &spawn_program,
             &args,
             move |ev| {
-                let _ = spawn_channel.send(ev);
+                let _ = spawn_channel.send(friendly_herdr_event(ev));
             },
             spawn_logs,
             spawn_flag,
         )
     })
     .await
-    .map_err(|e| format!("重建观察流失败: {e}"))??;
+    .map_err(|e| format!("重建观察流失败: {e}"))?
+    .map_err(|e| ssh::friendly_ssh_error_context("重建观察流失败", &e))?;
     registry
         .sessions
         .lock()
@@ -3185,7 +3238,9 @@ pub fn herdr_pane_input_start(
     c.stdin(std::process::Stdio::piped());
     c.stdout(std::process::Stdio::null());
     c.stderr(std::process::Stdio::null());
-    let mut child = c.spawn().map_err(|e| format!("启动输入通道失败: {e}"))?;
+    let mut child = c
+        .spawn()
+        .map_err(|e| ssh::friendly_ssh_error_context("启动输入通道失败", &e.to_string()))?;
     // 跟着应用生命周期走：App 退出/被强杀时不会留下孤儿 ssh
     crate::core::job::assign(child.id());
     let stdin = child
@@ -3321,11 +3376,14 @@ async fn herdr_write_input(
         let mut s = stdin.lock().map_err(|e| e.to_string())?;
         match s.write_all(line.as_bytes()) {
             Ok(()) => Ok(true),
-            Err(e) => Err(format!("输入通道断了（下次输入会自动重连）: {e}")),
+            Err(e) => Err(ssh::friendly_ssh_error_context(
+                "输入通道断了（下次输入会自动重连）",
+                &e.to_string(),
+            )),
         }
     })
     .await
-    .map_err(|e| format!("写入线程失败: {e}"))?
+    .map_err(|e| ssh::friendly_ssh_error_context("写入输入通道失败", &e.to_string()))?
     .map(|_| ())
 }
 
@@ -3879,3 +3937,36 @@ mod security_tests {
     }
 }
 
+#[cfg(test)]
+mod ssh_error_tests {
+    use super::*;
+
+    /// herdr stderr 原样送到 commands 的 sink，这里必须收口成中文分类 + 原始信息；
+    /// 普通数据/状态事件不能被改动。
+    #[test]
+    fn herdr_error_events_are_classified_without_stray_dash() {
+        let event = friendly_herdr_event(SessionEvent::Error {
+            message: "No common Kex algorithm - ours: [curve25519], theirs: []".into(),
+        });
+        match event {
+            SessionEvent::Error { message } => {
+                assert!(message.contains("算法不匹配"), "{message}");
+                assert!(message.contains("｜原始信息："), "{message}");
+                assert!(!message.contains(" - "), "{message}");
+            }
+            _ => panic!("Error 事件被改成了别的类型"),
+        }
+
+        let data = friendly_herdr_event(SessionEvent::Data {
+            data: "aGVsbG8=".into(),
+            seq: None,
+        });
+        match data {
+            SessionEvent::Data { data, seq } => {
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(seq, None);
+            }
+            _ => panic!("Data 事件不该被改动"),
+        }
+    }
+}

@@ -633,6 +633,8 @@ pub fn run() {
       commands::list_profiles,
       commands::save_profile,
       commands::delete_profile,
+      // 连接诊断：跑一次 ssh -G 把"实际生效的 host/port/user/密钥"给 UI 看（用户报障用）
+      commands::ssh_diagnose,
       commands::open_local,
       commands::open_ssh,
       commands::session_write,
