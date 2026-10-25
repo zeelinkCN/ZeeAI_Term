@@ -22,19 +22,23 @@ import { tmpdir } from "node:os";
 
 // 仓库根目录 = 本文件的上一级（这样从任何目录调用都能跑）
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-// 临时目录：优先用固定的 zeeai-fe-test；如果上一轮的 Edge 还占着（清理失败），
-// 就换一个带时间戳的目录 —— 宁可换目录，也不要因为清理失败整轮跑不起来。
-let OUT = join(tmpdir(), "zeeai-fe-test");
+// 临时目录：优先用固定的 zeeai-fe-test；并行跑（例如两个 agent 同时在同一个仓库上验）
+// 时用 ZEEAI_FE_OUT 指一个独立目录 —— 否则一轮开头的 rmSync 会删掉另一轮正在用的 site。
+let OUT = process.env.ZEEAI_FE_OUT || join(tmpdir(), "zeeai-fe-test");
 try {
   rmSync(OUT, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 } catch {
   OUT = join(tmpdir(), `zeeai-fe-test-${Date.now()}`);
 }
 const SITE = join(OUT, "site");
-const PORT = 8791;
+// 默认 8791；并行跑（例如两个 agent 同时在同一个仓库上验）时用 ZEEAI_FE_PORT 换一个，
+// 否则后启动的那轮会直接 EADDRINUSE 挂在起服务这一步。
+const PORT = Number(process.env.ZEEAI_FE_PORT || 8791);
 // CDP 端口随机 + 每次一个新的 Edge profile 目录：
 // 上一轮万一留下 Edge 进程（或用户自己在开 Edge），都不会和我们抢端口/抢 profile。
-const CDP_PORT = 9300 + Math.floor(Math.random() * 650);
+// 并行跑时用 ZEEAI_FE_CDP_PORT 固定一个 —— 否则两轮撞进同一个浏览器，会互相抢页面
+//（表现为窗口尺寸变成另一轮的值、甚至 Page.navigate 到对方端口）。
+const CDP_PORT = Number(process.env.ZEEAI_FE_CDP_PORT || (9300 + Math.floor(Math.random() * 650)));
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 
 const appData = join(process.env.APPDATA ?? "", "ZeeAI-Terminal");
@@ -89,6 +93,9 @@ function copyDir(from, to) {
 }
 
 const mockScript = `
+// 面板停用了，但看板那 50+ 条断言还得继续盯着"没删掉的代码"（用户说后续还要重构）。
+// 这个全局是 App.tsx 里 AI_PANEL_TEST_ONLY_SHOW 认的唯一豁免口；生产里没人设。
+window.__ZEEAI_TEST_AI_PANEL__ = true;
 window.__ZEEAI_CALLS__ = [];
 window.__ZEEAI_CALLARGS__ = [];
 window.__ZEEAI_MOCK__ = ${JSON.stringify({
@@ -333,6 +340,31 @@ const mockMergeBoard = (src, nowMs) => {
 };
 
 const noop = () => {};
+// ---------- SSH 连接诊断（ssh_diagnose）的固定数据 ----------
+// 真后端跑的是系统 ssh -G；无头页面里没有"那台机器"，所以用固定数据代替。
+// 注意：identityfile 带 ~、key_files 的 path 是**展开后**的绝对路径 ——
+// 诊断弹窗里那个 ✓/✗ 就是靠把两者认成同一个文件才标对的（这正是要验的点）。
+// 路径用正斜杠：这份代码是模板字符串注入页面的，反斜杠会被吃掉一层。
+const MOCK_DIAG_KEYS = [
+  { path: "C:/Users/me/.ssh/id_ed25519", exists: true },
+  { path: "C:/Users/me/.ssh/id_rsa", exists: false },
+];
+const mockDiagnosis = (noKey) => ({
+  effective: {
+    hostname: "203.0.113.10",
+    port: 2222,
+    user: "alice",
+    identityfile: ["~/.ssh/id_ed25519", "~/.ssh/id_rsa"],
+    proxyjump: "bastion.example:2200",
+    proxycommand: "",
+    identitiesonly: "yes",
+    batchmode: "no",
+  },
+  key_files: noKey ? MOCK_DIAG_KEYS.map((k) => ({ ...k, exists: false })) : MOCK_DIAG_KEYS,
+  summary: noKey
+    ? "将使用 alice@203.0.113.10:2222，密钥 ~/.ssh/id_ed25519（不存在）"
+    : "将使用 alice@203.0.113.10:2222，密钥 ~/.ssh/id_ed25519（存在）",
+});
 const resolveCmd = (cmd, args, opts) => {
   const M = window.__ZEEAI_MOCK__;
   const S = window.__ZEEAI_SCENARIO__;
@@ -347,7 +379,16 @@ const resolveCmd = (cmd, args, opts) => {
     return new Promise((r) => setTimeout(() => r(resolveCmd(cmd, args, { fast: true })), 1200));
   }
   switch (cmd) {
-    case "list_profiles": return M.profiles;
+    // allowPassword 场景：把第一台 SSH 服务器改成"允许在终端里输入密码"。
+    // 只改这份**内存里的副本**（用户的 profiles.json 一个字节都不动），用来验
+    // "认证失败 + 有密钥 + 开了密码模式"时那句提示。
+    case "list_profiles": {
+      if (S.allowPassword) {
+        const p = M.profiles.find((x) => x.ssh);
+        if (p && p.ssh) p.ssh.allowPassword = true;
+      }
+      return M.profiles;
+    }
     case "settings_get": return Object.assign({}, M.settings, S.settingsPatch || {});
     // 历史列表：herdrHistory = 带一条 herdr 会话（验证"从侧栏点开也进 herdr"）。
     // 注意三个入口（list/save/remove）都要走同一份 —— 应用启动时恢复会话会调 history_save，
@@ -4413,6 +4454,228 @@ check(
 );
 
 console.log("\n--- 页面控制台里的 error/warning ---");
+// ================= (NEW) AI 面板停用：星号只开一块灰色空容器 =================
+// 用户 2026-10-24：「AI 助手面板太鸡肋，先关闭；点星号打开只显示个 AI 任务面板」，
+// 追问后明确：「整个面板都停用，只留灰色容器」。
+// mockScript 默认把测试豁免打开（保住上面那 50+ 条看板断言）；这一组先关掉它，
+// 钉住用户看到的那一面：内容**不挂 DOM**（不是 display:none），只有一块灰底。
+await send("Page.addScriptToEvaluateOnNewDocument", {
+  source: "window.__ZEEAI_TEST_AI_PANEL__ = false;",
+});
+await setScenario({ settingsPatch: { theme: "dark" } });
+await reload();
+const clickAiStar = () =>
+  evaluate(`(() => {
+    const b = [...document.querySelectorAll(".activitybar .act")].find((x) => (x.title || "").includes("AI"));
+    if (!b) return false;
+    b.click();
+    return true;
+  })()`);
+const probesBeforePanelOpen = await countAiProbes();
+const starOpened = await clickAiStar();
+await sleep(500);
+const readAiOffPanel = () =>
+  evaluate(`(() => {
+    const panel = document.querySelector(".ai-panel");
+    if (!panel) return null;
+    const probe = document.createElement("div");
+    probe.style.background = "var(--panel-2)";
+    // --panel-2 定义在 .app 上：探针必须挂进 .app，挂 body 上拿不到变量（会返回透明）
+    (document.querySelector(".app") || document.body).appendChild(probe);
+    const expectBg = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    const cs = getComputedStyle(panel);
+    return {
+      text: (panel.innerText || "").trim(),
+      descendants: panel.querySelectorAll("*").length,
+      buttons: panel.querySelectorAll("button").length,
+      bg: cs.backgroundColor,
+      expectBg: expectBg,
+      width: Math.round(panel.getBoundingClientRect().width),
+      off: panel.classList.contains("off"),
+      appLight: document.querySelector(".app").classList.contains("light"),
+    };
+  })()`);
+const rgbNums = (s) =>
+  String(s)
+    .slice(String(s).indexOf("(") + 1, String(s).indexOf(")"))
+    .split(",")
+    .map((x) => Number(x.trim()))
+    .slice(0, 3);
+const isGrey = (s) => {
+  const c = rgbNums(s);
+  return c.length === 3 && Math.max(...c) - Math.min(...c) <= 12;
+};
+const aiOff = await readAiOffPanel();
+const probesAfterPanelOpen = await countAiProbes();
+check(
+  "AI 面板停用：点星号打开的是一块空容器（没有一个字、没有子元素）",
+  starOpened && !!aiOff && aiOff.off && aiOff.text === "" && aiOff.descendants === 0,
+  JSON.stringify(aiOff),
+);
+check(
+  "AI 面板停用：看板卡片 / 按钮 / 提示文字 / 刷新入口都不渲染（DOM 里也找不到）",
+  !!aiOff && aiOff.buttons === 0 && aiOff.descendants === 0 && aiOff.text === "",
+  `buttons=${(aiOff || {}).buttons} descendants=${(aiOff || {}).descendants}`,
+);
+check(
+  "AI 面板停用：底色就是主题灰 --panel-2（不透明、三通道接近、不是写死颜色）",
+  !!aiOff && aiOff.bg === aiOff.expectBg && aiOff.bg !== "rgba(0, 0, 0, 0)" && isGrey(aiOff.bg),
+  `bg=${(aiOff || {}).bg} expect=${(aiOff || {}).expectBg}`,
+);
+check(
+  "AI 面板停用：容器宽度还是 268px（开合 / 宽度都保留，不是整块删掉）",
+  !!aiOff && aiOff.width >= 258 && aiOff.width <= 278,
+  `width=${(aiOff || {}).width}`,
+);
+check(
+  "AI 面板停用：打开面板不触发任何 AI 探测（看板逻辑没在背后偷跑）",
+  probesAfterPanelOpen === probesBeforePanelOpen,
+  `${probesBeforePanelOpen} → ${probesAfterPanelOpen}`,
+);
+await clickAiStar();
+await sleep(350);
+check(
+  "AI 面板停用：再点一次星号就收起（活动栏按钮照旧能开合）",
+  await evaluate(`!document.querySelector(".ai-panel")`),
+  "",
+);
+// 浅色主题：还是同一块「--panel-2」浅灰，不能变成刺眼的白 / 透明 / 深色
+await setScenario({ settingsPatch: { theme: "light" } });
+await reload();
+await clickAiStar();
+await sleep(450);
+const aiOffLight = await readAiOffPanel();
+check(
+  "AI 面板停用（浅色主题）：仍是 --panel-2 的浅灰、仍然一个字都不显示",
+  !!aiOffLight &&
+    aiOffLight.appLight &&
+    aiOffLight.bg === aiOffLight.expectBg &&
+    aiOffLight.text === "" &&
+    aiOffLight.descendants === 0 &&
+    rgbNums(aiOffLight.bg).every((v) => v >= 200),
+  JSON.stringify(aiOffLight),
+);
+
+// ================= (NEW) 会话承载徽标：T / H / S =================
+// T = tmux、H = herdr、S = 纯 SSH；本地终端不加。判定只看会话对象里的承载字段
+// （herdrPane / tmuxName / tmuxMode），不靠标题猜。
+const sshProfileId = await evaluate(
+  `(window.__ZEEAI_MOCK__.profiles.find((p) => p.ssh) || {}).id || ""`,
+);
+await send("Page.addScriptToEvaluateOnNewDocument", {
+  source: `window.__ZEEAI_SESSION__ = ${JSON.stringify({
+    version: 1,
+    savedAt: Date.now(),
+    activeIndex: 0,
+    sessions: [
+      { kind: "remote", title: "S 纯 SSH", profileId: sshProfileId, user: "lz", tmuxMode: "none" },
+      { kind: "remote", title: "T tmux", profileId: sshProfileId, user: "lz", tmuxMode: "name", tmuxName: "carrier-tmux" },
+      { kind: "remote", title: "H herdr", profileId: sshProfileId, user: "lz", tmuxMode: "name", herdrPane: "wD:p1", herdrMode: "control" },
+    ],
+  })};`,
+});
+const readCarrierTabs = () =>
+  evaluate(`(() => {
+    const appBg = getComputedStyle(document.querySelector(".app")).backgroundColor;
+    const num = (s) => String(s).slice(String(s).indexOf("(") + 1, String(s).indexOf(")")).split(",").map((x) => Number(x.trim())).slice(0, 3);
+    const lum = (s) => {
+      const c = num(s).map((v) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); });
+      return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    };
+    const contrast = (a, b) => { const l1 = lum(a), l2 = lum(b); return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05); };
+    return {
+      appLight: document.querySelector(".app").classList.contains("light"),
+      appBg: appBg,
+      tabs: [...document.querySelectorAll(".session-tab")].map((t) => {
+        const b = t.querySelector(".carrier-badge");
+        const cs = b ? getComputedStyle(b) : null;
+        return {
+          tab: (t.innerText || "").trim(),
+          letter: b ? (b.textContent || "").trim() : "",
+          cls: b ? String(b.className) : "",
+          title: b ? b.title : "",
+          color: cs ? cs.color : "",
+          bg: cs ? cs.backgroundColor : "",
+          contrast: cs ? contrast(cs.color, appBg) : 0,
+          next: b && b.nextElementSibling ? (b.nextElementSibling.textContent || "").trim() : "",
+        };
+      }),
+    };
+  })()`);
+await setScenario({ settingsPatch: { theme: "dark" } });
+await reload();
+await sleep(1800);
+const carrier = await readCarrierTabs();
+const tabOf = (k) => carrier.tabs.find((t) => t.cls.includes(k)) || {};
+const tTab = tabOf("tmux");
+const hTab = tabOf("herdr");
+const sTab = tabOf("ssh");
+check(
+  "会话标签：tmux / herdr / 纯 SSH 三个标签分别显示 T / H / S",
+  tTab.letter === "T" && hTab.letter === "H" && sTab.letter === "S",
+  JSON.stringify(carrier.tabs.map((t) => t.tab + "=" + t.letter)),
+);
+check(
+  "会话标签：T / H / S 三种颜色明显不同（文字色与底色都不是同一个）",
+  new Set([tTab.color, hTab.color, sTab.color]).size === 3 &&
+    new Set([tTab.bg, hTab.bg, sTab.bg]).size === 3,
+  `${tTab.color} / ${hTab.color} / ${sTab.color}`,
+);
+check(
+  "会话标签：悬停 title 分别写明 tmux / herdr / SSH",
+  String(tTab.title).toLowerCase().includes("tmux") &&
+    String(hTab.title).toLowerCase().includes("herdr") &&
+    String(sTab.title).includes("SSH"),
+  `${tTab.title} | ${hTab.title} | ${sTab.title}`,
+);
+check(
+  "会话标签：徽标在标题前面（紧挨着的下一个元素就是标题）",
+  tTab.next === "T tmux" && hTab.next === "H herdr" && sTab.next === "S 纯 SSH",
+  `${tTab.next} | ${hTab.next} | ${sTab.next}`,
+);
+// 本地终端不加徽标：切到 PowerShell 模块 → 新建一个本地会话
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".activitybar .act")].find((x) => (x.title || "") === "PowerShell");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(500);
+await evaluate(`(() => {
+  const b = [...document.querySelectorAll("button")].find((x) => {
+    const t = (x.innerText || "").trim();
+    return t.includes("新建 PowerShell") && !t.includes("7");
+  });
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(1200);
+const localTabBadge = await evaluate(`(() => {
+  const t = [...document.querySelectorAll(".session-tab")].find((x) => (x.innerText || "").includes("PowerShell"));
+  return t ? { tab: (t.innerText || "").trim(), badges: t.querySelectorAll(".carrier-badge").length } : null;
+})()`);
+check(
+  "会话标签：本地终端（PowerShell）不加承载徽标",
+  !!localTabBadge && localTabBadge.badges === 0,
+  JSON.stringify(localTabBadge),
+);
+// 浅色主题下三种颜色仍然分得开、和面板底色对比度够（小号字也读得清）
+await setScenario({ settingsPatch: { theme: "light" } });
+await reload();
+await sleep(1800);
+const carrierLight = await readCarrierTabs();
+const lightTabOf = (k) => carrierLight.tabs.find((t) => t.cls.includes(k)) || {};
+const lt = lightTabOf("tmux");
+const lh = lightTabOf("herdr");
+const ls = lightTabOf("ssh");
+check(
+  "浅色主题：三个徽标仍然三种颜色，且与浅底对比度 >= 3:1（读得清）",
+  carrierLight.appLight &&
+    new Set([lt.color, lh.color, ls.color]).size === 3 &&
+    [lt, lh, ls].every((x) => x.contrast >= 3),
+  `app=${carrierLight.appBg} contrast=${[lt, lh, ls].map((x) => Math.round(x.contrast * 10) / 10).join("/")}`,
+);
+
 // ================= (NEW) 每个会话独立草稿：切换 / 发送 / 附件都不串 =================
 const clickSessionTab = (needle) =>
   evaluate(`(() => {

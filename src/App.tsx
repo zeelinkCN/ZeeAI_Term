@@ -301,6 +301,77 @@ function aiToolLabel(name: string): string {
 }
 
 /**
+ * ⚠️ AI 助手面板总开关（2026-10-24 用户要求暂时停用）。
+ *
+ * 用户原话：「AI 助手面板太鸡肋，先关闭；点星号打开只显示个 AI 任务面板」，
+ * 追问后明确：「整个面板都停用，只留灰色容器」。
+ *
+ * 现在保留的是：右侧面板容器、活动栏星号按钮的开合、面板宽度（268px）、
+ * 看板数据采集 / 红点逻辑 / 卡片代码 —— 只是**一条内容都不渲染**，
+ * 面板里只有一块灰色背景（`.ai-panel.off`，用主题变量）。
+ *
+ * 为什么用开关位而不是删代码：用户说后续重构还要用这些代码（看板 v2 的
+ * 两区、折叠行、承载健康、时间线、通知都在下面原样留着）。
+ *
+ * 恢复方法：把 `AI_PANEL_DISABLED` 改成 `false` 即可 —— 不需要动任何 JSX /
+ * 逻辑 / 样式；面板体量/开合行为都还是原来的。
+ */
+const AI_PANEL_DISABLED = true;
+
+/**
+ * 仅供无头回归测试的"临时把内容渲出来"开关（正常构建 / 正常启动**不存在**）。
+ *
+ * 为什么留这个口子：面板里那套看板有 50+ 条无头断言，是这些代码唯一的回归网；
+ * 如果一刀切成空面板，它们会全部变红、被删掉，等以后重构时就没有任何东西兜底了。
+ * `scripts/fe-smoke.mjs` 会在页面启动前设 `window.__ZEEAI_TEST_AI_PANEL__ = true`，
+ * 只在那轮测试里渲染；用户打开应用时这个全局永远是 undefined → 面板仍是灰容器。
+ */
+const AI_PANEL_TEST_ONLY_SHOW =
+  typeof window !== "undefined" &&
+  (window as Window & { __ZEEAI_TEST_AI_PANEL__?: boolean }).__ZEEAI_TEST_AI_PANEL__ === true;
+/** 实际生效的"要不要藏内容"：停用开关 + 测试豁免 */
+const AI_PANEL_HIDDEN = AI_PANEL_DISABLED && !AI_PANEL_TEST_ONLY_SHOW;
+
+/** 会话的承载方式：T = tmux、H = herdr、S = 纯 SSH（本地终端没有徽标） */
+type CarrierKey = "tmux" | "herdr" | "ssh";
+
+const CARRIER_LETTER: Record<CarrierKey, string> = {
+  tmux: "T",
+  herdr: "H",
+  ssh: "S",
+};
+
+/** 悬停文案：必须把 tmux / herdr / SSH 三个词写清楚（用户要求） */
+const CARRIER_TITLE: Record<CarrierKey, string> = {
+  tmux: "tmux —— 这个会话跑在 tmux 里（断线重连能回到同一个会话）",
+  herdr: "herdr —— 这个会话是 herdr 里的窗格（观察 / 接管都算）",
+  ssh: "SSH —— 纯 SSH 会话（没有 tmux / herdr）",
+};
+
+/**
+ * 判定一个会话的承载方式 —— 只看会话对象里**已有的**承载字段，不靠标题猜：
+ * - `herdrPane`：观察窗 / 接管窗格（后端建会话时写入的窗格号）；
+ * - `tmuxName`：连上后后端返回的真实 tmux 会话名（`info.tmuxSession`）；
+ * - `tmuxMode === "none"`：新建时明确选了"普通 shell / 纯 SSH"；
+ * - `tmuxMode === "default"`：跟着服务器配置走（`ssh.tmuxEnabled`，默认是开）。
+ *
+ * 连接中的 tmux 会话还没拿到 `tmuxName`，先按这次选的打开方式标；连上后
+ * `tmuxName` 一到就以它为准（见 openSshSession 里的 setSessions）。
+ */
+function carrierOfSession(
+  s: OpenSession,
+  profile?: ConnectionProfile,
+): CarrierKey | null {
+  // 本地终端（PowerShell / CMD / WSL / Git / 串口 / ADB）不是 T/H/S 承载，不加徽标
+  if (s.kind !== "remote") return null;
+  if (s.herdrPane) return "herdr";
+  if (s.tmuxName) return "tmux";
+  if (s.tmuxMode === "none") return "ssh";
+  if (s.tmuxMode === "default" && profile?.ssh?.tmuxEnabled === false) return "ssh";
+  return "tmux";
+}
+
+/**
  * 一组"这就是个壳"的 shell 名字。
  *
  * 用来判断一个 herdr 窗格**是不是空壳**（前台进程就停在提示符上、没跑任何活）。
@@ -4055,6 +4126,19 @@ export default function App() {
           kindOfSession(s.kind),
         ).background
       : undefined;
+  /**
+   * 会话承载徽标：T / H / S，放在每个会话标签标题**前面**（普通标签、herdr 接管标签、
+   * sub-tab 都用这一个）。本地终端返回 null —— 用户要求本地不加徽标。
+   */
+  function carrierBadge(s: OpenSession): JSX.Element | null {
+    const carrier = carrierOfSession(s, profiles.find((p) => p.id === s.profileId));
+    if (!carrier) return null;
+    return (
+      <span className={"carrier-badge " + carrier} title={CARRIER_TITLE[carrier]}>
+        {CARRIER_LETTER[carrier]}
+      </span>
+    );
+  }
   // 看板只摆两个区：**需要你** + **运行中**（§10.2）。
   // 「最近完成」「空闲」各折成一行，点开才渲染明细；承载健康只在异常时出现。
   //
@@ -7600,7 +7684,9 @@ export default function App() {
               {/* 有"要你处理/新消息"没看过时显示数字（设置里可关） */}
               {/* 红点只在两件事上亮（§10.6）：需要你（亮到你处理）、跑完停下（点开就消）。
                   两条规则各有一个开关，所以这里不能再拿一个"总开关"去盖。 */}
-              {aiBadgeCount > 0 && (
+              {/* 面板停用时红点逻辑照跑、但不渲染给人看（用户：「只看灰容器」；
+                  点开也看不到任何东西，亮个数字只会让人以为有地方可去） */}
+              {!AI_PANEL_HIDDEN && aiBadgeCount > 0 && (
                 <span className="act-badge">{aiBadgeCount > 9 ? "9+" : aiBadgeCount}</span>
               )}
             </button>
@@ -8985,6 +9071,7 @@ export default function App() {
                 title={`${s.title}（右键可以重命名）`}
               >
                 {moduleIcon(s.kind)}
+                {carrierBadge(s)}
                 <span>{s.title}</span>
                 {s.logPath && <span className="rec-dot" title="正在记录终端日志" />}
                 <span className={"status-dot " + s.state} />
@@ -9033,6 +9120,7 @@ export default function App() {
                 className={"sub-tab term" + (activeSession.activeTab === "terminal" ? " active" : "")}
                 onClick={() => selectTab(activeSession.id, "terminal")}
               >
+                {carrierBadge(activeSession)}
                 <IconTerminal size={14} /> 终端
               </button>
               {/* 分隔：左边是"终端"，右边是打开的文件 —— 不分开真的分不清哪个是哪个 */}
@@ -9411,7 +9499,17 @@ export default function App() {
         </main>
 
         {aiPanelOpen && (
-          <aside className="ai-panel">
+          <aside className={"ai-panel" + (AI_PANEL_HIDDEN ? " off" : "")}>
+            {/* ---------- 面板整体停用（开关在上面的 AI_PANEL_DISABLED） ----------
+                用户 2026-10-24：「整个面板都停用，只留灰色容器」。
+                保留：容器 / 开合 / 宽度；**内容一条都不渲染** —— 不是 CSS 藏起来，
+                是这里直接不挂 DOM（看板卡片、按钮、提示、刷新入口全都不会出现）。
+                代码原样包在下面这个条件里；把常量改回 false 就全回来。
+                唯一例外：无头测试注入 `__ZEEAI_TEST_AI_PANEL__` 时临时渲染（见上方
+                `AI_PANEL_TEST_ONLY_SHOW` 的说明），正常启动没有这个全局。
+                `aiPanelOpen` 还照旧控制"有没有这块灰板"，活动栏星号也照旧能开合。 */}
+            {AI_PANEL_HIDDEN ? null : (
+              <>
             <div className="ai-head">
               {/* 标题**固定**，不再跟着当前会话走。
                   以前写「AI Agent · PowerShell」，下面列的却是远端的卡 —— 用户实测因此以为
@@ -9775,6 +9873,8 @@ export default function App() {
               </div>
             )}
 
+              </>
+            )}
           </aside>
         )}
       </div>
@@ -9826,7 +9926,9 @@ export default function App() {
             所以这里**只有**「需要你」那一个 chip —— "AI 已完成" 不再单独占一个
             （完成已经在面板的「最近完成 N 项」里，三处各说一遍是这轮要收掉的乱）。
             点它 = 打开面板；needs-you 是唯一真正值得打断用户的事。 */}
-        {aiNeedIds.length > 0 && (
+        {/* 面板停用时不渲染「需要你」chip：逻辑保留（状态还在算），只是没有面板可去，
+            亮一个红色数字反而误导。恢复面板 = 把 AI_PANEL_DISABLED 改成 false。 */}
+        {!AI_PANEL_HIDDEN && aiNeedIds.length > 0 && (
           <button
             type="button"
             className="stat ai-need-chip"

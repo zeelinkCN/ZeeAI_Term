@@ -1112,6 +1112,16 @@ body {
   overflow: auto;
 }
 
+/* AI 面板停用态（App.tsx 的 AI_PANEL_DISABLED）：只留一块灰色容器。
+   用 --panel-2：深色主题是 #2a2d2e、浅色主题是 #f6f6f6，都是"面板底色"，
+   和两侧的 --sidebar / --bg 有明显区分又不刺眼；不写死颜色，
+   五套浅色主题（light / github / paper / sakura / mint）一起跟着走。 */
+.ai-panel.off {
+  background: var(--panel-2);
+  border-left-color: var(--border);
+  overflow: hidden;
+}
+
 .ai-head {
   display: flex;
   align-items: center;
@@ -1450,6 +1460,56 @@ body {
   background: rgba(35, 209, 139, 0.18);
   color: var(--green);
   font-weight: 700;
+}
+
+/* 会话承载徽标：T = tmux / H = herdr / S = 纯 SSH（本地终端不加）。
+   小号圆角方块，和侧栏的 .tag / AI 面板的 .ai-tag 一个风格；三色都用主题变量派生：
+   accent（蓝）/ green（绿）/ amber（黄），浅色主题下把绿、黄压深，白底上也读得清。 */
+.carrier-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.carrier-badge.tmux {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.carrier-badge.herdr {
+  color: var(--green);
+  background: rgba(35, 209, 139, 0.16);
+  border-color: rgba(35, 209, 139, 0.55);
+}
+
+.carrier-badge.ssh {
+  color: var(--amber);
+  background: rgba(226, 192, 141, 0.16);
+  border-color: rgba(226, 192, 141, 0.55);
+}
+
+/* 浅色主题：绿 / 黄在白色底上会发飘，换成同色系的深一档（不引入新主题变量，只调明度） */
+.app.light .carrier-badge.herdr {
+  color: #1f6b3c;
+  background: rgba(35, 160, 105, 0.14);
+  border-color: rgba(35, 160, 105, 0.5);
+}
+
+.app.light .carrier-badge.ssh {
+  color: #775a12;
+  background: rgba(180, 140, 30, 0.14);
+  border-color: rgba(180, 140, 30, 0.5);
 }
 
 .session-tab {
