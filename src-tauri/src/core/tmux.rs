@@ -44,10 +44,9 @@ pub fn list_remote_command() -> String {
 }
 
 pub fn kill_remote_command(name: &str) -> String {
-    format!(
-        "tmux kill-session -t '{}' 2>&1 || true",
-        name.replace('\'', "")
-    )
+    // 用 quote() 而不是 replace('\'', "")：后者会**静默改掉**会话名，
+    // 名字里本来带单引号时杀错会话；quote() 是标准 shell 转义，语义不变。
+    format!("tmux kill-session -t {} 2>&1 || true", quote(name))
 }
 
 /// tmux 窗口（给「tmux 快捷操作」面板列出来点着切）
@@ -204,5 +203,20 @@ mod tests {
         let c = action_command("my sess'x", "new-window", None).unwrap();
         // 里面的单引号被转义掉，不会跑出 shell 语法
         assert!(c.contains(r"'my sess'\''x'"), "got: {c}");
+    }
+
+    /// kill 也必须走 quote()：以前 `replace('\'', "")` 会静默改掉会话名（杀错会话）
+    #[test]
+    fn kill_session_quotes_name_instead_of_dropping_quotes() {
+        let c = kill_remote_command("my sess'x; rm -rf /");
+        assert!(
+            c.contains(r"'my sess'\''x; rm -rf /'"),
+            "会话名必须整体转义，而不是删掉单引号: {c}"
+        );
+        // 正常名字保持原样
+        assert_eq!(
+            kill_remote_command("main"),
+            "tmux kill-session -t 'main' 2>&1 || true"
+        );
     }
 }

@@ -7,7 +7,7 @@
 //! - 以后做上传/下载进度条、断点续传，SFTP 才能按块读写（scp 只能黑盒等）。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::{self, Handle};
@@ -23,18 +23,72 @@ pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 /// 什么都不做的回调（不需要进度时用）
 pub fn no_progress(_done: u64, _total: u64) {}
 
-pub struct Client;
+/// SSH 客户端 handler：把服务器主机密钥交给 TOFU 记录校验（见 `core::known_hosts`）。
+///
+/// 为什么 handler 里要带 host/port：`check_server_key` 只拿得到公钥，
+/// 而 known_hosts 是按 `host:port` 记的；`Client` 由我们自己在 `connect()` 里构造，
+/// 所以把目标地址塞进来是最省事、也最不容易串线的做法。
+pub struct Client {
+    host: String,
+    port: u16,
+    /// 校验失败的中文原因。russh 发现 `check_server_key` 返回 false 时只会给一个
+    /// 泛泛的 `UnknownKey`，这里把详细原因留给 `connect()` 拼进错误信息，最终传到 UI。
+    reject: Arc<Mutex<Option<String>>>,
+}
+
+impl Client {
+    /// 返回 handler 和"拒绝原因"的共享槽（connect 失败后从槽里取原因）。
+    fn new(host: &str, port: u16) -> (Self, Arc<Mutex<Option<String>>>) {
+        let reject = Arc::new(Mutex::new(None));
+        (
+            Self {
+                host: host.to_string(),
+                port,
+                reject: reject.clone(),
+            },
+            reject,
+        )
+    }
+}
 
 impl client::Handler for Client {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // 和终端那边保持一致：首次连接直接信任（StrictHostKeyChecking=accept-new 的等价行为）
-        Ok(true)
+        // TOFU：首次记录指纹；之后指纹必须一致，不一致直接拒绝（MITM 防护）。
+        match crate::core::known_hosts::verify(&self.host, self.port, server_public_key) {
+            None => Ok(true),
+            Some(reason) => {
+                if let Ok(mut slot) = self.reject.lock() {
+                    *slot = Some(reason);
+                }
+                // 返回 false → russh 中止握手，连接失败
+                Ok(false)
+            }
+        }
     }
+}
+
+/// SFTP / 跳板机所有英文错误统一从这里过：动作中文 + 分类 + 原始信息。
+fn sftp_err(context: &str, e: impl std::fmt::Display) -> String {
+    crate::core::ssh::friendly_ssh_error_context(context, &e.to_string())
+}
+
+/// 连接失败时的文案：优先用 known_hosts 给出的具体原因，否则走通用的 SSH 错误归类。
+///
+/// 两个分支都带动作上下文；known_hosts 的原因本身已经是完整中文，不再重复分类。
+fn connect_error_text(
+    e: &russh::Error,
+    reject: &Arc<Mutex<Option<String>>>,
+    context: &str,
+) -> String {
+    if let Some(reason) = reject.lock().ok().and_then(|slot| slot.clone()) {
+        return format!("{context}：{reason}");
+    }
+    crate::core::ssh::friendly_ssh_error_context(context, &e.to_string())
 }
 
 #[derive(Clone, Serialize)]
@@ -83,42 +137,45 @@ pub async fn connect(
         Some(j) => {
             let (j_user, j_host, j_port) = parse_jump(j, user)?;
             log::info!("sftp: 经跳板机 {j_user}@{j_host}:{j_port} 连接 {host}:{port}");
-            let mut jump_session = client::connect(config.clone(), (j_host.as_str(), j_port), Client)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "连接跳板机 {j_host}:{j_port} 失败：{}",
-                        crate::core::ssh::friendly_ssh_error(&e.to_string())
-                    )
-                })?;
+            let (jump_handler, jump_reject) = Client::new(&j_host, j_port);
+            let mut jump_session =
+                client::connect(config.clone(), (j_host.as_str(), j_port), jump_handler)
+                    .await
+                    .map_err(|e| {
+                        connect_error_text(
+                            &e,
+                            &jump_reject,
+                            &format!("连接跳板机 {j_host}:{j_port} 失败"),
+                        )
+                    })?;
             authenticate(&mut jump_session, &j_user, key_path, password).await?;
             let ch = jump_session
                 .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
                 .await
                 .map_err(|e| {
-                    format!(
-                        "跳板机转发到 {host}:{port} 失败：{}",
-                        crate::core::ssh::friendly_ssh_error(&e.to_string())
-                    )
+                    sftp_err(&format!("跳板机转发到 {host}:{port} 失败"), e)
                 })?;
-            client::connect_stream(config.clone(), ch.into_stream(), Client)
+            let (target_handler, target_reject) = Client::new(host, port);
+            client::connect_stream(config.clone(), ch.into_stream(), target_handler)
                 .await
                 .map_err(|e| {
-                    format!(
-                        "经跳板机连接 {host}:{port} 失败：{}",
-                        crate::core::ssh::friendly_ssh_error(&e.to_string())
+                    connect_error_text(
+                        &e,
+                        &target_reject,
+                        &format!("经跳板机连接 {host}:{port} 失败"),
                     )
                 })?
         }
-        None => client::connect(config.clone(), (host, port), Client)
-            .await
-            .map_err(|e| {
-                // 这一条是用户最常看到的：把 russh 的英文报错分类成中文，原文附在后面
-                format!(
-                    "连接 {host}:{port} 失败：{}",
-                    crate::core::ssh::friendly_ssh_error(&e.to_string())
-                )
-            })?,
+        None => {
+            let (handler, reject) = Client::new(host, port);
+            client::connect(config.clone(), (host, port), handler)
+                .await
+                .map_err(|e| {
+                    // 这一条是用户最常看到的：把 russh 的英文报错分类成中文；
+                    // 主机密钥变了则直接给 known_hosts 的具体原因（见 connect_error_text）。
+                    connect_error_text(&e, &reject, &format!("连接 {host}:{port} 失败"))
+                })?
+        }
     };
 
     authenticate(&mut session, user, key_path, password).await?;
@@ -126,14 +183,14 @@ pub async fn connect(
     let channel = session
         .channel_open_session()
         .await
-        .map_err(|e| format!("打开通道失败: {e}"))?;
+        .map_err(|e| sftp_err("打开 SFTP 通道失败", e))?;
     channel
         .request_subsystem(true, "sftp")
         .await
-        .map_err(|e| format!("服务器不支持 SFTP 子系统: {e}"))?;
+        .map_err(|e| sftp_err("服务器不支持 SFTP 子系统", e))?;
     let sftp = SftpSession::new(channel.into_stream())
         .await
-        .map_err(|e| format!("初始化 SFTP 失败: {e}"))?;
+        .map_err(|e| sftp_err("初始化 SFTP 失败", e))?;
 
     Ok(SftpConn { session, sftp })
 }
@@ -212,13 +269,13 @@ pub async fn list(conn: &SftpConn, path: Option<&str>) -> Result<(String, Vec<Sf
             .sftp
             .canonicalize(".")
             .await
-            .map_err(|e| format!("取家目录失败: {e}"))?,
+            .map_err(|e| sftp_err("取家目录失败", e))?,
     };
     let raw = conn
         .sftp
         .read_dir(&dir)
         .await
-        .map_err(|e| format!("读取目录 {dir} 失败: {e}"))?;
+        .map_err(|e| sftp_err(&format!("读取目录 {dir} 失败"), e))?;
 
     let mut entries: Vec<SftpEntry> = raw
         .map(|e| {
@@ -247,14 +304,14 @@ pub async fn read_file(conn: &SftpConn, path: &str, max: u64) -> Result<Vec<u8>,
         .sftp
         .open(path)
         .await
-        .map_err(|e| format!("打开 {path} 失败: {e}"))?;
+        .map_err(|e| sftp_err(&format!("打开 {path} 失败"), e))?;
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     loop {
         let n = f
             .read(&mut chunk)
             .await
-            .map_err(|e| format!("读取 {path} 失败: {e}"))?;
+            .map_err(|e| sftp_err(&format!("读取 {path} 失败"), e))?;
         if n == 0 {
             break;
         }
@@ -282,12 +339,12 @@ async fn write_remote_stream(
 
     let mut file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+        .map_err(|e| sftp_err("打开本地文件失败", e))?;
     if offset > 0 {
         use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
-            .map_err(|e| format!("定位本地文件失败: {e}"))?;
+            .map_err(|e| sftp_err("定位本地文件失败", e))?;
     }
 
     // 续传：不用 APPEND 标志（实测这台服务器的 sshd 不认，只写了半截），
@@ -301,16 +358,16 @@ async fn write_remote_stream(
                 russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::CREATE,
             )
             .await
-            .map_err(|e| format!("打开远端文件（续传）失败: {e}"))?;
+            .map_err(|e| sftp_err("打开远端文件（续传）失败", e))?;
         f.seek(std::io::SeekFrom::Start(offset))
             .await
-            .map_err(|e| format!("定位远端文件失败: {e}"))?;
+            .map_err(|e| sftp_err("定位远端文件失败", e))?;
         f
     } else {
         conn.sftp
             .create(remote)
             .await
-            .map_err(|e| format!("创建 {remote} 失败: {e}"))?
+            .map_err(|e| sftp_err(&format!("创建 {remote} 失败"), e))?
     };
 
     let mut done = base_done;
@@ -319,17 +376,19 @@ async fn write_remote_stream(
         let n = file
             .read(&mut buf)
             .await
-            .map_err(|e| format!("读本地文件失败: {e}"))?;
+            .map_err(|e| sftp_err("读本地文件失败", e))?;
         if n == 0 {
             break;
         }
         f.write_all(&buf[..n])
             .await
-            .map_err(|e| format!("写入 {remote} 失败: {e}"))?;
+            .map_err(|e| sftp_err(&format!("写入 {remote} 失败"), e))?;
         done += n as u64;
         sink(done, total.max(done));
     }
-    f.flush().await.map_err(|e| format!("刷新 {remote} 失败: {e}"))?;
+    f.flush()
+        .await
+        .map_err(|e| sftp_err(&format!("刷新 {remote} 失败"), e))?;
     let _ = f.shutdown().await;
     Ok(done - base_done)
 }
@@ -373,13 +432,13 @@ async fn upload_inner(
         let _ = conn.sftp.create_dir(remote).await; // 已存在会报错，忽略
         let mut rd = tokio::fs::read_dir(local)
             .await
-            .map_err(|e| format!("读取本地目录失败: {e}"))?;
+            .map_err(|e| sftp_err("读取本地目录失败", e))?;
         let mut sent = 0u64;
         let mut acc = done;
         while let Some(entry) = rd
             .next_entry()
             .await
-            .map_err(|e| format!("遍历本地目录失败: {e}"))?
+            .map_err(|e| sftp_err("遍历本地目录失败", e))?
         {
             let name = entry.file_name().to_string_lossy().to_string();
             let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
@@ -457,17 +516,17 @@ async fn download_inner(
         .sftp
         .metadata(remote)
         .await
-        .map_err(|e| format!("远端不存在或读不到: {e}"))?;
+        .map_err(|e| sftp_err("远端不存在或读不到", e))?;
 
     if md.is_dir() {
         tokio::fs::create_dir_all(local)
             .await
-            .map_err(|e| format!("创建本地目录失败: {e}"))?;
+            .map_err(|e| sftp_err("创建本地目录失败", e))?;
         let raw = conn
             .sftp
             .read_dir(remote)
             .await
-            .map_err(|e| format!("读取远端目录失败: {e}"))?;
+            .map_err(|e| sftp_err("读取远端目录失败", e))?;
         let mut sent = 0u64;
         let mut acc = done;
         for e in raw {
@@ -525,12 +584,12 @@ async fn read_to_local(
         .sftp
         .open(remote)
         .await
-        .map_err(|e| format!("打开 {remote} 失败: {e}"))?;
+        .map_err(|e| sftp_err(&format!("打开 {remote} 失败"), e))?;
     if offset > 0 {
         use tokio::io::AsyncSeekExt;
         f.seek(std::io::SeekFrom::Start(offset))
             .await
-            .map_err(|e| format!("定位远端文件失败: {e}"))?;
+            .map_err(|e| sftp_err("定位远端文件失败", e))?;
     }
     let mut out = tokio::fs::OpenOptions::new()
         .create(true)
@@ -539,7 +598,7 @@ async fn read_to_local(
         .truncate(offset == 0)
         .open(local)
         .await
-        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+        .map_err(|e| sftp_err("打开本地文件失败", e))?;
 
     let mut done = base_done;
     let mut buf = vec![0u8; CHUNK];
@@ -548,18 +607,20 @@ async fn read_to_local(
         let n = f
             .read(&mut buf)
             .await
-            .map_err(|e| format!("读取 {remote} 失败: {e}"))?;
+            .map_err(|e| sftp_err(&format!("读取 {remote} 失败"), e))?;
         if n == 0 {
             break;
         }
         out.write_all(&buf[..n])
             .await
-            .map_err(|e| format!("写入本地文件失败: {e}"))?;
+            .map_err(|e| sftp_err("写入本地文件失败", e))?;
         done += n as u64;
         written += n as u64;
         sink(done, total.max(done));
     }
-    out.flush().await.map_err(|e| format!("刷新本地文件失败: {e}"))?;
+    out.flush()
+        .await
+        .map_err(|e| sftp_err("刷新本地文件失败", e))?;
     Ok(written)
 }
 
@@ -567,7 +628,7 @@ pub async fn mkdir(conn: &SftpConn, path: &str) -> Result<(), String> {
     conn.sftp
         .create_dir(path)
         .await
-        .map_err(|e| format!("新建目录失败: {e}"))
+        .map_err(|e| sftp_err("新建目录失败", e))
 }
 
 /// 删除文件或目录（目录递归删）
@@ -576,13 +637,13 @@ pub async fn remove(conn: &SftpConn, path: &str) -> Result<(), String> {
         .sftp
         .metadata(path)
         .await
-        .map_err(|e| format!("读不到 {path}: {e}"))?;
+        .map_err(|e| sftp_err(&format!("读不到 {path}"), e))?;
     if md.is_dir() {
         let raw = conn
             .sftp
             .read_dir(path)
             .await
-            .map_err(|e| format!("读取目录失败: {e}"))?;
+            .map_err(|e| sftp_err("读取目录失败", e))?;
         for e in raw {
             let name = e.file_name();
             if name == "." || name == ".." {
@@ -594,12 +655,12 @@ pub async fn remove(conn: &SftpConn, path: &str) -> Result<(), String> {
         conn.sftp
             .remove_dir(path)
             .await
-            .map_err(|e| format!("删除目录失败: {e}"))
+            .map_err(|e| sftp_err("删除目录失败", e))
     } else {
         conn.sftp
             .remove_file(path)
             .await
-            .map_err(|e| format!("删除文件失败: {e}"))
+            .map_err(|e| sftp_err("删除文件失败", e))
     }
 }
 
@@ -607,7 +668,7 @@ pub async fn rename(conn: &SftpConn, from: &str, to: &str) -> Result<(), String>
     conn.sftp
         .rename(from, to)
         .await
-        .map_err(|e| format!("重命名失败: {e}"))
+        .map_err(|e| sftp_err("重命名失败", e))
 }
 
 pub async fn exists(conn: &SftpConn, path: &str) -> bool {
@@ -624,10 +685,10 @@ pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
         .session
         .channel_open_session()
         .await
-        .map_err(|e| format!("打开通道失败: {e}"))?;
+        .map_err(|e| sftp_err("打开远端命令通道失败", e))?;
     ch.exec(true, command)
         .await
-        .map_err(|e| format!("执行远端命令失败: {e}"))?;
+        .map_err(|e| sftp_err("执行远端命令失败", e))?;
 
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -639,4 +700,39 @@ pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
         }
     }
     Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 主机密钥变了时，UI 看到的必须是 known_hosts 给的具体原因，
+    /// 而不是 russh 那个泛泛的 "unknown key"。
+    #[test]
+    fn host_key_rejection_reason_wins_over_generic_russh_error() {
+        let reject = Arc::new(Mutex::new(Some(
+            "example.com:22 的主机密钥变了，可能被中间人劫持".to_string(),
+        )));
+        let text = connect_error_text(
+            &russh::Error::UnknownKey,
+            &reject,
+            "连接 example.com:22 失败",
+        );
+        assert_eq!(
+            text,
+            "连接 example.com:22 失败：example.com:22 的主机密钥变了，可能被中间人劫持"
+        );
+        assert!(!text.contains("unknown key"), "不能退回 russh 的英文泛泛报错: {text}");
+    }
+
+    /// 没有 known_hosts 拒绝原因时，仍走原来的中文错误归类。
+    #[test]
+    fn without_rejection_reason_falls_back_to_friendly_error() {
+        let reject = Arc::new(Mutex::new(None));
+        let e = russh::Error::UnknownKey;
+        assert_eq!(
+            connect_error_text(&e, &reject, "连接 h:22 失败"),
+            crate::core::ssh::friendly_ssh_error_context("连接 h:22 失败", &e.to_string())
+        );
+    }
 }

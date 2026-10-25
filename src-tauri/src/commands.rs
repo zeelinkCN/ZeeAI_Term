@@ -1222,8 +1222,9 @@ pub async fn fs_list(
     user_override: Option<String>,
 ) -> Result<remote_fs::RemoteListing, String> {
     log::info!("ipc: fs_list profile_id={profile_id} path={path:?}");
-    let cfg = ssh_config_for(&profile_id, user_override)?;
-    let conn = sftp_for(&profile_id, None).await?;
+    // 必须把 user_override 一路带到**连接**上：以前这里只把它给了配置解析，连接仍用默认用户，
+    // 于是"临时换用户"之后文件面板列的还是默认用户的家目录（审查 C-03）。
+    let conn = sftp_for(&profile_id, user_override).await?;
     let (dir, entries) = sftp::list(&conn, path.as_deref()).await?;
     let listing = remote_fs::RemoteListing {
         path: dir,
@@ -2033,23 +2034,73 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
     }
 }
 
+/// 校验「用系统默认浏览器打开」的 URL。
+///
+/// 以前是 `cmd /C start "" <url>`：URL 里只要带 `&` / `|` / `"` / `%VAR%` 就能
+/// 拼出额外的 cmd 命令（经典命令注入）。现在两层防护：
+/// 1. 只允许 http/https（`javascript:` / `file:` 直接拒）；
+/// 2. 拒绝 shell 元字符与换行（命中即返回错误，**不静默**）——
+///    即使将来启动方式退回 cmd，这层也拦得住。
+fn validate_external_url(url: &str) -> Result<&str, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("链接为空".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("只允许打开 http/https 链接".into());
+    }
+    for ch in trimmed.chars() {
+        if matches!(ch, '&' | '|' | '<' | '>' | '^' | '"' | '%') || ch.is_control() {
+            return Err(format!(
+                "链接里含有不允许的字符 {ch:?}（可能导致命令注入），已拒绝打开"
+            ));
+        }
+    }
+    Ok(trimmed)
+}
+
 /// 用系统默认浏览器打开一个 http/https 链接（用于「检查更新 → 下载新版」）
 #[tauri::command]
 pub fn open_external_url(url: String) -> Result<(), String> {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return Err("只允许打开 http/https 链接".into());
-    }
+    let trimmed = validate_external_url(&url)?;
     log::info!("ipc: open_external_url {trimmed}");
     #[cfg(windows)]
     {
-        // 用 cmd 的 start 走默认浏览器；空标题参数是为了防止带引号的 URL 被当成窗口标题。
-        // 这是"用户主动点开链接"，浏览器窗口该出来；但 cmd 自己不能闪一下控制台，
-        // 所以同样走 hidden_command（CREATE_NO_WINDOW 不影响 start 拉起浏览器）。
-        proc::hidden_command_quiet("cmd")
-            .args(["/C", "start", "", trimmed])
-            .spawn()
-            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE};
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        fn wide(s: &str) -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        // 直接 ShellExecuteW("open")：不经过 cmd，URL 不再有被 shell 解释的机会。
+        // 浏览器窗口该出来（这是用户主动点链接），不需要隐藏窗口。
+        let op = wide("open");
+        let file = wide(trimmed);
+        let rc: HINSTANCE = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecute 约定：返回值 <= 32 表示失败（32 是"找不到关联程序"）
+        let code = rc as isize;
+        if code <= 32 {
+            let last = unsafe { GetLastError() };
+            return Err(format!(
+                "打开浏览器失败（ShellExecuteW 返回 {code}，系统错误 {last}）"
+            ));
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -2459,6 +2510,14 @@ fn sha256_of(path: &std::path::Path) -> Result<String, String> {
         }
     }
     Err("certutil 没能算出 sha256，无法校验更新包".into())
+}
+
+/// 截断 sha256 用于界面展示：按 **char** 截断。
+///
+/// 不能写 `&s[..s.len().min(12)]` —— 那按字节切，遇到多字节 UTF-8（例如用户/来源里
+/// 混进中文）会 panic。sha256 正常是 ASCII，但界面文案不该有这种隐雷。
+fn short_sha(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 /// 校验下好的包：没问题返回 None，有问题返回原因。
@@ -3384,7 +3443,7 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
         "官方最新版 herdr {}（协议 {}，sha256 {}…）",
         manifest.version,
         manifest.protocol,
-        &want_sha[..want_sha.len().min(12)]
+        short_sha(&want_sha, 12)
     ));
 
     // ---- 3) 在 Windows 侧下载（官方不通就走镜像，校验标准不变） ----
@@ -3446,7 +3505,7 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
                                     "{}·{} 下到的文件 sha256 和官方不一致（拿到 {}…），已丢弃",
                                     src.label,
                                     tag,
-                                    &have[..have.len().min(12)]
+                                    short_sha(&have, 12)
                                 );
                                 let _ = std::fs::remove_file(&dest);
                                 continue;
@@ -3740,3 +3799,83 @@ mod update_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    /// ADB shell 是"一整条字符串交给设备端 sh"，路径里的 `'` / `;` / `&&` / 空格
+    /// 都必须被 `remote_fs::sq` 转义成字面量，不能跑出 shell 语法。
+    #[test]
+    fn adb_shell_commands_quote_dangerous_paths() {
+        let path = "/sdcard/a b'c; rm -rf / && echo pwned";
+
+        assert_eq!(
+            adb_ls_command(path),
+            "ls -la '/sdcard/a b'\\''c; rm -rf / && echo pwned'"
+        );
+        assert_eq!(
+            adb_rm_command(path, true),
+            "rm -rf '/sdcard/a b'\\''c; rm -rf / && echo pwned'"
+        );
+        assert_eq!(
+            adb_rm_command(path, false),
+            "rm -f '/sdcard/a b'\\''c; rm -rf / && echo pwned'"
+        );
+        assert_eq!(
+            adb_mkdir_command(path),
+            "mkdir -p '/sdcard/a b'\\''c; rm -rf / && echo pwned'"
+        );
+
+        // 内部那个单引号必须转义成 '\''；如果把转义去掉，`; rm -rf /` 就会变成独立命令
+        let cmd = adb_rm_command(path, true);
+        assert!(cmd.contains(r"'/sdcard/a b'\''c; rm -rf / && echo pwned'"), "{cmd}");
+    }
+
+    /// 正常路径也要保持原样，别把引号加错（`/sdcard` 不能变成带空格的怪串）
+    #[test]
+    fn adb_shell_commands_keep_plain_paths() {
+        assert_eq!(adb_ls_command("/sdcard"), "ls -la '/sdcard'");
+        assert_eq!(adb_mkdir_command("/sdcard/My Files"), "mkdir -p '/sdcard/My Files'");
+    }
+
+    /// `open_external_url` 的输入白名单：命令注入字符、非 http(s) 协议一律拒绝。
+    #[test]
+    fn external_url_rejects_injection_and_non_http() {
+        for bad in [
+            "https://x/&calc",
+            "https://x/a%PATH%",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "https://x/\" & calc & \"",
+            "https://x/a\ncalc",
+            "https://x/|calc",
+            "https://x/^calc",
+            "ftp://example.com/file",
+            "",
+        ] {
+            assert!(
+                validate_external_url(bad).is_err(),
+                "必须拒绝: {bad:?}"
+            );
+        }
+        // 正常链接仍要放行
+        assert_eq!(
+            validate_external_url("  https://github.com/zeelinkCN/ZeeAI_Term  ").unwrap(),
+            "https://github.com/zeelinkCN/ZeeAI_Term"
+        );
+        assert!(validate_external_url("http://127.0.0.1:64502/").is_ok());
+    }
+
+    /// L1：按 char 截断，不能因为多字节 UTF-8 而 panic
+    #[test]
+    fn short_sha_never_panics_on_multibyte() {
+        assert_eq!(short_sha("abcdef0123456789", 12), "abcdef012345");
+        assert_eq!(short_sha("中文指纹abcdef", 4), "中文指纹");
+        // 长度不足时原样返回
+        assert_eq!(short_sha("短", 12), "短");
+        // 关键：多字节字符跨越第 12 个字节时，按字节切片会 panic，这里必须安全
+        let _ = short_sha("中文中文中文中文中文", 12);
+    }
+}
+

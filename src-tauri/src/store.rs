@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +121,7 @@ fn default_group() -> String {
     "默认".into()
 }
 
-fn store_dir() -> PathBuf {
+pub(crate) fn store_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(base).join("ZeeAI-Terminal")
 }
@@ -141,44 +142,147 @@ fn settings_file() -> PathBuf {
 ///
 /// 用户手动编辑过 JSON（旧版记事本、部分编辑器会写 BOM）之后，serde_json 会因为开头的
 /// BOM 直接解析失败 —— 表现就是「设置/服务器列表被悄悄重置成默认值」。统一在这里容错。
-fn read_text(path: &PathBuf) -> std::io::Result<String> {
+fn read_text(path: &Path) -> std::io::Result<String> {
     let text = fs::read_to_string(path)?;
     Ok(text.trim_start_matches('\u{feff}').to_string())
 }
 
-/// **原子写**：先写同目录的 `.tmp`，再 `rename` 覆盖目标。
+/// 同一个进程里的所有"配置写盘"共用这一把锁。
+///
+/// 为什么需要：settings / profiles / workspace / ai_turns / known_hosts 都可能被不同线程
+/// 同时保存（UI 设置、看板轮询、SSH 连接回调）。以前各自算各自的临时文件名、各自
+/// remove + rename，并发时会互相踩掉对方刚写的文件，甚至留下半截 JSON。
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 临时文件名后缀：pid + 纳秒。多开一个实例也不会撞名。
+fn unique_save_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    path.with_file_name(format!("{name}.{}.tmp", unique_save_suffix()))
+}
+
+/// 把 `tmp` 原子地替换成目标文件。
+///
+/// Windows：`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`。
+/// **不能先删目标再 rename** —— 那两步之间有个空窗，进程被杀就是"配置文件消失"；
+/// 而 `std::fs::rename` 在目标已存在时会直接失败（Windows 语义）。
+#[cfg(windows)]
+fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let from = wide(tmp);
+    let to = wide(dst);
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// 非 Windows 的兜底：先把旧目标改名备份，再 rename 新的上去；
+/// 新文件替换失败时把备份改回来，保证原文件还在。
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.exists() {
+        return fs::rename(tmp, dst);
+    }
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    let backup = dst.with_file_name(format!("{name}.old-{}.bak", unique_save_suffix()));
+    fs::rename(dst, &backup)?;
+    match fs::rename(tmp, dst) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // 尽力恢复原文件；即使恢复失败也把真实错误返回，不静默丢数据
+            let _ = fs::rename(&backup, dst);
+            Err(e)
+        }
+    }
+}
+
+/// **原子写**：先写同目录的唯一 `.tmp`，`sync_all` 落盘，再整体替换目标。
 ///
 /// 为什么必须这样：以前是 `fs::write(目标, text)` 直接覆盖。升级脚本会在 App 退出后
 /// 立刻覆盖安装（等不到退出还会 `taskkill /F`），一旦撞上正在写盘的那一瞬间，文件就会
 /// 变成半截 JSON；下一次启动 `load_settings()` / `store::load()` 解析失败，
 /// **静默回落默认值** —— 用户看到的就是「服务器列表突然空了」「主题/配色/高亮规则全没了」，
-/// 而且没有任何提示。NTFS 上同目录 rename 是原子的，所以要么是完整的旧文件，要么是完整的新文件。
-fn write_atomic(path: &PathBuf, text: &str) -> Result<(), String> {
+/// 而且没有任何提示。
+///
+/// 现在：同进程写盘串行化 + 唯一临时名（pid+纳秒） + `sync_all` + 系统级原子替换。
+/// Windows 上用 `MoveFileExW`，全程**碰不到"目标文件不存在"的中间态**。
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let _guard = SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let dir = path
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(store_dir);
+        .unwrap_or_else(|| store_dir());
     fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("写临时文件失败: {e}"))?;
-    // Windows 上 rename 到已存在的目标会失败，所以先把目标挪开再放新的
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        // 失败也把临时文件清掉，免得留一地 .tmp
+
+    let tmp = tmp_path_for(path);
+    let wrote = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        // 必须等数据真正落盘，否则断电/强杀后 rename 过去的是个空文件
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = wrote {
         let _ = fs::remove_file(&tmp);
-        format!("保存失败: {e}")
-    })
+        return Err(format!("写临时文件失败: {e}"));
+    }
+
+    if let Err(e) = replace_file(&tmp, path) {
+        // 替换失败：目标文件原样保留（MoveFileExW 失败不会动源/目标数据），只清临时文件
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("保存失败: {e}"));
+    }
+    Ok(())
 }
 
 /// 解析失败时把坏文件另存一份 `.bad-<时间戳>`，方便事后找回。
 ///
 /// 为什么不直接删：坏文件里可能还有用户手工加过的内容，留着比丢掉强；
 /// 同时也让「配置被重置」这件事在磁盘上留下证据，而不是无声无息。
-pub fn backup_broken(path: &PathBuf) {
+///
+/// 返回备份后的路径（备份失败返回 None，调用方据此给出提示）。
+pub fn backup_broken(path: &Path) -> Option<PathBuf> {
     let stamp = now_secs();
-    let mut backup = path.clone();
+    let mut backup = path.to_path_buf();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -186,6 +290,9 @@ pub fn backup_broken(path: &PathBuf) {
     backup.set_file_name(format!("{name}.bad-{stamp}"));
     if fs::rename(path, &backup).is_ok() {
         log::warn!("配置解析失败，已备份为 {}", backup.display());
+        Some(backup)
+    } else {
+        None
     }
 }
 
@@ -403,7 +510,7 @@ pub fn load_settings() -> Settings {
         Err(e) => {
             // 解析不了就先把坏文件留证，再用默认值起来（总不能让应用起不来）
             log::error!("settings.json 解析失败（{e}），已备份并回落默认值");
-            backup_broken(&path);
+            let _ = backup_broken(&path);
             Settings::default()
         }
     };
@@ -489,7 +596,10 @@ pub fn save_history(entries: &[HistoryEntry]) -> Result<(), String> {
     let dir = store_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
     let text = serde_json::to_string_pretty(entries).map_err(|e| format!("序列化失败: {e}"))?;
-    fs::write(history_file(), text).map_err(|e| format!("写入历史失败: {e}"))
+    // 和 profiles / settings 走同一条原子写：history.json 以前是裸 `fs::write`，
+    // 升级安装撞上写盘就会变半截 JSON，下次 `load_history` 静默回落到空列表
+    // （用户看到的就是"会话历史突然没了"）。这里补上同一套 SAVE_LOCK + 原子替换。
+    write_atomic(&history_file(), &text).map_err(|e| format!("写入历史失败: {e}"))
 }
 
 /// 历史记录的去重键。
@@ -683,14 +793,24 @@ mod settings_tests {
     }
 }
 
+/// 读服务器配置。
+///
+/// **读接口绝不写盘**：
+/// - 文件不存在 → 返回默认值（空列表），由显式保存（例如添加服务器）创建文件；
+/// - 解析失败 → 把坏文件备份成 `.bad-<时间戳>`，返回明确的 `Err`，**绝不自动覆盖**。
+///
+/// 以前这两条都会顺手 `save(seed())`：一旦读到半截 JSON，用户原来的服务器列表就被
+/// 默认值永久覆盖了 —— 这正是"配置被悄悄重置"的根因。
 pub fn load() -> Result<Vec<ConnectionProfile>, String> {
-    let path = store_file();
+    load_from(&store_file())
+}
+
+/// 从指定路径读（单测用临时文件，绝不碰用户真实配置）。
+fn load_from(path: &Path) -> Result<Vec<ConnectionProfile>, String> {
     if !path.exists() {
-        let seeded = seed();
-        save(&seeded)?;
-        return Ok(seeded);
+        return Ok(seed());
     }
-    let text = read_text(&path).map_err(|e| format!("读取配置失败: {e}"))?;
+    let text = read_text(path).map_err(|e| format!("读取配置失败: {e}"))?;
     if text.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -698,13 +818,17 @@ pub fn load() -> Result<Vec<ConnectionProfile>, String> {
         Ok(v) => Ok(v),
         Err(e) => {
             // 半截 JSON（例如写盘时被升级安装打断）会走到这里。
-            // 以前是直接报错 → 上层 `unwrap_or_default()` → **服务器列表静默变空**。
-            // 现在：把坏文件备份留证，然后给一份可用的初始列表，用户至少能继续干活。
-            log::error!("profiles.json 解析失败（{e}），已备份并重建初始列表");
-            backup_broken(&path);
-            let seeded = seed();
-            let _ = save(&seeded);
-            Ok(seeded)
+            // 备份留证后**返回错误**，让 UI 明确提示；下一次保存才会写新文件。
+            let backup = backup_broken(path);
+            let hint = backup
+                .as_ref()
+                .map(|b| format!("，坏文件已备份为 {}", b.display()))
+                .unwrap_or_else(|| "，坏文件备份失败".to_string());
+            log::error!("profiles.json 解析失败（{e}）{hint}");
+            Err(format!(
+                "服务器配置 profiles.json 解析失败（{e}）{hint}。请检查该文件；\
+                 如确认损坏，可删除后重新添加服务器。"
+            ))
         }
     }
 }
@@ -719,12 +843,29 @@ pub fn save(profiles: &[ConnectionProfile]) -> Result<(), String> {
 mod history_tests {
     use super::{dedupe_history, history_key_for, write_atomic, HistoryEntry};
 
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zeeai-store-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftover_tmp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
     #[test]
     fn atomic_write_replaces_content_and_leaves_no_tmp() {
-        let dir = std::env::temp_dir().join("zeeai-store-tests");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp_dir("atomic");
         let f = dir.join("atomic.json");
-        let _ = std::fs::remove_file(&f);
 
         write_atomic(&f, "{\"v\":1}").unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"v\":1}");
@@ -732,8 +873,51 @@ mod history_tests {
         write_atomic(&f, "{\"v\":22}").unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"v\":22}");
         // 不能留下 .tmp
-        assert!(!f.with_extension("json.tmp").exists(), "留下了临时文件");
-        let _ = std::fs::remove_file(&f);
+        assert!(
+            leftover_tmp_files(&dir).is_empty(),
+            "留下了临时文件: {:?}",
+            leftover_tmp_files(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 20 个线程同时保存：不管谁最后写，落盘的一定是**某一次的完整 JSON**，
+    /// 不能出现半截文件，也不能留下临时文件。
+    #[test]
+    fn concurrent_writes_never_leave_half_written_json() {
+        let dir = tmp_dir("concurrent");
+        let f = dir.join("profiles.json");
+        // 先放一个完整的初始文件，确保并发期间目标始终存在
+        write_atomic(&f, "{\"writer\":-1,\"pad\":\"\"}").unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let f = f.clone();
+            handles.push(std::thread::spawn(move || {
+                let text = format!("{{\"writer\":{i},\"pad\":\"{}\"}}", "x".repeat(8192));
+                write_atomic(&f, &text).expect("并发写不能失败");
+                text
+            }));
+        }
+        let written: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("写线程不能 panic"))
+            .collect();
+
+        let final_text = std::fs::read_to_string(&f).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&final_text).expect("最终文件必须是完整 JSON");
+        assert!(v.get("writer").is_some(), "JSON 结构不完整: {final_text}");
+        assert!(
+            written.iter().any(|w| w == &final_text),
+            "最终内容必须是某一次完整写入，而不是拼出来的"
+        );
+        assert!(
+            leftover_tmp_files(&dir).is_empty(),
+            "留下了临时文件: {:?}",
+            leftover_tmp_files(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -803,5 +987,78 @@ mod history_tests {
         assert_eq!(out[0].id, "1");
         assert_eq!(out[1].id, "3");
         assert_eq!(out[2].id, "4");
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::{load_from, ConnectionProfile};
+    use std::path::{Path, PathBuf};
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zeeai-store-load-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains(".bad-"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 文件不存在 = 首次运行：返回空列表，**不能顺手创建文件**（读接口不写盘）
+    #[test]
+    fn missing_file_returns_defaults_without_writing() {
+        let dir = tmp_dir("missing");
+        let f = dir.join("profiles.json");
+
+        let profiles: Vec<ConnectionProfile> = load_from(&f).expect("缺文件不算错误");
+        assert!(profiles.is_empty());
+        assert!(!f.exists(), "读配置不能创建/初始化文件");
+        assert!(backups(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 坏 JSON：必须原样备份成 .bad-<时间戳> 并返回 Err，绝不能覆盖成默认值
+    #[test]
+    fn bad_json_is_backed_up_and_never_overwritten() {
+        let dir = tmp_dir("bad");
+        let f = dir.join("profiles.json");
+        let bad = "{ this is half a json";
+        std::fs::write(&f, bad).unwrap();
+        let before = std::fs::read_to_string(&f).unwrap();
+
+        let err = match load_from(&f) {
+            Ok(_) => panic!("坏 JSON 必须返回错误，而不是静默回落"),
+            Err(e) => e,
+        };
+        assert!(err.contains("解析失败"), "错误信息要说清原因: {err}");
+
+        // 原文件被移走（备份），而不是被默认值覆盖
+        assert!(!f.exists(), "坏文件不能被就地覆盖");
+        let backup_files = backups(&dir);
+        assert_eq!(backup_files.len(), 1, "必须留下恰好一份 .bad 备份");
+        assert_eq!(
+            std::fs::read_to_string(&backup_files[0]).unwrap(),
+            before,
+            "备份内容必须和坏文件完全一致"
+        );
+
+        // 再读一次：文件不存在 → 空列表；依然不会偷偷创建文件
+        assert!(load_from(&f).unwrap().is_empty());
+        assert!(!f.exists(), "第二次读也不能创建文件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
