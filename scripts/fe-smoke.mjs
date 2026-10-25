@@ -4238,6 +4238,180 @@ check(
   JSON.stringify(errUi),
 );
 
+// ---------- 选择/复制：鼠标上报（tmux）里也能本地选 ----------
+// 用户实测：SSH + tmux 开了鼠标上报，鼠标拖过文字选不中。
+// 首选是 xterm 5.x 原生的 Shift+拖拽强制本地选择；备选是显式的「选择/复制模式」。
+// 这一组按**用户路径**验：真往终端送"打开鼠标上报"的序列 → Shift 拖选 → 右键菜单 →
+// 进入模式时 session_write 的原始字节 → Esc 后按进入前的状态恢复。
+await setScenario({ settingsPatch: { copyKey: "select" } });
+await reload();
+await sleep(1800);
+const mouseSession = await evaluate(`(() => {
+  const calls = (window.__ZEEAI_CALLARGS__ || []).filter((c) => c.cmd === "open_ssh");
+  const last = calls.length ? calls[calls.length - 1] : null;
+  const id = last && last.args ? last.args.id : null;
+  return id ? {
+    id,
+    channel: !!window.__ZEEAI_SESSION_CHANNELS__[id],
+    hasTerm: !!document.querySelector(".terminal-host .xterm"),
+  } : null;
+})()`);
+check(
+  "选择/复制：会话终端已挂载（后面几条都依赖它）",
+  !!mouseSession && mouseSession.channel && mouseSession.hasTerm,
+  JSON.stringify(mouseSession),
+);
+// 模拟 tmux：先输出两行文字，再打开鼠标上报（1000 点击 / 1002 拖拽 / 1003 移动 / 1006 SGR）
+await evaluate(String.raw`(() => {
+  const id = ${JSON.stringify(mouseSession && mouseSession.id)};
+  window.__ZEEAI_TERM_DATA__(id, "HELLO_SELECT_ME\r\nabcdefghijklmnop\r\n");
+  window.__ZEEAI_TERM_DATA__(id, "\u001b[?1000h\u001b[?1002h\u001b[?1003h\u001b[?1006h");
+  return true;
+})()`);
+await sleep(900);
+// 无头环境没有真剪贴板：把 navigator.clipboard.writeText 换成记录器。
+// 「选中即复制」走的就是这一句，所以断言的是**真实复制路径**被调用，而不是假 UI。
+const clipStub = await evaluate(`(() => {
+  window.__ZEEAI_CLIP__ = [];
+  const fake = {
+    writeText: async (t) => { window.__ZEEAI_CLIP__.push(String(t)); },
+    readText: async () => "",
+  };
+  try { Object.defineProperty(navigator, "clipboard", { value: fake, configurable: true }); }
+  catch (e) {
+    try { Object.defineProperty(Navigator.prototype, "clipboard", { get: () => fake, configurable: true }); }
+    catch (e2) { return { ok: false, why: String(e) + " / " + String(e2) }; }
+  }
+  return { ok: navigator.clipboard === fake };
+})()`);
+// Shift+拖拽 = 强制本地选择（xterm 原生，不需要我们拦事件）。拖过第一行文字。
+const shiftDrag = await evaluate(String.raw`(() => {
+  const host = document.querySelector(".terminal-host");
+  const screen = host && host.querySelector(".xterm-screen");
+  if (!screen) return { ok: false, why: "没有 .xterm-screen" };
+  const r = screen.getBoundingClientRect();
+  const el = host.querySelector(".xterm") || screen;
+  const x1 = Math.round(r.left + 3), x2 = Math.round(r.left + 240), y = Math.round(r.top + 6);
+  const down = new MouseEvent("mousedown", {
+    bubbles: true, cancelable: true, clientX: x1, clientY: y,
+    button: 0, buttons: 1, detail: 1, shiftKey: true,
+  });
+  el.dispatchEvent(down);
+  document.dispatchEvent(new MouseEvent("mousemove", {
+    bubbles: true, cancelable: true, clientX: x2, clientY: y,
+    button: 0, buttons: 1, shiftKey: true,
+  }));
+  document.dispatchEvent(new MouseEvent("mouseup", {
+    bubbles: true, cancelable: true, clientX: x2, clientY: y,
+    button: 0, buttons: 0, shiftKey: true,
+  }));
+  return { ok: true, prevented: down.defaultPrevented, w: Math.round(r.width) };
+})()`);
+await sleep(700);
+const shiftCopy = await evaluate(`(() => ({
+  clip: window.__ZEEAI_CLIP__ || [],
+  mouseMode: !!document.querySelector(".xterm.enable-mouse-events"),
+}))()`);
+check(
+  "Shift+拖拽：鼠标上报开着也能本地选中，并走「选中即复制」写剪贴板",
+  !!shiftDrag.ok && shiftCopy.mouseMode && shiftCopy.clip.some((t) => t.includes("HELLO_SELECT_ME")),
+  `stub=${JSON.stringify(clipStub)} drag=${JSON.stringify(shiftDrag)} clip=${JSON.stringify(shiftCopy.clip).slice(0, 120)}`,
+);
+
+// 右键菜单：必须有「选择/复制模式」这一项（tmux 里用户不一定记得 Shift）
+const menuOpen = await evaluate(`(() => {
+  const host = document.querySelector(".terminal-host");
+  if (!host) return false;
+  const r = host.getBoundingClientRect();
+  host.dispatchEvent(new MouseEvent("contextmenu", {
+    bubbles: true, cancelable: true, clientX: r.x + 60, clientY: r.y + 60,
+  }));
+  return true;
+})()`);
+await sleep(400);
+const menuItems = await evaluate(
+  `[...document.querySelectorAll(".ctx-menu .menu-item")].map((b) => (b.innerText || "").trim())`,
+);
+check(
+  "右键菜单出现「选择/复制模式」（和复制/粘贴并列）",
+  menuOpen && menuItems.includes("选择/复制模式") && menuItems.includes("复制"),
+  JSON.stringify(menuItems),
+);
+// 点它进入选择模式：必须真的把关闭鼠标上报的原始字节写进会话
+const enterMark = await evaluate("window.__ZEEAI_CALLARGS__.length");
+const clickedSelect = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".ctx-menu .menu-item")].find((x) =>
+    (x.innerText || "").trim() === "选择/复制模式");
+  if (!b) return false;
+  b.click();
+  return true;
+})()`);
+await sleep(500);
+const entered = await evaluate(`(() => {
+  const dec = (b64) => { try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch { return ""; } };
+  const writes = (window.__ZEEAI_CALLARGS__ || []).slice(${enterMark})
+    .filter((c) => c.cmd === "session_write")
+    .map((c) => dec((c.args || {}).dataB64 || ""));
+  const bar = document.querySelector(".term-select-bar");
+  return { writes, bar: bar ? (bar.innerText || "").replace(/\\n/g, " ").trim() : "" };
+})()`);
+const MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+check(
+  "选择模式：进入时向会话写 ?1000l/?1002l/?1003l/?1006l，并显示「Esc 退出」",
+  clickedSelect && entered.writes.some((w) => w.includes(MOUSE_OFF)) &&
+    entered.bar.includes("选择模式") && entered.bar.includes("Esc 退出"),
+  `bar="${entered.bar}" writes=${JSON.stringify(entered.writes).slice(0, 160)}`,
+);
+// Esc 退出：只恢复进入前真的开着的四个 mode（这里是全开，所以四个 h 都要有）
+const exitMark = await evaluate("window.__ZEEAI_CALLARGS__.length");
+await evaluate(
+  `window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }))`,
+);
+await sleep(500);
+const exited = await evaluate(`(() => {
+  const dec = (b64) => { try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch { return ""; } };
+  const writes = (window.__ZEEAI_CALLARGS__ || []).slice(${exitMark})
+    .filter((c) => c.cmd === "session_write")
+    .map((c) => dec((c.args || {}).dataB64 || ""));
+  return { writes, barGone: !document.querySelector(".term-select-bar") };
+})()`);
+const MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+check(
+  "选择模式：Esc 退出后按进入前的状态恢复 ?1000h/?1002h/?1003h/?1006h",
+  exited.barGone && exited.writes.some((w) => w.includes(MOUSE_ON)),
+  `barGone=${exited.barGone} writes=${JSON.stringify(exited.writes).slice(0, 160)}`,
+);
+// 反向：原来没开鼠标上报时，退出不能凭空发 h（把鼠标模式打开）
+await setScenario({ settingsPatch: { copyKey: "select" } });
+await reload();
+await sleep(1800);
+const quietMark = await evaluate("window.__ZEEAI_CALLARGS__.length");
+await evaluate(
+  `window.dispatchEvent(new KeyboardEvent("keydown", { key: " ", code: "Space", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }))`,
+);
+await sleep(400);
+const shortcutBar = await evaluate(
+  `(document.querySelector(".term-select-bar")?.innerText || "").replace(/\\n/g, " ").trim()`,
+);
+await evaluate(
+  `window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }))`,
+);
+await sleep(400);
+const quiet = await evaluate(`(() => {
+  const dec = (b64) => { try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch { return ""; } };
+  const writes = (window.__ZEEAI_CALLARGS__ || []).slice(${quietMark})
+    .filter((c) => c.cmd === "session_write")
+    .map((c) => dec((c.args || {}).dataB64 || ""));
+  return { writes, barGone: !document.querySelector(".term-select-bar") };
+})()`);
+check(
+  "选择模式：原本没开鼠标上报时退出不会凭空发 h（恢复只针对进入前开着的）",
+  shortcutBar.includes("选择模式") &&
+    quiet.barGone &&
+    !quiet.writes.some((w) => ["?1000h", "?1002h", "?1003h", "?1006h"].some((m) => w.includes(m))),
+  `快捷键提示="${shortcutBar}" writes=${JSON.stringify(quiet.writes).slice(0, 160)}`,
+);
+
 console.log("\n--- 页面控制台里的 error/warning ---");
 // ================= (NEW) 每个会话独立草稿：切换 / 发送 / 附件都不串 =================
 const clickSessionTab = (needle) =>

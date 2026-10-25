@@ -158,6 +158,17 @@ const MIN_FIT_W = 160;
 const MIN_FIT_H = 80;
 
 /**
+ * 关掉"鼠标上报"的四个 DEC private mode（1000 基本点击 / 1002 拖拽 / 1003 任意移动 /
+ * 1006 SGR 编码）。
+ *
+ * 为什么选择模式要这么做：tmux / vim / less 打开鼠标上报之后，xterm 会把拖拽当鼠标事件
+ * 发给远端，SelectionService 被禁用 —— 于是拖不出本地选区。把这几条 `l` 交给 xterm 自己
+ * 的解析器，它会立刻退回"可选文本"模式（见下面 select 模式那段）。
+ */
+const MOUSE_OFF_SEQ = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+const MOUSE_MODES: number[] = [1000, 1002, 1003, 1006];
+
+/**
  * 连续 resize 的合并窗口。
  *
  * 为什么要合并：拖动窗口边缘、拖侧栏宽度、开关右侧 AI 面板时，ResizeObserver 会**连着触发几十次**。
@@ -424,6 +435,46 @@ export default function TerminalView({
     termRef.current = term;
     fitRef.current = fit;
 
+    // 终端（重新）建了：选择模式的状态按这条新终端重新算。旧的恢复序列不能跨会话用。
+    selectModeRef.current = false;
+    restoreSeqRef.current = "";
+    mouseModesRef.current = {};
+    setSelectMode(false);
+    setSelectionInfo("");
+    setMouseReporting(false);
+
+    /**
+     * 逐位记录程序对鼠标上报的开关（1000/1002/1003 + SGR 1006）。
+     *
+     * 为什么不能只看 `term.modes.mouseTrackingMode`：它只保留**最后一个** tracking mode
+     * （none/x10/vt200/drag/any），退出选择模式时没法知道原先到底开过哪几个；
+     * 而 1006 这个编码开关它根本不暴露。这里挂 CSI 解析器旁听，返回 false = 不消费，
+     * 照旧让 xterm 自己处理。
+     */
+    const trackMouseModes = (on: boolean) => (params: (number | number[])[]) => {
+      let mouse = false;
+      let other = false;
+      for (const p of params) {
+        const n = Array.isArray(p) ? p[0] : p;
+        if (MOUSE_MODES.includes(n)) {
+          mouse = true;
+          if (on && selectModeRef.current) continue; // 选择模式期间：h 吞掉（见下面 return）
+          mouseModesRef.current[n] = on;
+        } else {
+          other = true;
+        }
+      }
+      setMouseReporting(MOUSE_MODES.some((n) => mouseModesRef.current[n]));
+      // 选择模式期间远端如果重发"开鼠标"，本地必须吞掉，否则拖选又会被抢走。
+      // 只吞"整条都是 mouse mode"的序列 —— 混着别的模式（例如 bracketed paste）时
+      // 不能整条消费，宁可让 xterm 处理。
+      return on && selectModeRef.current && mouse && !other;
+    };
+    const mouseModeSubs = [
+      term.parser.registerCsiHandler({ prefix: "?", final: "h" }, trackMouseModes(true)),
+      term.parser.registerCsiHandler({ prefix: "?", final: "l" }, trackMouseModes(false)),
+    ];
+
     let disposed = false;
     let resizeTimer: number | null = null;
     let lastSent = { cols: 0, rows: 0 };
@@ -487,15 +538,128 @@ export default function TerminalView({
     // 首次布局可能晚于挂载，多补几次，确保最终尺寸正确
     const timers = [80, 300, 900, 1800].map((ms) => window.setTimeout(doFit, ms));
 
+    /**
+     * 输出写入队列（前端背压的另一半）。
+     *
+     * 后端一次 IPC 给一大块，但 xterm 的 `write` 是**异步解析**的：如果不管它、
+     * 每来一片就立刻 write，解析队列会在长会话里越堆越长（用户看到的"越用越卡"）。
+     * 这里保证**同一时刻只有一次 write 在跑**，写完了才取下一条：
+     *   - 每条 write 完成回调里给后端 ack（seq 累积确认）；
+     *   - 本地待写字节数 = outBacklog；超过 4MB 时把下一帧推迟 16ms（不丢字节）；
+     *   - 顺序严格 FIFO，高亮后的字符串也走同一条队列。
+     *
+     * 为什么不用 `onWriteParsed` 做 ack：它按帧合并，**一次回调可能覆盖多批**；
+     * 用它 ack 容易把还没真正解析的批次提前确认。`term.write(data, cb)` 的 cb
+     * 才是"这一批已经解析完"的精确点（xterm 5.x 的契约）。
+     */
+    let outQueue: PendingTermWrite[] = [];
+    let outBacklog = 0;
+    let outWriting = false;
+    let outYieldScheduled = false;
+    let outClosed = false;
+    let backlogWarned = false;
+
+    const ackOutput = (seq?: number) => {
+      if (!seq) return;
+      void sessionOutputAck(sessionId, seq).catch(() => {
+        // 会话可能刚好关了。不要在这里重试：后端的 1s ack 超时会推进窗口，
+        // 重试只会放大 IPC。失败也没有丢字节——丢的是"确认"，不是数据。
+      });
+    };
+
+    const pumpWrites = () => {
+      if (outClosed || outWriting || outYieldScheduled) return;
+      const next = outQueue[0];
+      if (!next) {
+        outYieldScheduled = false;
+        return;
+      }
+      if (outBacklog > OUTPUT_BACKLOG_LIMIT) {
+        if (!backlogWarned) {
+          backlogWarned = true;
+          console.warn(
+            `terminal ${sessionId}: output backlog ${outBacklog} bytes > ${OUTPUT_BACKLOG_LIMIT}，降频写入（不丢字节）`,
+          );
+        }
+      } else {
+        backlogWarned = false;
+      }
+      outQueue.shift();
+      outWriting = true;
+      const finish = () => {
+        outWriting = false;
+        outBacklog = Math.max(0, outBacklog - next.rawBytes);
+        // **关键**：只有回调触发（这批真的被 xterm 解析完）才 ack 后端。
+        ackOutput(next.seq);
+        // 积压超阈值时，一批写完先让出一帧再写下一批（顺序不变、字节不丢）。
+        if (outBacklog > OUTPUT_BACKLOG_LIMIT) {
+          if (!outYieldScheduled) {
+            outYieldScheduled = true;
+            window.setTimeout(() => {
+              outYieldScheduled = false;
+              pumpWrites();
+            }, OUTPUT_BACKLOG_YIELD_MS);
+          }
+        } else {
+          pumpWrites();
+        }
+      };
+      try {
+        term.write(next.data, finish);
+      } catch (e) {
+        // 理论上 write 不抛；真抛了也必须走 finish，否则后端要等 1s 超时。
+        console.warn(`terminal ${sessionId}: write failed`, e);
+        finish();
+      }
+    };
+
+    const enqueueWrite = (
+      data: string | Uint8Array,
+      rawBytes: number,
+      seq?: number,
+    ) => {
+      if (outClosed) return;
+      if (typeof data === "string" ? data.length === 0 : data.byteLength === 0) {
+        // 空批（例如高亮把整片都当关键词前缀挂起）也要把 seq 还回去。
+        ackOutput(seq);
+        return;
+      }
+      outQueue.push({ data, rawBytes, seq });
+      outBacklog += rawBytes;
+      pumpWrites();
+    };
+
     // 关键字高亮：在 term.write 之前插一层（把命中的关键词包上 ANSI 颜色）。
     // 只影响界面 —— 日志是后端从 PTY 原始字节写的，落盘前早就剥掉了 ANSI。
-    const hl = new Highlighter((data) => term.write(data));
+    //
+    // 高亮的 sink 平时直接进写入队列；一批数据进来时先把本轮同步产生的字符串
+    // 收集起来，拼成**一个** term.write（不额外 decode、也不拆成多次 IPC 级写入）。
+    // `flush()` 的迟到内容会走 hlBatchOut = null 那条路，仍然排在同一个 FIFO 后面。
+    let hlBatchOut: string[] | null = null;
+    const hl = new Highlighter((data) => {
+      if (outClosed) return;
+      if (hlBatchOut) hlBatchOut.push(data);
+      else enqueueWrite(data, 0);
+    });
     hl.setRules(hlOnRef.current ? hlRulesRef.current : []);
     hlRef.current = hl;
     bus.attach(sessionId, (bytes) => {
-      // 没开高亮就完全走原路（原样把字节交给 xterm，零开销）
-      if (hl.active) hl.push(bytes);
-      else term.write(bytes);
+      // seq 必须最先取：ipc.ts 在调用 App 之前已经把它入队，和这片字节一一对应。
+      // 串口 / herdr 的 data 没有 seq，这里就是 undefined（不需要 ack）。
+      const seq = takeOutputSeq(sessionId);
+      if (!hl.active) {
+        // 没开高亮：原样把字节交给 xterm，只做一次 write
+        enqueueWrite(bytes, bytes.byteLength, seq);
+        return;
+      }
+      const out: string[] = [];
+      hlBatchOut = out;
+      try {
+        hl.push(bytes);
+      } finally {
+        hlBatchOut = null;
+      }
+      enqueueWrite(out.join(""), bytes.byteLength, seq);
     });
 
     /**
@@ -626,8 +790,19 @@ export default function TerminalView({
     let lastAutoCopied = "";
     let selTimer: number | null = null;
     const selSub = term.onSelectionChange(() => {
-      if (copyKeyRef.current !== "select") return;
       const text = term.getSelection();
+      // 选择模式提示条：没开「选中即复制」时告诉用户选中了多少、怎么复制；
+      // 开了就等下面自动复制成功后改成「已复制 N 个字符」。
+      if (selectModeRef.current) {
+        setSelectionInfo(
+          !text
+            ? ""
+            : copyKeyRef.current === "select"
+              ? `已选中 ${text.length} 个字符（自动复制）`
+              : `已选中 ${text.length} 个字符，按 Ctrl+Shift+C 复制`,
+        );
+      }
+      if (copyKeyRef.current !== "select") return;
       if (!text || text === lastAutoCopied) return;
       if (selTimer !== null) window.clearTimeout(selTimer);
       selTimer = window.setTimeout(() => {
@@ -637,6 +812,9 @@ export default function TerminalView({
         lastAutoCopied = now;
         void navigator.clipboard
           .writeText(now)
+          .then(() => {
+            if (selectModeRef.current) setSelectionInfo(`已复制 ${now.length} 个字符`);
+          })
           .catch(() => onNotice?.("自动复制失败（剪贴板被拒）：选中后按 Ctrl+Shift+C"));
       }, 120);
     });
@@ -734,6 +912,7 @@ export default function TerminalView({
       host.removeEventListener("paste", onPaste, true);
       if (selTimer !== null) window.clearTimeout(selTimer);
       selSub.dispose();
+      for (const s of mouseModeSubs) s.dispose();
       sub.dispose();
       writeParsedSub.dispose();
       // 终端真的没了：这条会话的"最后输出时间"也就没有意义了（卡片要靠它推断"还在跑"，
