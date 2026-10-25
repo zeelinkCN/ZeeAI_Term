@@ -28,6 +28,7 @@ import type {
   HerdrServerStatus,
   HerdrWorkspaceScan,
   HerdrInstallReport,
+  SshDiagnosis,
 } from "./types";
 
 export async function listProfiles(): Promise<ConnectionProfile[]> {

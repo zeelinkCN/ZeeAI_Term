@@ -751,3 +751,44 @@ export interface SerialPortInfo {
   path: string;
   label: string;
 }
+
+// ---------------------------------------------------------------------------
+// SSH 连接诊断（后端 `ssh_diagnose`：跑一次只读的 `ssh -G`，不连服务器）
+// ---------------------------------------------------------------------------
+
+/**
+ * `ssh -G` 解析出来的「实际生效」配置。
+ *
+ * 字段名沿用 OpenSSH 配置项的小写写法（`identityfile` / `proxyjump` …）——
+ * 后端结构体就是这么序列化的，**不是** `identity_files`。取密钥列表请用
+ * `App.tsx` 里的 `identityFilesOf()`，它两种都认，免得以后后端改名前端就瞎。
+ */
+export interface SshEffectiveConfig {
+  hostname: string;
+  /** 0 不会出现：后端解析完会落回 22 */
+  port: number;
+  /** 可能是空串（= 用户名交给系统当前用户） */
+  user: string;
+  /** 可能有多条（配置里的 IdentityFile + OpenSSH 的系统默认值） */
+  identityfile: string[];
+  /** 空 / undefined = 没配；后端会把 "none" 归一成 undefined */
+  proxyjump?: string | null;
+  proxycommand?: string | null;
+  /** "yes" / "no" / ""（空 = 本机配置里没写） */
+  identitiesonly: string;
+  /** "yes" / "no" / ""（空 = 本机配置里没写） */
+  batchmode: string;
+}
+
+/** 一个候选密钥文件：`exists` 是后端在本机 `Path::exists()` 的真实结果 */
+export interface SshKeyFile {
+  path: string;
+  exists: boolean;
+}
+
+/** `ssh_diagnose` 的返回值：生效配置 + 每个候选密钥是否存在 + 后端给的一句中文总结 */
+export interface SshDiagnosis {
+  effective: SshEffectiveConfig;
+  key_files: SshKeyFile[];
+  summary: string;
+}

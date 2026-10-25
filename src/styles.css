@@ -3277,3 +3277,168 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--fg);
 }
 
+
+/* ---------- SSH 连接诊断弹窗（后端 ssh_diagnose 的只读结果） ---------- */
+
+.diag-modal {
+  width: 560px;
+  max-width: 92vw;
+}
+
+/* 后端给的那句总结：用户最先要看的东西，字号压过其它行（"大字"） */
+.diag-summary {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.55;
+  color: var(--fg);
+  padding: 2px 0 10px;
+  word-break: break-word;
+}
+
+/* 前端算的"人话结论"：左边一条色条，一眼分清 能连 / 要留意 / 会失败 */
+.diag-verdict {
+  border-left: 3px solid var(--muted);
+  background: var(--hover);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 4px;
+  line-height: 1.55;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.diag-verdict.ok {
+  border-left-color: var(--green);
+}
+
+.diag-verdict.warn {
+  border-left-color: var(--amber);
+}
+
+.diag-verdict.bad {
+  border-left-color: var(--red);
+}
+
+/* 密码模式提示：琥珀色，和"要留意"一档 */
+.diag-hint {
+  background: rgba(226, 192, 141, 0.14);
+  border: 1px solid rgba(226, 192, 141, 0.45);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  line-height: 1.55;
+  font-size: 12.5px;
+}
+
+/* 刚才那条连接错误（只从"连接失败"入口进来时才有） */
+.diag-failure {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.diag-error {
+  color: var(--red);
+  line-height: 1.55;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.diag-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.diag-row {
+  display: flex;
+  gap: 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.diag-row > span {
+  flex: none;
+  width: 176px;
+  color: var(--muted);
+}
+
+.diag-row > b {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.diag-section {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 8px 0 6px;
+}
+
+.diag-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.diag-key {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+}
+
+.diag-key-flag {
+  flex: none;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.diag-key.ok .diag-key-flag {
+  color: var(--green);
+}
+
+.diag-key.missing .diag-key-flag {
+  color: var(--red);
+}
+
+.diag-key-path {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  word-break: break-all;
+  color: var(--fg);
+}
+
+/* 状态栏里的「诊断一下」入口：紧贴错误文字后面，不能被省略号挤没 */
+.statusbar .status-notice .status-text {
+  /* flex 子项默认 min-width:auto 不肯收缩，省略号就不会出现 —— 必须显式给 0 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusbar .status-notice .status-diag {
+  flex: none;
+  margin-left: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.statusbar .status-notice .status-diag:hover {
+  opacity: 0.85;
+}

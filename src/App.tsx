@@ -105,6 +105,7 @@ import {
   tmuxList,
   tmuxWindows,
   tmuxAction,
+  sshDiagnose,
 } from "./ipc";
 import { b64ToBytes, bytesToB64, uid } from "./util";
 import {
@@ -149,6 +150,8 @@ import type {
   SerialPortInfo,
   SessionEvent,
   SessionState,
+  SshDiagnosis,
+  SshEffectiveConfig,
   TmuxSession,
   TmuxWindow,
   TransferEvent,
@@ -759,13 +762,324 @@ function looksLikeAuthFailure(text: string): boolean {
  *
  * `what` 是我们自己的上下文（"SSH 连接失败"这种），后面接后端的原始报错；
  * 原始信息部分会在 `notify` 里被挪进悬停。
+ *
+ * `allowPassword`：这台服务器**已经**勾了「允许在终端里输入密码」时，就别再劝他去勾
+ *（他勾了还是认证失败，问题在别处）—— 那种情况由 `explainSshFailure` 补"密码模式"提示。
  */
-function connErrorText(what: string, err: unknown): string {
+function connErrorText(what: string, err: unknown, allowPassword?: boolean): string {
   const raw = String(err);
-  const hint = looksLikeAuthFailure(raw)
-    ? "\n这台服务器可能要密码：在「编辑服务器」里勾上「允许在终端里输入密码」再连"
-    : "";
+  const hint =
+    !allowPassword && looksLikeAuthFailure(raw)
+      ? "\n这台服务器可能要密码：在「编辑服务器」里勾上「允许在终端里输入密码」再连"
+      : "";
   return `${what}：${raw}${hint}`;
+}
+
+/**
+ * "密码模式提示"该不该出现：认证 / 权限 / 算法这类错误，正是"本机明明有免密配置、
+ * 却被密码模式挡住了"的典型症状。网络错误（超时 / 连不上）跟密码无关，不提示。
+ */
+function looksLikePasswordModeTrap(text: string): boolean {
+  const low = text.toLowerCase();
+  return (
+    looksLikeAuthFailure(text) ||
+    text.includes("算法不匹配") ||
+    low.includes("no common algorithm") ||
+    low.includes("no matching host key")
+  );
+}
+
+/** 后端那句密码模式提示（只读常量；文案和后端 `ssh::PASSWORD_MODE_HINT` 保持一致） */
+const PASSWORD_MODE_HINT =
+  "本机已有免密配置；密码模式不会使用 ~/.ssh/config 与 ssh-agent，若想免密请取消勾选「允许在终端里输入密码」";
+
+/**
+ * 要不要提示"你其实有免密配置，只是被密码模式挡住了"。
+ *
+ * 后端 `ssh::password_mode_hint` 的口径是：启用「允许输入密码」且（配了 keyPath 或
+ * `ssh -G` 有 IdentityFile 或 ssh-agent 可用）。前端**拿不到 agent 的状态**（没有命令
+ * 暴露它），所以这里只认"诊断证明本机真有密钥"这一条 —— 宁可少提示，也不要把
+ * "本机已有免密配置"说在一台根本没钥匙的机器上（那会让用户去关一个救命的勾）。
+ */
+function passwordModeHintFor(
+  profile: ConnectionProfile | undefined,
+  d: SshDiagnosis | undefined,
+): string | null {
+  if (!d || !profile?.ssh?.allowPassword) return null;
+  const keys = Array.isArray(d.key_files) ? d.key_files : [];
+  if (!keys.some((k) => k.exists)) return null;
+  return PASSWORD_MODE_HINT;
+}
+
+/**
+ * `ssh -G` 给的是 `~/.ssh/id_ed25519` 这种路径，后端 `key_files` 给的是展开后的
+ * `C:\Users\你\.ssh\id_ed25519`。要按"同一个文件"比，就得把两边都归一成
+ * `.ssh/` 之后那一段（`/id_ed25519`）—— 直接字符串相等永远比不上。
+ */
+function keyPathKey(p: string): string {
+  const s = p.replace(/\\/g, "/").toLowerCase();
+  const home = /^(?:~|%userprofile%)(\/.*)$/.exec(s);
+  if (home) {
+    const i = home[1].lastIndexOf("/.ssh/");
+    return i >= 0 ? home[1].slice(i + 5) : home[1];
+  }
+  const dotSsh = s.lastIndexOf("/.ssh/");
+  if (dotSsh >= 0) return s.slice(dotSsh + 5);
+  return s;
+}
+
+function sameKeyPath(a: string, b: string): boolean {
+  return keyPathKey(a) === keyPathKey(b);
+}
+
+/**
+ * 取"配置里真实会用的密钥列表"。
+ *
+ * 后端字段是 `identityfile`（OpenSSH 配置项同名）；这里同时认 `identity_files`
+ * 这种写法，免得字段哪天改名界面直接瞎掉。空串 / "none" 不算。
+ */
+function identityFilesOf(effective: SshEffectiveConfig | undefined): string[] {
+  if (!effective) return [];
+  const e = effective as SshEffectiveConfig & { identity_files?: unknown };
+  const raw = Array.isArray(e.identityfile) ? e.identityfile : e.identity_files;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x): x is string => typeof x === "string" && x.trim() !== "");
+}
+
+/**
+ * 一句人话结论 —— 用户不该自己对着 `ssh -G` 的输出推断"我到底会怎么登录"。
+ *
+ * 判定顺序（先看有没有能用的钥匙，再补一句"所以接下来会怎样"）：
+ * 1. 找到存在的密钥 → 说清用哪一把；他手填的私钥不在时**必须点名**（否则他会一直
+ *    以为在用那把，直到某天发现免密突然失效）；
+ * 2. 一把都没有 + 填了私钥路径 → 「主机密钥文件不存在」（路径写错 / 密钥没拷过来）；
+ * 3. 一把都没有 + 没填 → 「没找到本机密钥」，并点出最常见的原因（「主机」里填的不是别名）；
+ * 最后统一追加登录方式：勾了「允许在终端里输入密码」就会转密码登录，否则直接认证失败。
+ */
+function sshDiagnosisConclusion(
+  d: SshDiagnosis,
+  profile?: ConnectionProfile,
+): { tone: "ok" | "warn" | "bad"; text: string } {
+  const configured = (profile?.ssh?.keyPath ?? "").trim();
+  const keys = Array.isArray(d.key_files) ? d.key_files : [];
+  const existing = keys.filter((k) => k.exists);
+  const configuredKey = configured
+    ? keys.find((k) => sameKeyPath(k.path, configured))
+    : undefined;
+  const jump = String(d.effective?.proxyjump ?? "").trim();
+  const viaJump = jump ? `；会先经过跳板机 ${jump}` : "";
+  const pure = d.effective?.identitiesonly === "yes";
+
+  if (existing.length > 0) {
+    let tone: "ok" | "warn" = "ok";
+    let text: string;
+    if (configured && configuredKey && !configuredKey.exists) {
+      tone = "warn";
+      text = `你指定的私钥 ${configuredKey.path} 不存在，会改用 ${existing[0].path} 免密登录`;
+    } else if (configured && configuredKey?.exists) {
+      text = `会用 ${configuredKey.path} 免密登录`;
+    } else if (configured && !configuredKey) {
+      // 填了路径但后端候选列表里没有它（例如写成相对路径）：不能假装在用，提醒一句
+      tone = "warn";
+      text = `会用 ${existing[0].path} 免密登录；你填的 ${configured} 没在本机找到，确认一下路径`;
+    } else {
+      text = `会用 ${existing[0].path} 免密登录（来自 ~/.ssh/config 或系统默认密钥）`;
+    }
+    if (pure) {
+      text += "。config 里开了 IdentitiesOnly：只用配置里列的密钥，不会去试 ssh-agent 里的";
+    }
+    return { tone, text: text + viaJump };
+  }
+
+  // 一把都不存在
+  let text: string;
+  if (configured) {
+    text = `主机密钥文件不存在：${configuredKey?.path ?? configured}（本机找不到这个文件，连接会失败）`;
+  } else {
+    text =
+      "没找到本机密钥，可能因为「主机」里填的不是 ~/.ssh/config 里的别名；也可能是这台机器还没配过 SSH 密钥";
+  }
+  if (profile?.ssh?.allowPassword) {
+    text += "。你勾了「允许在终端里输入密码」，会改用密码登录";
+  } else {
+    text += "。而且没勾「允许在终端里输入密码」，连不上时会直接报认证失败";
+  }
+  if (pure) {
+    text += "。config 里还开了 IdentitiesOnly，ssh-agent 里的钥匙也不会被拿来试";
+  }
+  return { tone: "bad", text: text + viaJump };
+}
+
+/** 一次连接诊断在界面上的状态（「编辑服务器」按钮 / 连接失败提示 两个入口共用） */
+interface SshDiagView {
+  profileId: string;
+  /** 服务器名：弹窗标题带上，免得连错机器 */
+  name: string;
+  /** 发起诊断时的那份配置（编辑框里**没保存**的改动也算 —— 密码模式提示才准） */
+  profile?: ConnectionProfile;
+  /** 从「连接失败」进来的那次：把刚才那条错误带进弹窗，别让用户再回忆一遍 */
+  failure?: string;
+  loading: boolean;
+  data?: SshDiagnosis;
+  error?: string;
+}
+
+/**
+ * 连接诊断弹窗 —— 「编辑服务器」里的按钮 和 连接失败提示 共用这一个。
+ *
+ * 只展示人看得懂的东西：一句总结（大字）、实际生效的主机/端口/用户、每个密钥存在与否、
+ * 有才显示的跳板机 / ProxyCommand / IdentitiesOnly / BatchMode，以及前端算出来的人话结论。
+ * **不摆原始 JSON** —— 那是给排查问题的人看的，普通用户只会被吓到。
+ */
+function SshDiagnosisModal(props: {
+  view: SshDiagView;
+  onClose: () => void;
+  onRetry: () => void;
+}): JSX.Element {
+  const { view, onClose, onRetry } = props;
+  const d = view.data;
+  const conclusion = d ? sshDiagnosisConclusion(d, view.profile) : null;
+  const hint = passwordModeHintFor(view.profile, d);
+  const idFiles = identityFilesOf(d?.effective);
+  const keyFiles = Array.isArray(d?.key_files) ? d!.key_files : [];
+  /** 某个路径在本机上到底存不存在；后端没给这一条时返回 undefined（不瞎猜） */
+  const existsOf = (path: string): boolean | undefined => {
+    const hit = keyFiles.find((k) => sameKeyPath(k.path, path));
+    return hit ? hit.exists : undefined;
+  };
+  const mainKeys =
+    idFiles.length > 0
+      ? idFiles.map((path) => ({ path, exists: existsOf(path) }))
+      : keyFiles.map((k) => ({ path: k.path, exists: k.exists as boolean | undefined }));
+  // 配置里没列、但本机真的有的密钥：用户最常问"我 ~/.ssh 里明明有钥匙，为什么没用上"
+  const otherKeys = keyFiles.filter(
+    (k) => k.exists && !mainKeys.some((m) => sameKeyPath(m.path, k.path)),
+  );
+  const extras: { label: string; value: string }[] = [];
+  if (d) {
+    const e = d.effective;
+    const jump = String(e?.proxyjump ?? "").trim();
+    const proxyCmd = String(e?.proxycommand ?? "").trim();
+    if (jump) extras.push({ label: "跳板机", value: jump });
+    if (proxyCmd) extras.push({ label: "ProxyCommand", value: proxyCmd });
+    // 这两个 OpenSSH 默认就是 no / 空：只有用户/配置真写了才说，别拿默认值凑数
+    if (e?.identitiesonly) {
+      extras.push({
+        label: "IdentitiesOnly（只用配置里列的密钥）",
+        value: e.identitiesonly === "yes" ? "是" : "否",
+      });
+    }
+    if (e?.batchmode) {
+      extras.push({
+        label: "BatchMode（不弹密码提示）",
+        value: e.batchmode === "yes" ? "是" : "否",
+      });
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal diag-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          连接诊断{view.name ? ` · ${view.name}` : ""}
+          <button
+            type="button"
+            className="mini-x"
+            style={{ float: "right", opacity: 1 }}
+            title="关闭"
+            onClick={onClose}
+          >
+            ✕
+          </button>
+        </div>
+        <div className="modal-body">
+          {view.failure && (
+            <div className="diag-failure">刚才的连接错误：{view.failure}</div>
+          )}
+          {view.loading && (
+            <div className="hint">正在读取本机 SSH 配置…（只读，不会连接服务器）</div>
+          )}
+          {view.error && (
+            <div className="diag-error">读不到本机 SSH 配置：{view.error}</div>
+          )}
+          {d && (
+            <>
+              <div className="diag-summary">{d.summary}</div>
+              {conclusion && (
+                <div className={"diag-verdict " + conclusion.tone}>{conclusion.text}</div>
+              )}
+              {hint && <div className="diag-hint">⚠ {hint}</div>}
+              <div className="diag-rows">
+                <div className="diag-row">
+                  <span>实际主机</span>
+                  <b>{d.effective?.hostname || "（未知）"}</b>
+                </div>
+                <div className="diag-row">
+                  <span>端口</span>
+                  <b>{d.effective?.port || 22}</b>
+                </div>
+                <div className="diag-row">
+                  <span>用户</span>
+                  <b>{d.effective?.user || "（本机当前用户名）"}</b>
+                </div>
+                {extras.map((x) => (
+                  <div className="diag-row" key={x.label}>
+                    <span>{x.label}</span>
+                    <b>{x.value}</b>
+                  </div>
+                ))}
+              </div>
+              <div className="diag-section">本机密钥（配置里列的 + 系统默认位置）</div>
+              {mainKeys.length === 0 ? (
+                <div className="hint">配置里没有 IdentityFile，也没在默认位置找到密钥</div>
+              ) : (
+                <div className="diag-keys">
+                  {mainKeys.map((k) => (
+                    <div
+                      className={
+                        "diag-key " + (k.exists === true ? "ok" : k.exists === false ? "missing" : "")
+                      }
+                      key={k.path}
+                    >
+                      <span className="diag-key-flag">
+                        {k.exists === true ? "✓ 存在" : k.exists === false ? "✗ 不存在" : "? 无法确认"}
+                      </span>
+                      <span className="diag-key-path" title={k.path}>
+                        {k.path}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {otherKeys.length > 0 && (
+                <>
+                  <div className="diag-section">本机找到的其他密钥（没在配置里，但可以用）</div>
+                  <div className="diag-keys">
+                    {otherKeys.map((k) => (
+                      <div className="diag-key ok" key={k.path}>
+                        <span className="diag-key-flag">✓ 存在</span>
+                        <span className="diag-key-path" title={k.path}>
+                          {k.path}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onRetry} disabled={view.loading}>
+            重新诊断
+          </button>
+          <button type="button" className="btn primary" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /** GitHub Release 里的一个附件（检查更新时用来挑安装包） */
@@ -1144,8 +1458,28 @@ export default function App() {
     /** 悬停时看的完整原文（含 `｜原始信息：<英文>`；没有额外原文时等于 text） */
     detail: string;
     at: number;
+    /** 这条提示的序号（`notify` 每发一条 +1）：异步补文案时认它，别认毫秒时间戳 */
+    seq: number;
     kind: "info" | "warn" | "error";
+    /**
+     * 这条提示来自哪台服务器的连接失败。给了就在状态栏上多一个
+     * 「为什么会失败？诊断一下」—— 点开只读诊断，不会再去连服务器。
+     */
+    diagProfileId?: string;
+    /** 那次失败的短句（带进诊断弹窗顶部，省得用户回忆刚才报了什么） */
+    diagFailure?: string;
+    /** 连接失败时算出来的「密码模式」提示：完整一句话，悬停和诊断弹窗里都能看到 */
+    hint?: string;
   } | null>(null);
+  /**
+   * 状态栏提示的序号计数器。
+   *
+   * 为什么不用 `Date.now()` 当身份：同一毫秒里可以连发两条（例如"打开失败"之后紧跟着
+   * 别处一句成功提示），时间戳一样 → 异步补的「密码模式」提示会盖到错的那条上（实测踩过）。
+   */
+  const statusSeq = useRef(0);
+  /** 连接诊断弹窗（「编辑服务器」里的按钮 和 连接失败的提示 共用这一个） */
+  const [diagView, setDiagView] = useState<SshDiagView | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...EMPTY_PROFILE });
 
@@ -1603,6 +1937,14 @@ export default function App() {
   const activeUserRef = useRef<string | undefined>(undefined);
   const reconnectTimers = useRef<Record<string, number>>({});
   const reconnectTries = useRef<Record<string, number>>({});
+  /**
+   * 哪几次 `openSshSession` 是**失败**的。
+   *
+   * 为什么要有：`openSshSession` 自己吞掉异常、把会话标成 error，然后**照常返回 id** ——
+   * 新建会话的 herdr 分支拿到 id 就以为成功了，还会补一句"已进入 herdr 的窗格"。
+   * 结果真正的认证失败提示（带「诊断一下」入口）被一句假的成功提示顶掉。
+   */
+  const failedSshOpens = useRef<Set<string>>(new Set());
 
   const [gitPath, setGitPath] = useState("");
   const [gitState, setGitState] = useState<GitStatus | null>(null);
@@ -4052,8 +4394,15 @@ export default function App() {
    *   info  完成类（已上传、已删除、AI 跑完…）→ ✓
    *   warn  需要留意但不致命（还没好、已重试 N 次…）→ ⚠ 琥珀黄
    *   error 出错（失败、无法、请先…）→ ❗ 红底加粗并闪一下
+   *
+   * `opts.diagProfileId`：这条是"某台服务器连不上"时，状态栏上再多一个
+   * 「为什么会失败？诊断一下」；返回这次提示的**序号**，失败后补"密码模式"那句时
+   * 用它确认"还是同一条提示"（否则会把过期的诊断结果盖到新提示上）。
    */
-  function notify(text: string) {
+  function notify(
+    text: string,
+    opts?: { diagProfileId?: string; diagFailure?: string },
+  ): number {
     // 后半句"这台服务器可能要密码…"是**给用户照做的**，不能被切掉 —— 所以先把它摘出来，
     // 只把「中文短句｜原始信息：…」那一半送进拆分逻辑（见 splitErrText）。
     const nl = text.indexOf("\n");
@@ -4067,8 +4416,87 @@ export default function App() {
       : /还没|没有|已尝试|重试|注意|不可|未/.test(text)
         ? "warn"
         : "info";
-    setStatusMsg({ text: short + tail, detail: detail + tail, at: Date.now(), kind });
+    const at = Date.now();
+    const seq = ++statusSeq.current;
+    setStatusMsg({
+      text: short + tail,
+      detail: detail + tail,
+      at,
+      seq,
+      kind,
+      diagProfileId: opts?.diagProfileId,
+      diagFailure: opts?.diagFailure,
+    });
+    return seq;
   }
+
+  /**
+   * 打开连接诊断弹窗（编辑服务器里的按钮 / 连接失败提示 两个入口都走这里）。
+   *
+   * 诊断本身是**只读**的（后端跑一次 `ssh -G`），所以连接失败之后再点它不会又卡一次。
+   * 编辑框里没保存的改动也算数（`profile` 优先取 draft）—— 否则用户刚勾上"允许输入密码"
+   * 就看到一句"没勾"的提示，会以为按钮坏了。
+   */
+  async function openSshDiagnosis(profileId: string, failure?: string) {
+    const editing = editDialog?.draft.id === profileId ? editDialog.draft : undefined;
+    const profile = editing ?? profiles.find((p) => p.id === profileId);
+    setDiagView({
+      profileId,
+      name: profile?.name ?? "",
+      profile,
+      failure,
+      loading: true,
+    });
+    try {
+      const data = await sshDiagnose(profileId);
+      setDiagView((cur) =>
+        cur && cur.profileId === profileId
+          ? { ...cur, loading: false, error: undefined, data }
+          : cur,
+      );
+    } catch (e) {
+      setDiagView((cur) =>
+        cur && cur.profileId === profileId
+          ? { ...cur, loading: false, error: String(e).replace(/^Error:\s*/, "") }
+          : cur,
+      );
+    }
+  }
+
+  /**
+   * 连接失败后补一条「密码模式」提示。
+   *
+   * 为什么要**异步**再跑一次诊断：只有 `ssh -G` 知道本机到底有没有现成的密钥。
+   * 用户勾了「允许在终端里输入密码」时，程序不再用 config / agent，认证失败最常见
+   * 的原因就是"本机明明有免密配置，却被密码模式挡住了"。诊断失败（例如没装 OpenSSH）
+   * 就安静地算了 —— 不能因为诊断不了，把真正的连接错误盖掉。
+   */
+  async function explainSshFailure(
+    seq: number,
+    profile: ConnectionProfile | undefined,
+    raw: string,
+  ) {
+    if (!profile || !looksLikePasswordModeTrap(raw)) return;
+    try {
+      const d = await sshDiagnose(profile.id);
+      const hint = passwordModeHintFor(profile, d);
+      if (!hint) return;
+      setStatusMsg((cur) =>
+        cur && cur.seq === seq
+          ? {
+              ...cur,
+              // 完整一句放上去（状态栏会省略号截断，悬停/诊断弹窗里能看全）
+              text: `${cur.text} · ${hint}`,
+              detail: `${cur.detail}\n${hint}`,
+              hint,
+            }
+          : cur,
+      );
+    } catch {
+      /* 诊断本身失败不影响这条报错：用户还能点「诊断一下」看原因 */
+    }
+  }
+
 
   // ---------- 给 AI 发文件 / 发消息（粘贴、拖拽、「✍ 发给 AI」输入窗共用这一套） ----------
 
@@ -4681,7 +5109,16 @@ export default function App() {
         }
       }
     } catch (e) {
-      notify(connErrorText("SSH 连接失败", e));
+      // 失败要留个记号：openSshSession 会照常返回 id，调用方别把这次当成"已经进去了"
+      failedSshOpens.current.add(id);
+      // 失败提示后面挂一个「为什么会失败？诊断一下」，用户不用自己猜填的对不对；
+      // 提示里的"可能要密码"只在没勾「允许输入密码」时才加（见 connErrorText）。
+      const msg = connErrorText("SSH 连接失败", e, !!profile.ssh?.allowPassword);
+      const seq = notify(msg, {
+        diagProfileId: profile.id,
+        diagFailure: splitErrText(msg).short,
+      });
+      void explainSshFailure(seq, profile, String(e));
       setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, state: "error" } : s)));
     }
     return id;
@@ -4690,8 +5127,12 @@ export default function App() {
   async function closeSession(id: string) {
     // 关标签时顺手清掉拖动状态
     setDragTabId(null);
+    failedSshOpens.current.delete(id);
     // 观察窗的输入通道跟着会话一起收（后端会把那条常驻 ssh 的 stdin 关掉）
     herdrInputs.current.delete(id);
+    // 会话没了，它那格「发给 AI」草稿也一起清（附件 / 正文都不该留着占地方）
+    composerDrafts.current.delete(id);
+    setComposerBusyIds((prev) => prev.filter((x) => x !== id));
     // 先记下它在标签栏里的位置，关掉之后要顶上来一个
     const list = sessionsRef.current;
     const idx = list.findIndex((s) => s.id === id);
@@ -4817,7 +5258,13 @@ export default function App() {
         s.user ?? null,
       );
     } catch (e) {
-      notify(connErrorText("重连失败", e));
+      const profile = profiles.find((p) => p.id === s.profileId);
+      const msg = connErrorText("重连失败", e, !!profile?.ssh?.allowPassword);
+      const seq = notify(msg, {
+        diagProfileId: s.profileId,
+        diagFailure: splitErrText(msg).short,
+      });
+      void explainSshFailure(seq, profile, String(e));
       setSessions((prev) => prev.map((x) => (x.id === s.id ? { ...x, state: "error" } : x)));
     }
   }
@@ -5172,7 +5619,7 @@ export default function App() {
         // 名字一定要带上"herdr"和窗格号：
         // 光看 "lz · w9:p1" 谁也认不出这是 herdr 的窗格（用户实测就是被这个坑到的）。
         const herdrTitle = wantedTitle || `${profile.name} · herdr ${pane}`;
-        await openSshSession(
+        const openedId = await openSshSession(
           profile,
           "name",
           pane,
@@ -5183,11 +5630,15 @@ export default function App() {
           pane,
           "control",
         );
-        notify(`已进入 herdr 的窗格 ${pane}（它是 herdr 管的那个终端，留在服务器上、随时能回来）`);
-        // 刚多了一个工作区，顺手把服务状态/工作区清单刷新一下（状态条和面板上那句
-        // 「N 个窗格 / N 个工作区」要跟着变，不然用户会以为没生效）
-        herdrProbedFor.current = profile.id;
-        void refreshHerdrServer(profile.id, userOverride);
+        // openSshSession 失败时**也会返回 id**（它自己把错误提示掉了），这里必须自己认一下，
+        // 否则真正的认证失败提示（带「诊断一下」）会被一句假的"已进入 herdr 的窗格"顶掉。
+        if (!failedSshOpens.current.delete(openedId)) {
+          notify(`已进入 herdr 的窗格 ${pane}（它是 herdr 管的那个终端，留在服务器上、随时能回来）`);
+          // 刚多了一个工作区，顺手把服务状态/工作区清单刷新一下（状态条和面板上那句
+          // 「N 个窗格 / N 个工作区」要跟着变，不然用户会以为没生效）
+          herdrProbedFor.current = profile.id;
+          void refreshHerdrServer(profile.id, userOverride);
+        }
       } else if (!newDialog.useTmux) {
         await openSshSession(
           profile,
@@ -9217,7 +9668,25 @@ export default function App() {
             title={statusMsg.detail || statusMsg.text}
             onClick={() => setStatusMsg(null)}
           >
-            {statusMsg.text}
+            {/* 文案单独一层：状态栏是 nowrap + 省略号，入口按钮不能被它挤出去 */}
+            <span className="status-text">{statusMsg.text}</span>
+            {statusMsg.diagProfileId && (
+              <button
+                type="button"
+                className="status-diag"
+                title="只读诊断：看本机实际会用哪个主机 / 端口 / 用户 / 密钥，不会再去连服务器"
+                onClick={(e) => {
+                  // 别让点按钮顺手把提示关掉（外层 onClick 是"点一下关掉"）
+                  e.stopPropagation();
+                  const id = statusMsg.diagProfileId;
+                  const why = statusMsg.diagFailure;
+                  setStatusMsg(null);
+                  if (id) void openSshDiagnosis(id, why);
+                }}
+              >
+                为什么会失败？诊断一下
+              </button>
+            )}
           </span>
         )}
         {activeFile && <span className="stat">{activeFile.path}</span>}
@@ -10478,6 +10947,28 @@ export default function App() {
                   onChange={(e) => patchDraft({}, { keyPath: e.target.value })}
                 />
               </label>
+              {/* 连接诊断：只读跑一次本机 ssh -G，看**实际**会用的主机/端口/用户/密钥。
+                  用户报障时不用再猜"我填的别名到底生效了没有""钥匙到底在哪找"。 */}
+              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={!editDialog.draft.id}
+                  title={
+                    editDialog.draft.id
+                      ? "只读：看看本机会用哪个主机 / 端口 / 用户 / 密钥，不会去连服务器"
+                      : "先保存这台服务器再诊断（诊断是按已保存的配置跑的）"
+                  }
+                  onClick={() => {
+                    if (editDialog.draft.id) void openSshDiagnosis(editDialog.draft.id);
+                  }}
+                >
+                  连接诊断（看看本机会用哪把钥匙）
+                </button>
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  只读，不会去连服务器（按已保存的配置诊断）
+                </span>
+              </div>
               <label className="modal-field">
                 跳板机（可选，写法同 ssh -J：user@jump-host 或 user@jump-host:22）
                 <input
@@ -10610,6 +11101,15 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 连接诊断弹窗：编辑服务器里的按钮 和 连接失败提示 共用 */}
+      {diagView && (
+        <SshDiagnosisModal
+          view={diagView}
+          onClose={() => setDiagView(null)}
+          onRetry={() => void openSshDiagnosis(diagView.profileId, diagView.failure)}
+        />
       )}
 
       {showSettings && (

@@ -503,7 +503,20 @@ const resolveCmd = (cmd, args, opts) => {
     case "plugin:dialog|open": return "C:/Temp/zeeai-paste/picker-shot.png";
     case "open_external_url": case "open_in_explorer": return null;
     case "secret_has": return false;
+    case "ssh_diagnose": {
+      if (S.diagError) {
+        return Promise.reject(new Error("系统没有 OpenSSH 客户端（请先在 Windows 可选功能里安装 OpenSSH 客户端）"));
+      }
+      return mockDiagnosis(!!S.diagNoKey);
+    }
     case "open_ssh": {
+      // 认证失败场景：模拟"本机有密钥、却还是被服务器拒了"（勾了允许输入密码那种）。
+      // 用真后端同款文案（中文短句｜原始信息：<英文>），前端才会走"密码模式提示"那条路。
+      if (S.openSshFail) {
+        return Promise.reject(
+          new Error("认证失败（用户名、密码或密钥不对，或服务器不允许这种登录方式）｜原始信息：Permission denied (publickey)"),
+        );
+      }
       // 记下这条会话的 Channel id：测试要用它模拟"终端真的收到输出"（见 __ZEEAI_TERM_DATA__）。
       if (args && args.id && args.onEvent) window.__ZEEAI_SESSION_CHANNELS__[args.id] = args.onEvent.id;
       return {
@@ -653,7 +666,12 @@ async function waitJson(path, tries = 60) {
 }
 
 const targets = await waitJson("/json/list");
-const page = targets.find((t) => t.type === "page");
+// 只挑真正的页面 target：新 profile 的 Edge 有时会额外开一条 edge://sync-confirmation-dialog，
+// 如果它在列表前面，连过去之后窗口尺寸/页面都不是被测应用（表现为所有布局断言都怪怪的）。
+const page =
+  targets.find((t) => t.type === "page" && !/^(edge|chrome|devtools):/.test(t.url)) ??
+  targets.find((t) => t.type === "page");
+if (!page) throw new Error("无头浏览器里找不到页面 target");
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 await new Promise((r, j) => {
   ws.onopen = r;
@@ -786,6 +804,11 @@ const setScenario = async (flags) => {
     // 把一次 AI 探测拖慢（只给「刷新」按钮的中间态用例用）；每个场景显式归零，
     // 否则下一段会一直慢 1.2 秒。
     slowAi: false,
+    // 连接诊断 / 密码模式提示那组（Z3）用的开关：每个场景显式归零，避免漏到下一段
+    openSshFail: false,
+    diagNoKey: false,
+    diagError: false,
+    allowPassword: false,
     // 看板 v2 的场景数据（前端只采集、后端合并 —— 假后端那份合并见 mockMergeBoard）。
     // ⚠️ herdrTasks / herdrScan **故意不在这里重置**：注入脚本是累积的，每轮都写 null
     //    会把前面场景放进去的任务清空（我踩过一次：D2 那条用例的卡片突然只剩 herdr 的）。
@@ -4216,6 +4239,246 @@ check(
 );
 
 console.log("\n--- 页面控制台里的 error/warning ---");
+// ---------- (Z3) SSH 连接诊断 ----------
+//
+// 用户报障：「~/.ssh/config 里明明配了别名和密钥，界面填别名就是连不上」——
+// 以前界面上只有一条英文原始错误，用户只能自己猜。这一组按用户路径验四件事：
+//   ① 编辑服务器里点「连接诊断」→ 弹窗有 summary / 实际主机 / 端口 / 用户 / 密钥存在状态；
+//   ② 一把钥匙都没有时，人话结论说「没找到本机密钥」（不是丢一堆 JSON 给用户）；
+//   ③ 认证失败 + 本机有钥匙 + 勾了密码模式 → 错误提示里出「密码模式」那句，并且能点进诊断；
+//   ④ 弹窗能关（右上角 ✕ / 关闭按钮 / 点遮罩）。
+const openServerManager = async () => {
+  const r = await evaluate(`(() => {
+    const b = [...document.querySelectorAll(".side-btn, button")].find(
+      (x) => (x.innerText || "").trim() === "服务器管理",
+    );
+    if (b) { b.click(); return true; }
+    return false;
+  })()`);
+  await sleep(700);
+  return r;
+};
+/** 点开服务器管理里第一台的「编辑」 */
+const openFirstEditDialog = async () => {
+  const r = await evaluate(`(() => {
+    const managers = [...document.querySelectorAll(".modal.wide")];
+    const m = managers[managers.length - 1];
+    if (!m) return { ok: false, why: "没有服务器管理弹窗" };
+    const b = [...m.querySelectorAll("button")].find((x) => (x.innerText || "").trim() === "编辑");
+    if (b) { b.click(); return { ok: true }; }
+    return { ok: false, why: "没有编辑按钮" };
+  })()`);
+  await sleep(700);
+  return r;
+};
+/** 在最后那个弹窗里找「连接诊断」并点开 */
+const clickDiagnoseInModal = async () => {
+  const r = await evaluate(`(() => {
+    const modals = [...document.querySelectorAll(".modal")];
+    const m = modals[modals.length - 1];
+    const b = m
+      ? [...m.querySelectorAll("button")].find((x) => (x.innerText || "").includes("连接诊断"))
+      : null;
+    if (!b) return { found: false };
+    const disabled = !!b.disabled;
+    if (!disabled) b.click();
+    return { found: true, disabled: disabled };
+  })()`);
+  await sleep(900);
+  return r;
+};
+const readDiagModal = async () =>
+  evaluate(`(() => {
+    const m = document.querySelector(".diag-modal");
+    if (!m) return { open: false };
+    const text = m.innerText || "";
+    const row = (label) => {
+      const r = [...m.querySelectorAll(".diag-row")].find(
+        (x) => ((x.querySelector("span") || {}).innerText || "").trim() === label,
+      );
+      return r ? ((r.querySelector("b") || {}).innerText || "").trim() : "";
+    };
+    return {
+      open: true,
+      summary: ((m.querySelector(".diag-summary") || {}).innerText || "").trim(),
+      verdict: ((m.querySelector(".diag-verdict") || {}).innerText || "").trim(),
+      hint: ((m.querySelector(".diag-hint") || {}).innerText || "").trim(),
+      failure: ((m.querySelector(".diag-failure") || {}).innerText || "").trim(),
+      host: row("实际主机"),
+      port: row("端口"),
+      user: row("用户"),
+      jump: row("跳板机"),
+      keys: [...m.querySelectorAll(".diag-key")].map((k) => ({
+        flag: ((k.querySelector(".diag-key-flag") || {}).innerText || "").trim(),
+        path: ((k.querySelector(".diag-key-path") || {}).innerText || "").trim(),
+      })),
+      rawJson: text.includes("key_files") || text.includes("identityfile") || text.includes('"effective"'),
+    };
+  })()`);
+
+// ① 编辑服务器里的入口（有密钥、有跳板机的固定诊断数据）
+await setScenario({ diagNoKey: false, openSshFail: false, allowPassword: false });
+await reload();
+const diagMgrOpened = await openServerManager();
+const editOpened = await openFirstEditDialog();
+const diagEntry = await clickDiagnoseInModal();
+const diagUi = await readDiagModal();
+check(
+  "连接诊断入口①：编辑服务器里点「连接诊断」→ 弹窗显示 summary / 实际主机 / 端口 2222 / 用户 alice",
+  diagMgrOpened &&
+    editOpened.ok &&
+    diagEntry.found &&
+    !diagEntry.disabled &&
+    diagUi.open &&
+    diagUi.summary.includes("将使用 alice@203.0.113.10:2222") &&
+    diagUi.host === "203.0.113.10" &&
+    diagUi.port === "2222" &&
+    diagUi.user === "alice",
+  JSON.stringify({
+    diagMgrOpened,
+    editOpened,
+    diagEntry,
+    open: diagUi.open,
+    summary: diagUi.summary,
+    host: diagUi.host,
+    port: diagUi.port,
+    user: diagUi.user,
+  }),
+);
+check(
+  "连接诊断弹窗：密钥列表按 key_files 的 exists 标 ✓存在 / ✗不存在（~ 与展开后的绝对路径认成同一个文件）",
+  diagUi.keys.length === 2 &&
+    diagUi.keys[0].flag.includes("✓ 存在") &&
+    diagUi.keys[0].path.includes("id_ed25519") &&
+    diagUi.keys[1].flag.includes("✗ 不存在") &&
+    diagUi.keys[1].path.includes("id_rsa"),
+  JSON.stringify(diagUi.keys),
+);
+check(
+  "连接诊断弹窗：有跳板机才显示跳板机；人话结论说「会用 … 免密登录」；界面上没有原始 JSON",
+  diagUi.jump.includes("bastion.example:2200") &&
+    diagUi.verdict.includes("免密登录") &&
+    !diagUi.rawJson,
+  JSON.stringify({ jump: diagUi.jump, verdict: diagUi.verdict, rawJson: diagUi.rawJson }),
+);
+// ④ 点遮罩关掉（弹窗开着的时候点外面）
+const closedByBackdrop = await evaluate(`(() => {
+  const m = document.querySelector(".diag-modal");
+  const back = m && m.closest(".modal-backdrop");
+  if (back) { back.click(); return true; }
+  return false;
+})()`);
+await sleep(400);
+const diagGoneByBackdrop = await evaluate(`!document.querySelector(".diag-modal")`);
+check(
+  "连接诊断弹窗：点遮罩能关掉",
+  closedByBackdrop && diagGoneByBackdrop,
+  `clicked=${closedByBackdrop} gone=${diagGoneByBackdrop}`,
+);
+
+// ② 一把钥匙都不存在 → 「没找到本机密钥」
+await setScenario({ diagNoKey: true, openSshFail: false, allowPassword: false });
+await reload();
+await openServerManager();
+await openFirstEditDialog();
+await clickDiagnoseInModal();
+const noKeyUi = await readDiagModal();
+check(
+  "连接诊断入口②：密钥不存在时人话结论是「没找到本机密钥」，每一项都标 ✗ 不存在",
+  noKeyUi.open &&
+    noKeyUi.verdict.includes("没找到本机密钥") &&
+    noKeyUi.keys.length > 0 &&
+    noKeyUi.keys.every((k) => k.flag.includes("✗ 不存在")),
+  JSON.stringify({ verdict: noKeyUi.verdict, keys: noKeyUi.keys }),
+);
+// 关掉，别挡住下一段（✕ 也是用户会点的那个）
+const closedByX = await evaluate(`(() => {
+  const x = document.querySelector(".diag-modal .mini-x");
+  if (x) { x.click(); return true; }
+  return false;
+})()`);
+await sleep(400);
+check(
+  "连接诊断弹窗：右上角 ✕ 能关掉",
+  closedByX && (await evaluate(`!document.querySelector(".diag-modal")`)),
+);
+
+// ③ 认证失败 + 本机有钥匙 + 勾了「允许在终端里输入密码」→ 错误提示里出「密码模式」那句
+await setScenario({ openSshFail: true, diagNoKey: false, allowPassword: true });
+await reload();
+// 启动时会恢复上次的工作区 → 自动开一次 SSH（假后端直接以"认证失败"拒掉）→
+// 状态栏出现带「诊断一下」的报错。万一没恢复（用户设置里关过），走"新建会话 → 连接"同样的路。
+await sleep(2500);
+const readFailBar = async () =>
+  evaluate(`(() => {
+    const bar = document.querySelector(".statusbar .status-notice");
+    return bar
+      ? {
+          text: (bar.innerText || "").trim(),
+          title: bar.getAttribute("title") || "",
+          buttons: [...bar.querySelectorAll("button")].map((b) => (b.innerText || "").trim()),
+        }
+      : null;
+  })()`);
+let failBar = await readFailBar();
+if (!failBar || !failBar.buttons.length) {
+  await evaluate(`(() => {
+    const b = [...document.querySelectorAll("button")].find((x) => (x.innerText || "").includes("新建会话"));
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(1500);
+  await evaluate(`(() => {
+    const b = [...document.querySelectorAll(".modal .modal-actions button")].find(
+      (x) => (x.innerText || "").trim() === "连接",
+    );
+    if (b) b.click();
+    return !!b;
+  })()`);
+  await sleep(2200);
+  failBar = await readFailBar();
+}
+check(
+  "连接失败提示：认证失败时给「为什么会失败？诊断一下」按钮，并补一句「密码模式」提示",
+  !!failBar &&
+    failBar.text.includes("认证失败") &&
+    failBar.buttons.some((t) => t.includes("为什么会失败？诊断一下")) &&
+    failBar.text.includes("本机已有免密配置"),
+  JSON.stringify(failBar),
+);
+const clickedFromBar = await evaluate(`(() => {
+  const bar = document.querySelector(".statusbar .status-notice");
+  const b = bar
+    ? [...bar.querySelectorAll("button")].find((x) => (x.innerText || "").includes("诊断一下"))
+    : null;
+  if (b) { b.click(); return true; }
+  return false;
+})()`);
+await sleep(900);
+const failDiagUi = await readDiagModal();
+check(
+  "连接诊断入口③：从失败提示点进来，弹窗带刚才的错误 + 「密码模式」那句提示",
+  clickedFromBar &&
+    failDiagUi.open &&
+    failDiagUi.failure.includes("认证失败") &&
+    failDiagUi.hint.includes("本机已有免密配置") &&
+    failDiagUi.hint.includes("密码模式不会使用"),
+  JSON.stringify({ failDiagUi }),
+);
+// ④ 关闭按钮
+const closedByBtn = await evaluate(`(() => {
+  const b = [...document.querySelectorAll(".diag-modal .modal-actions button")].find(
+    (x) => (x.innerText || "").trim() === "关闭",
+  );
+  if (b) { b.click(); return true; }
+  return false;
+})()`);
+await sleep(400);
+check(
+  "连接诊断弹窗：「关闭」按钮能关掉（失败之后不会一直挡着）",
+  closedByBtn && (await evaluate(`!document.querySelector(".diag-modal")`)),
+);
+
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}\n${shotLight}（浅色主题·设置面板）\n${shotComposer}（AI 输入窗）\n${shotArrowZoom}（箭头放大 4×）\n${shotCollapsed}（收起态）\n${shotExpanded}（展开态）`);
 
