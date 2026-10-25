@@ -3207,6 +3207,18 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: var(--accent);
 }
 
+/* 「已恢复上次的草稿」一行提示：只是提醒，不抢输入框的视觉重量。
+   走 accent-soft 底色，深/浅主题都不用另写一份。 */
+.composer-restored-hint {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--fg);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
 .composer-files {
   display: flex;
   flex-wrap: wrap;
@@ -3502,3 +3514,131 @@ input[type="range"]::-webkit-slider-thumb {
 .statusbar .status-notice .status-diag:hover {
   opacity: 0.85;
 }
+
+/* ---------- 白屏兜底（ErrorBoundary 的错误页） ---------- */
+/*
+ * 这一页在 `.app` **外面**渲染（App 崩了，.app 已经不存在），所以不能指望
+ * `.app` 上那套变量；这里自带一份和深/浅主题对齐的变量。`.btn` 样式复用
+ * 全局的（它按 --border / --btn-bg / --accent / --fg 取色），所以按钮也跟着主题走。
+ */
+.error-boundary {
+  --bg: #1e1e1e;
+  --card: #252526;
+  --fg: #cccccc;
+  --muted: #9d9d9d;
+  --border: #3c3c3c;
+  --accent: #3794ff;
+  --btn-bg: #2a2d2e;
+  --btn-bg-hover: #34383a;
+  --code-bg: #1b1b1b;
+
+  position: fixed;
+  inset: 0;
+  z-index: 9999; /* 盖住残留的启动屏 / 任何半渲染的界面 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  overflow: auto;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system,
+    sans-serif;
+  font-size: 13px;
+}
+
+.error-boundary.light {
+  --bg: #ffffff;
+  --card: #f6f6f6;
+  --fg: #1f1f1f;
+  --muted: #6a6a6a;
+  --border: #cfcfcf;
+  --accent: #0a66c2;
+  --btn-bg: #ececec;
+  --btn-bg-hover: #e0e0e0;
+  --code-bg: #f3f3f3;
+}
+
+.error-card {
+  width: min(720px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: 22px 24px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+}
+
+.error-kicker {
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.error-title {
+  margin: 6px 0 8px;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.error-lead {
+  margin: 0 0 16px;
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.75;
+}
+
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.error-actions .btn {
+  padding: 7px 16px;
+  font-size: 13px;
+}
+
+.error-details {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.error-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  user-select: none;
+}
+
+.error-details summary:hover {
+  color: var(--fg);
+}
+
+.error-pre {
+  max-height: 40vh;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error-note {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+

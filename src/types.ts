@@ -682,6 +682,17 @@ export interface AppSettings {
   aiNotifyNeedsYou: boolean;
   /** 产物范围：true = 任何新文件都算；false = 只算 HTML / Markdown 文档（默认） */
   aiNotifyAllArtifacts: boolean;
+  /**
+   * **两条被动监视线程**（本机 codex rollout 日志 / herdr 红点轮询）的总开关。
+   *
+   * 默认 **false**：AI 面板这一版整体暂停（前端的 `AI_PANEL_DISABLED`），后端在启动时
+   * 读这个值，没启用就一个监视线程都不起（`lib.rs`）。字段放在设置里、而不是写死，
+   * 是为了将来恢复面板时能由前端打开它。
+   *
+   * 前端目前**不暴露开关**，只负责"读进来、原样带回去" —— 少了这条，
+   * 每次保存设置都会把它写回默认 false，用户之前打开过的等于白开。
+   */
+  aiWatchEnabled: boolean;
 }
 
 export interface GitFile {

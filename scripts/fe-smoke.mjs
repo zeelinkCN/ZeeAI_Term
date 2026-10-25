@@ -50,15 +50,49 @@ const readJson = (name, fallback) => {
   }
 };
 
-const profiles = readJson("profiles.json", []);
-// 为了验证"服务器配置里勾了默认用 herdr"这条链路：把 lz 那台的 herdrEnabled 打开
-for (const p of profiles) {
-  if (p.ssh) p.ssh.herdrEnabled = true;
+// ---------- 测试数据卫生（审查 L11） ----------
+// 以前默认把**真实** profiles.json（主机 / 用户名 / 密钥路径）塞进无头页面的假后端，
+// 于是 %TEMP% 下的 Edge profile / 截图 / 调试输出里会带上用户的真实服务器信息。
+// 现在默认只用下面这份**合成数据**；只有显式 `ZEEAI_FE_TEST_REAL_PROFILES=1`
+//（在本机排查"只有真实配置才复现"的问题时才用）才读真实文件。
+const USE_REAL_PROFILES = process.env.ZEEAI_FE_TEST_REAL_PROFILES === "1";
+const SYNTHETIC_PROFILES = [
+  {
+    id: "p-synthetic-ssh",
+    type: "ssh",
+    name: "demo-ssh",
+    group: "测试",
+    color: "#4f8cff",
+    ssh: {
+      // RFC 5737 文档保留地址 + 合成用户名（绝不指向谁的机器）
+      host: "203.0.113.10",
+      port: 2222,
+      user: "alice",
+      // 私钥**故意留空**：这是新服务器最常见的默认形态，诊断用例②要验
+      //「一把钥匙都没有 + 没填私钥」这条分支；填一个假路径会把它变成
+      //「主机密钥文件不存在」，等于偷偷改掉原有断言的口径。
+      authKind: "key",
+      keyPath: "",
+      jump: "bastion.example:2200",
+      // 为了验证"服务器配置里勾了默认用 herdr"这条链路：合成的这台默认勾上
+      tmuxEnabled: true,
+      tmuxTemplate: "{host}-{user}",
+      herdrEnabled: true,
+      startDir: "/home/alice",
+    },
+  },
+];
+const profiles = USE_REAL_PROFILES ? readJson("profiles.json", []) : SYNTHETIC_PROFILES;
+// 真实模式下（只是本机排查用）同样把 herdrEnabled 打开，覆盖"服务器配置决定默认值"那条链路。
+if (USE_REAL_PROFILES) {
+  for (const p of profiles) {
+    if (p.ssh) p.ssh.herdrEnabled = true;
+  }
 }
 const settings = readJson("settings.json", {});
 // 测试必须能"启动即恢复会话"，否则后面几十条都会假失败（我踩过：用户在设置里把
 // 「启动时恢复上次的工作空间」关掉之后，整轮 41/67 —— 看着像代码坏了，其实是设置变了）。
-// 和上面给 lz 打开 herdrEnabled 是一个道理：只改测试用的这份副本，不动用户的文件。
+// 和上面给合成服务器打开 herdrEnabled 是一个道理：只改测试用的这份副本，不动用户的文件。
 settings.restoreWorkspace = true;
 // 同理：终端那几个"习惯项"也**固定成默认值**再跑。
 // 为什么：应用跑过之后会把这些值持久化进真实的 settings.json（我自己就撞到过：
@@ -69,12 +103,17 @@ settings.pasteKey = "both";
 settings.rightClick = "menu";
 settings.copyKey = "ctrl-shift-c";
 settings.pasteDir = "~/.zeeai/paste";
-const history = readJson("history.json", []);
+// 历史记录里同样可能有真实主机名 / 用户名：默认不注入；真实模式才带。
+// （需要历史行的用例会用 herdrHistory 场景显式塞入合成数据。）
+const history = USE_REAL_PROFILES ? readJson("history.json", []) : [];
 // 诊断开关：把假后端换成"全空"，用来判断崩溃是"数据形状不对"还是"代码本身"
 const MINIMAL = !!process.env.ZEEAI_FE_TEST_MINIMAL;
 const KEEP = (process.env.ZEEAI_FE_TEST_KEEP ?? "profiles,settings,history").split(",");
 if (MINIMAL) {
   console.log("（诊断模式：所有假后端返回空数据）");
+}
+if (!USE_REAL_PROFILES) {
+  console.log("（数据卫生：使用合成 profiles / 空历史，不读取本机真实服务器配置）");
 }
 const lz = profiles.find((p) => p.ssh && String(p.name).toLowerCase().includes("lz")) ?? profiles.find((p) => p.ssh);
 
@@ -951,6 +990,52 @@ if (consoleMsgs.length) {
 }
 const calls = await evaluate("window.__ZEEAI_CALLS__");
 check("启动时的后端调用都在预期内", calls.includes("list_profiles") && calls.includes("settings_get"), [...new Set(calls)].join(","));
+
+// ================= 测试数据卫生（审查 L11） =================
+// 断言假后端里只有合成值（alice@203.0.113.10 / demo-ssh），没有本机真实 profiles
+// 里的主机 / 用户名 / 密钥路径。真实值只在这个测试进程里读来比对，**不进页面**。
+const mockDataForHygiene = await evaluate(`(() => {
+  const M = window.__ZEEAI_MOCK__ || {};
+  const ps = M.profiles || [];
+  const hs = M.history || [];
+  const vals = [];
+  for (const p of ps) {
+    if (p && p.ssh) for (const k of ["host", "user", "keyPath", "jump"]) {
+      if (typeof p.ssh[k] === "string" && p.ssh[k].trim()) vals.push(p.ssh[k].trim());
+    }
+  }
+  for (const h of hs) for (const k of ["host", "profileName"]) {
+    if (h && typeof h[k] === "string" && h[k].trim()) vals.push(h[k].trim());
+  }
+  return { profiles: JSON.stringify(ps), history: JSON.stringify(hs), values: vals };
+})()`);
+const realSensitiveValues = [];
+if (!USE_REAL_PROFILES) {
+  for (const p of readJson("profiles.json", [])) {
+    if (!p || !p.ssh) continue;
+    for (const k of ["host", "user", "keyPath", "jump"]) {
+      if (typeof p.ssh[k] === "string" && p.ssh[k].trim()) realSensitiveValues.push(p.ssh[k].trim());
+    }
+  }
+  for (const h of readJson("history.json", [])) {
+    if (!h) continue;
+    for (const k of ["host", "profileName"]) {
+      if (typeof h[k] === "string" && h[k].trim()) realSensitiveValues.push(h[k].trim());
+    }
+  }
+}
+const leakedValues = realSensitiveValues.filter((v) => mockDataForHygiene.values.includes(v));
+check(
+  "测试数据卫生（L11）：假后端默认只用合成 profiles（alice@203.0.113.10 / demo-ssh），不含本机真实主机/用户名/密钥路径",
+  USE_REAL_PROFILES ||
+    (mockDataForHygiene.profiles.includes("203.0.113.10") &&
+      mockDataForHygiene.profiles.includes("alice") &&
+      mockDataForHygiene.profiles.includes("demo-ssh") &&
+      leakedValues.length === 0),
+  USE_REAL_PROFILES
+    ? "ZEEAI_FE_TEST_REAL_PROFILES=1（显式真实模式，跳过）"
+    : `合成值=alice/203.0.113.10/demo-ssh 泄漏=${leakedValues.length}`,
+);
 
 // ================= 手动「刷新」：这一轮把 AI 面板的定时探测全删了 =================
 // 用户原话：「把这个功能去掉算了，不探测了，影响电脑性能」→ 确认后：「保留手动刷新，
@@ -4801,6 +4886,113 @@ check(
   tBack.value === "T 的草稿" && tBack.cards.length === 1,
   JSON.stringify(tBack),
 );
+
+// ================= (NEW) 输入窗草稿跨重启（localStorage，只存纯文本） =================
+// 用户报/自认遗留：切标签草稿能留住，但**重启就丢**。这里走真实路径：
+// 打字 → 切走 → 整页 reload（模拟重启，React 状态全没、localStorage 还在）→ 草稿回来
+// → 发送 → 再 reload → 不许再冒出来。附件必须不恢复（临时文件重启后就没了）。
+const readDraftStore = () =>
+  evaluate(`(() => {
+    const raw = localStorage.getItem("zeeai.composer-drafts.v1");
+    if (!raw) return { keys: [], hasText: false, cards: [] };
+    let data = {};
+    try { data = JSON.parse(raw) || {}; } catch { data = {}; }
+    return { keys: Object.keys(data.entries || {}), hasText: raw.includes(${JSON.stringify("重启之后还得在的草稿")}) };
+  })()`);
+const restartDraft = "重启之后还得在的草稿";
+await clickSessionTab("S 纯 SSH");
+await sleep(450);
+await openComposerNow();
+await sleep(250);
+await typeComposer(restartDraft);
+await sleep(450); // 300ms 防抖 + 一点余量
+const draftStoreBeforeRestart = await readDraftStore();
+check(
+  "草稿跨重启：打字 300ms 后写进 localStorage，键按会话身份（含会话标题，不含运行期 sessionId）",
+  draftStoreBeforeRestart.hasText &&
+    draftStoreBeforeRestart.keys.length >= 1 &&
+    draftStoreBeforeRestart.keys.some((k) => k.includes("S 纯 SSH")) &&
+    draftStoreBeforeRestart.keys.every((k) => !k.includes(sTabId)),
+  JSON.stringify(draftStoreBeforeRestart.keys),
+);
+// 切走再"重启"：先切到 T，确保草稿跟着会话走，不是全局一份
+await clickSessionTab("T tmux");
+await sleep(450);
+const beforeRestartState = await composerState();
+check(
+  "草稿跨重启：切走时输入框换成 T 的草稿（S 的半句不跟着跑）",
+  beforeRestartState.value === "T 的草稿",
+  JSON.stringify(beforeRestartState),
+);
+await reload();
+await sleep(1200);
+await openComposerNow();
+await sleep(350);
+const afterRestartState = await composerState();
+const afterRestartHint = await evaluate(
+  `(document.querySelector(".composer-restored-hint") || {}).innerText || ""`,
+);
+check(
+  "草稿跨重启：reload 后 S 会话的草稿回来了，且给一行「已恢复上次的草稿」提示",
+  afterRestartState.open &&
+    afterRestartState.value === restartDraft &&
+    afterRestartState.cards.length === 0 &&
+    afterRestartHint.includes("已恢复上次的草稿"),
+  JSON.stringify({ value: afterRestartState.value, hint: afterRestartHint, cards: afterRestartState.cards }),
+);
+// 附件不持久化：T 那边原来的附件卡片重启后必须没了（文字仍然在）
+await clickSessionTab("T tmux");
+await sleep(450);
+const tAfterRestart = await composerState();
+check(
+  "草稿跨重启：附件不恢复（T 的文字还在，附件卡片为 0）",
+  tAfterRestart.value === "T 的草稿" && tAfterRestart.cards.length === 0,
+  JSON.stringify(tAfterRestart),
+);
+// 发送 S 的草稿 → localStorage 里那份必须马上清掉
+await clickSessionTab("S 纯 SSH");
+await sleep(450);
+const beforeRestartSend = await evaluate("window.__ZEEAI_CALLARGS__.length");
+await evaluate(`(() => {
+  const b = document.querySelector(".composer-actions .btn.primary");
+  if (b) b.click();
+  return !!b;
+})()`);
+await sleep(900);
+const afterRestartSend = await evaluate(`(() => ({
+  value: (document.querySelector(".composer-input") || {}).value ?? "",
+}))()`);
+const draftStoreAfterSend = await readDraftStore();
+const sentDraftWrites = await evaluate(`(() => {
+  const dec = (b64) => { try { return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch { return ""; } };
+  return (window.__ZEEAI_CALLARGS__ || []).slice(${beforeRestartSend})
+    .filter((c) => c.cmd === "session_write")
+    .map((c) => dec((c.args || {}).dataB64 || ""));
+})()`);
+check(
+  "草稿跨重启：发送后输入框清空，localStorage 里这份也删掉（正文确实写给会话）",
+  afterRestartSend.value === "" &&
+    !draftStoreAfterSend.hasText &&
+    sentDraftWrites.some((t) => t.includes(restartDraft)),
+  `keys=${JSON.stringify(draftStoreAfterSend.keys)} writes=${JSON.stringify(sentDraftWrites).slice(0, 120)}`,
+);
+// 再重启一次：发送过的那份不许复活
+await clickSessionTab("T tmux");
+await sleep(400);
+await reload();
+await sleep(1200);
+await openComposerNow();
+await sleep(350);
+const afterSendRestart = await composerState();
+const afterSendRestartHint = await evaluate(
+  `(document.querySelector(".composer-restored-hint") || {}).innerText || ""`,
+);
+check(
+  "草稿跨重启：发送过的草稿再重启也不会复活（S 是空的、没有恢复提示）",
+  afterSendRestart.value === "" && !afterSendRestartHint.includes("已恢复上次的草稿"),
+  JSON.stringify({ value: afterSendRestart.value, hint: afterSendRestartHint }),
+);
+
 // 关会话时清理它的草稿：关掉带草稿的 T，自动落到 H，H 那里不许出现 T 的字和附件
 await evaluate(`(() => {
   const t = [...document.querySelectorAll(".session-tab")].find((x) => (x.innerText || "").includes("T tmux"));
@@ -5058,6 +5250,100 @@ await sleep(400);
 check(
   "连接诊断弹窗：「关闭」按钮能关掉（失败之后不会一直挡着）",
   closedByBtn && (await evaluate(`!document.querySelector(".diag-modal")`)),
+);
+
+// ================= (NEW) 白屏兜底：渲染异常时必须出现可操作的错误页 =================
+// 真实注入方式：App.tsx 里有一个只在 sessionStorage["zeeai:test:crash"]==="1" 时才抛错的
+// TestOnlyCrashProbe（生产代码里没有任何地方写这个键）。写标记 → reload → 渲染即抛，
+// 由最外层的 AppErrorBoundary 接住；正常路径不受影响。
+const normalBeforeCrash = await evaluate(
+  `(() => ({ app: !!document.querySelector(".app"), errorPage: !!document.querySelector(".error-boundary") }))()`,
+);
+check(
+  "白屏兜底：正常路径不受影响（错误页只在异常时出现）",
+  normalBeforeCrash.app && !normalBeforeCrash.errorPage,
+  JSON.stringify(normalBeforeCrash),
+);
+const armCrash = async (theme) => {
+  await evaluate(`(() => {
+    localStorage.setItem("zeeai.ui.theme-kind", ${JSON.stringify(theme)});
+    sessionStorage.setItem("zeeai:test:crash", "1");
+    return true;
+  })()`);
+  await reload();
+  await sleep(1200);
+  return evaluate(`(() => {
+    const page = document.querySelector(".error-boundary");
+    if (!page) return { open: false, body: (document.body.innerText || "").slice(0, 160) };
+    const btn = (text) => [...page.querySelectorAll("button")].find((b) => (b.innerText || "").trim() === text);
+    const pre = page.querySelector(".error-pre");
+    return {
+      open: true,
+      light: page.classList.contains("light"),
+      bg: getComputedStyle(page).backgroundColor,
+      title: (page.querySelector(".error-title") || {}).innerText || "",
+      lead: (page.querySelector(".error-lead") || {}).innerText || "",
+      reload: !!btn("重新加载"),
+      copy: !!btn("复制错误信息"),
+      details: !!page.querySelector("details.error-details"),
+      summary: (page.querySelector(".error-details summary") || {}).innerText || "",
+      pre: pre ? (pre.textContent || "") : "",
+      appGone: !document.querySelector(".app"),
+      bodyLen: (document.body.innerText || "").length,
+    };
+  })()`);
+};
+const darkCrash = await armCrash("dark");
+check(
+  "白屏兜底（ErrorBoundary）：渲染异常时不再白屏 —— 有一句人话 + 可折叠错误摘要 + 「重新加载」/「复制错误信息」",
+  darkCrash.open &&
+    darkCrash.appGone &&
+    darkCrash.bodyLen > 20 &&
+    /界面出了点问题/.test(darkCrash.title) &&
+    darkCrash.lead.length > 10 &&
+    darkCrash.details &&
+    darkCrash.summary.includes("错误摘要") &&
+    darkCrash.pre.includes("fe-smoke 注入的渲染异常") &&
+    darkCrash.reload &&
+    darkCrash.copy,
+  JSON.stringify({
+    open: darkCrash.open,
+    title: darkCrash.title,
+    reload: darkCrash.reload,
+    copy: darkCrash.copy,
+    details: darkCrash.details,
+    pre: (darkCrash.pre || "").split("\n")[0],
+  }).slice(0, 360),
+);
+check(
+  "白屏兜底：错误页跟深色主题一致（深色底、不带 light 类）",
+  darkCrash.open && !darkCrash.light && darkCrash.bg === "rgb(30, 30, 30)",
+  `light=${darkCrash.light} bg=${darkCrash.bg}`,
+);
+// 「重新加载」真的能回到正常界面（先解除注入，再点按钮 → 依赖 location.reload 本身）
+const reloadClicked = await evaluate(`(() => {
+  sessionStorage.setItem("zeeai:test:crash", "0");
+  const b = [...document.querySelectorAll(".error-boundary button")].find(
+    (x) => (x.innerText || "").trim() === "重新加载",
+  );
+  if (b) { b.click(); return true; }
+  return false;
+})()`);
+await sleep(3200);
+const recovered = await evaluate(
+  `(() => ({ app: !!document.querySelector(".app"), errorPage: !!document.querySelector(".error-boundary") }))()`,
+);
+check(
+  "白屏兜底：「重新加载」按钮真能回到正常界面（不是死按钮）",
+  reloadClicked && recovered.app && !recovered.errorPage,
+  JSON.stringify({ reloadClicked, ...recovered }),
+);
+// 浅色主题下同一块错误页不能是深色（跟 .app.light 的口径一致）
+const lightCrash = await armCrash("light");
+check(
+  "白屏兜底：错误页跟浅色主题一致（浅色底 + light 类）",
+  lightCrash.open && lightCrash.light && lightCrash.bg === "rgb(255, 255, 255)",
+  `light=${lightCrash.light} bg=${lightCrash.bg}`,
 );
 
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));

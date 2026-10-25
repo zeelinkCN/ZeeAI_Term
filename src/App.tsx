@@ -1,12 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openLocalDialog } from "@tauri-apps/plugin-dialog";
-import MarkdownIt from "markdown-it";
-import DOMPurify from "dompurify";
-import TerminalView from "./features/Terminal";
 import { lastTerminalSize } from "./features/terminalSize";
 import TermThemeDialog from "./features/TermThemeDialog";
 import HighlightDialog from "./features/HighlightDialog";
@@ -28,7 +24,6 @@ import {
   aiSessionSnapshot,
   aiTaskArtifacts,
   aiTimelineAdd,
-  aiTimelineClear,
   aiTimelineList,
   aiSourceProbe,
   herdrAgents,
@@ -77,16 +72,13 @@ import {
   openSerial,
   openSsh,
   remotePwd,
-  secretSet,
   secretHas,
-  secretDelete,
   workspaceSave,
   workspaceLoad,
   saveProfile,
   sessionClose,
   sessionLogStart,
   sessionLogStop,
-  sessionLogStatus,
   sessionLogDir,
   openInExplorer,
   openExternalUrl,
@@ -112,7 +104,6 @@ import {
   CUSTOM_SCHEME_KEY,
   TERM_SCHEMES,
   resolveTermPalette,
-  type TermPalette,
 } from "./termThemes";
 import type {
   AdbDevice,
@@ -124,7 +115,6 @@ import type {
   AiAgentKind,
   AiCarrier,
   AiEvidence,
-  AiHerdrGroup,
   AiInstance,
   AiLedgerGroup,
   AiLogSignal,
@@ -143,1389 +133,78 @@ import type {
   GitBranch,
   GitCommit,
   GitStatus,
-  HighlightRule,
   HistoryEntry,
   RemoteEntry,
   SerialConfig,
   SerialPortInfo,
   SessionEvent,
-  SessionState,
-  SshDiagnosis,
-  SshEffectiveConfig,
   TmuxSession,
   TmuxWindow,
   TransferEvent,
 } from "./types";
-import {
-  IconActivity,
-  IconAndroid,
-  IconChevronDown,
-  IconChevronRight,
-  IconChevronsDown,
-  IconChevronsUp,
-  IconClose,
-  IconCmd,
-  IconFile,
-  IconFolder,
-  IconGear,
-  IconGit,
-  IconLogoRadio,
-  IconPlus,
-  IconPowerShell,
-  IconSerial,
-  IconServer,
-  IconSpark,
-  IconTerminal,
-  IconWsl,
-} from "./components/Icons";
 
-type ModuleKey = "remote" | "powershell" | "cmd" | "wsl" | "git" | "serial" | "adb";
-type FileKind = "md" | "html" | "img" | "code" | "text";
-type MdStyle = "github" | "minimal" | "dark" | "paper";
-
-interface OpenFile {
-  name: string;
-  path: string;
-  kind: FileKind;
-  b64: string;
-}
-
-interface OpenSession {
-  id: string;
-  title: string;
-  kind: ModuleKey;
-  profileId?: string;
-  /** 这个会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
-  highlightSetId?: string | null;
-  /** 该会话实际登录的用户名（可能来自新建会话时的临时覆盖） */
-  user?: string;
-  tmuxName?: string;
-  tmuxMode?: "default" | "none" | "name";
-  /**
-   * herdr 观察窗：这个标签页看的是哪个窗格（形如 w1:p1）。
-   * 有它就说明这是"只看不跑 TUI"的观察窗（见 core/herdr.rs 顶部说明）。
-   */
-  herdrPane?: string;
-  /** herdr 窗格的打开方式：observe = 只读观察；control = 可读可写（进她的环境里干活） */
-  herdrMode?: "observe" | "control";
-  /** 终端当前工作目录（OSC 7 或 tmux 上报） */
-  cwd?: string;
-  /** 正在记录终端日志时的文件路径（没记录就是 undefined） */
-  logPath?: string;
-  state: SessionState;
-  openFiles: OpenFile[];
-  activeTab: string; // "terminal" 或文件名
-}
-
-/** 「发给 AI」输入窗里的一个附件（图片 / 文件）：发送时只把远端路径拼进正文 */
-interface ComposerFile {
-  name: string;
-  local: string;
-  remote: string;
-  thumb?: string;
-  size?: number;
-}
-
-/** 一个会话自己的输入窗草稿（正文 + 附件）—— 切标签时按会话保存 / 恢复，互不串 */
-interface ComposerDraft {
-  text: string;
-  files: ComposerFile[];
-}
-
-/** 工作区快照里存的一个会话（只存"怎么把它开回来"，不存文件内容） */
-interface SavedSession {
-  kind: ModuleKey;
-  title: string;
-  profileId?: string;
-  user?: string;
-  tmuxName?: string;
-  tmuxMode?: "default" | "none" | "name";
-  /**
-   * herdr 窗格会话：恢复时必须带上这两项，否则重启后会被当成 tmux/普通 shell 打开
-   * （实测踩过：恢复了才发现"根本不在 herdr 里面"，服务器上还多出一个假 tmux 会话）。
-   */
-  herdrPane?: string;
-  herdrMode?: "observe" | "control";
-  cwd?: string;
-}
-
-interface SavedWorkspace {
-  version: number;
-  savedAt: number;
-  activeIndex: number;
-  sessions: SavedSession[];
-}
-
-interface MenuItem {
-  sep: boolean;
-  label?: string;
-  action?: () => void;
-}
-
-const MODULES: { key: ModuleKey; label: string; node: JSX.Element }[] = [
-  { key: "remote", label: "远程", node: <IconServer size={22} /> },
-  { key: "powershell", label: "PowerShell", node: <IconPowerShell size={22} /> },
-  { key: "cmd", label: "CMD", node: <IconCmd size={22} /> },
-  { key: "wsl", label: "WSL", node: <IconWsl size={22} /> },
-  { key: "git", label: "Git", node: <IconGit size={22} /> },
-  { key: "serial", label: "串口", node: <IconSerial size={22} /> },
-  { key: "adb", label: "ADB", node: <IconAndroid size={22} /> },
-];
-
-const MODULE_LABEL: Record<ModuleKey, string> = {
-  remote: "远程",
-  powershell: "PowerShell",
-  cmd: "CMD",
-  wsl: "WSL",
-  git: "Git",
-  serial: "串口",
-  adb: "ADB",
-};
-
-/** 本地终端在 AI 看板里显示成哪个"服务器" */
-function shellLabelOf(kind: string): string {
-  if (kind === "wsl") return "WSL";
-  if (kind === "cmd") return "本机 CMD（仅状态）";
-  return "本机 PowerShell";
-}
-
-const AI_TOOL_LABEL: Record<string, string> = {
-  codex: "OpenAI Codex CLI",
-  claude: "Claude Code",
-  aider: "Aider",
-  gemini: "Gemini CLI",
-};
-
-function aiToolLabel(name: string): string {
-  return AI_TOOL_LABEL[name] ?? name;
-}
+// ---- 拆分出去的纯逻辑 / 弹窗组件（App.tsx 只留编排）----
+import type { StoredComposerDraft } from "./lib/composer-draft";
+import type { Asset, AutoCardEvent, ComposerDraft, ComposerFile, ConfirmDialogState, CtxMenuState, EditDialogState, FsMenuState, HerdrMgrState, MenuItem, ModuleKey, NameDialogState, NewSessionDialogState, OpenSession, PasteCard, SavedWorkspace, SerialDialogState, SerialMenuState, SessionRenameState, SshDiagView, StatusMsg, TabMenuState, TransferItem } from "./lib/ui-model";
+import { AboutDialog } from "./features/AboutDialog";
+import { ActivityBar } from "./features/ActivityBar";
+import { AdbFileDialog } from "./features/AdbFileDialog";
+import { AiPanel } from "./features/AiPanel";
+import { AppErrorBoundary, TestOnlyCrashProbe } from "./features/AppErrorBoundary";
+import { CommandPalette } from "./features/CommandPalette";
+import { Composer } from "./features/Composer";
+import { FileSubTabs } from "./features/FileSubTabs";
+import { FsMenu } from "./features/FsMenu";
+import { DiffDialog, GitInitDialog } from "./features/GitDialogs";
+import { LocalModule } from "./features/LocalModule";
+import { NewSessionDialog } from "./features/NewSessionDialog";
+import { SerialMenu } from "./features/SerialMenu";
+import { SerialProfileDialog } from "./features/SerialProfileDialog";
+import { ServerEditDialog } from "./features/ServerEditDialog";
+import { ServersDialog } from "./features/ServersDialog";
+import { SessionContextMenu } from "./features/SessionContextMenu";
+import { SessionTabs } from "./features/SessionTabs";
+import { SettingsPanel } from "./features/SettingsPanel";
+import { HerdrDock, TmuxDock } from "./features/SidebarDocks";
+import { SidebarFiles } from "./features/SidebarFiles";
+import { SidebarGit } from "./features/SidebarGit";
+import { SidebarAdb, SidebarSerial } from "./features/SidebarSerialAdb";
+import { SidebarSessions } from "./features/SidebarSessions";
+import { ConfirmDialog, NameDialog } from "./features/SmallDialogs";
+import { SshDiagnosisModal } from "./features/SshDiagnosisModal";
+import { StatusBar } from "./features/StatusBar";
+import { SessionRenameDialog, TabContextMenu } from "./features/TabContextMenu";
+import { TerminalArea } from "./features/TerminalArea";
+import { TitleBar } from "./features/TitleBar";
+import { TransfersDock } from "./features/TransfersDock";
+import { AI_PANEL_HIDDEN, aiAgentLabel, aiBadgeCoversSource, aiBadgeTitle, aiDurationText, aiEnvLabel, aiShorten, aiSourceLabelOf, aiStateLabel, aiStateLabelOf, aiToolLabel, herdrAgentLabel, herdrStateOf, isActiveInstance, tokenM } from "./lib/ai-labels";
+import { APP_VERSION, DEFAULT_SETTINGS, EMPTY_PROFILE, LOCAL_SCAN_MIN_INTERVAL_MS, SHELL_LABEL, compareVersion, paneCount, themeKind } from "./lib/app-consts";
+import { DRAFT_MAX_BYTES, DRAFT_SAVE_DEBOUNCE_MS, composerDraftIdentity, draftTextBytes, loadStoredDrafts, writeStoredDrafts } from "./lib/composer-draft";
+import { fileKind, humanSize, isDocName, joinPath } from "./lib/file-kind";
+import { MODULE_LABEL } from "./lib/modules";
+import { CARRIER_LETTER, CARRIER_TITLE, SHELL_NAMES, carrierOfSession, dirBase, herdrShortLabel, kindOfSession, shellLabelOf, termPaletteFor, termSchemeFor } from "./lib/session-labels";
+import { connErrorText, looksLikePasswordModeTrap, passwordModeHintFor, portOrZero, splitErrText } from "./lib/ssh-text";
+import { UI_THEME_KEY } from "./lib/theme-ui";
+import { useUiClock } from "./lib/use-ui-clock";
+// ---- 拆分结束 ----
 
 /**
- * ⚠️ AI 助手面板总开关（2026-10-24 用户要求暂时停用）。
+ * 根组件：ErrorBoundary 包住整个 App。
  *
- * 用户原话：「AI 助手面板太鸡肋，先关闭；点星号打开只显示个 AI 任务面板」，
- * 追问后明确：「整个面板都停用，只留灰色容器」。
- *
- * 现在保留的是：右侧面板容器、活动栏星号按钮的开合、面板宽度（268px）、
- * 看板数据采集 / 红点逻辑 / 卡片代码 —— 只是**一条内容都不渲染**，
- * 面板里只有一块灰色背景（`.ai-panel.off`，用主题变量）。
- *
- * 为什么用开关位而不是删代码：用户说后续重构还要用这些代码（看板 v2 的
- * 两区、折叠行、承载健康、时间线、通知都在下面原样留着）。
- *
- * 恢复方法：把 `AI_PANEL_DISABLED` 改成 `false` 即可 —— 不需要动任何 JSX /
- * 逻辑 / 样式；面板体量/开合行为都还是原来的。
+ * 为什么要在最外层：以前任何一处渲染异常都会让 React 卸载整棵树 → WebView 里只剩
+ * 一块白屏（用户只能杀进程）。现在接住异常，至少给出「重新加载 / 复制错误信息」。
+ * `TestOnlyCrashProbe` 是 fe-smoke 的注入点（正常启动永远不抛，见它的说明）。
  */
-const AI_PANEL_DISABLED = true;
-
-/**
- * 仅供无头回归测试的"临时把内容渲出来"开关（正常构建 / 正常启动**不存在**）。
- *
- * 为什么留这个口子：面板里那套看板有 50+ 条无头断言，是这些代码唯一的回归网；
- * 如果一刀切成空面板，它们会全部变红、被删掉，等以后重构时就没有任何东西兜底了。
- * `scripts/fe-smoke.mjs` 会在页面启动前设 `window.__ZEEAI_TEST_AI_PANEL__ = true`，
- * 只在那轮测试里渲染；用户打开应用时这个全局永远是 undefined → 面板仍是灰容器。
- */
-const AI_PANEL_TEST_ONLY_SHOW =
-  typeof window !== "undefined" &&
-  (window as Window & { __ZEEAI_TEST_AI_PANEL__?: boolean }).__ZEEAI_TEST_AI_PANEL__ === true;
-/** 实际生效的"要不要藏内容"：停用开关 + 测试豁免 */
-const AI_PANEL_HIDDEN = AI_PANEL_DISABLED && !AI_PANEL_TEST_ONLY_SHOW;
-
-/** 会话的承载方式：T = tmux、H = herdr、S = 纯 SSH（本地终端没有徽标） */
-type CarrierKey = "tmux" | "herdr" | "ssh";
-
-const CARRIER_LETTER: Record<CarrierKey, string> = {
-  tmux: "T",
-  herdr: "H",
-  ssh: "S",
-};
-
-/** 悬停文案：必须把 tmux / herdr / SSH 三个词写清楚（用户要求） */
-const CARRIER_TITLE: Record<CarrierKey, string> = {
-  tmux: "tmux —— 这个会话跑在 tmux 里（断线重连能回到同一个会话）",
-  herdr: "herdr —— 这个会话是 herdr 里的窗格（观察 / 接管都算）",
-  ssh: "SSH —— 纯 SSH 会话（没有 tmux / herdr）",
-};
-
-/**
- * 判定一个会话的承载方式 —— 只看会话对象里**已有的**承载字段，不靠标题猜：
- * - `herdrPane`：观察窗 / 接管窗格（后端建会话时写入的窗格号）；
- * - `tmuxName`：连上后后端返回的真实 tmux 会话名（`info.tmuxSession`）；
- * - `tmuxMode === "none"`：新建时明确选了"普通 shell / 纯 SSH"；
- * - `tmuxMode === "default"`：跟着服务器配置走（`ssh.tmuxEnabled`，默认是开）。
- *
- * 连接中的 tmux 会话还没拿到 `tmuxName`，先按这次选的打开方式标；连上后
- * `tmuxName` 一到就以它为准（见 openSshSession 里的 setSessions）。
- */
-function carrierOfSession(
-  s: OpenSession,
-  profile?: ConnectionProfile,
-): CarrierKey | null {
-  // 本地终端（PowerShell / CMD / WSL / Git / 串口 / ADB）不是 T/H/S 承载，不加徽标
-  if (s.kind !== "remote") return null;
-  if (s.herdrPane) return "herdr";
-  if (s.tmuxName) return "tmux";
-  if (s.tmuxMode === "none") return "ssh";
-  if (s.tmuxMode === "default" && profile?.ssh?.tmuxEnabled === false) return "ssh";
-  return "tmux";
-}
-
-/**
- * 一组"这就是个壳"的 shell 名字。
- *
- * 用来判断一个 herdr 窗格**是不是空壳**（前台进程就停在提示符上、没跑任何活）。
- * herdr 的 `pane process-info` 给的是前台进程名（`bash` / `codex` / …），
- * 拿它跟这张表比就行 —— 也是"清理工作区"唯一敢自动碰的情况。
- */
-const SHELL_NAMES = new Set([
-  "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu", "busybox",
-]);
-
-/**
- * 从窗格号取工作区号：`w9:p1` → `w9`。
- *
- * herdr 是 workspace > tab > pane 三层，而**会在服务器上攒着的是工作区** ——
- * 回收的时候要按工作区来，所以这个转换到处都在用。
- */
-function paneWorkspace(paneId?: string | null): string {
-  return paneId ? paneId.split(":")[0] : "";
-}
-
-/**
- * 从"存下来的会话名"里摘出给标签用的短名。
- *
- * 存下来的形如 `lz · codex w1P:p1`，而标签里还会再拼一次服务器名和窗格号，
- * 所以两段都要摘掉。**注意 herdr 的工作区号是带字母的**（`w1P` / `wD` / `wE`）——
- * 以前这里写成 `w\d+`，字母那种摘不掉，于是标签变成
- * `lz · codex w1P:p1 w1P:p1`（用户截图里那个重复的标签就是它）。
- */
-function herdrShortLabel(title?: string | null): string | undefined {
-  const t = (title ?? "").trim();
-  if (!t) return undefined;
-  const stripped = t
-    .replace(/^.*·\s*/, "")
-    .replace(/\s*w[0-9A-Za-z]+:p\d+.*$/, "")
-    .trim();
-  return stripped || undefined;
-}
-
-/**
- * 把标题里**重复出现的窗格号**收成一个：`codex w1P:p1 w1P:p1` → `codex w1P:p1`。
- *
- * 这是老版本留下的脏数据：当时摘窗格号的正则写成 `w\d+`，而 herdr 的工作区号带字母
- * （`w1P`/`wD`/`wE`），摘不掉就又拼了一遍。历史记录里那些名字现在还是脏的，
- * 重新打开一次才会写干净，所以显示的时候顺手收一下。
- */
-function dedupPaneId(text: string, paneId?: string | null): string {
-  const p = (paneId ?? "").trim();
-  if (!p) return text;
-  let out = text.split(`${p} ${p}`).join(p);
-  // 极端情况：连着拼了三次
-  while (out.includes(`${p} ${p}`)) out = out.split(`${p} ${p}`).join(p);
-  return out.trim();
-}
-
-/** 环境徽标：本地 / 远端 / WSL */
-function aiEnvLabel(env: string): string {
-  if (env === "remote") return "远端";
-  if (env === "wsl") return "WSL";
-  return "本地";
-}
-
-/**
- * 这张卡该不该占「需要你 / 运行中」两个区（口径 docs/design-ai-board-v2.md §10.2）。
- *
- * 「空闲 / 最近完成」是**窗格/实例现状**，不是"有个任务在跑" —— 摆在卡片区就变成
- * "历史上哪些窗格跑过 codex"，用户实测因此以为"它在探测我的 PowerShell"。
- *
- * 这里只说"占不占大卡位"：**状态的判定不在这里** —— 统一状态由后端模型给
- * （`AiState` / 承载能力闸门），前端不再自己推。
- */
-function isActiveInstance(i: AiInstance): boolean {
-  return i.state === "needs-you" || i.state === "working";
-}
-
-/**
- * 卡片上那句状态词（§3.1 的五个词 + §10.4 对裸 SSH 的一句如实降级）。
- *
- * 裸 SSH 的 working 是**进程推断**出来的：只能看到"有这么个进程"，
- * 看不到它在等谁、也看不出它是不是卡住了 —— 所以那句要写全：
- * 「运行中（进程推断，可能已卡住）」。其它承载照旧只写状态词，推断与否交给来源徽标说。
- */
-function aiStateLabelOf(i: AiInstance): string {
-  // 输出活动推断出来的 working：状态词就写「运行中」，**推断这件事由卡片上的
-  // 「推断 · 输出活动」标负责**（见 boardCard）。这里不能再套「进程推断，可能已卡住」——
-  // 那句说的是"进程表只看到有这么个进程"，和"终端还在刷输出"是两回事，混着写等于说错原因。
-  if (activityEvidenceOf(i)) return "运行中";
-  const firstHand = i.evidence.some((e) => e.confidence === "first-hand");
-  if (i.carrier === "ssh-bare" && i.state === "working" && !firstHand) {
-    return "运行中（进程推断，可能已卡住）";
-  }
-  return aiStateLabel(i.state);
-}
-
-/** 统一状态 → 卡片上那句中文（只有这五个词，§3.1） */
-function aiStateLabel(s: AiState): string {
-  switch (s) {
-    case "needs-you":
-      return "需要你";
-    case "working":
-      return "运行中";
-    case "finished":
-      return "已完成";
-    case "idle":
-      return "空闲";
-    default:
-      return "状态未知";
-  }
-}
-
-/**
- * herdr 的原始状态词 → 界面上那句中文（「接管已有窗格」那一列还在用它）。
- *
- * 口径和后端 `ai_instance::state_of_herdr` 对齐：`blocked` = **需要你**（不是"跑完了"），
- * `idle` 与 `done` 是两件事（老看板把两者都压成"已完成"，那是错的）。
- */
-function herdrStateLabel(status: string): string {
-  switch ((status || "").trim().toLowerCase()) {
-    case "working":
-      return "运行中";
-    case "blocked":
-      return "需要你";
-    case "done":
-      return "已完成";
-    case "idle":
-      return "空闲";
-    default:
-      return "状态未知";
-  }
-}
-
-/**
- * 概览徽标：承载（"它是怎么被看见的"）。
- *
- * §10.4：裸 SSH 只能说"运行中（进程推断，可能已卡住）"—— 那句话在卡片上是**承载 + 状态**
- * 合起来说的，所以这里由承载决定前缀。
- */
-function aiCarrierLabel(c: AiCarrier): string {
-  switch (c) {
-    case "herdr":
-      return "herdr 第一手";
-    case "tmux":
-      return "tmux 窗格";
-    case "ssh-bare":
-      return "裸 SSH";
-    case "wsl":
-      return "WSL";
-    case "local-cmd":
-      return "本机 CMD";
-    default:
-      return "本机 PowerShell";
-  }
-}
-
-/** agent 枚举（含带数据的 `{other}` 变体）→ 界面文字 */
-function aiAgentLabel(a: AiAgentKind): string {
-  if (a && typeof a === "object") return a.other || "未知工具";
-  switch (a) {
-    case "codex":
-      return "codex";
-    case "claude":
-      return "claude";
-    case "gemini":
-      return "gemini";
-    case "aider":
-      return "aider";
-    default:
-      return "未知工具";
-  }
-}
-
-/**
- * herdr 报的 agent 种类 → 界面文字。
- *
- * herdr 会给出我们枚举里没有的种类（opencode / qwen / …）。认不出来时**把 herdr 的原名
- * 写出来**，而不是像看板卡片那样兜底成"未知工具" —— 红点提示里"哪台机器上的谁在等你"
- * 必须能一眼认出来，写"未知工具"等于把这条信息丢了。
- */
-function herdrAgentLabel(agent: string): string {
-  const known = aiAgentLabel(agent as AiAgentKind);
-  return known === "未知工具" && agent.trim() ? agent.trim() : known;
-}
-
-/**
- * 后端 `AiInstance.badge` 里已经带了"谁说的 / 多久前 / 能不能证明"，
- * 但没带"在哪儿" —— 悬停写"怎么得出的"时，第一句要能回答"这是哪台机器 / 哪个目录"。
- */
-function aiInstanceWhere(i: AiInstance): string {
-  const parts = i.where.split(" · ");
-  return parts.slice(0, 2).filter(Boolean).join(" · ");
-}
-
-/**
- * 卡片上那个来源徽标的悬停文案（§3.3 的要求：**谁说的 / 多久前 / 能证明什么**）。
- *
- * `badge()` 已经把后两件事写全了（含"只能说明它在跑"、"可能已卡住"这些如实降级），
- * 这里只补三样：这是哪里、这句话是谁说的（枚举名）、一共几条证据。
- */
-function aiBadgeTitle(i: AiInstance): string {
-  const source = i.evidence
-    .map(
-      (e) =>
-        `${aiEvidenceSourceLabel(e.source)}（${e.confidence === "first-hand" ? "第一手" : "推断"}）`,
-    )
-    .join("、");
-  const activity = activityEvidenceOf(i);
-  return (
-    `${aiInstanceWhere(i)}\n` +
-    `${aiAgentLabel(i.agent)} · ${aiCarrierLabel(i.carrier)}\n` +
-    `怎么得出的：${i.badge}\n` +
-    // 卡片上那枚徽标末尾带「自动更新」= 这条是自动事件直接改的（没点刷新）；
-    // 手动刷新后整份数据来自后端 `ai_instances`，不再带这个后缀。
-    (i.badge.includes("自动更新")
-      ? "来源方式：自动事件（本机日志 / herdr 轮询）直接更新，不是点「刷新」拿到的\n"
-      : "来源方式：「刷新」时后端合并出来的全量数据\n") +
-    `谁说的：${source || "（没有证据）"} · 共 ${i.evidence.length} 条\n` +
-    `能证明什么：${
-      i.evidence.some((e) => e.confidence === "first-hand")
-        ? "对面自己报的状态"
-        : "只能说明有这么个进程在跑，说不了它在等谁 / 跑完没"
-    }` +
-    // 推断必须自己说清楚"能证明到哪一步"。这一段只在卡片是按输出活动补成运行中时出现。
-    (activity
-      ? "\n其中「终端输出活动」是推断：最近 5 秒这条会话的终端还有输出 —— " +
-        "只能说明界面在动，看不出它是跑完了在收尾、还是卡在等你按回车。" +
-        "所以只在 5 秒内显示成「运行中」，herdr / 日志 / 刷新给出状态就立刻让位。"
-      : "")
-  );
-}
-
-/**
- * 卡片上那枚来源徽标（`badge()`）**已经说过的**来源，就别在下面那行再说一遍。
- *
- * 为什么：§9① 用户抱怨的原话就是"同一件事说了三遍"。徽标写的是"谁说的"
- *（herdr 第一手 / 本应用账本 / rollout 日志），只有"进程扫描"这一类它写成
- * "只能说明它在跑"、没点明是哪张进程表 —— 所以这时才在下面补一句。
- */
-function aiBadgeCoversSource(i: AiInstance): boolean {
-  if (!i.badge) return false;
-  return !/只能说明它在跑/.test(i.badge);
-}
-
-/** 证据来源的中文短语（和后端 `EvidenceSource::label()` 对齐；认不出就写"未知来源"） */
-function aiEvidenceSourceLabel(s: string): string {
-  switch (s) {
-    case "herdr-agent-list":
-      return "herdr 第一手";
-    case "app-ledger":
-      return "本应用账本";
-    case "rollout":
-      return "rollout 日志";
-    case "remote-tmux-ps":
-      return "远端进程扫描";
-    case "local-process-table":
-      return "本机进程表";
-    case "wsl-ps":
-      return "WSL 进程扫描";
-    // 前端独有（后端不会出这一条）：按终端输出活动推断的运行中，见 boardActivity.ts
-    case "terminal-activity":
-      return "终端输出活动";
-    default:
-      return "未知来源";
-  }
-}
-
-/** 后端观测来源 → 旧的卡片文案（卡片上那行 `耗时 X · 来源` 还在用） */
-function aiSourceLabelOf(source: string): string {
-  switch (source) {
-    case "app-ledger":
-      return "App 启动（最准）";
-    case "herdr-agent-list":
-      return "herdr 第一手";
-    case "rollout":
-      return "rollout 日志";
-    case "remote-tmux-ps":
-      return "tmux / ps 扫描";
-    case "local-process-table":
-      return "Windows 进程表";
-    case "wsl-ps":
-      return "WSL 进程扫描";
-    default:
-      return "ps 扫描";
-  }
-}
-
-/** 毫秒 →「1 分 23 秒」；拿不到就显示「—」 */
-function aiDurationText(ms: number): string {
-  if (!ms || ms < 0) return "—";
-  const secs = Math.round(ms / 1000);
-  if (secs < 60) return `${secs} 秒`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return secs % 60 ? `${mins} 分 ${secs % 60} 秒` : `${mins} 分`;
-  return `${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
-}
-
-/** Unix 秒 → 本地时间 HH:MM:SS */
-function clockText(sec: number): string {
-  const d = new Date(sec * 1000);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-/**
- * 这个文件名算不算"要你去看的文档产物"？
- *
- * 用户的原话是"我选择只看生成的 HTML 或者 MD 文档"——所以默认口径里，
- * 只有 HTML / Markdown 才算"值得为它提醒一次"；其它文件（日志、临时脚本、图片…）
- * 一律不弹（想让它们也触发，去设置里把「产物范围」改成"所有文件"）。
- */
-function isDocName(name: string): boolean {
-  const n = name.trim().toLowerCase();
-  return n.endsWith(".md") || n.endsWith(".markdown") || n.endsWith(".html") || n.endsWith(".htm");
-}
-
-/** 一行短文本（通知里用）：压成一行并截断 */
-function aiShorten(s: string, max: number): string {
-  const one = s.replace(/\s+/g, " ").trim();
-  return one.length <= max ? one : one.slice(0, max) + "…";
-}
-
-/** token 数 → 以「兆（M）」为单位显示，例如 1_234_567 → "1.23M" */
-function tokenM(n: number): string {
-  if (!n || n < 0) return "0M";
-  const m = n / 1_000_000;
-  if (m >= 100) return `${Math.round(m)}M`;
-  if (m >= 1) return `${m.toFixed(2)}M`;
-  if (m >= 0.01) return `${m.toFixed(3)}M`;
-  return "0.01M 以下";
-}
-
-/** 路径 → 只留最后一段（卡片上显示"项目目录"用） */
-function dirBase(p: string): string {
-  const t = p.replace(/[\\/]+$/, "");
-  const parts = t.split(/[\\/]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : "";
-}
-
-/**
- * 会话类型 → 我们对外暴露的 4 种"终端类型"（作用范围就用这几种）
- * remote=SSH；powershell/cmd/wsl 都是本地终端；serial=串口；adb=Android
- */
-function kindOfSession(kind: string): "ssh" | "local" | "serial" | "adb" {
-  if (kind === "remote") return "ssh";
-  if (kind === "serial") return "serial";
-  if (kind === "adb") return "adb";
-  return "local";
-}
-
-/**
- * 某个会话该用哪一套高亮规则：
- * 这台服务器/设备**独立**设过 → 用它自己的（全局怎么改都不动它）；
- * 没设过（= 在服务器配置里勾了「跟随全局」）→ 用"该终端类型"那一档 → 再兜底到全局默认。
- */
-function highlightRulesFor(
-  settings: AppSettings,
-  profile: ConnectionProfile | undefined,
-  terminalKind?: string,
-): HighlightRule[] {
-  const byKind = terminalKind ? settings.highlightSetByKind?.[terminalKind] : "";
-  // profile 上存了值 = 这台机器选了"独立"，优先级最高（这正是用户要的：独立的不被全局覆盖）
-  const id = (profile?.highlightSetId || byKind || "").trim();
-  const set = id ? settings.highlightRuleSets.find((s) => s.id === id) : undefined;
-  if (set) return set.rules;
-  const fallback = settings.highlightRuleSets.find((s) => s.id === "default");
-  return fallback?.rules ?? settings.highlightRules;
-}
-
-/**
- * 某个会话该用哪套终端配色（16 色）：
- * 这台服务器/设备独立设过 → 用它自己的；否则用"该终端类型"那一档 → 全局那套。
- *
- * `from` 是**这套值是从哪一层来的**，给界面用：用户改"全局默认"却被上层盖住时，
- * 必须能看见"现在真正生效的是谁、谁定的"（否则就是"改了没反应"的困惑，实测踩过）。
- */
-function termSchemeFor(
-  settings: AppSettings,
-  profile: ConnectionProfile | undefined,
-  terminalKind?: string,
-): { key: string; custom?: string; from: "profile" | "kind" | "global" } {
-  const byKind = terminalKind ? settings.termSchemeByKind?.[terminalKind] : "";
-  const own = (profile?.termScheme ?? "").trim();
-  const from: "profile" | "kind" | "global" = own
-    ? "profile"
-    : (byKind ?? "").trim()
-      ? "kind"
-      : "global";
-  const key = (own || byKind || settings.termScheme || "").trim();
-  const custom = profile?.termSchemeCustom ?? settings.termSchemeCustom;
-  return { key: key || settings.termScheme, custom, from };
-}
-
-/** 直接算出某个会话该用的 16 色配色 */
-function termPaletteFor(
-  settings: AppSettings,
-  profile: ConnectionProfile | undefined,
-  terminalKind?: string,
-): TermPalette {
-  const look = termSchemeFor(settings, profile, terminalKind);
-  return resolveTermPalette(look.key, look.custom);
-}
-
-/**
- * 服务器列表上那一行「谁@哪台机器:端口」。
- *
- * 端口/用户留空是**合法**的（= 交给 `~/.ssh/config`），所以不能原样拼出
- * `@myalias:0` 这种看不懂的东西 —— 那种显示会让人以为配置坏了。
- */
-function sshTargetLabel(ssh: { host: string; user?: string; port?: number }): string {
-  const user = (ssh.user ?? "").trim();
-  const port = ssh.port ?? 0;
-  return `${user ? user + "@" : ""}${ssh.host}${port ? ":" + port : ""}`;
-}
-
-const EMPTY_PROFILE = {
-  name: "",
-  host: "",
-  /**
-   * 端口 / 用户**默认留空**（"没说"）。
-   *
-   * 为什么不留 22 / root：这两个值一旦填上，后端就会拼出 `ssh -p 22 root@myalias` ——
-   * 实测这会把 `~/.ssh/config` 里的 `Port` / `User` **顶掉**，于是"本机配了免密别名"
-   * 的用户永远连不上（2026-10 用户报障）。留空时后端不传 `-p`、只给 `host`，
-   * config 才生效（默认 22 / 当前用户名）。显式填了仍然是我们说了算。
-   *
-   * port 存**字符串**而不是数字：`<input type="number">` 清空时 `Number("")` 是 0，
-   * 但界面上得能看见"空"，数字类型一存就变成 `NaN` 或被迫回填 22（两种都出过）。
-   */
-  port: "",
-  user: "",
-  group: "默认",
-  keyPath: "",
-};
-
-/** 端口留空 = 0 = "没说"：交给 `~/.ssh/config` 的 Port（后端已支持）。 */
-function portOrZero(v: string): number {
-  const n = Number(String(v).trim());
-  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
-}
-
-/**
- * 把后端的报错拆成「中文短句」+「原始信息」两半。
- *
- * 后端（russh 那条路）现在返回的是 `中文短句｜原始信息：<英文>` 这种形状。
- * 界面上只该看见中文那半（英文原文一长串，挤在状态栏里没人读得下去），
- * 但排查问题又必须能拿到原文 —— 所以原文进悬停（`title`）。
- */
-function splitErrText(text: string): { short: string; detail: string } {
-  const i = text.indexOf("｜原始信息：");
-  if (i < 0) return { short: text, detail: text };
-  return { short: text.slice(0, i).trim(), detail: text };
-}
-
-/**
- * 错误看着像"认证失败 / 权限拒绝"吗？
- *
- * 为什么要单独判：默认 `BatchMode=yes`（见 `src-tauri/src/commands.rs` 里 `open_ssh` 的
- * `!cfg.allow_password`）—— 不勾「允许在终端里输入密码」时，密码登录**根本不会问你**，
- * 直接以 `Permission denied (publickey,password)` 收场。用户看到"认证失败"只会以为
- * 是密钥配错了，其实只差一个勾。所以这种情况必须**给一句能照做的话**。
- */
-function looksLikeAuthFailure(text: string): boolean {
-  const low = text.toLowerCase();
-  return (
-    text.includes("认证失败") ||
-    text.includes("权限拒绝") ||
-    text.includes("拒绝访问") ||
-    low.includes("permission denied") ||
-    low.includes("publickey") ||
-    low.includes("authentication failed")
-  );
-}
-
-/**
- * 连接类报错 → 状态栏那一行文字。
- *
- * `what` 是我们自己的上下文（"SSH 连接失败"这种），后面接后端的原始报错；
- * 原始信息部分会在 `notify` 里被挪进悬停。
- *
- * `allowPassword`：这台服务器**已经**勾了「允许在终端里输入密码」时，就别再劝他去勾
- *（他勾了还是认证失败，问题在别处）—— 那种情况由 `explainSshFailure` 补"密码模式"提示。
- */
-function connErrorText(what: string, err: unknown, allowPassword?: boolean): string {
-  const raw = String(err);
-  const hint =
-    !allowPassword && looksLikeAuthFailure(raw)
-      ? "\n这台服务器可能要密码：在「编辑服务器」里勾上「允许在终端里输入密码」再连"
-      : "";
-  return `${what}：${raw}${hint}`;
-}
-
-/**
- * "密码模式提示"该不该出现：认证 / 权限 / 算法这类错误，正是"本机明明有免密配置、
- * 却被密码模式挡住了"的典型症状。网络错误（超时 / 连不上）跟密码无关，不提示。
- */
-function looksLikePasswordModeTrap(text: string): boolean {
-  const low = text.toLowerCase();
-  return (
-    looksLikeAuthFailure(text) ||
-    text.includes("算法不匹配") ||
-    low.includes("no common algorithm") ||
-    low.includes("no matching host key")
-  );
-}
-
-/** 后端那句密码模式提示（只读常量；文案和后端 `ssh::PASSWORD_MODE_HINT` 保持一致） */
-const PASSWORD_MODE_HINT =
-  "本机已有免密配置；密码模式不会使用 ~/.ssh/config 与 ssh-agent，若想免密请取消勾选「允许在终端里输入密码」";
-
-/**
- * 要不要提示"你其实有免密配置，只是被密码模式挡住了"。
- *
- * 后端 `ssh::password_mode_hint` 的口径是：启用「允许输入密码」且（配了 keyPath 或
- * `ssh -G` 有 IdentityFile 或 ssh-agent 可用）。前端**拿不到 agent 的状态**（没有命令
- * 暴露它），所以这里只认"诊断证明本机真有密钥"这一条 —— 宁可少提示，也不要把
- * "本机已有免密配置"说在一台根本没钥匙的机器上（那会让用户去关一个救命的勾）。
- */
-function passwordModeHintFor(
-  profile: ConnectionProfile | undefined,
-  d: SshDiagnosis | undefined,
-): string | null {
-  if (!d || !profile?.ssh?.allowPassword) return null;
-  const keys = Array.isArray(d.key_files) ? d.key_files : [];
-  if (!keys.some((k) => k.exists)) return null;
-  return PASSWORD_MODE_HINT;
-}
-
-/**
- * `ssh -G` 给的是 `~/.ssh/id_ed25519` 这种路径，后端 `key_files` 给的是展开后的
- * `C:\Users\你\.ssh\id_ed25519`。要按"同一个文件"比，就得把两边都归一成
- * `.ssh/` 之后那一段（`/id_ed25519`）—— 直接字符串相等永远比不上。
- */
-function keyPathKey(p: string): string {
-  const s = p.replace(/\\/g, "/").toLowerCase();
-  const home = /^(?:~|%userprofile%)(\/.*)$/.exec(s);
-  if (home) {
-    const i = home[1].lastIndexOf("/.ssh/");
-    return i >= 0 ? home[1].slice(i + 5) : home[1];
-  }
-  const dotSsh = s.lastIndexOf("/.ssh/");
-  if (dotSsh >= 0) return s.slice(dotSsh + 5);
-  return s;
-}
-
-function sameKeyPath(a: string, b: string): boolean {
-  return keyPathKey(a) === keyPathKey(b);
-}
-
-/**
- * 取"配置里真实会用的密钥列表"。
- *
- * 后端字段是 `identityfile`（OpenSSH 配置项同名）；这里同时认 `identity_files`
- * 这种写法，免得字段哪天改名界面直接瞎掉。空串 / "none" 不算。
- */
-function identityFilesOf(effective: SshEffectiveConfig | undefined): string[] {
-  if (!effective) return [];
-  const e = effective as SshEffectiveConfig & { identity_files?: unknown };
-  const raw = Array.isArray(e.identityfile) ? e.identityfile : e.identity_files;
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((x): x is string => typeof x === "string" && x.trim() !== "");
-}
-
-/**
- * 一句人话结论 —— 用户不该自己对着 `ssh -G` 的输出推断"我到底会怎么登录"。
- *
- * 判定顺序（先看有没有能用的钥匙，再补一句"所以接下来会怎样"）：
- * 1. 找到存在的密钥 → 说清用哪一把；他手填的私钥不在时**必须点名**（否则他会一直
- *    以为在用那把，直到某天发现免密突然失效）；
- * 2. 一把都没有 + 填了私钥路径 → 「主机密钥文件不存在」（路径写错 / 密钥没拷过来）；
- * 3. 一把都没有 + 没填 → 「没找到本机密钥」，并点出最常见的原因（「主机」里填的不是别名）；
- * 最后统一追加登录方式：勾了「允许在终端里输入密码」就会转密码登录，否则直接认证失败。
- */
-function sshDiagnosisConclusion(
-  d: SshDiagnosis,
-  profile?: ConnectionProfile,
-): { tone: "ok" | "warn" | "bad"; text: string } {
-  const configured = (profile?.ssh?.keyPath ?? "").trim();
-  const keys = Array.isArray(d.key_files) ? d.key_files : [];
-  const existing = keys.filter((k) => k.exists);
-  const configuredKey = configured
-    ? keys.find((k) => sameKeyPath(k.path, configured))
-    : undefined;
-  const jump = String(d.effective?.proxyjump ?? "").trim();
-  const viaJump = jump ? `；会先经过跳板机 ${jump}` : "";
-  const pure = d.effective?.identitiesonly === "yes";
-
-  if (existing.length > 0) {
-    let tone: "ok" | "warn" = "ok";
-    let text: string;
-    if (configured && configuredKey && !configuredKey.exists) {
-      tone = "warn";
-      text = `你指定的私钥 ${configuredKey.path} 不存在，会改用 ${existing[0].path} 免密登录`;
-    } else if (configured && configuredKey?.exists) {
-      text = `会用 ${configuredKey.path} 免密登录`;
-    } else if (configured && !configuredKey) {
-      // 填了路径但后端候选列表里没有它（例如写成相对路径）：不能假装在用，提醒一句
-      tone = "warn";
-      text = `会用 ${existing[0].path} 免密登录；你填的 ${configured} 没在本机找到，确认一下路径`;
-    } else {
-      text = `会用 ${existing[0].path} 免密登录（来自 ~/.ssh/config 或系统默认密钥）`;
-    }
-    if (pure) {
-      text += "。config 里开了 IdentitiesOnly：只用配置里列的密钥，不会去试 ssh-agent 里的";
-    }
-    return { tone, text: text + viaJump };
-  }
-
-  // 一把都不存在
-  let text: string;
-  if (configured) {
-    text = `主机密钥文件不存在：${configuredKey?.path ?? configured}（本机找不到这个文件，连接会失败）`;
-  } else {
-    text =
-      "没找到本机密钥，可能因为「主机」里填的不是 ~/.ssh/config 里的别名；也可能是这台机器还没配过 SSH 密钥";
-  }
-  if (profile?.ssh?.allowPassword) {
-    text += "。你勾了「允许在终端里输入密码」，会改用密码登录";
-  } else {
-    text += "。而且没勾「允许在终端里输入密码」，连不上时会直接报认证失败";
-  }
-  if (pure) {
-    text += "。config 里还开了 IdentitiesOnly，ssh-agent 里的钥匙也不会被拿来试";
-  }
-  return { tone: "bad", text: text + viaJump };
-}
-
-/** 一次连接诊断在界面上的状态（「编辑服务器」按钮 / 连接失败提示 两个入口共用） */
-interface SshDiagView {
-  profileId: string;
-  /** 服务器名：弹窗标题带上，免得连错机器 */
-  name: string;
-  /** 发起诊断时的那份配置（编辑框里**没保存**的改动也算 —— 密码模式提示才准） */
-  profile?: ConnectionProfile;
-  /** 从「连接失败」进来的那次：把刚才那条错误带进弹窗，别让用户再回忆一遍 */
-  failure?: string;
-  loading: boolean;
-  data?: SshDiagnosis;
-  error?: string;
-}
-
-/**
- * 连接诊断弹窗 —— 「编辑服务器」里的按钮 和 连接失败提示 共用这一个。
- *
- * 只展示人看得懂的东西：一句总结（大字）、实际生效的主机/端口/用户、每个密钥存在与否、
- * 有才显示的跳板机 / ProxyCommand / IdentitiesOnly / BatchMode，以及前端算出来的人话结论。
- * **不摆原始 JSON** —— 那是给排查问题的人看的，普通用户只会被吓到。
- */
-function SshDiagnosisModal(props: {
-  view: SshDiagView;
-  onClose: () => void;
-  onRetry: () => void;
-}): JSX.Element {
-  const { view, onClose, onRetry } = props;
-  const d = view.data;
-  const conclusion = d ? sshDiagnosisConclusion(d, view.profile) : null;
-  const hint = passwordModeHintFor(view.profile, d);
-  const idFiles = identityFilesOf(d?.effective);
-  const keyFiles = Array.isArray(d?.key_files) ? d!.key_files : [];
-  /** 某个路径在本机上到底存不存在；后端没给这一条时返回 undefined（不瞎猜） */
-  const existsOf = (path: string): boolean | undefined => {
-    const hit = keyFiles.find((k) => sameKeyPath(k.path, path));
-    return hit ? hit.exists : undefined;
-  };
-  const mainKeys =
-    idFiles.length > 0
-      ? idFiles.map((path) => ({ path, exists: existsOf(path) }))
-      : keyFiles.map((k) => ({ path: k.path, exists: k.exists as boolean | undefined }));
-  // 配置里没列、但本机真的有的密钥：用户最常问"我 ~/.ssh 里明明有钥匙，为什么没用上"
-  const otherKeys = keyFiles.filter(
-    (k) => k.exists && !mainKeys.some((m) => sameKeyPath(m.path, k.path)),
-  );
-  const extras: { label: string; value: string }[] = [];
-  if (d) {
-    const e = d.effective;
-    const jump = String(e?.proxyjump ?? "").trim();
-    const proxyCmd = String(e?.proxycommand ?? "").trim();
-    if (jump) extras.push({ label: "跳板机", value: jump });
-    if (proxyCmd) extras.push({ label: "ProxyCommand", value: proxyCmd });
-    // 这两个 OpenSSH 默认就是 no / 空：只有用户/配置真写了才说，别拿默认值凑数
-    if (e?.identitiesonly) {
-      extras.push({
-        label: "IdentitiesOnly（只用配置里列的密钥）",
-        value: e.identitiesonly === "yes" ? "是" : "否",
-      });
-    }
-    if (e?.batchmode) {
-      extras.push({
-        label: "BatchMode（不弹密码提示）",
-        value: e.batchmode === "yes" ? "是" : "否",
-      });
-    }
-  }
-
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal diag-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">
-          连接诊断{view.name ? ` · ${view.name}` : ""}
-          <button
-            type="button"
-            className="mini-x"
-            style={{ float: "right", opacity: 1 }}
-            title="关闭"
-            onClick={onClose}
-          >
-            ✕
-          </button>
-        </div>
-        <div className="modal-body">
-          {view.failure && (
-            <div className="diag-failure">刚才的连接错误：{view.failure}</div>
-          )}
-          {view.loading && (
-            <div className="hint">正在读取本机 SSH 配置…（只读，不会连接服务器）</div>
-          )}
-          {view.error && (
-            <div className="diag-error">读不到本机 SSH 配置：{view.error}</div>
-          )}
-          {d && (
-            <>
-              <div className="diag-summary">{d.summary}</div>
-              {conclusion && (
-                <div className={"diag-verdict " + conclusion.tone}>{conclusion.text}</div>
-              )}
-              {hint && <div className="diag-hint">⚠ {hint}</div>}
-              <div className="diag-rows">
-                <div className="diag-row">
-                  <span>实际主机</span>
-                  <b>{d.effective?.hostname || "（未知）"}</b>
-                </div>
-                <div className="diag-row">
-                  <span>端口</span>
-                  <b>{d.effective?.port || 22}</b>
-                </div>
-                <div className="diag-row">
-                  <span>用户</span>
-                  <b>{d.effective?.user || "（本机当前用户名）"}</b>
-                </div>
-                {extras.map((x) => (
-                  <div className="diag-row" key={x.label}>
-                    <span>{x.label}</span>
-                    <b>{x.value}</b>
-                  </div>
-                ))}
-              </div>
-              <div className="diag-section">本机密钥（配置里列的 + 系统默认位置）</div>
-              {mainKeys.length === 0 ? (
-                <div className="hint">配置里没有 IdentityFile，也没在默认位置找到密钥</div>
-              ) : (
-                <div className="diag-keys">
-                  {mainKeys.map((k) => (
-                    <div
-                      className={
-                        "diag-key " + (k.exists === true ? "ok" : k.exists === false ? "missing" : "")
-                      }
-                      key={k.path}
-                    >
-                      <span className="diag-key-flag">
-                        {k.exists === true ? "✓ 存在" : k.exists === false ? "✗ 不存在" : "? 无法确认"}
-                      </span>
-                      <span className="diag-key-path" title={k.path}>
-                        {k.path}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {otherKeys.length > 0 && (
-                <>
-                  <div className="diag-section">本机找到的其他密钥（没在配置里，但可以用）</div>
-                  <div className="diag-keys">
-                    {otherKeys.map((k) => (
-                      <div className="diag-key ok" key={k.path}>
-                        <span className="diag-key-flag">✓ 存在</span>
-                        <span className="diag-key-path" title={k.path}>
-                          {k.path}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
-            </>
-          )}
-        </div>
-        <div className="modal-actions">
-          <button type="button" className="btn" onClick={onRetry} disabled={view.loading}>
-            重新诊断
-          </button>
-          <button type="button" className="btn primary" onClick={onClose}>
-            关闭
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/** GitHub Release 里的一个附件（检查更新时用来挑安装包） */
-interface Asset {
-  name?: string;
-  size?: number;
-  browser_download_url?: string;
-  /** GitHub 会给的 sha256（形如 "sha256:...."），用来校验下载到的包 */
-  digest?: string;
-}
-
-/**
- * 「tmux 快捷操作」面板上的按钮。
- *
- * 刻意做成按钮而不是帮用户改 `Ctrl+B`：`Ctrl+B` 是 tmux 的默认前缀，
- * 动它会毁掉所有 tmux 用户的手感。这里是把**前缀 + 某个键**对应的 tmux 命令
- * 做成可点的按钮（`title` 里写着等价快捷键，顺便当教学）。
- */
-/**
- * 服务器没填分组时用的分组名。
- *
- * 这个值只用来"归类"，界面上**不显示** —— 只有一台服务器都不填分组时，
- * 列表里出现一行莫名其妙的「默认」反而让人看不懂。多个分组同时存在时，
- * 它才以「未分组」的名义出现，用来区分其它自建分组。
- */
-const DEFAULT_SERVER_GROUP = "默认";
-
-/** 设置对话框左侧的分类（点一下就跳到右边对应内容） */
-const SETTINGS_TABS: { key: string; label: string }[] = [
-  { key: "look", label: "外观" },
-  { key: "term", label: "终端与会话" },
-  { key: "log", label: "会话日志" },
-  // 应用级行为（启动恢复会话 / 关闭窗口时）—— 跟"终端怎么跑"是两件事，单独一页
-  { key: "app", label: "应用" },
-  { key: "notify", label: "通知" },
-  { key: "update", label: "更新与关于" },
-];
-
-const TMUX_ACTIONS: { key: string; label: string; title: string }[] = [
-  { key: "new-window", label: "新建窗口", title: "等价于 Ctrl+B c" },
-  { key: "split-h", label: "左右分屏", title: "等价于 Ctrl+B %" },
-  { key: "split-v", label: "上下分屏", title: '等价于 Ctrl+B "' },
-  { key: "prev-window", label: "上个窗口", title: "等价于 Ctrl+B p" },
-  { key: "next-window", label: "下个窗口", title: "等价于 Ctrl+B n" },
-  { key: "zoom", label: "放大/还原", title: "等价于 Ctrl+B z" },
-  { key: "next-layout", label: "换布局", title: "等价于 Ctrl+B 空格" },
-  { key: "pane-left", label: "窗格 ←", title: "等价于 Ctrl+B ←" },
-  { key: "pane-up", label: "窗格 ↑", title: "等价于 Ctrl+B ↑" },
-  { key: "pane-down", label: "窗格 ↓", title: "等价于 Ctrl+B ↓" },
-  { key: "pane-right", label: "窗格 →", title: "等价于 Ctrl+B →" },
-  { key: "copy-mode", label: "滚动查看", title: "等价于 Ctrl+B [（进入滚动/复制模式）" },
-  { key: "copy-mode-exit", label: "退出滚动", title: "等价于 Ctrl+B q 或 Esc" },
-  { key: "rename-window", label: "重命名窗口", title: "等价于 Ctrl+B ," },
-  { key: "kill-pane", label: "关闭窗格", title: "等价于 Ctrl+B x" },
-  { key: "kill-window", label: "关闭窗口", title: "等价于 Ctrl+B &" },
-  { key: "detach", label: "脱离会话", title: "等价于 Ctrl+B d：断开但会话继续在服务器上跑" },
-];
-
-/**
- * 「herdr 快捷操作」面板上的按钮。
- *
- * 和上面 tmux 那份是同一个思路：**不模拟按键**，而是另开一条 ssh 去跑 herdr 自己的
- * socket API（白名单见后端 core/herdr.rs::action_command）。所以它不会碰任何快捷键，
- * 也不管窗格里此刻在跑什么。herdr 没有"上一个/下一个工作区"这种指令，就没有这两项；
- * 它的滚动是观察端自己做的（我们用 xterm 的滚动条），所以也没有复制模式那两项。
- */
-const HERDR_ACTIONS: { key: string; label: string; title: string }[] = [
-  { key: "new-workspace", label: "新建工作区", title: "在服务器上新开一个工作区（窗格会留在服务器上，随时能回来）" },
-  { key: "split-right", label: "右分屏", title: "把当前窗格左右分成两块" },
-  { key: "split-down", label: "下分屏", title: "把当前窗格上下分成两块" },
-  { key: "zoom", label: "放大/还原", title: "当前窗格占满（再点还原）" },
-  { key: "pane-left", label: "窗格 ←", title: "把焦点移到左边那个窗格" },
-  { key: "pane-up", label: "窗格 ↑", title: "把焦点移到上边那个窗格" },
-  { key: "pane-down", label: "窗格 ↓", title: "把焦点移到下边那个窗格" },
-  { key: "pane-right", label: "窗格 →", title: "把焦点移到右边那个窗格" },
-  { key: "rename-pane", label: "重命名窗格", title: "给这个窗格起个名字（herdr 里显示的名字）" },
-  { key: "close-pane", label: "关闭窗格", title: "关掉当前窗格（会问一次）" },
-  { key: "close-workspace", label: "关闭工作区", title: "关掉整个工作区，连同里面的窗格（会问一次）" },
-];
-
-const DEFAULT_SETTINGS: AppSettings = {
-  fontSize: 13,
-  defaultShell: "powershell",
-  recordHistory: true,
-  tmuxDefault: true,
-  theme: "dark",
-  closeAction: "exit",
-  updateUrl: "https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest",
-  autoReconnect: true,
-  fsFollowTerminal: true,
-  restoreWorkspace: true,
-  scrollback: 10000,
-  autoLog: false,
-  lastUpdateCheck: 0,
-  ignoredUpdateVersion: "",
-  termScheme: "vscode-dark",
-  termSchemeCustom: "",
-  logDir: "",
-  highlightEnabled: true,
-  // 预设规则由后端给（core::highlight::presets），前端这里只留空；
-  // 设置读回来之后就有内容了，用户也可以自己改。
-  highlightRules: [],
-  // 规则集由后端给（core::highlight::presets 兜底），前端启动后就有内容
-  highlightRuleSets: [],
-  termSchemeByKind: {},
-  highlightSetByKind: {},
-  // 通知分层：默认只在活动栏 AI 图标点红点；闪任务栏 / 右下角提示由用户自己开
-  aiNotifyTaskbar: false,
-  aiNotifyBadge: true,
-  // 红点只为两种情况亮（docs/design-ai-board-v2.md §10.6）：
-  // ① 有人需要你 → 亮到你处理；② 跑完一轮并停下 → 点开就消。其它情况不提醒。
-  aiNotifyNeedsYouBadge: true,
-  aiNotifyFinishedBadge: true,
-  // 「什么时候才提醒我」的默认口径（和后端 store.rs 保持一致）：
-  // 小任务太多，跑完就弹会很吵 → 默认关；
-  // 真正要人接手的两种（产出了 HTML/MD 文档、AI 在等你做选择题）默认开。
-  aiNotifyComplete: false,
-  aiNotifyDocs: true,
-  aiNotifyNeedsYou: true,
-  aiNotifyAllArtifacts: false,
-  // 粘贴/拖进来的图片、文件在远端落到哪个目录；`.` = 跟随终端当前目录
-  pasteDir: "~/.zeeai/paste",
-  // 终端的三个习惯项（和后端 store.rs 的默认值保持一致）：
-  // 两个键都能粘、右键弹菜单、Ctrl+Shift+C 复制 —— 跟大多数人预期一致
-  pasteKey: "both",
-  rightClick: "menu",
-  copyKey: "ctrl-shift-c",
-  // 直接粘进终端（不经过输入窗）时是否给一眼缩略图。
-  // **默认关**：用户明确要求"图片上传/粘贴不要在右下角弹消息"——要确认粘对了没有，
-  // 看输入行里那串路径就够了（想开的人可以在设置里打开）。
-  pasteToast: false,
-};
-
-const APP_VERSION = "0.1.14";
-/** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
-const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
-
-/** 比较 a、b 两个版本号：a 新返回 1，相同返回 0，a 旧返回 -1（忽略 v 前缀与预发布后缀） */
-function compareVersion(a: string, b: string): number {
-  const nums = (v: string) =>
-    v
-      .trim()
-      .replace(/^v/i, "")
-      .split(/[.+\-]/)
-      .map((x) => parseInt(x, 10))
-      .filter((n) => Number.isFinite(n));
-  const A = nums(a);
-  const B = nums(b);
-  for (let i = 0; i < Math.max(A.length, B.length); i++) {
-    const x = A[i] ?? 0;
-    const y = B[i] ?? 0;
-    if (x !== y) return x > y ? 1 : -1;
-  }
-  return 0;
-}
-
-/** 各种分屏布局对应几个窗格 */
-function paneCount(layout: "single" | "v2" | "h2" | "v3" | "grid4"): number {
-  switch (layout) {
-    case "v2":
-    case "h2":
-      return 2;
-    case "v3":
-      return 3;
-    case "grid4":
-      return 4;
-    default:
-      return 1;
-  }
-}
-
-const THEMES: { key: string; label: string; kind: "dark" | "light" }[] = [
-  { key: "dark", label: "VS Code 深色", kind: "dark" },
-  { key: "one", label: "One Dark Pro", kind: "dark" },
-  { key: "tokyo", label: "Tokyo Night", kind: "dark" },
-  { key: "nord", label: "Nord 蓝灰", kind: "dark" },
-  { key: "dracula", label: "Dracula", kind: "dark" },
-  { key: "monokai", label: "Monokai", kind: "dark" },
-  { key: "wechat", label: "微信绿", kind: "dark" },
-  { key: "teams", label: "Teams 紫", kind: "dark" },
-  { key: "teal", label: "青瓷（暗）", kind: "dark" },
-  { key: "light", label: "VS Code 浅色", kind: "light" },
-  { key: "github", label: "GitHub 浅色", kind: "light" },
-  { key: "paper", label: "纸白（护眼）", kind: "light" },
-  { key: "sakura", label: "樱花粉", kind: "light" },
-  { key: "mint", label: "薄荷绿", kind: "light" },
-];
-
-function themeKind(key: string): "dark" | "light" {
-  return THEMES.find((t) => t.key === key)?.kind ?? "dark";
-}
-
-const SHELL_LABEL: Record<AppSettings["defaultShell"], string> = {
-  powershell: "PowerShell",
-  cmd: "CMD",
-  wsl: "WSL",
-};
-
-const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
-
-function moduleIcon(kind: ModuleKey, size = 14): JSX.Element {
-  switch (kind) {
-    case "remote":
-      return <IconServer size={size} />;
-    case "cmd":
-      return <IconCmd size={size} />;
-    case "wsl":
-      return <IconWsl size={size} />;
-    case "git":
-      return <IconGit size={size} />;
-    case "serial":
-      return <IconSerial size={size} />;
-    case "adb":
-      return <IconAndroid size={size} />;
-    default:
-      return <IconTerminal size={size} />;
-  }
-}
-
-function extOf(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
-}
-
-function fileKind(name: string): FileKind {
-  const ext = extOf(name);
-  if (ext === "md" || ext === "markdown") return "md";
-  if (ext === "html" || ext === "htm") return "html";
-  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico"].includes(ext)) return "img";
-  if (
-    [
-      "json", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "sh", "bash", "rs", "go",
-      "java", "c", "cc", "cpp", "h", "hpp", "yml", "yaml", "toml", "ini", "conf",
-      "css", "scss", "sql", "xml", "env", "gitignore", "dockerfile",
-    ].includes(ext)
-  ) {
-    return "code";
-  }
-  return "text";
-}
-
-function imgMime(name: string): string {
-  switch (extOf(name)) {
-    case "png":
-      return "image/png";
-    case "jpg":
-    case "jpeg":
-      return "image/jpeg";
-    case "gif":
-      return "image/gif";
-    case "webp":
-      return "image/webp";
-    case "bmp":
-      return "image/bmp";
-    case "svg":
-      return "image/svg+xml";
-    case "ico":
-      return "image/x-icon";
-    default:
-      return "application/octet-stream";
-  }
-}
-
-function decodeB64Text(b64: string): string {
-  try {
-    return new TextDecoder("utf-8", { fatal: false }).decode(b64ToBytes(b64));
-  } catch {
-    return "";
-  }
-}
-
-function humanSize(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function joinPath(dir: string, name: string): string {
-  if (!dir) return `/${name}`;
-  return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
-}
-
-function parentOf(path: string): string {
-  if (!path || path === "/") return "/";
-  const trimmed = path.replace(/\/+$/, "");
-  const i = trimmed.lastIndexOf("/");
-  return i <= 0 ? "/" : trimmed.slice(0, i);
-}
-
-/** herdr 原始状态 → 统一状态词（和后端 `ai_instance::state_of_herdr` 对齐）。 */
-function herdrStateOf(status: string): AiState {
-  switch ((status || "").trim().toLowerCase()) {
-    case "working":
-      return "working";
-    case "blocked":
-      return "needs-you";
-    case "done":
-      return "finished";
-    case "idle":
-      return "idle";
-    default:
-      return "unknown";
-  }
-}
-
-/**
- * 1 秒的**纯 UI 时钟**：只用来重算看板标签，不是探测。
- *
- * 为什么要有：卡片要显示"这个会话最近还有没有输出"，而输出活动（`src/activity.ts`）
- * 是一个内存 Map，`markOutput` 只写时间戳、不触发 React 更新 —— 没有时钟，界面就会
- * 一直停在"上一帧"的推断上。所以这里每秒把 `Date.now()` 放进 state，逼着渲染重算一次。
- *
- * 三条纪律：
- * - **回调里只有 `setNow(Date.now())`**：不 I/O、不发 IPC、不起子进程（也不是定时探测）；
- * - **只在 AI 面板打开时走**：看不见的卡片不需要每秒重算，面板一关就 `clearInterval`，
- *   不给主线程留一个永远在跳的定时器；
- * - 打开那一刻先对齐一次时间：否则会拿"上次关闭时"的旧值去判断"最近 5 秒有没有输出"，
- *   卡片会先闪一下"空闲"，再被 tick 纠正 —— 那是界面在说谎。
- */
-function useUiClock(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active]);
-  return now;
-}
-
-/**
- * 一条"自动事件"归一之后的样子（本机日志信号 / herdr 卡片快照都先转成它）。
- *
- * 为什么先归一：两路事件字段形状不一样（日志给 cwd/turn，herdr 给 server/pane），
- * 但"更新哪张卡、改成什么状态"这件事**只能有一套实现** —— 否则迟早出现
- * "日志那条会把 herdr 的卡改坏"这种互相打架。
- */
-interface AutoCardEvent {
-  /** 来源：日志 = 只读本机 rollout；herdr = 轮询 `herdr agent list` */
-  source: "log" | "herdr";
-  /** 实例标识（跨轮不变）：日志 `local|codex|<cwd>`；herdr `herdr|<服务器>|<窗格>` */
-  key: string;
-  carrier: AiCarrier;
-  agent: AiAgentKind;
-  /** `where` 的第一段：`本机` / 服务器显示名 */
-  env: string;
-  cwd: string;
-  state: AiState;
-  activity: string;
-  atMs: number;
-  /** herdr 专用：窗格号 / 服务器配置 id / 原始状态词 */
-  pane?: string;
-  profileId?: string;
-  status?: string;
-  attention?: boolean;
-  /** 本机 codex 日志带会话 id（点卡片能切过去） */
-  sessionId?: string | null;
-}
-
 export default function App() {
+  return (
+    <AppErrorBoundary>
+      <TestOnlyCrashProbe />
+      <AppBody />
+    </AppErrorBoundary>
+  );
+}
+
+function AppBody() {
   const busRef = useRef(new SessionBus());
   const bus = busRef.current;
 
@@ -1538,25 +217,7 @@ export default function App() {
    * 所有提示都只走底部状态栏（`statusMsg`）。
    * 曾经有过一个中央浮层 toast，用户明确要求"不要在这里悬浮任何消息"——已彻底移除。
    */
-  const [statusMsg, setStatusMsg] = useState<{
-    /** 状态栏上显示的那一行（只看中文短句） */
-    text: string;
-    /** 悬停时看的完整原文（含 `｜原始信息：<英文>`；没有额外原文时等于 text） */
-    detail: string;
-    at: number;
-    /** 这条提示的序号（`notify` 每发一条 +1）：异步补文案时认它，别认毫秒时间戳 */
-    seq: number;
-    kind: "info" | "warn" | "error";
-    /**
-     * 这条提示来自哪台服务器的连接失败。给了就在状态栏上多一个
-     * 「为什么会失败？诊断一下」—— 点开只读诊断，不会再去连服务器。
-     */
-    diagProfileId?: string;
-    /** 那次失败的短句（带进诊断弹窗顶部，省得用户回忆刚才报了什么） */
-    diagFailure?: string;
-    /** 连接失败时算出来的「密码模式」提示：完整一句话，悬停和诊断弹窗里都能看到 */
-    hint?: string;
-  } | null>(null);
+  const [statusMsg, setStatusMsg] = useState<StatusMsg | null>(null);
   /**
    * 状态栏提示的序号计数器。
    *
@@ -1571,23 +232,8 @@ export default function App() {
 
   // 记录「被折叠」的服务器（默认全展开，新加的服务器也是展开的）
   const [collapsedServers, setCollapsedServers] = useState<string[]>([]);
-  const [ctxMenu, setCtxMenu] = useState<{
-    profile: ConnectionProfile;
-    x: number;
-    y: number;
-    /**
-     * 这条菜单是**对着某一条会话记录**（侧栏服务器下面那一行）打开的时候带上它。
-     *
-     * 为什么要区分：服务器那一栏的菜单是"管理这台机器"，而 herdr 的窗格是**会攒的**
-     * （每开一次新会话就多一个），用户需要能"就在这一行上"把它回收掉，而不是先记住
-     * 窗格号再跑去别的地方找。
-     */
-    herdrRow?: HistoryEntry;
-  } | null>(null);
-  const [editDialog, setEditDialog] = useState<{
-    draft: ConnectionProfile;
-    isNew: boolean;
-  } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
+  const [editDialog, setEditDialog] = useState<EditDialogState | null>(null);
 
   const [tmuxTarget, setTmuxTarget] = useState<ConnectionProfile | null>(null);
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([]);
@@ -1595,11 +241,7 @@ export default function App() {
   /** 「管理 herdr 工作区」面板对着的那台服务器（和上面的 tmuxTarget 一个道理） */
   const [herdrTarget, setHerdrTarget] = useState<ConnectionProfile | null>(null);
   /** 那台机器上的工作区 + 每个窗格的前台进程 + 服务状态（三样一起刷） */
-  const [herdrMgr, setHerdrMgr] = useState<{
-    scan: HerdrWorkspaceScan;
-    panes: HerdrPane[];
-    server: HerdrServerStatus;
-  } | null>(null);
+  const [herdrMgr, setHerdrMgr] = useState<HerdrMgrState | null>(null);
   const [herdrMgrLoading, setHerdrMgrLoading] = useState(false);
   /** 正在等"再点一次确认"的工作区号（关掉工作区会连带关掉里面的窗格） */
   const [herdrMgrArmed, setHerdrMgrArmed] = useState<string | null>(null);
@@ -1610,25 +252,7 @@ export default function App() {
   /** 供异步流程读最新历史（自动编号要数"这台机器已有几个普通 shell"） */
   const historyRef = useRef<HistoryEntry[]>(history);
   historyRef.current = history;
-  const [newDialog, setNewDialog] = useState<{
-    profileId: string;
-    useTmux: boolean;
-    tmuxKind: "new" | "attach";
-    tmuxName: string;
-    attachTarget: string;
-    /** 用 herdr 打开这次会话（默认值跟着服务器配置走，勾上就直接进她的环境） */
-    useHerdr: boolean;
-    /** herdr：新开一个窗格，还是接管已有的 */
-    herdrKind: "new" | "attach";
-    /** herdr：要接管的窗格号（形如 w1:p1） */
-    herdrTarget: string;
-    user: string;
-    rememberUser: boolean;
-    /** 会话名字（留空 = 自动命名；普通 shell 会自动编号） */
-    title?: string;
-    /** 这次会话临时选的高亮规则集（空 = 跟随服务器绑定） */
-    highlightSetId?: string | null;
-  } | null>(null);
+  const [newDialog, setNewDialog] = useState<NewSessionDialogState | null>(null);
   const [dialogTmux, setDialogTmux] = useState<TmuxSession[]>([]);
   const [dialogBusy, setDialogBusy] = useState(false);
   /** 「接管已有 herdr 窗格」时列出来的窗格（按需加载；含没有 agent 的空壳窗格） */
@@ -1668,8 +292,12 @@ export default function App() {
    *
    * 它**不是探测**：只把 `Date.now()` 放进 state，让"最近 5 秒还有没有终端输出"
    * 这件事被重新算一遍（见 `useUiClock` 与 `boardActivity.ts`）。
+   *
+   * 面板停用（`AI_PANEL_HIDDEN`）时**连这个 1 秒时钟也不许挂** —— 面板里一个字都不画，
+   * 每秒 setState 纯属白烧主线程（审计要求：停用后前端不为它留任何定时器）。
+   * 只有 fe-smoke 的测试豁免会把它打开。
    */
-  const aiUiNow = useUiClock(aiPanelOpen);
+  const aiUiNow = useUiClock(aiPanelOpen && !AI_PANEL_HIDDEN);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   // AI 任务看板（v2）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片。
   //
@@ -1882,6 +510,101 @@ export default function App() {
    * + 本地临时路径（用完删）+ 缩略图 data URL（只用于"发送前确认粘对了没有"）。
    */
   const [composerFiles, setComposerFiles] = useState<ComposerFile[]>([]);
+  /**
+   * 跨重启的纯文本草稿：
+   * - `persistedDrafts` 是 localStorage 那份的内存镜像（懒加载，首次用到才读盘）；
+   * - `draftSaveTimer` 是 300ms 防抖写盘句柄，卸载时**先落盘再清掉**（见下面的 cleanup）；
+   * - `composerRestoredHint` 是"这份草稿是上次启动留下的"那一行提示（只有恢复时显示）。
+   */
+  const persistedDrafts = useRef<Map<string, StoredComposerDraft> | null>(null);
+  const draftSaveTimer = useRef<number | null>(null);
+  /**
+   * 这个进程里"从 localStorage 恢复出来"的草稿身份键。
+   *
+   * 为什么不能只用一个 boolean：启动恢复是**一条一条**开会话的，activeId 会先经过
+   * S → T → H 再回到 S；切回 S 时内容来自内存里的草稿（不是刚读的 localStorage），
+   * 只看"这次 load 有没有读盘"会把提示弄丢。用集合记着"这份草稿本来就是恢复来的"，
+   * 切回来仍然给提示；发送 / 清空 / 关会话时把键删掉。
+   */
+  const restoredDraftKeys = useRef<Set<string>>(new Set());
+  const [composerRestoredHint, setComposerRestoredHint] = useState(false);
+
+  /** 懒加载持久层（避免每次渲染都读一遍 localStorage） */
+  function persistedDraftStore(): Map<string, StoredComposerDraft> {
+    if (persistedDrafts.current === null) persistedDrafts.current = loadStoredDrafts();
+    return persistedDrafts.current;
+  }
+
+  /** 把某个会话当前的正文记进持久层（只记文本） */
+  function rememberDraftText(id: string, text: string) {
+    const s = sessionsRef.current.find((x) => x.id === id);
+    if (!s) return;
+    const store = persistedDraftStore();
+    const key = composerDraftIdentity(s);
+    if (!text.trim() || draftTextBytes(text) > DRAFT_MAX_BYTES) {
+      store.delete(key);
+      return;
+    }
+    store.set(key, { text, at: Date.now() });
+  }
+
+  /** 立刻写盘（切会话 / 发送 / 关闭会话时用，保证"刚敲完就重启"也不丢） */
+  function flushDraftStore() {
+    if (draftSaveTimer.current !== null) {
+      window.clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = null;
+    }
+    writeStoredDrafts(persistedDraftStore());
+  }
+
+  /** 打字时：先更新内存镜像，再防抖 300ms 写盘 */
+  function scheduleDraftPersist(id: string, text: string) {
+    rememberDraftText(id, text);
+    if (draftSaveTimer.current !== null) window.clearTimeout(draftSaveTimer.current);
+    draftSaveTimer.current = window.setTimeout(() => {
+      draftSaveTimer.current = null;
+      writeStoredDrafts(persistedDraftStore());
+    }, DRAFT_SAVE_DEBOUNCE_MS);
+  }
+
+  /** 发送成功 / 关会话：这个会话的持久草稿也一起删掉 */
+  function forgetPersistedDraft(id: string) {
+    const s = sessionsRef.current.find((x) => x.id === id);
+    if (s) {
+      const key = composerDraftIdentity(s);
+      persistedDraftStore().delete(key);
+      restoredDraftKeys.current.delete(key);
+    }
+    flushDraftStore();
+  }
+
+  /**
+   * 卸载时兜底：
+   * - 草稿防抖计时器还没到点 → **先写盘**再 clearTimeout（否则关窗口前刚敲的字会丢）；
+   * - 其它延迟动作（粘贴卡片 / 字号落盘 / 自动重连）的回调里都会 setState，卸载后跑没有意义。
+   */
+  useEffect(
+    () => () => {
+      if (draftSaveTimer.current !== null) {
+        window.clearTimeout(draftSaveTimer.current);
+        draftSaveTimer.current = null;
+        if (persistedDrafts.current) writeStoredDrafts(persistedDrafts.current);
+      }
+      if (pasteCardTimer.current !== null) {
+        window.clearTimeout(pasteCardTimer.current);
+        pasteCardTimer.current = null;
+      }
+      if (fontSaveTimer.current !== null) {
+        window.clearTimeout(fontSaveTimer.current);
+        fontSaveTimer.current = null;
+      }
+      for (const id of Object.keys(reconnectTimers.current)) {
+        window.clearTimeout(reconnectTimers.current[id]);
+      }
+      reconnectTimers.current = {};
+    },
+    [],
+  );
 
   /**
    * Ctrl+Alt+A：展开 / 收起底部的 AI 输入窗（键盘党的入口）。
@@ -1903,11 +626,7 @@ export default function App() {
    * 一张图比一行日志有用得多。这个设置（pasteToast）现在管的是"在终端区直接粘图片走哪条路"：
    * 不勾 = 放进输入窗（默认，能确认能补话）；勾上 = 插路径进终端 + 弹这张浮层。
    */
-  const [pasteCard, setPasteCard] = useState<{
-    thumb?: string;
-    name: string;
-    remote: string;
-  } | null>(null);
+  const [pasteCard, setPasteCard] = useState<PasteCard | null>(null);
   const pasteCardTimer = useRef<number | null>(null);
   /**
    * 当前会话的 ref：原生拖拽回调只订阅一次，但每次都要发给**当时**那个会话。
@@ -1960,43 +679,19 @@ export default function App() {
   const [adbPath, setAdbPath] = useState("/sdcard");
   const [adbFiles, setAdbFiles] = useState<AdbFile[]>([]);
   const [adbNewName, setAdbNewName] = useState("");
-  const [serialDialog, setSerialDialog] = useState<{
-    isNew: boolean;
-    draft: ConnectionProfile;
-  } | null>(null);
-  const [serialMenu, setSerialMenu] = useState<{
-    profile: ConnectionProfile;
-    x: number;
-    y: number;
-  } | null>(null);
+  const [serialDialog, setSerialDialog] = useState<SerialDialogState | null>(null);
+  const [serialMenu, setSerialMenu] = useState<SerialMenuState | null>(null);
 
   const [fsPath, setFsPath] = useState("");
   const [fsInput, setFsInput] = useState("");
   const [fsEntries, setFsEntries] = useState<RemoteEntry[]>([]);
   const [fsLoading, setFsLoading] = useState(false);
   const [fsBusy, setFsBusy] = useState(false);
-  const [fsMenu, setFsMenu] = useState<{
-    profileId: string;
-    name: string;
-    isDir: boolean;
-    x: number;
-    y: number;
-  } | null>(null);
-  const [nameDialog, setNameDialog] = useState<{
-    mode: "mkdir" | "rename";
-    profileId: string;
-    dir: string;
-    from: string;
-    value: string;
-  } | null>(null);
-  const [confirmDialog, setConfirmDialog] = useState<{
-    title: string;
-    message: string;
-    okLabel?: string;
-    onOk: () => void;
-  } | null>(null);
-  const [tabMenu, setTabMenu] = useState<{ id: string; x: number; y: number } | null>(null);
-  const [sessionRename, setSessionRename] = useState<{ id: string; value: string } | null>(null);
+  const [fsMenu, setFsMenu] = useState<FsMenuState | null>(null);
+  const [nameDialog, setNameDialog] = useState<NameDialogState | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [tabMenu, setTabMenu] = useState<TabMenuState | null>(null);
+  const [sessionRename, setSessionRename] = useState<SessionRenameState | null>(null);
   /** 正在被拖动的标签（用来实现左右拖动排序） */
   const [dragTabId, setDragTabId] = useState<string | null>(null);
   /** 拖动时鼠标的位置（画一个跟着鼠标的"虚影"，VSCode 那样看得见在拖） */
@@ -2062,16 +757,15 @@ export default function App() {
   const [editPassword, setEditPassword] = useState("");
   const [editHasPassword, setEditHasPassword] = useState(false);
   // 文件传输进度（右下角那个小面板）
-  const [transfers, setTransfers] = useState<
-    {
-      id: string;
-      name: string;
-      done: number;
-      total: number;
-      status: "running" | "done" | "failed";
-      message?: string;
-    }[]
-  >([]);
+  const [transfers, setTransfers] = useState<TransferItem[]>([]);
+  /**
+   * 「整批传完再留 3.5 秒」的那些 setTimeout 句柄。
+   *
+   * 为什么要单独存：传输事件可能连着来（多个任务），3500ms 后回调里会 setTransfers。
+   * 组件卸载 / 换页面后这个回调没有意义；以前直接 `window.setTimeout` 没存句柄，
+   * 关窗口时定时器还挂在那儿（审计 L 报的就是这一条）。
+   */
+  const transferClearTimers = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     void refresh();
@@ -3851,10 +2545,14 @@ export default function App() {
     void listen<TransferEvent>("zeeai://transfer", (ev) => {
       const e = ev.payload;
       if (e.kind === "allDone") {
-        // 整批结束后留一会儿再收起来，让用户看得到结果
-        window.setTimeout(() => {
-          setTransfers((cur) => cur.filter((t) => !t.id.startsWith(`${e.task}:`)));
+        // 整批结束后留一会儿再收起来，让用户看得到结果。
+        // 句柄进集合：effect cleanup / 组件卸载时统一 clearTimeout（否则 3.5 秒后
+        // 还会对着已经卸载的树 setTransfers）。
+        const t = window.setTimeout(() => {
+          transferClearTimers.current.delete(t);
+          setTransfers((cur) => cur.filter((x) => !x.id.startsWith(`${e.task}:`)));
         }, 3500);
+        transferClearTimers.current.add(t);
         return;
       }
       const key = `${e.task}:${e.name}`;
@@ -3896,6 +2594,9 @@ export default function App() {
     });
     return () => {
       if (unlisten) unlisten();
+      // 传输面板的 3.5 秒收尾定时器：effect 卸载时全部取消（见 transferClearTimers 的说明）
+      for (const t of transferClearTimers.current) window.clearTimeout(t);
+      transferClearTimers.current.clear();
     };
   }, []);
 
@@ -3903,6 +2604,13 @@ export default function App() {
   // 不设置的话，即使应用里是深色，标题栏还是系统浅色的白条。
   useEffect(() => {
     const kind = themeKind(settings.theme);
+    // 给 ErrorBoundary 的 fallback 留一条线索：App 崩了以后读不到 settings，
+    // 只能靠这次正常渲染时记下的深浅色，错误页才不会和用户选的主题打架。
+    try {
+      localStorage.setItem(UI_THEME_KEY, kind);
+    } catch {
+      /* 存不下就跟随系统 */
+    }
     void getCurrentWindow()
       .setTheme(kind)
       .catch(() => {
@@ -4627,7 +3335,6 @@ export default function App() {
     }
   }
 
-
   // ---------- 给 AI 发文件 / 发消息（粘贴、拖拽、「✍ 发给 AI」输入窗共用这一套） ----------
 
   /** 粘贴文件的落盘名：`paste-20261009-213045-原名`（本地时间，一眼看得出先后，且不撞名） */
@@ -4903,13 +3610,41 @@ export default function App() {
       return;
     }
     composerDrafts.current.set(id, { text: composerText, files: composerFiles });
+    // 切走这一下就把文本落盘（不等 300ms 防抖）——否则"敲完立刻切标签"后马上关窗口会丢字
+    rememberDraftText(id, composerText);
+    flushDraftStore();
   }
 
-  /** 把某个会话的草稿换进编辑框（null = 清空编辑框） */
+  /**
+   * 把某个会话的草稿换进编辑框（null = 清空编辑框）。
+   *
+   * 内存里没有这份草稿（= 刚启动、或者重启后第一次点开这个会话）时，再看一眼
+   * localStorage 里按"会话身份键"存下的纯文本；命中了就给一行「已恢复上次的草稿」。
+   * 附件永远不恢复（远端临时文件 / 本地上传临时文件都已经被清理）。
+   */
   function loadComposerDraft(id: string | null) {
     const d = id ? composerDraftOf(id) : { text: "", files: [] };
-    setComposerText(d.text);
+    const s = id ? sessionsRef.current.find((x) => x.id === id) : undefined;
+    const key = s ? composerDraftIdentity(s) : null;
+    let text = d.text;
+    // 这份草稿之前就是从 localStorage 恢复来的（启动恢复时 activeId 会来回跳，
+    // 切回来时内容已经在内存里了 —— 但仍然要显示"已恢复上次的草稿"）
+    let restored = !!key && restoredDraftKeys.current.has(key);
+    if (id && !text.trim() && key) {
+      const stored = persistedDraftStore().get(key);
+      if (stored && stored.text.trim()) {
+        text = stored.text;
+        restored = true;
+        restoredDraftKeys.current.add(key);
+      }
+    }
+    setComposerText(text);
     setComposerFiles(d.files);
+    setComposerRestoredHint(restored && text.trim().length > 0);
+    if (id && restored) {
+      const cur = composerDraftOf(id);
+      composerDrafts.current.set(id, { ...cur, text });
+    }
     composerViewId.current = id;
   }
 
@@ -4917,10 +3652,14 @@ export default function App() {
   function changeComposerText(value: string) {
     setComposerText(value);
     const id = composerViewId.current;
-    if (id) {
-      const d = composerDraftOf(id);
-      composerDrafts.current.set(id, { ...d, text: value });
-    }
+    if (!id) return;
+    const d = composerDraftOf(id);
+    composerDrafts.current.set(id, { ...d, text: value });
+    // 用户动过这份草稿了：提示收掉，之后切回来也不再标"已恢复"
+    setComposerRestoredHint(false);
+    const s = sessionsRef.current.find((x) => x.id === id);
+    if (s) restoredDraftKeys.current.delete(composerDraftIdentity(s));
+    scheduleDraftPersist(id, value);
   }
 
   /**
@@ -5045,7 +3784,10 @@ export default function App() {
     // 只清**当前会话**这一格：别的会话的草稿原样留着（用户切回去还要接着写）
     setComposerText("");
     setComposerFiles([]);
+    setComposerRestoredHint(false);
     composerDrafts.current.set(session.id, { text: "", files: [] });
+    // 发送成功 = 这份草稿已经用掉了：内存和 localStorage 一起删，重启后不许再冒出来
+    forgetPersistedDraft(session.id);
   }
 
   /**
@@ -5340,8 +4082,13 @@ export default function App() {
     failedSshOpens.current.delete(id);
     // 观察窗的输入通道跟着会话一起收（后端会把那条常驻 ssh 的 stdin 关掉）
     herdrInputs.current.delete(id);
-    // 会话没了，它那格「发给 AI」草稿也一起清（附件 / 正文都不该留着占地方）
+    // 会话没了，它那格「发给 AI」草稿也一起清（附件 / 正文都不该留着占地方，
+    // localStorage 里那份也要删 —— 否则下次重启会重新冒出来）
     composerDrafts.current.delete(id);
+    forgetPersistedDraft(id);
+    // 这个会话还挂着的自动重连也取消：会话已经关了，到点再去连是白费
+    window.clearTimeout(reconnectTimers.current[id]);
+    delete reconnectTimers.current[id];
     setComposerBusyIds((prev) => prev.filter((x) => x !== id));
     // 先记下它在标签栏里的位置，关掉之后要顶上来一个
     const list = sessionsRef.current;
@@ -5420,8 +4167,11 @@ export default function App() {
           /* 已经断开 */
         }
         bus.drop(s.id);
-        // 批量关会话同样清掉各自的「发给 AI」草稿
+        // 批量关会话同样清掉各自的「发给 AI」草稿（含 localStorage 那份）
         composerDrafts.current.delete(s.id);
+        forgetPersistedDraft(s.id);
+        window.clearTimeout(reconnectTimers.current[s.id]);
+        delete reconnectTimers.current[s.id];
       }
       setComposerBusyIds((prev) => {
         const gone = new Set(list.map((s) => s.id));
@@ -7614,93 +6364,15 @@ export default function App() {
         "app theme-" + settings.theme + (themeKind(settings.theme) === "light" ? " light" : "")
       }
     >
-      <div className="titlebar">
-        <div className="menus">
-          {buildMenus().map((menu) => (
-            <div key={menu.key} className="menu">
-              <span
-                className={"menu-label" + (openMenu === menu.key ? " open" : "")}
-                onClick={() => setOpenMenu(openMenu === menu.key ? null : menu.key)}
-              >
-                {menu.label}
-                {menu.key === "help" && updateOffer && <span className="menu-dot" />}
-              </span>
-              {openMenu === menu.key && (
-                <div className="menu-drop">
-                  {menu.items.map((item, i) =>
-                    item.sep ? (
-                      <div key={"sep" + i} className="menu-sep" />
-                    ) : (
-                      <button
-                        key={item.label}
-                        type="button"
-                        className="menu-item"
-                        onClick={() => {
-                          setOpenMenu(null);
-                          item.action?.();
-                        }}
-                      >
-                        {item.label}
-                      </button>
-                    ),
-                  )}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-        <div className="title">
-          ZeeAI Term{activeSession ? " — " + activeSession.title : ""}
-        </div>
-        <div className="win-controls" aria-hidden="true">
-          <span className="wbtn" />
-          <span className="wbtn" />
-          <span className="wbtn" />
-        </div>
-      </div>
+      <TitleBar {...{ buildMenus, openMenu, setOpenMenu, updateOffer, activeSession }} />
 
       <div className="workbench">
-        <nav className="activitybar">
-          {MODULES.map((m) => (
-            <button
-              key={m.key}
-              type="button"
-              className={"act" + (module === m.key ? " active" : "")}
-              title={m.label}
-              onClick={() => activateModule(m.key)}
-            >
-              {m.node}
-            </button>
-          ))}
-          <div className="act-sep" />
-          <div className="act-foot">
-            <button
-              type="button"
-              className={"act" + (aiPanelOpen ? " active" : "")}
-              title="AI 任务看板（需要你 / 运行中 / 最近完成）"
-              onClick={() => setAiPanelOpen((v) => !v)}
-            >
-              <IconSpark size={22} />
-              {/* 有"要你处理/新消息"没看过时显示数字（设置里可关） */}
-              {/* 红点只在两件事上亮（§10.6）：需要你（亮到你处理）、跑完停下（点开就消）。
-                  两条规则各有一个开关，所以这里不能再拿一个"总开关"去盖。 */}
-              {/* 面板停用时红点逻辑照跑、但不渲染给人看（用户：「只看灰容器」；
-                  点开也看不到任何东西，亮个数字只会让人以为有地方可去） */}
-              {!AI_PANEL_HIDDEN && aiBadgeCount > 0 && (
-                <span className="act-badge">{aiBadgeCount > 9 ? "9+" : aiBadgeCount}</span>
-              )}
-            </button>
-            <button
-              type="button"
-              className="act"
-              title="设置"
-              onClick={() => setShowSettings(true)}
-            >
-              <IconGear size={22} />
-              {updateOffer && <span className="act-dot" />}
-            </button>
-          </div>
-        </nav>
+        <ActivityBar
+          {...{
+            module, activateModule, aiPanelOpen, setAiPanelOpen, aiBadgeCount, updateOffer,
+            setShowSettings,
+          }}
+        />
 
       <aside
         className="sidebar"
@@ -7748,649 +6420,30 @@ export default function App() {
 
           <div className="side-body">
             {module === "remote" && sideTab === "sessions" && (
-              <>
-                <div className="side-head-row">
-                  <span className="side-head-title">服务器</span>
-                  <button
-                    type="button"
-                    className="side-btn"
-                    title="新建一台服务器（SSH）"
-                    onClick={() => openEditDialog()}
-                  >
-                    <IconPlus size={12} /> 新建
-                  </button>
-                  <button
-                    type="button"
-                    className="side-btn"
-                    title="服务器管理：编辑 / 复制 / 删除"
-                    onClick={() => setShowServers(true)}
-                  >
-                    服务器管理
-                  </button>
-                </div>
-                {grouped.length === 0 && (
-                  <div className="hint">还没有服务器</div>
-                )}
-                {sshProfiles.length > 0 && (
-                  <button type="button" className="side-allbtn" onClick={() => toggleAllServers()}>
-                    {allServersExpanded ? "▾ 折叠全部会话" : "▸ 展开全部会话"}
-                  </button>
-                )}
-                {grouped.map(([group, list]) => (
-                  <div key={group}>
-                    {showGroupHeaders && (
-                      <div className="tree-subgroup">
-                        {group === DEFAULT_SERVER_GROUP ? "未分组" : group}
-                      </div>
-                    )}
-                    {list.map((p) => {
-                      const items = history.filter((h) => h.profileId === p.id);
-                      const expanded = !collapsedServers.includes(p.id);
-                      return (
-                        <div key={p.id}>
-                          <div
-                            className="tree-item srv-node"
-                            onClick={() => toggleServer(p.id)}
-                            onDoubleClick={() => openEditDialog(p)}
-                            onContextMenu={(e) => {
-                              e.preventDefault();
-                              setCtxMenu({ profile: p, x: e.clientX, y: e.clientY });
-                            }}
-                            title={`${p.ssh?.user}@${p.ssh?.host}:${p.ssh?.port}\n单击：展开/收起会话历史　双击或右键：服务器设置`}
-                          >
-                            <span
-                              className="chev"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                toggleServer(p.id);
-                              }}
-                            >
-                              {expanded ? (
-                                <IconChevronDown size={12} />
-                              ) : (
-                                <IconChevronRight size={12} />
-                              )}
-                            </span>
-                            <IconServer size={15} />
-                            {p.color && (
-                              <span className="color-dot" style={{ background: p.color }} />
-                            )}
-                            <span className="grow ellipsis">{p.name}</span>
-                            {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
-                            {items.length > 0 && (
-                              <span className="dim count">{items.length}</span>
-                            )}
-                            <button
-                              type="button"
-                              className="mini-x"
-                              title="服务器管理（编辑 / 复制 / 删除）"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                const r = (e.target as HTMLElement).getBoundingClientRect();
-                                setCtxMenu({ profile: p, x: r.left - 170, y: r.bottom + 4 });
-                              }}
-                            >
-                              ⋯
-                            </button>
-                          </div>
-                          {expanded &&
-                            items.map((h) => {
-                              // tmux 会话能精确判断"是不是已经在标签里开着"
-                              // 已打开的判定：tmux 按 tmux 会话名比；普通 shell 按"这台机器 + 没有 tmux 名"比
-                              // 普通 shell 还必须**比名字** —— 否则同一台机器上随便开一个普通 shell，
-                              // 它所有普通 shell 的历史行都会显示"已打开"（实测就是这个 bug）
-                              // herdr：按**窗格号**比（和上面两个都不是一回事；
-                              // 以前漏了这一支，于是 herdr 行会拿标题去比普通 shell，判得一塌糊涂）
-                              const opened = sessions.find((s) =>
-                                h.herdrPane
-                                  ? s.profileId === h.profileId && s.herdrPane === h.herdrPane
-                                  : h.tmuxSession
-                                  ? s.profileId === h.profileId && s.tmuxName === h.tmuxSession
-                                  : s.profileId === h.profileId &&
-                                    !s.tmuxName &&
-                                    (s.title ?? "").trim() === (h.title ?? "").trim(),
-                              );
-                              const rawTitle = h.title?.trim() || "";
-                              const rowLabel = h.herdrPane
-                                ? // herdr 行：去掉"服务器名 · "前缀（服务器就在上一级树里），
-                                  // 窗格号由左边的 H 标和悬停提示给出，行里不用再挤一遍
-                                  // 再把老版本拼重复的窗格号收掉（那时候正则漏了带字母的工作区号，
-                                  // 标题会变成 "… w1P:p1 w1P:p1"）
-                                  dedupPaneId(rawTitle.replace(/^[^·]*·\s*/, ""), h.herdrPane) ||
-                                  h.herdrPane
-                                : rawTitle ||
-                                  h.tmuxSession ||
-                                  `${h.profileName || "服务器"} · 普通 shell`;
-                              return (
-                                <div
-                                  key={h.id}
-                                  className={"tree-item child" + (opened ? " opened" : "")}
-                                  onClick={() => void connectFromHistory(h)}
-                                  onContextMenu={(e) => {
-                                    // herdr 的行才给菜单：它对着的是"服务器上那个工作区"，
-                                    // 能就地决定留着还是回收（别的行没有服务器侧的东西要管）。
-                                    if (!h.herdrPane) return;
-                                    e.preventDefault();
-                                    setHerdrRowArmed(null);
-                                    setCtxMenu({ profile: p, x: e.clientX, y: e.clientY, herdrRow: h });
-                                  }}
-                                  title={
-                                    (h.herdrPane
-                                      ? `herdr 窗格 ${h.herdrPane}`
-                                      : h.tmuxSession ?? "普通 shell") +
-                                    `　${relTime(h.lastUsed)}` +
-                                    (opened ? "\n已经开着了 —— 点一下切到那个标签" : "") +
-                                    (h.herdrPane
-                                      ? "\n右键：只移除记录 / 在服务器上关掉这个工作区"
-                                      : "")
-                                  }
-                                >
-                                  <span
-                                    className={"open-dot" + (opened ? " on" : "")}
-                                    title={opened ? "已打开" : "未打开"}
-                                  />
-                                  {/* 最前面标一下是不是 tmux 会话（用户要的"小 T 字图标"） */}
-                                  {h.tmuxSession && (
-                                    <span className="tmux-mark" title="tmux 会话（服务器上会一直活着）">
-                                      T
-                                    </span>
-                                  )}
-                                  {/* herdr 会话用一个小 H 标出来 —— 和上面那个 T 一个道理，
-                                      侧栏一眼就能看出这条是 herdr 管的窗格 */}
-                                  {h.herdrPane && (
-                                    <span
-                                      className="herdr-mark"
-                                      title={`herdr 窗格（服务器上的工作区/窗格：${h.herdrPane}）`}
-                                    >
-                                      H
-                                    </span>
-                                  )}
-                                  <IconTerminal size={13} />
-                                  <span className="grow ellipsis" title={rowLabel}>
-                                    {rowLabel}
-                                  </span>
-                                  {opened && <span className="tag">已打开</span>}
-                                  <button
-                                    type="button"
-                                    className="mini-x"
-                                    title="从历史中移除"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      void removeHistoryEntry(h.id);
-                                    }}
-                                  >
-                                    ×
-                                  </button>
-                                </div>
-                              );
-                            })}
-                          {expanded && items.length === 0 && (
-                            <div className="tree-item child hint child-empty">
-                              还没有会话历史。双击服务器可以新建/编辑连接。
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))}
-
-                <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn primary"
-                    onClick={() => openNewSessionDialog()}
-                  >
-                    <IconPlus size={14} /> 新建会话
-                  </button>
-                </div>
-
-                {showForm && (
-                  <div className="form">
-                    <label>
-                      名称
-                      <input
-                        value={form.name}
-                        placeholder="只是标签，不参与连接"
-                        onChange={(e) => setForm({ ...form, name: e.target.value })}
-                      />
-                    </label>
-                    <label>
-                      主机
-                      <input
-                        value={form.host}
-                        placeholder="IP 或 ~/.ssh/config 里的别名（填别名才能带上 config 里的密钥/端口/用户）"
-                        onChange={(e) => setForm({ ...form, host: e.target.value })}
-                      />
-                    </label>
-                    <div className="row">
-                      <label className="grow">
-                        端口
-                        <input
-                          type="number"
-                          min={0}
-                          value={form.port}
-                          // 留空送 0（= "没说"）：后端不传 -p，交给 config。
-                          // 这里存字符串就是为了"能空着"；`Number("")` 是 0，不会变成 NaN。
-                          placeholder="留空则用 ~/.ssh/config 里的值（默认 22）"
-                          onChange={(e) => setForm({ ...form, port: e.target.value })}
-                        />
-                      </label>
-                      <label className="grow">
-                        用户
-                        <input
-                          value={form.user}
-                          placeholder="留空则用 ~/.ssh/config 里的值（默认当前用户名）"
-                          onChange={(e) => setForm({ ...form, user: e.target.value })}
-                        />
-                      </label>
-                    </div>
-                    <label>
-                      分组
-                      <input
-                        value={form.group}
-                        onChange={(e) => setForm({ ...form, group: e.target.value })}
-                      />
-                    </label>
-                    <label>
-                      私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
-                      <input
-                        value={form.keyPath}
-                        placeholder="C:\Users\me\.ssh\id_ed25519"
-                        onChange={(e) => setForm({ ...form, keyPath: e.target.value })}
-                      />
-                    </label>
-                    <button type="button" className="btn primary" onClick={() => void submitProfile()}>
-                      保存
-                    </button>
-                  </div>
-                )}
-
-                {grouped.length === 0 && !showForm && (
-                  <div className="hint">还没有连接</div>
-                )}
-
-                {tmuxTarget && (
-                  <div className="tmux-panel">
-                    <div className="tmux-head">
-                      <span>tmux · {tmuxTarget.name}</span>
-                      <span className="tmux-actions">
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void refreshTmux(tmuxTarget)}
-                        >
-                          刷新
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => setTmuxTarget(null)}
-                        >
-                          关闭
-                        </button>
-                      </span>
-                    </div>
-                    {tmuxLoading && <div className="hint">正在读取…</div>}
-                    {!tmuxLoading && tmuxSessions.length === 0 && (
-                      <div className="hint">没有 tmux 会话</div>
-                    )}
-                    {tmuxSessions.map((s) => (
-                      <div key={s.name} className="tmux-row">
-                        <IconTerminal size={14} />
-                        <span className="grow">{s.name}</span>
-                        <span className="dim">{s.windows} 窗口</span>
-                        {s.attached && <span className="tag">已连接</span>}
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void openSshSession(tmuxTarget, "name", s.name)}
-                        >
-                          连接
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void killTmux(tmuxTarget, s.name)}
-                        >
-                          结束
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* ---------- 管理 herdr 工作区（服务器右键打开） ----------
-                    herdr 的工作区天生持久，关标签页不会回收 —— 所以必须有一个"就在服务器上
-                    看一遍、决定留哪个"的地方。 */}
-                {herdrTarget && (
-                  <div className="tmux-panel herdr-panel">
-                    <div className="tmux-head">
-                      <span>herdr · {herdrTarget.name}</span>
-                      <span className="tmux-actions">
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => void refreshHerdrMgr(herdrTarget)}
-                        >
-                          刷新
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => {
-                            setHerdrTarget(null);
-                            setHerdrMgr(null);
-                            setHerdrMgrArmed(null);
-                          }}
-                        >
-                          关闭
-                        </button>
-                      </span>
-                    </div>
-                    {herdrMgrLoading && <div className="hint">正在读取…</div>}
-                    {!herdrMgrLoading && !herdrMgr && (
-                      <div className="hint">读不到 herdr 状态（这台机器可能没装，或没连上）</div>
-                    )}
-                    {!herdrMgrLoading && herdrMgr && (
-                      <>
-                        <div className="herdr-svc-row">
-                          <span className="grow">
-                            {herdrMgr.server.running
-                              ? `服务运行中 · ${herdrMgr.scan.panes.length} 个窗格`
-                              : "服务没在跑"}
-                          </span>
-                          {herdrMgr.server.running ? (
-                            herdrStopArmed ? (
-                              <>
-                                <button
-                                  type="button"
-                                  className="mini-btn danger"
-                                  title="停止 herdr 服务 —— 它管着的所有窗格都会关掉"
-                                  onClick={() =>
-                                    void stopHerdrServer(
-                                      herdrTarget.id,
-                                      herdrTarget.ssh?.user ?? null,
-                                    )
-                                  }
-                                >
-                                  确认停止
-                                </button>
-                                <button
-                                  type="button"
-                                  className="mini-btn"
-                                  onClick={() => setHerdrStopArmed(false)}
-                                >
-                                  取消
-                                </button>
-                              </>
-                            ) : (
-                              <button
-                                type="button"
-                                className="mini-btn"
-                                onClick={() => setHerdrStopArmed(true)}
-                              >
-                                停止服务…
-                              </button>
-                            )
-                          ) : (
-                            <button
-                              type="button"
-                              className="mini-btn"
-                              onClick={() =>
-                                void startHerdrServer(
-                                  herdrTarget.id,
-                                  herdrTarget.ssh?.user ?? null,
-                                )
-                              }
-                            >
-                              启动服务
-                            </button>
-                          )}
-                        </div>
-                        {herdrMgr.scan.workspaces.length === 0 && (
-                          <div className="hint">服务器上没有 herdr 工作区</div>
-                        )}
-                        {herdrTarget &&
-                          herdrMgrRows(herdrTarget, herdrMgr).map((w) => (
-                            <div key={w.ws} className="tmux-row herdr-ws-row">
-                              <span className="herdr-mark">H</span>
-                              <span className="grow ellipsis" title={w.detail}>
-                                {w.ws}
-                                <span className="dim"> · {w.summary}</span>
-                              </span>
-                              {w.inUse && <span className="tag">在用</span>}
-                              {w.idle && <span className="tag">空壳</span>}
-                              <button
-                                type="button"
-                                className="mini-btn"
-                                title={`以可写方式接管 ${w.pane}`}
-                                onClick={() =>
-                                  void openHerdrPane(
-                                    herdrTarget.id,
-                                    w.pane,
-                                    w.label,
-                                    herdrTarget.ssh?.user ?? null,
-                                    "control",
-                                  )
-                                }
-                              >
-                                接管
-                              </button>
-                              <button
-                                type="button"
-                                className="mini-btn"
-                                title={`只读观察 ${w.pane}`}
-                                onClick={() =>
-                                  void openHerdrPane(
-                                    herdrTarget.id,
-                                    w.pane,
-                                    w.label,
-                                    herdrTarget.ssh?.user ?? null,
-                                    "observe",
-                                  )
-                                }
-                              >
-                                观察
-                              </button>
-                              {herdrMgrArmed === w.ws ? (
-                                <>
-                                  <button
-                                    type="button"
-                                    className="mini-btn danger"
-                                    title={`真的关掉 ${w.ws}（含里面的窗格）`}
-                                    onClick={() => void closeHerdrWorkspace(herdrTarget, w.ws)}
-                                  >
-                                    确认关掉 {w.ws}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="mini-btn"
-                                    onClick={() => setHerdrMgrArmed(null)}
-                                  >
-                                    取消
-                                  </button>
-                                </>
-                              ) : (
-                                <button
-                                  type="button"
-                                  className="mini-btn"
-                                  title={`关掉工作区 ${w.ws}（里面的窗格也会一起没）`}
-                                  onClick={() => setHerdrMgrArmed(w.ws)}
-                                >
-                                  关掉
-                                </button>
-                              )}
-                            </div>
-                          ))}
-                        {herdrTarget && herdrMgrIdleCount(herdrTarget, herdrMgr) > 0 && (
-                          <div className="herdr-svc-row">
-                            <span className="grow hint">
-                              其中 {herdrMgrIdleCount(herdrTarget, herdrMgr)} 个是空壳（只停着
-                              shell，且不在任何已打开/历史会话里）
-                            </span>
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                )}
-
-              </>
+              <SidebarSessions
+                {...{
+                  sessions, sshProfiles, history, grouped, showGroupHeaders, collapsedServers,
+                  toggleServer, allServersExpanded, toggleAllServers, showForm, form, setForm,
+                  submitProfile, setShowServers, openEditDialog, openNewSessionDialog,
+                  openSshSession, connectFromHistory, removeHistoryEntry, setCtxMenu, relTime,
+                  tmuxTarget, setTmuxTarget, tmuxSessions, tmuxLoading, refreshTmux, killTmux,
+                  herdrTarget, setHerdrTarget, herdrMgr, setHerdrMgr, herdrMgrLoading,
+                  refreshHerdrMgr, herdrMgrRows, herdrMgrIdleCount, herdrMgrArmed,
+                  setHerdrMgrArmed, setHerdrRowArmed, closeHerdrWorkspace,
+                  herdrStopArmed, setHerdrStopArmed, startHerdrServer, stopHerdrServer,
+                  openHerdrPane,
+                }}
+              />
             )}
 
             {module === "remote" && sideTab === "files" && (
-              <>
-                {!fileProfile && (
-                  <div className="hint">先打开一个 SSH 会话</div>
-                )}
-                {fileProfile && (
-                  <>
-                    <div className="fs-toolbar">
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => void loadDir(fileProfile.id, parentOf(fsPath))}
-                      >
-                        ↑ 上级
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        title="重新读取当前目录"
-                        onClick={() => void loadDir(fileProfile.id, fsPath)}
-                      >
-                        刷新
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        title="跳到终端当前所在目录（你在终端里 cd 到哪儿就同步到哪儿）"
-                        onClick={() =>
-                          void syncFsToTerminal(
-                            fileProfile.id,
-                            activeTmuxName,
-                            activeSession?.cwd,
-                          )
-                        }
-                      >
-                        ⤓ 同步终端目录
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => void loadDir(fileProfile.id, undefined)}
-                      >
-                        家目录
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        disabled={fsBusy}
-                        title="把本机文件上传到当前目录"
-                        onClick={() => void uploadToRemote(fileProfile.id)}
-                      >
-                        上传
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        disabled={fsBusy}
-                        title="在当前目录新建文件夹"
-                        onClick={() =>
-                          setNameDialog({
-                            mode: "mkdir",
-                            profileId: fileProfile.id,
-                            dir: fsPath,
-                            from: "",
-                            value: "新建文件夹",
-                          })
-                        }
-                      >
-                        新建文件夹
-                      </button>
-                      <button
-                        type="button"
-                        className={"mini-btn" + (settings.fsFollowTerminal ? " active" : "")}
-                        title={
-                          settings.fsFollowTerminal
-                            ? "已开启：刷新会跳到终端（tmux）当前所在目录"
-                            : "已关闭：刷新只重读当前目录"
-                        }
-                        onClick={() =>
-                          void updateSettings({ fsFollowTerminal: !settings.fsFollowTerminal })
-                        }
-                      >
-                        {settings.fsFollowTerminal ? "✓ 跟随终端" : "跟随终端"}
-                      </button>
-                    </div>
-                    <input
-                      className="fs-path-input"
-                      value={fsInput}
-                      spellCheck={false}
-                      placeholder="/path/to/dir  回车跳转"
-                      onChange={(e) => setFsInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          void loadDir(fileProfile.id, fsInput.trim() || undefined);
-                        }
-                      }}
-                    />
-                    <div className="fs-list">
-                      {fsEntries.map((en) => (
-                        <div
-                          key={en.name}
-                          className="fs-row"
-                          onClick={() =>
-                            en.isDir
-                              ? void loadDir(fileProfile.id, joinPath(fsPath, en.name))
-                              : void openRemoteFile(fileProfile.id, en.name)
-                          }
-                          onContextMenu={(e) => {
-                            e.preventDefault();
-                            setFsMenu({
-                              profileId: fileProfile.id,
-                              name: en.name,
-                              isDir: en.isDir,
-                              x: e.clientX,
-                              y: e.clientY,
-                            });
-                          }}
-                          title={
-                            (en.isDir ? "进入目录" : "预览文件") +
-                            "　（右键：下载 / 重命名 / 删除）"
-                          }
-                        >
-                          {en.isDir ? <IconFolder size={15} /> : <IconFile size={15} />}
-                          <span className="grow">{en.name}</span>
-                          <span className="dim">{en.isDir ? "" : humanSize(en.size)}</span>
-                          <button
-                            type="button"
-                            className="mini-x"
-                            title="下载 / 重命名 / 删除"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const r = (e.target as HTMLElement).getBoundingClientRect();
-                              setFsMenu({
-                                profileId: fileProfile.id,
-                                name: en.name,
-                                isDir: en.isDir,
-                                x: r.left - 150,
-                                y: r.bottom + 4,
-                              });
-                            }}
-                          >
-                            ⋯
-                          </button>
-                        </div>
-                      ))}
-                      {!fsLoading && fsEntries.length === 0 && (
-                        <div className="hint">空目录</div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </>
+              <SidebarFiles
+                {...{
+                  activeSession, activeTmuxName, fileProfile, settings, updateSettings,
+                  fsPath, fsInput, setFsInput, fsEntries, fsLoading, fsBusy, loadDir,
+                  syncFsToTerminal, uploadToRemote, openRemoteFile, setFsMenu, setNameDialog,
+                }}
+              />
             )}
 
             {module === "powershell" && (
@@ -8431,677 +6484,64 @@ export default function App() {
               />
             )}
             {module === "git" && (
-              <>
-                <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn primary"
-                    title="选一个本地仓库目录，直接在这个目录开一个本地终端（PowerShell / CMD / WSL 按设置来）"
-                    onClick={() => void openGitWorkspace()}
-                  >
-                    <IconPlus size={14} /> 打开本地仓库
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    title="在一个目录里执行 git init，建好后直接打开终端"
-                    onClick={() => setGitInitDialog({ path: "" })}
-                  >
-                    新建仓库
-                  </button>
-                </div>
-                <div className="tree-group">Git 工作空间</div>
-                {gitWorkspaces.length === 0 && (
-                  <div className="hint">还没有工作空间</div>
-                )}
-                {gitWorkspaces.map((p) => (
-                  <div
-                    key={p.id}
-                    className="tree-item"
-                    title={`${p.local?.cwd}（点击查看改动，右侧按钮开终端）`}
-                    onClick={() => {
-                      const dir = p.local?.cwd ?? "";
-                      setGitPath(dir);
-                      void refreshGitAll(dir);
-                    }}
-                  >
-                    <IconGit size={14} />
-                    <span className="grow ellipsis">{p.name}</span>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="在这个目录再开一个新的本地终端（可以开任意多个）"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const dir = p.local?.cwd ?? "";
-                        void openLocalSession(
-                          p.local?.shell ?? settings.defaultShell,
-                          p.local?.distro,
-                          dir,
-                          `${p.name}`,
-                        );
-                      }}
-                    >
-                      新终端
-                    </button>
-                    <button
-                      type="button"
-                      className="mini-x"
-                      title="从工作空间里移除"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void removeGitWorkspace(p);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-
-                <div className="tree-group">快速查看某个仓库</div>
-                <label className="modal-field" style={{ paddingTop: 4 }}>
-                  仓库路径
-                  <input
-                    value={gitPath}
-                    placeholder="D:\AI\ZeeAI_term"
-                    onChange={(e) => setGitPath(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void refreshGitAll();
-                    }}
-                  />
-                </label>
-                <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={gitBusy}
-                    onClick={() => void refreshGitAll()}
-                  >
-                    {gitBusy ? "读取中…" : "刷新"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    title="在当前仓库目录打开一个新的本地终端"
-                    onClick={() => void openGitTerminal(gitPath, undefined)}
-                  >
-                    开终端
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={!gitState?.ok}
-                    onClick={() => {
-                      setShowBranches((v) => !v);
-                      if (!gitBranchList.length && gitState?.ok) void refreshGitAll();
-                    }}
-                  >
-                    分支 {gitState?.branch ? `(${gitState.branch})` : ""}
-                  </button>
-                </div>
-                {gitLoading && <div className="hint">正在读取…</div>}
-                {!gitLoading && gitState && !gitState.ok && (
-                  <div className="hint">{gitState.message}</div>
-                )}
-                {!gitLoading && gitState?.ok && (
-                  <>
-                    {/* 分支列表 */}
-                    {showBranches && (
-                      <div className="git-branches">
-                        {gitBranchList.map((b) => (
-                          <div
-                            key={b.name}
-                            className={"tree-item" + (b.current ? " current" : "")}
-                            title={`${b.name}${b.upstream ? ` → ${b.upstream}` : ""}　${b.when}`}
-                            onClick={() => {
-                              if (!b.current) void doGitCheckout(b.name);
-                            }}
-                          >
-                            <IconGit size={13} />
-                            <span className="grow ellipsis">{b.name}</span>
-                            {b.current && <span className="tag">当前</span>}
-                            <span className="dim">{b.when}</span>
-                          </div>
-                        ))}
-                        <div className="git-newbranch">
-                          <input
-                            value={newBranch}
-                            placeholder="新分支名"
-                            onChange={(e) => setNewBranch(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && newBranch.trim())
-                                void doGitCheckout(newBranch, true);
-                            }}
-                          />
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            disabled={!newBranch.trim()}
-                            onClick={() => void doGitCheckout(newBranch, true)}
-                          >
-                            新建并切换
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="git-commit-box">
-                      <textarea
-                        className="git-commit-msg"
-                        rows={2}
-                        placeholder="提交信息（Ctrl+Enter 提交）"
-                        value={gitMessage}
-                        onChange={(e) => setGitMessage(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-                            e.preventDefault();
-                            void doGitCommit();
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="btn primary git-commit-btn"
-                        disabled={gitBusy || !gitMessage.trim()}
-                        onClick={() => void doGitCommit()}
-                      >
-                        提交
-                      </button>
-                    </div>
-
-                    {/* 已暂存 */}
-                    {stagedFiles.length > 0 && (
-                      <>
-                        <div className="tree-group">
-                          已暂存（{stagedFiles.length}）
-                          <button
-                            type="button"
-                            className="mini-x"
-                            style={{ marginLeft: "auto", opacity: 1 }}
-                            title="全部取消暂存"
-                            onClick={() => void doGitUnstage(stagedFiles.map((f) => f.path))}
-                          >
-                            −
-                          </button>
-                        </div>
-                        {stagedFiles.map((f) => (
-                          <div
-                            key={"s" + f.path}
-                            className="tree-item git-file"
-                            title={`${f.path}（点击看 diff）`}
-                            onClick={() => void showFileDiff(f.path, true)}
-                          >
-                            <span className="git-st staged">{f.st}</span>
-                            <span className="grow ellipsis">{f.path}</span>
-                            <button
-                              type="button"
-                              className="mini-x"
-                              title="取消暂存"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void doGitUnstage([f.path]);
-                              }}
-                            >
-                              −
-                            </button>
-                          </div>
-                        ))}
-                      </>
-                    )}
-
-                    {/* 更改 */}
-                    <div className="tree-group">
-                      更改（{changedFiles.length}）
-                      <button
-                        type="button"
-                        className="mini-x"
-                        style={{ marginLeft: "auto", opacity: 1 }}
-                        title="全部暂存"
-                        onClick={() => void doGitAdd()}
-                      >
-                        ＋
-                      </button>
-                    </div>
-                    {changedFiles.length === 0 && (
-                      <div className="hint">没有未暂存的改动。</div>
-                    )}
-                    {changedFiles.map((f) => (
-                      <div
-                        key={"c" + f.path}
-                        className="tree-item git-file"
-                        title={`${f.path}（点击看 diff）`}
-                        onClick={() => void showFileDiff(f.path, false)}
-                      >
-                        <span className="git-st">{f.st}</span>
-                        <span className="grow ellipsis">{f.path}</span>
-                        <button
-                          type="button"
-                          className="mini-x"
-                          title="暂存这个文件"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void doGitAdd([f.path]);
-                          }}
-                        >
-                          ＋
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-x"
-                          title="丢弃改动（不可撤销）"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            askGitDiscard([f.path]);
-                          }}
-                        >
-                          ↺
-                        </button>
-                      </div>
-                    ))}
-
-                    <div className="hint">
-                      分支 {gitState.branch || "(未知)"}
-                      {gitState.upstream ? ` → ${gitState.upstream}` : ""}
-                      {gitState.ahead > 0 ? ` · 领先 ${gitState.ahead}` : ""}
-                      {gitState.behind > 0 ? ` · 落后 ${gitState.behind}` : ""}
-                    </div>
-
-                    {/* 历史 */}
-                    <div className="tree-group">提交历史（{gitCommits.length}）</div>
-                    {gitCommits.length === 0 && <div className="hint">还没有提交。</div>}
-                    {gitCommits.map((cm) => (
-                      <div
-                        key={cm.hash}
-                        className="tree-item git-commit"
-                        title={`${cm.hash}\n${cm.author} · ${cm.when}\n点击查看这次提交的 diff`}
-                        onClick={() => void showCommitDiff(cm.hash, cm.subject)}
-                      >
-                        <span className="git-hash">{cm.short}</span>
-                        <span className="grow ellipsis">{cm.subject}</span>
-                        <span className="dim">{cm.when}</span>
-                      </div>
-                    ))}
-                  </>
-                )}
-                {!gitLoading && !gitState && (
-                  <div className="hint">填一个本地仓库路径</div>
-                )}
-              </>
+              <SidebarGit
+                {...{
+                  settings, gitWorkspaces, gitPath, setGitPath, gitState, gitLoading, gitBusy,
+                  gitMessage, setGitMessage, gitCommits, gitBranchList, showBranches,
+                  setShowBranches, newBranch, setNewBranch, changedFiles, stagedFiles,
+                  refreshGitAll, openGitWorkspace, removeGitWorkspace, openGitTerminal,
+                  openLocalSession, setGitInitDialog, doGitAdd, doGitUnstage, askGitDiscard,
+                  doGitCommit, doGitCheckout, showFileDiff, showCommitDiff,
+                }}
+              />
             )}
             {module === "serial" && (
-              <>
-                <div className="side-actions">
-                  <button
-                    type="button"
-                    className="btn primary"
-                    onClick={() => openSerialDialog()}
-                  >
-                    <IconPlus size={14} /> 新建串口连接
-                  </button>
-                </div>
-                {serialLoading && <div className="hint">正在检测串口…</div>}
-                {!serialLoading && serialProfiles.length === 0 && (
-                  <div className="hint">还没有串口连接</div>
-                )}
-                {serialProfiles.map((p) => {
-                  const cfg = p.serial;
-                  const alive = serialPorts.some((x) => x.path === cfg?.path);
-                  return (
-                    <div
-                      key={p.id}
-                      className="tree-item"
-                      onClick={() => void openSerialSession(p)}
-                      title={`${cfg?.path} · ${cfg?.baudRate} 波特率（点击打开）`}
-                    >
-                      <IconSerial size={15} />
-                      <span className="grow ellipsis">{p.name}</span>
-                      <span className="dim">{cfg?.baudRate}</span>
-                      {!alive && <span className="tag warn">未接入</span>}
-                      <button
-                        type="button"
-                        className="mini-x"
-                        title="编辑 / 复制 / 删除"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const r = (e.target as HTMLElement).getBoundingClientRect();
-                          setSerialMenu({ profile: p, x: r.left - 170, y: r.bottom + 4 });
-                        }}
-                      >
-                        ⋯
-                      </button>
-                    </div>
-                  );
-                })}
-              </>
+              <SidebarSerial
+                {...{
+                  serialProfiles, serialPorts, serialLoading, openSerialDialog,
+                  openSerialSession, setSerialMenu,
+                }}
+              />
             )}
             {module === "adb" && (
-              <>
-                <div className="side-actions">
-                  <button type="button" className="btn" onClick={() => void refreshAdb()}>
-                    <IconPlus size={14} /> 刷新设备
-                  </button>
-                </div>
-                <div className="hint">
-                  {adbVer
-                    ? "adb 已就绪"
-                    : adbLoading
-                      ? "正在检测 adb…"
-                      : "未检测到 adb"}
-                </div>
-                {!adbLoading && adbList.length === 0 && adbVer !== "" && (
-                  <div className="hint">没有已连接的设备</div>
-                )}
-                {adbList.map((d) => (
-                  <div
-                    key={d.serial}
-                    className="tree-item"
-                    onClick={() => void openAdbSession(d.serial)}
-                    title={`${d.serial} · ${d.state} — 点击打开 adb shell`}
-                  >
-                    <IconAndroid size={15} />
-                    <span className="grow">{d.model || d.serial}</span>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="打开设备文件管理（浏览 / 推送 / 拉取）"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setAdbSerial(d.serial);
-                        void refreshAdbFiles(d.serial, "/sdcard");
-                      }}
-                    >
-                      文件
-                    </button>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="打开 logcat（实时日志）"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void openAdbSession(d.serial, "logcat");
-                      }}
-                    >
-                      logcat
-                    </button>
-                    <span className={d.state === "device" ? "dot ok" : "dot off"} />
-                  </div>
-                ))}
-                {/* 只读探测：这里**只能看**（fastboot devices / --version），
-                    刷机、重启到 bootloader 这些命令都还没有 —— 所以标题写清楚，
-                    别让用户以为点了能刷（README 里同步说明）。 */}
-                <div className="tree-group">Fastboot 设备（bootloader 模式 · 只读探测）</div>
-                <div className="hint">
-                  {fbVer ? "fastboot 已就绪" : "未检测到 fastboot"}
-                </div>
-                {fbList.length === 0 && (
-                  <div className="hint">没有 fastboot 设备</div>
-                )}
-                {fbList.map((d) => (
-                  <div key={d.serial} className="tree-item" title={`${d.serial} · ${d.state}`}>
-                    <IconAndroid size={15} />
-                    <span className="grow ellipsis">{d.serial}</span>
-                    <span className="tag">fastboot</span>
-                  </div>
-                ))}
-              </>
+              <SidebarAdb
+                {...{
+                  adbList, adbVer, adbLoading, fbList, fbVer, refreshAdb, openAdbSession,
+                  setAdbSerial, refreshAdbFiles,
+                }}
+              />
             )}
           </div>
 
           {/* tmux 快捷操作：只在当前会话是 tmux 会话时出现，钉在侧栏底部 */}
           {module === "remote" && curTmuxSession !== "" && (
-            <div className="tmux-dock">
-              <button
-                type="button"
-                className="tmux-head"
-                title="不想记 Ctrl+B 的话，点这里的按钮就行（Ctrl+B 本身照旧可用）"
-                onClick={() => setTmuxDockOpen((v) => !v)}
-              >
-                {tmuxDockOpen ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
-                <span className="grow">tmux 快捷操作</span>
-                <span className="tag">{curTmuxSession}</span>
-              </button>
-
-              {tmuxDockOpen && (
-                <div className="tmux-body">
-                  <div className="tmux-grid">
-                    {TMUX_ACTIONS.map((a) => (
-                      <button
-                        key={a.key}
-                        type="button"
-                        className="mini-btn tmux-btn"
-                        title={a.title}
-                        disabled={tmuxBusy}
-                        onClick={() => {
-                          if (a.key === "rename-window") {
-                            const cur = tmuxWinList.find((w) => w.active);
-                            setTmuxRename(cur?.name ?? "");
-                            return;
-                          }
-                          void runTmuxAction(a.key);
-                        }}
-                      >
-                        {a.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  {tmuxRename !== null && (
-                    <div className="tmux-rename">
-                      <input
-                        autoFocus
-                        value={tmuxRename}
-                        placeholder="给当前窗口起个名字"
-                        onChange={(e) => setTmuxRename(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            void runTmuxAction("rename-window", tmuxRename);
-                            setTmuxRename(null);
-                          } else if (e.key === "Escape") {
-                            setTmuxRename(null);
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => {
-                          void runTmuxAction("rename-window", tmuxRename);
-                          setTmuxRename(null);
-                        }}
-                      >
-                        确定
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="tmux-sub">
-                    <span className="grow">窗口（点一下切过去）</span>
-                    <button
-                      type="button"
-                      className="mini-x"
-                      style={{ opacity: 1 }}
-                      title="刷新窗口列表"
-                      onClick={() => void refreshTmuxWindows()}
-                    >
-                      ↻
-                    </button>
-                  </div>
-                  <div className="tmux-wins">
-                    {tmuxWinList.length === 0 && (
-                      <div className="hint" style={{ padding: "2px 8px" }}>
-                        没读到窗口（服务器可能刚断开，点 ↻ 重试）
-                      </div>
-                    )}
-                    {tmuxWinList.map((w) => (
-                      <button
-                        key={w.index}
-                        type="button"
-                        className={"tmux-win" + (w.active ? " active" : "")}
-                        title={w.panes > 1 ? `${w.panes} 个窗格` : undefined}
-                        onClick={() => void runTmuxAction("select-window", String(w.index))}
-                      >
-                        <span className="dim">{w.index}</span>
-                        <span className="grow ellipsis">{w.name || "—"}</span>
-                        {w.panes > 1 && <span className="tag">{w.panes} 格</span>}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
+            <TmuxDock
+              {...{
+                curTmuxSession, tmuxDockOpen, setTmuxDockOpen, tmuxBusy, tmuxWinList,
+                tmuxRename, setTmuxRename, refreshTmuxWindows, runTmuxAction,
+              }}
+            />
           )}
 
           {/* herdr 快捷操作：和上面 tmux 那条同构 —— 只在当前会话是 herdr 窗格时出现，
               按钮走的是 herdr 自己的 socket API（另开一条 ssh），不模拟按键。 */}
           {module === "remote" && activeSession?.herdrPane && (
-            <div className="tmux-dock herdr-dock">
-              <button
-                type="button"
-                className="tmux-head"
-                title="不想记 herdr 的快捷键的话，点这里的按钮就行（herdr 自己的快捷键照旧可用）"
-                onClick={() => setHerdrDockOpen((v) => !v)}
-              >
-                {herdrDockOpen ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
-                <span className="grow">herdr 快捷操作</span>
-                <span className="tag herdr">{activeSession.herdrPane}</span>
-              </button>
-
-              {herdrDockOpen && (
-                <div className="tmux-body">
-                  <div className="tmux-grid">
-                    {HERDR_ACTIONS.map((a) => {
-                      const destructive = a.key === "close-pane" || a.key === "close-workspace";
-                      const armed = herdrArmed === a.key;
-                      return (
-                        <button
-                          key={a.key}
-                          type="button"
-                          className={"mini-btn tmux-btn" + (armed ? " danger" : "")}
-                          title={armed ? "再点一次就是真的关掉了" : a.title}
-                          disabled={herdrBusy}
-                          onClick={() => {
-                            if (a.key === "rename-pane") {
-                              setHerdrRename(activeSession.herdrPane ?? "");
-                              return;
-                            }
-                            // 会真的关掉东西的两个动作：第一次点只是"上膛"，再点才执行
-                            if (destructive && !armed) {
-                              setHerdrArmed(a.key);
-                              return;
-                            }
-                            void runHerdrAction(a.key);
-                          }}
-                        >
-                          {armed ? "确认？" : a.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {herdrRename !== null && (
-                    <div className="tmux-rename">
-                      <input
-                        autoFocus
-                        value={herdrRename}
-                        placeholder="窗格名字（留空 = 清掉）"
-                        onChange={(e) => setHerdrRename(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            void runHerdrAction("rename-pane", herdrRename);
-                            setHerdrRename(null);
-                          } else if (e.key === "Escape") {
-                            setHerdrRename(null);
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => {
-                          void runHerdrAction("rename-pane", herdrRename);
-                          setHerdrRename(null);
-                        }}
-                      >
-                        确定
-                      </button>
-                      <button type="button" className="mini-btn" onClick={() => setHerdrRename(null)}>
-                        取消
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="tmux-sub">
-                    <span className="grow hint">
-                      这些按钮是让服务器上的 herdr 去做（另开一条 ssh），不碰你的键盘
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
+            <HerdrDock
+              {...{
+                activeSession, herdrDockOpen, setHerdrDockOpen, herdrBusy, herdrRename,
+                setHerdrRename, herdrArmed, setHerdrArmed, runHerdrAction,
+              }}
+            />
           )}
         </aside>
 
         <main className="main">
-          <div className="session-tabs">
-            {sessions.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                className={
-                  "session-tab" +
-                  (s.id === activeId ? " active" : "") +
-                  (s.id === dragTabId ? " dragging" : "")
-                }
-                // 左右拖动排序：把一个标签拖到另一个上面，就插到它前面/后面
-                data-tab-id={s.id}
-                // 注意：HTML5 的 draggable 在 WebView2 里对 <button> 不生效，
-                // 所以这里自己用鼠标事件做拖动（见下面那个全局 mousemove 的 effect）
-                onMouseDown={(e) => {
-                  if (e.button === 0) {
-                    setDragTabId(s.id);
-                    setDragPos({ x: e.clientX, y: e.clientY });
-                  }
-                }}
-                onClick={() => setActiveId(s.id)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setActiveId(s.id);
-                  setTabMenu({ id: s.id, x: e.clientX, y: e.clientY });
-                }}
-                title={`${s.title}（右键可以重命名）`}
-              >
-                {moduleIcon(s.kind)}
-                {carrierBadge(s)}
-                <span>{s.title}</span>
-                {s.logPath && <span className="rec-dot" title="正在记录终端日志" />}
-                <span className={"status-dot " + s.state} />
-                {(s.state === "closed" || s.state === "error") && s.profileId && (
-                  <span
-                    className="tab-x"
-                    title="重新连接"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void reconnectSession(s);
-                    }}
-                  >
-                    ↻
-                  </span>
-                )}
-                <span
-                  className="tab-x"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void closeSession(s.id);
-                  }}
-                >
-                  <IconClose size={12} />
-                </span>
-              </button>
-            ))}
-            {sessions.length === 0 && (
-              <span className="session-tab placeholder">没有打开的会话</span>
-            )}
-          </div>
+          <SessionTabs
+            {...{
+              sessions, activeId, setActiveId, dragTabId, setDragTabId, setDragPos,
+              setTabMenu, carrierBadge, closeSession, reconnectSession,
+            }}
+          />
 
           {/* 拖动标签时跟着鼠标走的"虚影"（VSCode 那种手感：拖起来就看得见） */}
           {dragTabId && dragPos && (
@@ -9114,372 +6554,32 @@ export default function App() {
           )}
 
           {activeSession && activeSession.openFiles.length > 0 && (
-            <div className="sub-tabs">
-              <button
-                type="button"
-                className={"sub-tab term" + (activeSession.activeTab === "terminal" ? " active" : "")}
-                onClick={() => selectTab(activeSession.id, "terminal")}
-              >
-                {carrierBadge(activeSession)}
-                <IconTerminal size={14} /> 终端
-              </button>
-              {/* 分隔：左边是"终端"，右边是打开的文件 —— 不分开真的分不清哪个是哪个 */}
-              <span className="sub-tab-sep" />
-              <span className="sub-tabs-label">文件</span>
-              {activeSession.openFiles.map((f) => (
-                <button
-                  key={f.path}
-                  type="button"
-                  className={"sub-tab file" + (activeSession.activeTab === f.name ? " active" : "")}
-                  onClick={() => selectTab(activeSession.id, f.name)}
-                >
-                  <IconFile size={14} />
-                  <span>{f.name}</span>
-                  <span
-                    className="tab-x"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      closeFile(activeSession.id, f.name);
-                    }}
-                  >
-                    <IconClose size={11} />
-                  </span>
-                </button>
-              ))}
-            </div>
+            <FileSubTabs
+              {...{ activeSession, carrierBadge, selectTab, closeFile }}
+            />
           )}
 
-          <div
-            className="pane"
-            style={{ "--term-bg": termBgOf(activeSession) } as CSSProperties}
-          >
-            {paneLayout !== "single" && (
-              <div className={"pane-grid " + paneLayout}>
-                {paneSlots.map((sid, i) => {
-                  const ps = sid ? sessions.find((s) => s.id === sid) : null;
-                  return (
-                    <div
-                      key={i}
-                      className={"pane-cell" + (i === focusedPane ? " focused" : "")}
-                      style={{ "--term-bg": termBgOf(ps) } as CSSProperties}
-                      onClick={() => {
-                        setFocusedPane(i);
-                        if (sid) setActiveId(sid);
-                      }}
-                    >
-                      <div className="pane-cell-head">
-                        <span className="grow ellipsis">
-                          {ps ? `${MODULE_LABEL[ps.kind]} · ${ps.title}` : `窗格 ${i + 1}（空）`}
-                        </span>
-                        {sid && (
-                          <button
-                            type="button"
-                            className="mini-x"
-                            style={{ opacity: 1 }}
-                            title="把这个窗格空出来（不会关闭会话）"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setPanes((prev) => {
-                                const next = [...prev];
-                                next[i] = null;
-                                return next;
-                              });
-                            }}
-                          >
-                            ✕
-                          </button>
-                        )}
-                      </div>
-                      <div className="pane-cell-body">
-                        {ps ? (
-                          <TerminalView
-                            key={ps.id}
-                            sessionId={ps.id}
-                            bus={bus}
-                            active={i === focusedPane}
-                            onPasteFiles={(files) => void handleIncomingFiles(ps, files)}
-                            pasteKey={settings.pasteKey}
-                            rightClick={settings.rightClick}
-                            copyKey={settings.copyKey}
-                            fontSize={settings.fontSize}
-                            scrollback={settings.scrollback}
-                            light={themeKind(settings.theme) === "light"}
-                            palette={termPaletteFor(
-                              settings,
-                              profiles.find((p) => p.id === ps.profileId),
-                              kindOfSession(ps.kind),
-                            )}
-                            highlightEnabled={settings.highlightEnabled}
-                            highlightRules={highlightRulesFor(
-                              settings,
-                              profiles.find((p) => p.id === ps.profileId),
-                              kindOfSession(ps.kind),
-                            )}
-                            onCwd={(path) => handleTerminalCwd(ps.id, path)}
-                            onCommandDone={(code) =>
-                              setCmdExit((prev) => ({ ...prev, [ps.id]: { exit: code, at: Date.now() } }))
-                            }
-                            onNotice={notify}
-                            onZoom={bumpFont}
-                            herdrPane={
-                              ps.herdrPane
-                                ? { paneId: ps.herdrPane, mode: ps.herdrMode ?? "observe" }
-                                : undefined
-                            }
-                            onHerdrInputNeeded={() =>
-                              void ensureHerdrInput(
-                                ps.id,
-                                ps.profileId ?? "",
-                                ps.user ?? null,
-                                ps.herdrPane ?? "",
-                              )
-                            }
-                          />
-                        ) : (
-                          <div className="pane-empty">
-                            点左侧「会话」里的任意一个会话，它就会出现在这个窗格。
-                            <br />
-                            分屏只是多开几个视口，会话本身还是一个。
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {paneLayout === "single" && sessions.length === 0 ? (
-              <div className="empty">
-                <div className="empty-title">ZeeAI Term</div>
-                <div className="empty-sub">
-                  左侧「远程」里选一台服务器，或用 PowerShell / CMD / WSL 打开本地终端。
-                </div>
-              </div>
-            ) : paneLayout === "single" ? (
-              sessions.map((s) => (
-                <div
-                  key={s.id}
-                  className="term-wrap"
-                  style={{
-                    // 用 flex（不是 block）：`.term-wrap` 里除了终端还可能有一条 `.herdr-bar`，
-                    // 靠 flex 把高度**分**给两者。写成 block 会让 `.terminal-host` 的 flex:1 失效、
-                    // 终端按自己的内容高度撑开，最后一行就被下面的输入窗盖住了（用户报的 bug）。
-                    // 这里只管"显不显示"，布局规则在 styles.css 的 .term-wrap 里。
-                    display:
-                      s.id === activeId && s.activeTab === "terminal" ? "flex" : "none",
-                  }}
-                >
-                  {/* herdr 会话：终端上方挂一条**一眼可见**的状态条（像 tmux 的状态栏那样），
-                      避免"到底进没进 herdr"这种疑惑。 */}
-                  {s.herdrPane && (
-                    <div className="herdr-bar" title={`${s.title}\nherdr 工作区/窗格：${s.herdrPane}`}>
-                      <span className="tag herdr">herdr</span>
-                      <span>{s.herdrMode === "control" ? "接管中（可写）" : "只读观察"}</span>
-                      <span className="dim">{s.herdrPane}</span>
-                      <span className="grow" />
-                      <span className="dim">
-                        {herdrServer
-                          ? herdrServer.running
-                            ? `服务运行中 · ${herdrServer.panes} 个窗格`
-                            : "服务没在跑"
-                          : ""}
-                      </span>
-                    </div>
-                  )}
-                  <TerminalView
-                    sessionId={s.id}
-                    bus={bus}
-                    active={s.id === activeId && s.activeTab === "terminal"}
-                    onPasteFiles={(files) => void handleIncomingFiles(s, files)}
-                    pasteKey={settings.pasteKey}
-                    rightClick={settings.rightClick}
-                    copyKey={settings.copyKey}
-                    // 单窗格模式下**所有**会话都挂着（用 display:none 藏着，为了不丢回滚缓冲），
-                    // 但只有当前这条看得见 —— WebGL 渲染器只给看得见的挂，
-                    // 否则开 N 个会话就占 N 个 GPU 上下文（见 Terminal.tsx 里那段说明）
-                    visible={s.id === activeId && s.activeTab === "terminal"}
-                    fontSize={settings.fontSize}
-                    scrollback={settings.scrollback}
-                    light={themeKind(settings.theme) === "light"}
-                    palette={termPaletteFor(
-                      settings,
-                      profiles.find((p) => p.id === s.profileId),
-                      kindOfSession(s.kind),
-                    )}
-                    highlightEnabled={settings.highlightEnabled}
-                    highlightRules={highlightRulesFor(
-                      settings,
-                      profiles.find((p) => p.id === s.profileId),
-                      kindOfSession(s.kind),
-                    )}
-                    onCwd={(path) => handleTerminalCwd(s.id, path)}
-                    onCommandDone={(code) =>
-                      setCmdExit((prev) => ({ ...prev, [s.id]: { exit: code, at: Date.now() } }))
-                    }
-                    onNotice={notify}
-                    onZoom={bumpFont}
-                    herdrPane={
-                      s.herdrPane
-                        ? { paneId: s.herdrPane, mode: s.herdrMode ?? "observe" }
-                        : undefined
-                    }
-                    onHerdrInputNeeded={() =>
-                      void ensureHerdrInput(
-                        s.id,
-                        s.profileId ?? "",
-                        s.user ?? null,
-                        s.herdrPane ?? "",
-                      )
-                    }
-                  />
-                </div>
-              ))
-            ) : null}
-            {paneLayout === "single" && activeFile && (
-              <div className="file-wrap">
-                <FileView
-                  key={activeFile.path}
-                  file={activeFile}
-                  profileId={activeSession?.profileId}
-                  userOverride={activeSession?.user ?? null}
-                  onNotice={notify}
-                />
-              </div>
-            )}
-          </div>
+          <TerminalArea
+            {...{
+              activeSession, activeFile, sessions, profiles, settings, bus, activeId,
+              setActiveId, paneLayout, paneSlots, focusedPane, setFocusedPane, setPanes,
+              setCmdExit, herdrServer, termBgOf, handleTerminalCwd, handleIncomingFiles,
+              ensureHerdrInput, notify, bumpFont,
+            }}
+          />
 
           {/* ---------- AI 输入窗：**默认收起**成一条细栏，点箭头才拉出来慢慢写 ----------
               终端才是主角：收起时只占 26px，你照旧直接在 SSH 里敲字；
               要用它写长提示词 / 传图片时再展开（展开后终端会自动重排，见 Terminal 的 ResizeObserver）。 */}
           {activeSession && (
-            <div className={"composer" + (composerOpen ? " open" : " collapsed")}>
-              <button
-                type="button"
-                className="composer-bar"
-                title={
-                  composerOpen
-                    ? "收起输入窗（Esc 或 Ctrl+Alt+A）"
-                    : "拉出输入窗：多行编辑、可粘贴 / 上传图片，Enter 发送（Ctrl+Alt+A）"
-                }
-                onClick={() => setComposerOpen((v) => !v)}
-              >
-                {composerOpen ? <IconChevronsDown size={16} /> : <IconChevronsUp size={16} />}
-                <span className="grow ellipsis" style={{ textAlign: "left" }}>
-                  发给 AI · {activeSession.title}
-                  <span className="dim">
-                    {activeSession.herdrPane
-                      ? activeSession.herdrMode === "control"
-                        ? " · herdr 接管窗格"
-                        : " · herdr 只读观察窗（发不了字，先接管）"
-                      : activeSession.kind === "remote"
-                        ? " · SSH"
-                        : " · 本机"}
-                  </span>
-                </span>
-                {!composerOpen && <span className="dim">点这里展开</span>}
-              </button>
-              {composerOpen && (
-                <>
-              {composerFiles.length > 0 && (
-                <div className="composer-files">
-                  {composerFiles.map((f) => (
-                    <div className="composer-card" key={f.remote} title={`${f.name}\n${f.remote}`}>
-                      {f.thumb ? (
-                        <img className="composer-thumb" src={f.thumb} alt={f.name} />
-                      ) : (
-                        <div className="composer-thumb composer-thumb-file">📄</div>
-                      )}
-                      <span className="composer-card-name ellipsis">{f.name}</span>
-                      <button
-                        type="button"
-                        className="mini-x composer-card-x"
-                        style={{ opacity: 1 }}
-                        title="移除这个附件（顺手删掉本地临时文件）"
-                        onClick={() => {
-                          void pasteDiscardFile(f.local).catch(() => {});
-                          removeComposerFile(activeSession.id, f.remote);
-                        }}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <textarea
-                className="composer-input"
-                placeholder="写给 AI 的话…（Enter 发送 / Shift+Enter 换行；可直接 Ctrl+V 粘图片，或把文件拖进来）"
-                value={composerText}
-                autoFocus
-                onChange={(e) => changeComposerText(e.target.value)}
-                onPaste={(e) => {
-                  const files = Array.from(e.clipboardData?.files ?? []);
-                  if (!files.length) return; // 纯文本：照旧粘进编辑框，不拦
-                  e.preventDefault();
-                  e.stopPropagation();
-                  void (async () => {
-                    const out: { name: string; bytes: Uint8Array }[] = [];
-                    for (const f of files) {
-                      try {
-                        out.push({
-                          name: f.name || "paste.png",
-                          bytes: new Uint8Array(await f.arrayBuffer()),
-                        });
-                      } catch {
-                        /* 单个读失败就跳过 */
-                      }
-                    }
-                    if (!out.length) return;
-                    try {
-                      const locals: string[] = [];
-                      for (const f of out)
-                        locals.push(await pasteSaveFile(pasteName(f.name), bytesToB64(f.bytes)));
-                      await composerAttachPaths(activeSession, locals, true);
-                    } catch (err) {
-                      notify("粘贴上传失败：" + String(err));
-                    }
-                  })();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setComposerOpen(false);
-                    return;
-                  }
-                  // Enter 发送、Shift+Enter 换行 —— 和 VS Code / 主流聊天框一致。
-                  // **有意这么选**：写长提示词时换行比发送更常用，所以把修饰键留给换行。
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void sendComposer();
-                  }
-                }}
-              />
-              <div className="composer-actions">
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={composerBusy}
-                  title="选本地文件（图片 / 文本都行）：先上传到远端，再把路径一起发给 AI"
-                  onClick={() => void composerPickFiles(activeSession)}
-                >
-                  ＋ 添加图片 / 文件
-                </button>
-                {composerBusy && <span className="hint">正在上传…</span>}
-                <span className="hint">Enter 发送 · Shift+Enter 换行 · 可直接 Ctrl+V 粘图片</span>
-                <span className="grow" />
-                <button
-                  type="button"
-                  className="btn primary"
-                  disabled={composerBusy}
-                  onClick={() => void sendComposer()}
-                >
-                  发送
-                </button>
-              </div>
-                </>
-              )}
-            </div>
+            <Composer
+              {...{
+                activeSession, composerOpen, setComposerOpen, composerText,
+                changeComposerText, composerFiles, composerBusy, composerRestoredHint,
+                removeComposerFile, composerAttachPaths, composerPickFiles, sendComposer,
+                pasteName, pasteCard, setPasteCard, notify,
+              }}
+            />
           )}
 
           {/* 直接粘进终端时的缩略图浮层：几秒后自己消失（没有它，用户不知道粘对没有） */}
@@ -9499,1842 +6599,189 @@ export default function App() {
         </main>
 
         {aiPanelOpen && (
-          <aside className={"ai-panel" + (AI_PANEL_HIDDEN ? " off" : "")}>
-            {/* ---------- 面板整体停用（开关在上面的 AI_PANEL_DISABLED） ----------
-                用户 2026-10-24：「整个面板都停用，只留灰色容器」。
-                保留：容器 / 开合 / 宽度；**内容一条都不渲染** —— 不是 CSS 藏起来，
-                是这里直接不挂 DOM（看板卡片、按钮、提示、刷新入口全都不会出现）。
-                代码原样包在下面这个条件里；把常量改回 false 就全回来。
-                唯一例外：无头测试注入 `__ZEEAI_TEST_AI_PANEL__` 时临时渲染（见上方
-                `AI_PANEL_TEST_ONLY_SHOW` 的说明），正常启动没有这个全局。
-                `aiPanelOpen` 还照旧控制"有没有这块灰板"，活动栏星号也照旧能开合。 */}
-            {AI_PANEL_HIDDEN ? null : (
-              <>
-            <div className="ai-head">
-              {/* 标题**固定**，不再跟着当前会话走。
-                  以前写「AI Agent · PowerShell」，下面列的却是远端的卡 —— 用户实测因此以为
-                  "它探测到我的 PowerShell 里有 Codex"。面板里的卡片本来就是全环境的，
-                  所以标题只说这是什么，环境归属交给每张卡自己标（docs/backlog.md 第 2 条 ②）。 */}
-              <span className="grow ellipsis" title="全环境（本机 / WSL / 各台服务器）的 AI 任务">
-                AI 任务看板
-              </span>
-              <button
-                type="button"
-                className="mini-btn"
-                style={{ opacity: 1 }}
-                title="探测一次：本机 / 服务器上现在有没有 AI 在跑（只在你点的时候查，不会自动探测）"
-                disabled={aiRefreshing}
-                onClick={() => void refreshAiPanel()}
-              >
-                {aiRefreshing ? "探测中…" : "刷新"}
-              </button>
-              <button
-                type="button"
-                className="mini-x"
-                style={{ opacity: 1 }}
-                title="收起面板"
-                onClick={() => setAiPanelOpen(false)}
-              >
-                ✕
-              </button>
-            </div>
-
-            {/* ---------- AI 任务看板：多环境汇总 ---------- */}
-            {/* 口径 §10.2：**承载健康只在异常时出现**。
-                "herdr 服务：运行中 · 3 个窗格"这种正常状态看一眼就再也不需要了，
-                常驻等于每一层都在抢同一块注意力 —— 所以没异常时整块不渲染，
-                能查的东西（服务 / 工作区 / 来源明细）都在下面的折叠行与悬停里。 */}
-            <div className="ai-section">需要你 {boardNeedsYou.length}</div>
-            {boardInstances.length === 0 ? (
-              <div className="hint" style={{ padding: "2px 12px 8px" }}>
-                点「刷新」看看本机 / 服务器上现在有没有 AI 在跑
-              </div>
-            ) : null}
-            {boardNeedsYou.length > 0 && (
-              <div className="ai-board">{boardNeedsYou.map((i) => boardCard(i))}</div>
-            )}
-
-            <div className="ai-section">运行中 {boardWorking.length}</div>
-            {boardWorking.length > 0 && (
-              <div className="ai-board">{boardWorking.map((i) => boardCard(i))}</div>
-            )}
-
-            {/* 「最近完成」「空闲」各折成一行（§10.1 / §10.2）：点开才渲染明细。
-                数据一直落盘（`ai_turns.json`），不显示 ≠ 丢掉。 */}
-            {boardFinished.length > 0 && (
-              <button
-                type="button"
-                className="ai-fold"
-                title="最近完成的实例：谁 / 什么时候 / 有什么产物（点开才看）"
-                onClick={() => setFinishedOpen((v) => !v)}
-              >
-                {finishedOpen ? "▾" : "▸"} 最近完成 {boardFinished.length} 项
-              </button>
-            )}
-            {finishedOpen &&
-              boardFinished.map((i) => (
-                <div className="ai-board" key={i.id}>
-                  {boardCard(i)}
-                </div>
-              ))}
-
-            {boardIdle.length > 0 && (
-              <button
-                type="button"
-                className="ai-fold"
-                title="空闲 / 状态未知的实例：它们是现状，不是任务（点开才看）"
-                onClick={() => setIdleOpen((v) => !v)}
-              >
-                {idleOpen ? "▾" : "▸"} 空闲 {boardIdle.length} 项
-              </button>
-            )}
-            {idleOpen &&
-              boardIdle.map((i) => (
-                <div className="ai-board" key={i.id}>
-                  {boardCard(i)}
-                </div>
-              ))}
-
-            {/* ---------- L4 承载健康：**只在异常时出现**（§10.2 / §10.5） ----------
-                为什么只在异常时：`herdr 服务：运行中 · 3 个窗格` 这种正常状态用户看一眼就
-                再也不需要了，常驻等于每一层都在抢同一块注意力。
-                进这一块的条件只有三类：探测失败 / herdr 太旧 / 有工作区要清理。
-                （服务没在跑由 herdr 自己按需拉起，所以不算异常。）
-                没跑 agent 的承载（CMD 这类空承载，§10.5 **不上板**）也在这块的悬停里查。 */}
-            {/* 没点过「刷新」就不显示承载健康：`aiSource === null` 现在也可能是"还没探"，
-                直接写"探测失败"会冤枉一台好好的机器。 */}
-            {!aiSourceProbed ? null : aiSourceProbing ? null : !aiSource ? (
-              <div
-                className="ai-source-line warn"
-                role="button"
-                title="探测这台服务器时没连上（可能是网络/sshd 一时拥塞）。点击重试。"
-                onClick={() => void refreshAiSource(true)}
-              >
-                承载健康 · 探测失败（没连上，不代表没装）· 点一下重试
-              </div>
-            ) : aiSource.herdrVersion && aiSource.compat === "too_old" ? (
-              <div
-                className="ai-source-line warn"
-                role="button"
-                title={`herdr ${aiSource.herdrVersion} 的协议是 ${aiSource.protocol}（< 20），太旧 → 已回退到本机探测。点击重新探测。`}
-                onClick={() => void refreshAiSource(true)}
-              >
-                承载健康 · herdr {aiSource.herdrVersion} 太旧（协议 {aiSource.protocol} &lt; 20）
-                → 已回退到本机探测
-              </div>
-            ) : herdrCleanList.length > 0 ? (
-              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                <span
-                  className="hint"
-                  title={
-                    // 「我开了哪些承载」查得到的落点（§10.5）：
-                    // 服务器上所有 herdr 工作区 + 没在用的 + 能安全清理的 + 空承载清单
-                    `服务器上的工作区：${herdrScan?.workspaces.join("、") || "（没有）"}\n` +
-                    `没在用（不在任何已打开/历史会话里）：${herdrOrphanList.join("、") || "（没有）"}\n` +
-                    `其中是空壳（只停在提示符上，可以安全清理）：${herdrCleanList.join("、")}\n` +
-                    `承载与状态来源（没跑 agent 的不上看板，§10.5）：${
-                      boardInstances
-                        .map((i) => `${aiAgentLabel(i.agent)}@${aiCarrierLabel(i.carrier)}`)
-                        .join("、") || "（无）"
-                    }`
-                  }
-                >
-                  承载健康 · herdr 工作区：{herdrScan?.workspaces.length ?? 0} 个
-                  {herdrOrphanList.length ? `（${herdrOrphanList.length} 个没在用）` : "（都在用）"}
-                </span>
-                {herdrCleanArmed ? (
-                  <>
-                    <button
-                      type="button"
-                      className="mini-btn danger"
-                      title={`会关掉：${herdrCleanList.join("、")}\n（都是停在提示符上的空壳工作区；里面正跑着东西的一个都不会碰）`}
-                      onClick={() => void cleanHerdrOrphans()}
-                    >
-                      确认清理（{herdrCleanList.join("、")}）
-                    </button>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      onClick={() => setHerdrCleanArmed(false)}
-                    >
-                      取消
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    className="mini-btn"
-                    title="只关掉「不属于任何已打开/历史会话」而且「里面只停着 shell」的工作区"
-                    onClick={() => setHerdrCleanArmed(true)}
-                  >
-                    清理空壳（{herdrCleanList.length}）…
-                  </button>
-                )}
-              </div>
-            ) : null}
-            {/* 装了 herdr 时：服务的生命周期（停止会关掉它管着的所有窗格 → 二段确认）。
-                只在"当前会话那台机器"上给这个开关；正常运行时它是折叠的。
-                注意和上面那条互斥：有工作区要清理时先让用户清理（两行挤一起就不是"只在异常时出现"了）。 */}
-            {aiSource?.herdrVersion &&
-            herdrServer?.running &&
-            herdrCleanList.length === 0 &&
-            (activeSession?.profileId || herdrScan) ? (
-              <details className="ai-health" open={false}>
-                <summary title="承载健康：herdr 服务 / 工作区 / 探测明细（正常时不占位置）">
-                  herdr 服务：运行中 · {herdrServer.panes} 个窗格
-                </summary>
-                <div className="modal-inline-action" style={{ padding: "6px 0 2px" }}>
-                  {herdrStopArmed ? (
-                    <>
-                      <button
-                        type="button"
-                        className="mini-btn danger"
-                        title={
-                          "停止 herdr 服务 —— 它管着的所有窗格都会关掉，" +
-                          "里面正在跑的 AI 也会一起没；看板上这些窗格的卡片会跟着变准不了。\n" +
-                          "（只想腾地方的话，用「清理空壳工作区」一个个关更稳）"
-                        }
-                        onClick={() => void stopHerdrServer()}
-                      >
-                        确认停止（会关掉所有 herdr 窗格）
-                      </button>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => setHerdrStopArmed(false)}
-                      >
-                        取消
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      onClick={() => setHerdrStopArmed(true)}
-                    >
-                      停止服务…
-                    </button>
-                  )}
-                </div>
-              </details>
-            ) : null}
-            {/* 没装 herdr 时给一个"一键安装"入口：由 Windows 侧下载 → 校验 sha256 →
-                scp 到 ~/.local/bin（不执行远端脚本、不要 root）。已经装了就不显示。 */}
-            {aiSource && !aiSource.herdrVersion && activeSession?.profileId ? (
-              <div className="modal-inline-action" style={{ padding: "2px 12px 8px" }}>
-                {herdrInstalling[activeSession.profileId] ? (
-                  <span className="hint">正在装 herdr：{herdrInstalling[activeSession.profileId]}</span>
-                ) : (
-                  <button
-                    type="button"
-                    className="mini-btn"
-                    title="从 herdr.dev 拿官方版本号与 sha256，在 Windows 侧下载并校验后上传到 ~/.local/bin/herdr（不需要 root）"
-                    onClick={() =>
-                      void installHerdrFor(activeSession.profileId ?? "", activeSession.user ?? null)
-                    }
-                  >
-                    一键安装 herdr
-                  </button>
-                )}
-              </div>
-            ) : null}
-
-            {/* ---------- AI 任务时间线（G-01）：落盘的历史，应用重启后还在 ---------- */}
-            {/* 口径 docs/design-ai-board-v2.md §10.1：不要再有常驻列表，
-                只留折叠一行（默认收起，点开才看明细；记录一直落盘） */}
-            <div className="ai-section">
-              <button
-                type="button"
-                className="mini-btn"
-                style={{ opacity: 1 }}
-                title="点开看明细（记录一直落盘，重启应用也还在）"
-                onClick={() => setTimelineAll((v) => !v)}
-              >
-                {timelineAll ? "▾" : "▸"} 最近完成 {timeline.length} 项
-              </button>
-              <button
-                type="button"
-                className="mini-x"
-                style={{ marginLeft: "auto", opacity: 1 }}
-                title="刷新"
-                onClick={() => void loadTimeline()}
-              >
-                ⟳
-              </button>
-              {timeline.length > 0 && (
-                <button
-                  type="button"
-                  className="mini-x"
-                  style={{ opacity: 1 }}
-                  title="清空时间线（只删记录，不动会话和文件）"
-                  onClick={() => {
-                    void aiTimelineClear()
-                      .then(() => setTimeline([]))
-                      .catch(() => {});
-                    notify("已清空 AI 任务时间线");
-                  }}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-            {!timelineAll ? null : timeline.length === 0 ? (
-              <div className="hint" style={{ padding: "2px 12px 8px" }}>
-                还没有记录。AI 跑完一轮会记在这里（重启应用也还在）。
-              </div>
-            ) : (
-              // 不在这么小的框里让人上下拖：默认只露 3 条，下面给一个"展开全部"，
-              // 展开后整块跟着面板滚（而不是在那个 260px 的小窗里拖）
-              <>
-              <div className={"ai-timeline" + (timelineAll ? " all" : "")}>
-                {(timelineAll ? timeline.slice(0, 60) : timeline.slice(0, 3)).map((r) => {
-                  // 能不能"切过去"：找标题相同的已打开会话
-                  const target = sessions.find(
-                    (s) => (s.title ?? "").trim() === (r.sessionTitle ?? "").trim(),
-                  );
-                  return (
-                    <div className="ai-tl-row" key={r.id}>
-                      <div className="ai-tl-line">
-                        <span className="grow ellipsis" title={r.sessionTitle}>
-                          {new Date(r.completedAt * 1000).toLocaleString("zh-CN", {
-                            month: "2-digit",
-                            day: "2-digit",
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}
-                          {` · ${r.server}`}
-                          {r.cwd ? ` · ${dirBase(r.cwd)}` : ""}
-                        </span>
-                        <span className="dim">
-                          {r.durationMs > 0 ? aiDurationText(r.durationMs) : ""}
-                        </span>
-                      </div>
-                      <div className="ai-tl-msg ellipsis" title={r.message}>
-                        {r.message || "（这一轮没有留下文字）"}
-                      </div>
-                      <div className="ai-tl-actions">
-                        {r.artifacts.slice(0, 3).map((n) => (
-                          <span className="ai-tag" key={n}>
-                            📄 {n}
-                          </span>
-                        ))}
-                        {r.artifacts.length > 3 && (
-                          <span className="dim">+{r.artifacts.length - 3}</span>
-                        )}
-                        {target ? (
-                          <button
-                            type="button"
-                            className="mini-btn"
-                            title={`切到「${target.title}」`}
-                            onClick={() => {
-                              setActiveId(target.id);
-                              notify(`已切到「${target.title}」`);
-                            }}
-                          >
-                            切过去
-                          </button>
-                        ) : null}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              </>
-            )}
-
-            {aiNotices.length > 0 && (
-              <div className="ai-notices">
-                <div className="ai-section">
-                  消息通知（{aiNotices.length}）
-                  <button
-                    type="button"
-                    className="mini-x"
-                    style={{ marginLeft: "auto", opacity: 1 }}
-                    title="清空"
-                    onClick={() => setAiNotices([])}
-                  >
-                    ✕
-                  </button>
-                </div>
-                {aiNotices.slice(0, 4).map((n) => (
-                  <div className="ai-notice" key={n.id}>
-                    <span className="dot ok" />
-                    <span className="grow ellipsis" title={n.text}>
-                      {n.text}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {!activeSession?.profileId && (
-              <div className="hint" style={{ padding: "10px 12px" }}>
-                先打开一个 SSH 会话
-              </div>
-            )}
-
-              </>
-            )}
-          </aside>
+          <AiPanel
+            {...{
+              activeSession, sessions, setActiveId, setAiPanelOpen,
+              boardNeedsYou, boardWorking, boardFinished, boardIdle, boardInstances,
+              finishedOpen, setFinishedOpen, idleOpen, setIdleOpen, boardCard,
+              aiNotices, setAiNotices, aiSource, aiSourceProbed, aiSourceProbing,
+              aiRefreshing, refreshAiSource, refreshAiPanel, herdrServer, herdrScan,
+              herdrOrphanList, herdrCleanList, herdrCleanArmed, setHerdrCleanArmed,
+              herdrStopArmed, setHerdrStopArmed, herdrInstalling, cleanHerdrOrphans,
+              stopHerdrServer, installHerdrFor, timeline, timelineAll, setTimelineAll,
+              setTimeline, loadTimeline, notify,
+            }}
+          />
         )}
       </div>
 
       {/* 口径 docs/design-ai-board-v2.md §10.3：技术标识（编码 / 终端类型）收进悬停，
           状态栏只留：会话 · 连通性 · 需要你 · 传输 */}
-      <div
-        className="statusbar"
-        title="终端编码 UTF-8 · 终端类型 xterm-256color（右键终端可看「会话信息」）"
-      >
-        <span className="stat">
-          <IconActivity size={14} />
-          {activeSession
-            ? `${MODULE_LABEL[activeSession.kind]} · ${activeSession.title} · ${stateText(activeSession.state)}`
-            : "就绪"}
-        </span>
-        <span className="spacer" />
-        {statusMsg && (
-          <span
-            className={"status-notice " + statusMsg.kind}
-            // 悬停给**完整原文**：状态栏只显示中文短句（后端返回的是
-            // 「中文短句｜原始信息：<英文>」，英文那段太长，挤在状态栏里没人读得下去）
-            title={statusMsg.detail || statusMsg.text}
-            onClick={() => setStatusMsg(null)}
-          >
-            {/* 文案单独一层：状态栏是 nowrap + 省略号，入口按钮不能被它挤出去 */}
-            <span className="status-text">{statusMsg.text}</span>
-            {statusMsg.diagProfileId && (
-              <button
-                type="button"
-                className="status-diag"
-                title="只读诊断：看本机实际会用哪个主机 / 端口 / 用户 / 密钥，不会再去连服务器"
-                onClick={(e) => {
-                  // 别让点按钮顺手把提示关掉（外层 onClick 是"点一下关掉"）
-                  e.stopPropagation();
-                  const id = statusMsg.diagProfileId;
-                  const why = statusMsg.diagFailure;
-                  setStatusMsg(null);
-                  if (id) void openSshDiagnosis(id, why);
-                }}
-              >
-                为什么会失败？诊断一下
-              </button>
-            )}
-          </span>
-        )}
-        {activeFile && <span className="stat">{activeFile.path}</span>}
-        {/* 状态栏只留四件事：会话 · 连通性 · 「需要你 N」· 传输（§10.3）。
-            所以这里**只有**「需要你」那一个 chip —— "AI 已完成" 不再单独占一个
-            （完成已经在面板的「最近完成 N 项」里，三处各说一遍是这轮要收掉的乱）。
-            点它 = 打开面板；needs-you 是唯一真正值得打断用户的事。 */}
-        {/* 面板停用时不渲染「需要你」chip：逻辑保留（状态还在算），只是没有面板可去，
-            亮一个红色数字反而误导。恢复面板 = 把 AI_PANEL_DISABLED 改成 false。 */}
-        {!AI_PANEL_HIDDEN && aiNeedIds.length > 0 && (
-          <button
-            type="button"
-            className="stat ai-need-chip"
-            title={`${boardInstances
-              .filter((i) => i.state === "needs-you")
-              .map((i) => `${aiAgentLabel(i.agent)} · ${aiInstanceWhere(i)} · ${i.badge}`)
-              .join("\n")}\n\n点这里打开看板（红点亮到你处理为止）`}
-            onClick={() => setAiPanelOpen(true)}
-          >
-            需要你 {aiNeedIds.length}
-          </button>
-        )}
-        {isAdminMode && (
-          <span
-            className="stat admin"
-            title="当前以管理员身份运行：新开的 PowerShell / CMD / WSL 都是管理员"
-          >
-            🛡 管理员
-          </span>
-        )}
-      </div>
+      <StatusBar
+        {...{
+          activeSession, activeFile, statusMsg, setStatusMsg, aiNeedIds, boardInstances,
+          setAiPanelOpen, isAdminMode, openSshDiagnosis,
+        }}
+      />
 
       {transfers.length > 0 && (
-        <div className="transfer-dock">
-          <div className="transfer-head">
-            <span>文件传输（{transfers.filter((t) => t.status === "running").length} 进行中）</span>
-            <button
-              type="button"
-              className="mini-x"
-              style={{ opacity: 1 }}
-              title="清空列表"
-              onClick={() => setTransfers([])}
-            >
-              ✕
-            </button>
-          </div>
-          {transfers.map((t) => {
-            const pct =
-              t.total > 0 ? Math.min(100, Math.round((t.done / t.total) * 100)) : 0;
-            return (
-              <div key={t.id} className={"transfer-item " + t.status}>
-                <div className="transfer-line">
-                  <span className="grow ellipsis" title={t.name}>
-                    {t.name}
-                  </span>
-                  <span className="dim">
-                    {t.status === "done"
-                      ? "完成"
-                      : t.status === "failed"
-                        ? "失败"
-                        : `${pct}%`}
-                  </span>
-                </div>
-                <div className="transfer-bar">
-                  <div
-                    className="transfer-fill"
-                    style={{ width: t.status === "done" ? "100%" : `${pct}%` }}
-                  />
-                </div>
-                <div className="transfer-meta">
-                  {humanSize(t.done)}
-                  {t.total > 0 ? ` / ${humanSize(t.total)}` : ""}
-                  {t.message ? ` · ${t.message}` : ""}
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <TransfersDock {...{ transfers, setTransfers }} />
       )}
 
       {openMenu && <div className="menu-overlay" onClick={() => setOpenMenu(null)} />}
 
       {serialMenu && (
-        <div
-          className="ctx-backdrop"
-          onClick={() => setSerialMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setSerialMenu(null);
-          }}
-        >
-          <div
-            className="ctx-menu"
-            style={{
-              left: Math.min(Math.max(0, serialMenu.x), Math.max(0, window.innerWidth - 210)),
-              top: Math.min(Math.max(0, serialMenu.y), Math.max(0, window.innerHeight - 190)),
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="menu-head ellipsis">{serialMenu.profile.name}</div>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = serialMenu.profile;
-                setSerialMenu(null);
-                void openSerialSession(p);
-              }}
-            >
-              打开串口终端
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = serialMenu.profile;
-                setSerialMenu(null);
-                openSerialDialog(p);
-              }}
-            >
-              编辑（端口 / 波特率 / 校验…）
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = serialMenu.profile;
-                setSerialMenu(null);
-                void duplicateProfile(p);
-              }}
-            >
-              复制
-            </button>
-            <div className="menu-sep" />
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = serialMenu.profile;
-                setSerialMenu(null);
-                setConfirmDialog({
-                  title: "删除串口连接",
-                  message: `确定删除「${p.name}」这条串口连接吗？`,
-                  onOk: () => void removeSerialProfile(p),
-                });
-              }}
-            >
-              删除
-            </button>
-          </div>
-        </div>
+        <SerialMenu
+          serialMenu={serialMenu}
+          setSerialMenu={setSerialMenu}
+          setConfirmDialog={setConfirmDialog}
+          openSerialDialog={openSerialDialog}
+          openSerialSession={openSerialSession}
+          removeSerialProfile={removeSerialProfile}
+          duplicateProfile={duplicateProfile}
+        />
       )}
 
       {adbSerial && (
-        <div className="modal-backdrop" onClick={() => setAdbSerial(null)}>
-          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">设备文件 · {adbSerial}</div>
-            <div className="modal-body">
-              <div className="side-actions">
-                <button
-                  type="button"
-                  className="mini-btn"
-                  title="回到 /sdcard"
-                  onClick={() => void refreshAdbFiles(adbSerial, "/sdcard")}
-                >
-                  /sdcard
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  title="上一级"
-                  onClick={() => {
-                    const parent = adbPath.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
-                    void refreshAdbFiles(adbSerial, parent.startsWith("/") ? parent : "/");
-                  }}
-                >
-                  上一级
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  onClick={() => void refreshAdbFiles(adbSerial, adbPath)}
-                >
-                  刷新
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  title="把本机文件推到当前目录"
-                  onClick={() => void adbUpload(adbSerial)}
-                >
-                  推送文件
-                </button>
-              </div>
-              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
-                <input
-                  className="modal-input"
-                  style={{ flex: 1 }}
-                  value={adbPath}
-                  spellCheck={false}
-                  onChange={(e) => setAdbPath(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && adbSerial) void refreshAdbFiles(adbSerial, adbPath);
-                  }}
-                />
-              </div>
-              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
-                <input
-                  className="modal-input"
-                  style={{ flex: 1 }}
-                  placeholder="新建文件夹的名字"
-                  value={adbNewName}
-                  onChange={(e) => setAdbNewName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && adbSerial) void adbMkdirNow(adbSerial, adbNewName);
-                  }}
-                />
-                <button
-                  type="button"
-                  className="mini-btn"
-                  style={{ marginLeft: 6 }}
-                  disabled={!adbNewName.trim()}
-                  onClick={() => adbSerial && void adbMkdirNow(adbSerial, adbNewName)}
-                >
-                  新建文件夹
-                </button>
-              </div>
-              {adbLoading && <div className="hint">正在读取设备目录…</div>}
-              {!adbLoading && adbFiles.length === 0 && (
-                <div className="hint">空目录</div>
-              )}
-              {adbFiles.map((f) => (
-                <div
-                  key={f.name}
-                  className="tree-item"
-                  title={f.isDir ? "进入目录" : "下载到本机"}
-                  onClick={() =>
-                    adbSerial &&
-                    (f.isDir
-                      ? void refreshAdbFiles(adbSerial, joinRemote(adbPath, f.name))
-                      : void adbDownload(adbSerial, f.name))
-                  }
-                >
-                  {f.isDir ? <IconFolder size={14} /> : <IconFile size={14} />}
-                  <span className="grow ellipsis">{f.name}</span>
-                  <span className="dim">{f.isDir ? "" : humanSize(f.size)}</span>
-                  <button
-                    type="button"
-                    className="mini-x"
-                    title="删除"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (adbSerial) void adbDelete(adbSerial, f.name, f.isDir);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setAdbSerial(null)}>
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>
+        <AdbFileDialog
+          adbSerial={adbSerial}
+          setAdbSerial={setAdbSerial}
+          adbPath={adbPath}
+          setAdbPath={setAdbPath}
+          adbFiles={adbFiles}
+          adbNewName={adbNewName}
+          setAdbNewName={setAdbNewName}
+          adbLoading={adbLoading}
+          joinRemote={joinRemote}
+          refreshAdbFiles={refreshAdbFiles}
+          adbUpload={adbUpload}
+          adbDownload={adbDownload}
+          adbMkdirNow={adbMkdirNow}
+          adbDelete={adbDelete}
+        />
       )}
 
       {gitInitDialog && (
-        <div className="modal-backdrop" onClick={() => setGitInitDialog(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">新建 Git 仓库</div>
-            <div className="modal-body">
-              <label className="modal-field">
-                仓库目录（不存在会自动创建）
-                <input
-                  autoFocus
-                  value={gitInitDialog.path}
-                  placeholder="D:\code\my-repo"
-                  onChange={(e) => setGitInitDialog({ path: e.target.value })}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void createGitRepo(gitInitDialog.path);
-                    if (e.key === "Escape") setGitInitDialog(null);
-                  }}
-                />
-              </label>
-              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  onClick={() => {
-                    void (async () => {
-                      const picked = await openLocalDialog({
-                        directory: true,
-                        title: "选一个目录（可以是空目录）",
-                      });
-                      if (picked && !Array.isArray(picked)) {
-                        setGitInitDialog({ path: picked });
-                      }
-                    })();
-                  }}
-                >
-                  浏览目录…
-                </button>
-                <span className="hint" style={{ marginLeft: 8 }}>
-                  会在该目录执行 <code>git init -b main</code>，然后开一个终端。
-                </span>
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setGitInitDialog(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() => void createGitRepo(gitInitDialog.path)}
-              >
-                创建并打开终端
-              </button>
-            </div>
-          </div>
-        </div>
+        <GitInitDialog
+          gitInitDialog={gitInitDialog}
+          setGitInitDialog={setGitInitDialog}
+          createGitRepo={createGitRepo}
+        />
       )}
 
       {diffDialog && (
-        <div className="modal-backdrop" onClick={() => setDiffDialog(null)}>
-          <div className="modal wide diff-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head ellipsis" title={diffDialog.title}>
-              {diffDialog.title}
-            </div>
-            <div className="modal-body diff-body">
-              <pre className="diff-pre">
-                {diffDialog.text.split("\n").map((line, i) => (
-                  <div
-                    key={i}
-                    className={
-                      "diff-line" +
-                      (line.startsWith("+") && !line.startsWith("+++")
-                        ? " add"
-                        : line.startsWith("-") && !line.startsWith("---")
-                          ? " del"
-                          : line.startsWith("@@")
-                            ? " hunk"
-                            : line.startsWith("diff ") ||
-                                line.startsWith("index ") ||
-                                line.startsWith("commit ")
-                              ? " meta"
-                              : "")
-                    }
-                  >
-                    {line || " "}
-                  </div>
-                ))}
-              </pre>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setDiffDialog(null)}>
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>
+        <DiffDialog diffDialog={diffDialog} setDiffDialog={setDiffDialog} />
       )}
 
       {serialDialog && (
-        <div className="modal-backdrop">
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              {serialDialog.isNew ? "新建串口连接" : "编辑串口连接"}
-              <button
-                type="button"
-                className="mini-x"
-                style={{ float: "right", opacity: 1 }}
-                title="关闭"
-                onClick={() => setSerialDialog(null)}
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="modal-field">
-                名称
-                <input
-                  value={serialDialog.draft.name}
-                  placeholder="比如：ESP32 调试口"
-                  onChange={(e) => patchSerialDraft({ name: e.target.value })}
-                />
-              </label>
-
-              <label className="modal-field">
-                端口
-                <select
-                  value={
-                    serialPorts.some((p) => p.path === serialDialog.draft.serial?.path)
-                      ? serialDialog.draft.serial?.path
-                      : "__custom__"
-                  }
-                  onChange={(e) => {
-                    if (e.target.value !== "__custom__") {
-                      patchSerialDraft({}, { path: e.target.value });
-                    }
-                  }}
-                >
-                  {serialPorts.map((p) => (
-                    <option key={p.path} value={p.path}>
-                      {p.path} — {p.label}
-                    </option>
-                  ))}
-                  <option value="__custom__">
-                    {serialPorts.length === 0 ? "（没检测到串口，手动输入）" : "手动输入…"}
-                  </option>
-                </select>
-              </label>
-              <label className="modal-field">
-                端口名（也可以直接手填）
-                <input
-                  value={serialDialog.draft.serial?.path ?? ""}
-                  placeholder="COM5"
-                  onChange={(e) => patchSerialDraft({}, { path: e.target.value })}
-                />
-              </label>
-              <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={serialLoading}
-                  onClick={() => void refreshSerial()}
-                >
-                  {serialLoading ? "检测中…" : "重新检测串口"}
-                </button>
-                <span className="hint" style={{ marginLeft: 8 }}>
-                  检测到 {serialPorts.length} 个口（含蓝牙/虚拟串口，按需选）
-                </span>
-              </div>
-
-              <div className="modal-row">
-                <label className="modal-field">
-                  波特率
-                  <select
-                    value={
-                      [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].includes(
-                        serialDialog.draft.serial?.baudRate ?? 115200,
-                      )
-                        ? String(serialDialog.draft.serial?.baudRate)
-                        : "__custom__"
-                    }
-                    onChange={(e) => {
-                      if (e.target.value !== "__custom__") {
-                        patchSerialDraft({}, { baudRate: Number(e.target.value) });
-                      }
-                    }}
-                  >
-                    {[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600].map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                      </option>
-                    ))}
-                    <option value="__custom__">自定义…</option>
-                  </select>
-                </label>
-                <label className="modal-field">
-                  自定义波特率
-                  <input
-                    value={serialDialog.draft.serial?.baudRate ?? 115200}
-                    onChange={(e) =>
-                      patchSerialDraft({}, { baudRate: Number(e.target.value) || 115200 })
-                    }
-                  />
-                </label>
-              </div>
-
-              <div className="modal-row">
-                <label className="modal-field">
-                  数据位
-                  <select
-                    value={serialDialog.draft.serial?.dataBits ?? 8}
-                    onChange={(e) => patchSerialDraft({}, { dataBits: Number(e.target.value) })}
-                  >
-                    {[5, 6, 7, 8].map((n) => (
-                      <option key={n} value={n}>
-                        {n}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="modal-field">
-                  停止位
-                  <select
-                    value={serialDialog.draft.serial?.stopBits ?? 1}
-                    onChange={(e) => patchSerialDraft({}, { stopBits: Number(e.target.value) })}
-                  >
-                    <option value={1}>1</option>
-                    <option value={2}>2</option>
-                  </select>
-                </label>
-              </div>
-
-              <div className="modal-row">
-                <label className="modal-field">
-                  校验位
-                  <select
-                    value={serialDialog.draft.serial?.parity ?? "none"}
-                    onChange={(e) =>
-                      patchSerialDraft({}, {
-                        parity: e.target.value as SerialConfig["parity"],
-                      })
-                    }
-                  >
-                    <option value="none">无 (None)</option>
-                    <option value="odd">奇校验 (Odd)</option>
-                    <option value="even">偶校验 (Even)</option>
-                  </select>
-                </label>
-                <label className="modal-field">
-                  流控
-                  <select
-                    value={serialDialog.draft.serial?.flowControl ?? "none"}
-                    onChange={(e) =>
-                      patchSerialDraft({}, {
-                        flowControl: e.target.value as SerialConfig["flowControl"],
-                      })
-                    }
-                  >
-                    <option value="none">无</option>
-                    <option value="software">软件 (XON/XOFF)</option>
-                    <option value="hardware">硬件 (RTS/CTS)</option>
-                  </select>
-                </label>
-              </div>
-
-              <div className="hint" style={{ padding: "0 14px" }}>
-                这些参数只影响这条连接
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setSerialDialog(null)}>
-                取消
-              </button>
-              <button type="button" className="btn" onClick={() => void saveSerialDialog(false)}>
-                仅保存
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() => void saveSerialDialog(true)}
-              >
-                保存并打开
-              </button>
-            </div>
-          </div>
-        </div>
+        <SerialProfileDialog
+          serialDialog={serialDialog}
+          setSerialDialog={setSerialDialog}
+          serialPorts={serialPorts}
+          serialLoading={serialLoading}
+          patchSerialDraft={patchSerialDraft}
+          saveSerialDialog={saveSerialDialog}
+          refreshSerial={refreshSerial}
+        />
       )}
 
       {tabMenu && (
-        <div
-          className="ctx-backdrop"
-          onClick={() => setTabMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setTabMenu(null);
-          }}
-        >
-          <div
-            className="ctx-menu"
-            style={{
-              left: Math.min(Math.max(0, tabMenu.x), Math.max(0, window.innerWidth - 210)),
-              top: Math.min(Math.max(0, tabMenu.y), Math.max(0, window.innerHeight - 170)),
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const m = tabMenu;
-                const s = sessions.find((x) => x.id === m.id);
-                setTabMenu(null);
-                setSessionRename({ id: m.id, value: s?.title ?? "" });
-              }}
-            >
-              重命名会话…
-            </button>
-            {(() => {
-              const s = sessions.find((x) => x.id === tabMenu.id);
-              if (!s?.profileId) return null;
-              return (
-                <button
-                  type="button"
-                  className="menu-item"
-                  onClick={() => {
-                    setTabMenu(null);
-                    if (s) void reconnectSession(s);
-                  }}
-                >
-                  重新连接
-                </button>
-              );
-            })()}
-            {(() => {
-              const s = sessions.find((x) => x.id === tabMenu.id);
-              if (!s) return null;
-              return s.logPath ? (
-                <>
-                  <button
-                    type="button"
-                    className="menu-item"
-                    onClick={() => {
-                      setTabMenu(null);
-                      void stopSessionLog(s);
-                    }}
-                  >
-                    停止记录终端日志
-                  </button>
-                  <button
-                    type="button"
-                    className="menu-item"
-                    onClick={() => {
-                      setTabMenu(null);
-                      void openSessionLog(s);
-                    }}
-                  >
-                    打开日志文件
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  className="menu-item"
-                  onClick={() => {
-                    setTabMenu(null);
-                    void startSessionLog(s);
-                  }}
-                >
-                  开始记录终端日志
-                </button>
-              );
-            })()}
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                setTabMenu(null);
-                void (async () => {
-                  try {
-                    await openInExplorer(await sessionLogDir());
-                  } catch (e) {
-                    notify("打开日志目录失败：" + String(e));
-                  }
-                })();
-              }}
-            >
-              打开日志目录
-            </button>
-            <div className="menu-sep" />
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const m = tabMenu;
-                setTabMenu(null);
-                void closeSession(m.id);
-              }}
-            >
-              关闭会话
-            </button>
-          </div>
-        </div>
+        <TabContextMenu
+          tabMenu={tabMenu}
+          setTabMenu={setTabMenu}
+          setSessionRename={setSessionRename}
+          sessions={sessions}
+          startSessionLog={startSessionLog}
+          stopSessionLog={stopSessionLog}
+          openSessionLog={openSessionLog}
+          closeSession={closeSession}
+          reconnectSession={reconnectSession}
+          notify={notify}
+        />
       )}
 
-      {sessionRename && (() => {
-        // 点弹窗**外面**：什么都不做 —— 用户明确要求"弹窗不手动叉掉就不要关闭"。
-        // 弹窗留着、输入留着（既不保存也不丢弃）；只有三个出口能动它：
-        // ✕/「取消」= 关掉不保存、Enter/「保存」= 保存、Esc = 取消。
-        return (
-        <div className="modal-backdrop">
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">重命名会话</div>
-            <div className="modal-body">
-              <label className="modal-field">
-                显示名字
-                <input
-                  autoFocus
-                  value={sessionRename.value}
-                  placeholder="比如：后端调试 / AI 写文档"
-                  onChange={(e) =>
-                    setSessionRename({ ...sessionRename, value: e.target.value })
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void renameSession(sessionRename.id, sessionRename.value);
-                    // Esc = 取消（保留原名）：这是"我改主意了"的正规出口
-                    if (e.key === "Escape") setSessionRename(null);
-                  }}
-                />
-              </label>
-              <div className="hint" style={{ padding: "0 14px" }}>
-                改完会同时记进「会话历史」（「保存」或 Enter 生效；Esc /「取消」放弃）。
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setSessionRename(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() => void renameSession(sessionRename.id, sessionRename.value)}
-              >
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
-        );
-      })()}
+      {sessionRename && (
+        <SessionRenameDialog
+          sessionRename={sessionRename}
+          setSessionRename={setSessionRename}
+          renameSession={renameSession}
+        />
+      )}
 
       {fsMenu && (
-        <div
-          className="ctx-backdrop"
-          onClick={() => setFsMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setFsMenu(null);
-          }}
-        >
-          <div
-            className="ctx-menu"
-            style={{
-              left: Math.min(Math.max(0, fsMenu.x), Math.max(0, window.innerWidth - 210)),
-              top: Math.min(Math.max(0, fsMenu.y), Math.max(0, window.innerHeight - 190)),
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="menu-head ellipsis" title={fsMenu.name}>
-              {fsMenu.name}
-            </div>
-            {!fsMenu.isDir && (
-              <button
-                type="button"
-                className="menu-item"
-                onClick={() => {
-                  const m = fsMenu;
-                  setFsMenu(null);
-                  void openRemoteFile(m.profileId, m.name);
-                }}
-              >
-                打开预览
-              </button>
-            )}
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const m = fsMenu;
-                setFsMenu(null);
-                void downloadFromRemote(m.profileId, m.name);
-              }}
-            >
-              下载到本机…
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const m = fsMenu;
-                setFsMenu(null);
-                setNameDialog({
-                  mode: "rename",
-                  profileId: m.profileId,
-                  dir: fsPath,
-                  from: m.name,
-                  value: m.name,
-                });
-              }}
-            >
-              重命名…
-            </button>
-            <div className="menu-sep" />
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const m = fsMenu;
-                setFsMenu(null);
-                setConfirmDialog({
-                  title: m.isDir ? "删除目录" : "删除文件",
-                  message:
-                    `确定要删除服务器上的 ${joinPath(fsPath, m.name)} 吗？` +
-                    (m.isDir ? "目录会被递归删除。" : "") +
-                    "此操作不可撤销。",
-                  onOk: () => void doRemoveRemote(m.profileId, m.name),
-                });
-              }}
-            >
-              删除（不可撤销）
-            </button>
-          </div>
-        </div>
+        <FsMenu
+          fsMenu={fsMenu}
+          setFsMenu={setFsMenu}
+          setConfirmDialog={setConfirmDialog}
+          setNameDialog={setNameDialog}
+          fsPath={fsPath}
+          openRemoteFile={openRemoteFile}
+          downloadFromRemote={downloadFromRemote}
+          doRemoveRemote={doRemoveRemote}
+        />
       )}
 
       {nameDialog && (
-        <div className="modal-backdrop" onClick={() => setNameDialog(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              {nameDialog.mode === "mkdir" ? "新建文件夹" : "重命名"}
-            </div>
-            <div className="modal-body">
-              <label className="modal-field">
-                {nameDialog.mode === "mkdir" ? "文件夹名" : "新名字"}
-                <input
-                  autoFocus
-                  value={nameDialog.value}
-                  onChange={(e) => setNameDialog({ ...nameDialog, value: e.target.value })}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void confirmNameDialog();
-                    if (e.key === "Escape") setNameDialog(null);
-                  }}
-                />
-              </label>
-              <div className="hint" style={{ padding: "0 14px" }}>
-                位置：{nameDialog.dir || "/"}
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setNameDialog(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                disabled={fsBusy}
-                onClick={() => void confirmNameDialog()}
-              >
-                确定
-              </button>
-            </div>
-          </div>
-        </div>
+        <NameDialog
+          nameDialog={nameDialog}
+          setNameDialog={setNameDialog}
+          fsBusy={fsBusy}
+          confirmNameDialog={confirmNameDialog}
+        />
       )}
 
       {confirmDialog && (
-        <div className="modal-backdrop" onClick={() => setConfirmDialog(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">{confirmDialog.title}</div>
-            <div className="modal-body">
-              <div className="hint" style={{ padding: "0 14px" }}>
-                {confirmDialog.message}
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setConfirmDialog(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() => {
-                  const fn = confirmDialog.onOk;
-                  setConfirmDialog(null);
-                  fn();
-                }}
-              >
-                {confirmDialog.okLabel ?? "确定"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <ConfirmDialog confirmDialog={confirmDialog} setConfirmDialog={setConfirmDialog} />
       )}
 
       {ctxMenu && (
-        <div
-          className="ctx-backdrop"
-          onClick={() => setCtxMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setCtxMenu(null);
-          }}
-        >
-          <div
-            className="ctx-menu"
-            style={{
-              left: Math.min(ctxMenu.x, Math.max(0, window.innerWidth - 230)),
-              top: Math.min(ctxMenu.y, Math.max(0, window.innerHeight - 220)),
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* 对着**一条 herdr 会话**右键时，菜单是"这一条"的：herdr 的窗格会在服务器上攒着，
-                用户需要能就在这一行上决定"留着 / 回收"（菜单里不弹窗，第二次点才是确认）。 */}
-            {ctxMenu.herdrRow ? (
-              <>
-                <div className="menu-title">{ctxMenu.herdrRow.herdrPane}</div>
-                <button
-                  type="button"
-                  className="menu-item"
-                  onClick={() => {
-                    const h = ctxMenu.herdrRow!;
-                    setCtxMenu(null);
-                    void connectFromHistory(h);
-                  }}
-                >
-                  打开这个会话
-                </button>
-                <button
-                  type="button"
-                  className="menu-item"
-                  onClick={() => {
-                    const h = ctxMenu.herdrRow!;
-                    setCtxMenu(null);
-                    void removeHistoryEntry(h.id);
-                  }}
-                >
-                  只从列表移除（服务器上留着）
-                </button>
-                <div className="menu-sep" />
-                {herdrRowArmed === ctxMenu.herdrRow.herdrPane ? (
-                  <>
-                    <button
-                      type="button"
-                      className="menu-item danger"
-                      onClick={() => {
-                        const h = ctxMenu.herdrRow!;
-                        setCtxMenu(null);
-                        setHerdrRowArmed(null);
-                        void closeHerdrWorkspace(
-                          ctxMenu.profile,
-                          paneWorkspace(h.herdrPane),
-                        );
-                      }}
-                    >
-                      确认在服务器上关掉 {paneWorkspace(ctxMenu.herdrRow.herdrPane)}
-                    </button>
-                    <button
-                      type="button"
-                      className="menu-item"
-                      onClick={() => {
-                        setHerdrRowArmed(null);
-                        setCtxMenu(null);
-                      }}
-                    >
-                      取消
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    className="menu-item"
-                    onClick={() => setHerdrRowArmed(ctxMenu.herdrRow!.herdrPane ?? null)}
-                  >
-                    在服务器上关掉这个工作区…
-                  </button>
-                )}
-              </>
-            ) : (
-              <>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                openNewSessionDialog(p);
-              }}
-            >
-              新建会话
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                openEditDialog(p);
-              }}
-            >
-              编辑服务器…
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                void duplicateProfile(p);
-              }}
-            >
-              复制服务器
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                setTmuxTarget(p);
-                void refreshTmux(p);
-              }}
-            >
-              管理 tmux 会话
-            </button>
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                setHerdrTarget(p);
-                setHerdrMgrArmed(null);
-                void refreshHerdrMgr(p);
-              }}
-            >
-              管理 herdr 工作区
-            </button>
-            <div className="menu-sep" />
-            <button
-              type="button"
-              className="menu-item"
-              onClick={() => {
-                const p = ctxMenu.profile;
-                setCtxMenu(null);
-                void removeProfile(p);
-              }}
-            >
-              删除服务器
-            </button>
-              </>
-            )}
-          </div>
-        </div>
+        <SessionContextMenu
+          ctxMenu={ctxMenu}
+          setCtxMenu={setCtxMenu}
+          setTmuxTarget={setTmuxTarget}
+          setHerdrTarget={setHerdrTarget}
+          setHerdrMgrArmed={setHerdrMgrArmed}
+          setHerdrRowArmed={setHerdrRowArmed}
+          refreshHerdrMgr={refreshHerdrMgr}
+          closeHerdrWorkspace={closeHerdrWorkspace}
+          removeProfile={removeProfile}
+          openEditDialog={openEditDialog}
+          duplicateProfile={duplicateProfile}
+          refreshTmux={refreshTmux}
+          openNewSessionDialog={openNewSessionDialog}
+          connectFromHistory={connectFromHistory}
+          removeHistoryEntry={removeHistoryEntry}
+          herdrRowArmed={herdrRowArmed}
+        />
       )}
 
       {showServers && (
-        <div className="modal-backdrop" onClick={() => setShowServers(false)}>
-          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">服务器管理</div>
-            <div className="modal-body">
-              <div className="srv-toolbar">
-                <button type="button" className="btn primary" onClick={() => openEditDialog()}>
-                  ＋ 新建服务器
-                </button>
-                <span className="hint">共 {sshProfiles.length} 台</span>
-              </div>
-              {sshProfiles.length === 0 && (
-                <div className="hint" style={{ padding: "0 14px" }}>
-                  还没有服务器，点「＋ 新建服务器」添加第一台。
-                </div>
-              )}
-              {sshProfiles.map((p) => (
-                <div className="srv-row" key={p.id}>
-                  <span
-                    className="color-dot"
-                    style={{ background: p.color ?? "#4f8cff" }}
-                  />
-                  <div className="srv-main">
-                    <div className="srv-name">
-                      <span className="ellipsis">{p.name}</span>
-                      {p.ssh?.tmuxEnabled && <span className="tag">tmux</span>}
-                    </div>
-                    <div className="srv-meta">
-                      {p.ssh
-                        ? sshTargetLabel(p.ssh)
-                        : p.type.toUpperCase()}
-                      {p.group ? ` · ${p.group}` : ""}
-                      {p.ssh
-                        ? p.ssh.allowPassword
-                          ? " · 允许输入密码"
-                          : " · 只用密钥/agent"
-                        : ""}
-                    </div>
-                  </div>
-                  <div className="srv-actions">
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="用这台服务器开一个新会话"
-                      onClick={() => {
-                        setShowServers(false);
-                        openNewSessionDialog(p);
-                      }}
-                    >
-                      新建会话
-                    </button>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="编辑名称 / 主机 / 用户 / 密钥 / tmux"
-                      onClick={() => openEditDialog(p)}
-                    >
-                      编辑
-                    </button>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      onClick={() => void duplicateProfile(p)}
-                    >
-                      复制
-                    </button>
-                    {confirmDel === p.id ? (
-                      <>
-                        <button
-                          type="button"
-                          className="mini-btn danger"
-                          onClick={() => {
-                            setConfirmDel(null);
-                            void removeProfile(p);
-                          }}
-                        >
-                          确认删除
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-btn"
-                          onClick={() => setConfirmDel(null)}
-                        >
-                          取消
-                        </button>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        onClick={() => setConfirmDel(p.id)}
-                      >
-                        删除
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setShowServers(false)}>
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>
+        <ServersDialog
+          confirmDel={confirmDel}
+          setConfirmDel={setConfirmDel}
+          removeProfile={removeProfile}
+          openEditDialog={openEditDialog}
+          duplicateProfile={duplicateProfile}
+          openNewSessionDialog={openNewSessionDialog}
+          sshProfiles={sshProfiles}
+          setShowServers={setShowServers}
+        />
       )}
 
       {editDialog && (
-        <div className="modal-backdrop">
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              {editDialog.isNew ? "新建服务器" : "编辑服务器"}
-              <button
-                type="button"
-                className="mini-x"
-                style={{ float: "right", opacity: 1 }}
-                title="关闭"
-                onClick={() => setEditDialog(null)}
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="modal-field">
-                名称
-                <input
-                  value={editDialog.draft.name}
-                  placeholder="只是标签，不参与连接"
-                  onChange={(e) => patchDraft({ name: e.target.value })}
-                />
-              </label>
-              <label className="modal-field">
-                分组（可留空；留空就归到「未分组」）
-                <input
-                  value={editDialog.draft.group}
-                  placeholder="例如：生产环境 / 测试机"
-                  onChange={(e) => patchDraft({ group: e.target.value })}
-                />
-              </label>
-              {/* 外观：勾上=跟着"整体设置里那一类终端"走（全局一改它就跟着变）；
-                  取消勾选=这台机器独立一套，以后全局怎么改都不动它 */}
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={!editDialog.draft.termScheme && !editDialog.draft.highlightSetId}
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      patchDraft({ termScheme: null, termSchemeCustom: null, highlightSetId: null });
-                    } else {
-                      // 独立：从"当前生效的那套"起步，方便微调
-                      const kind = editDialog.draft.type === "serial" ? "serial" : "ssh";
-                      const cur = termSchemeFor(settings, undefined, kind);
-                      const curSet = settings.highlightSetByKind?.[kind] ?? "";
-                      patchDraft({ termScheme: cur.key, highlightSetId: curSet || null });
-                    }
-                  }}
-                />
-                <span>
-                  外观跟随全局设置（{editDialog.draft.type === "serial" ? "串口设备" : "远程 SSH"}那一档）；
-                  取消勾选就是独立一套，以后改全局不会动它
-                </span>
-              </label>
-              {(!editDialog.draft.termScheme && !editDialog.draft.highlightSetId) === false && (
-                <div className="modal-inline-action" style={{ paddingBottom: 8 }}>
-                  <select
-                    value={editDialog.draft.termScheme ?? ""}
-                    onChange={(e) => patchDraft({ termScheme: e.target.value || null })}
-                    title="这台机器独立的配色方案"
-                  >
-                    <option value="">（跟随全局那档）</option>
-                    {TERM_SCHEMES.map((s) => (
-                      <option key={s.key} value={s.key}>
-                        {s.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    style={{ marginLeft: 6 }}
-                    value={editDialog.draft.highlightSetId ?? ""}
-                    onChange={(e) => patchDraft({ highlightSetId: e.target.value || null })}
-                    title="这台机器独立的高亮规则集"
-                  >
-                    <option value="">（跟随全局那档）</option>
-                    {settings.highlightRuleSets.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.name || "(未命名)"}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              <label className="modal-field">
-                主机
-                <input
-                  value={editDialog.draft.ssh?.host ?? ""}
-                  placeholder="IP 或 ~/.ssh/config 里的别名（填别名才能带上 config 里的密钥/端口/用户）"
-                  onChange={(e) => patchDraft({}, { host: e.target.value })}
-                />
-              </label>
-              <div className="modal-row">
-                <label className="modal-field">
-                  端口
-                  <input
-                    type="number"
-                    min={0}
-                    // 0 显示成空：0 是"没说"（后端不传 -p），不是"端口 0"
-                    value={editDialog.draft.ssh?.port || ""}
-                    placeholder="留空则用 ~/.ssh/config 里的值（默认 22）"
-                    // 以前这里 `Number(...) || 22` 会把清空**打回 22** —— 用户想留空反而被填上，
-                    // 于是 config 里的 Port 被 22 顶掉（"我明明配了别名"就是这么坏掉的）。
-                    onChange={(e) => patchDraft({}, { port: portOrZero(e.target.value) })}
-                  />
-                </label>
-                <label className="modal-field">
-                  用户名
-                  <input
-                    value={editDialog.draft.ssh?.user ?? ""}
-                    placeholder="留空则用 ~/.ssh/config 里的值（默认当前用户名）"
-                    onChange={(e) => patchDraft({}, { user: e.target.value })}
-                  />
-                </label>
-              </div>
-              <label className="modal-field">
-                私钥路径（可选，留空则用默认密钥 / ~/.ssh/config）
-                <input
-                  value={editDialog.draft.ssh?.keyPath ?? ""}
-                  placeholder="C:\Users\me\.ssh\id_ed25519"
-                  onChange={(e) => patchDraft({}, { keyPath: e.target.value })}
-                />
-              </label>
-              {/* 连接诊断：只读跑一次本机 ssh -G，看**实际**会用的主机/端口/用户/密钥。
-                  用户报障时不用再猜"我填的别名到底生效了没有""钥匙到底在哪找"。 */}
-              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={!editDialog.draft.id}
-                  title={
-                    editDialog.draft.id
-                      ? "只读：看看本机会用哪个主机 / 端口 / 用户 / 密钥，不会去连服务器"
-                      : "先保存这台服务器再诊断（诊断是按已保存的配置跑的）"
-                  }
-                  onClick={() => {
-                    if (editDialog.draft.id) void openSshDiagnosis(editDialog.draft.id);
-                  }}
-                >
-                  连接诊断（看看本机会用哪把钥匙）
-                </button>
-                <span className="hint" style={{ marginLeft: 8 }}>
-                  只读，不会去连服务器（按已保存的配置诊断）
-                </span>
-              </div>
-              <label className="modal-field">
-                跳板机（可选，写法同 ssh -J：user@jump-host 或 user@jump-host:22）
-                <input
-                  value={editDialog.draft.ssh?.jump ?? ""}
-                  placeholder="root@10.0.0.1 —— 留空就是直连"
-                  onChange={(e) => patchDraft({}, { jump: e.target.value })}
-                />
-              </label>
-              <label className="modal-field">
-                tmux 会话名模板
-                <input
-                  value={editDialog.draft.ssh?.tmuxTemplate ?? "{host}-{user}"}
-                  onChange={(e) => patchDraft({}, { tmuxTemplate: e.target.value })}
-                />
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={editDialog.draft.ssh?.tmuxEnabled ?? true}
-                  onChange={(e) => patchDraft({}, { tmuxEnabled: e.target.checked })}
-                />
-                <span>默认使用 tmux（新建会话时仍可临时改）</span>
-              </label>
-              {/* 这台服务器"默认用 herdr 打开"。
-                  勾上之后新建会话里 herdr 那个勾会默认打上，不再每次问你。
-                  没装 herdr 的机器上勾了也没关系：真去开会话时探测到没装会明确告诉你。 */}
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={editDialog.draft.ssh?.herdrEnabled ?? false}
-                  onChange={(e) => patchDraft({}, { herdrEnabled: e.target.checked })}
-                />
-                <span>默认用 herdr 打开（新建会话时仍可临时取消）</span>
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={editDialog.draft.ssh?.allowPassword ?? false}
-                  onChange={(e) => patchDraft({}, { allowPassword: e.target.checked })}
-                />
-                <span>
-                  允许在终端里输入密码（默认关闭：只用密钥/agent，连不上直接报错而不是卡住）
-                </span>
-              </label>
-              {/* 密码存 Windows 凭据管理器：这样「只能用密码」的服务器也能读远程文件 / 列 tmux */}
-              <label className="modal-field">
-                密码（存在 Windows 凭据管理器，不会写进配置文件）
-                <input
-                  type="password"
-                  value={editPassword}
-                  placeholder={
-                    editHasPassword
-                      ? "已保存密码 · 输入新密码可覆盖"
-                      : "留空则不用密码登录"
-                  }
-                  onChange={(e) => setEditPassword(e.target.value)}
-                />
-              </label>
-              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={!editPassword || !editDialog.draft.id}
-                  title={
-                    editDialog.draft.id
-                      ? "存进 Windows 凭据管理器（控制面板 → 凭据管理器里可以看到并删除）"
-                      : "先保存这台服务器，再设置密码"
-                  }
-                  onClick={() => {
-                    const id = editDialog.draft.id;
-                    if (!id) {
-                      notify("先保存这台服务器，再来设置密码");
-                      return;
-                    }
-                    void (async () => {
-                      try {
-                        await secretSet(id, editPassword);
-                        setEditHasPassword(true);
-                        setEditPassword("");
-                        notify("密码已存进 Windows 凭据管理器");
-                      } catch (e) {
-                        notify("保存密码失败：" + String(e));
-                      }
-                    })();
-                  }}
-                >
-                  保存密码
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  style={{ marginLeft: 6 }}
-                  disabled={!editHasPassword || !editDialog.draft.id}
-                  onClick={() => {
-                    const id = editDialog.draft.id;
-                    void (async () => {
-                      try {
-                        await secretDelete(id);
-                        setEditHasPassword(false);
-                        notify("已删除保存的密码");
-                      } catch (e) {
-                        notify("删除密码失败：" + String(e));
-                      }
-                    })();
-                  }}
-                >
-                  清除密码
-                </button>
-                <span className="hint" style={{ marginLeft: 8 }}>
-                  {editHasPassword ? "✓ 已保存密码" : "未保存密码"}
-                </span>
-              </div>
-              <label className="modal-field">
-                标签颜色（可选，显示在服务器名前）
-                <input
-                  type="color"
-                  className="color-input"
-                  value={editDialog.draft.color ?? "#4f8cff"}
-                  onChange={(e) => patchDraft({ color: e.target.value })}
-                />
-              </label>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setEditDialog(null)}>
-                取消
-              </button>
-              <button type="button" className="btn primary" onClick={() => void saveEditDialog()}>
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
+        <ServerEditDialog
+          editDialog={editDialog}
+          setEditDialog={setEditDialog}
+          editPassword={editPassword}
+          setEditPassword={setEditPassword}
+          editHasPassword={editHasPassword}
+          setEditHasPassword={setEditHasPassword}
+          settings={settings}
+          openSshDiagnosis={openSshDiagnosis}
+          saveEditDialog={saveEditDialog}
+          patchDraft={patchDraft}
+          notify={notify}
+        />
       )}
 
       {/* 连接诊断弹窗：编辑服务器里的按钮 和 连接失败提示 共用 */}
@@ -11345,498 +6792,37 @@ export default function App() {
           onRetry={() => void openSshDiagnosis(diagView.profileId, diagView.failure)}
         />
       )}
-
       {showSettings && (
-        <div className="modal-backdrop">
-          {/* 点外面**不关**：设置要反复对照着改，误点一下全没了很难受；只认右上角 ✕ / 完成 */}
-          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              设置
-              <button
-                type="button"
-                className="mini-x"
-                style={{ float: "right", opacity: 1 }}
-                title="关闭设置"
-                onClick={() => setShowSettings(false)}
-              >
-                ✕
-              </button>
-            </div>
-            <div className="settings-split">
-              {/* 左边：分类。点一下右边就只显示这一类（像微信设置那样） */}
-              <div className="settings-nav">
-                {SETTINGS_TABS.map((t) => (
-                  <button
-                    key={t.key}
-                    type="button"
-                    className={"settings-nav-item" + (settingsTab === t.key ? " active" : "")}
-                    onClick={() => setSettingsTab(t.key)}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-              <div className="modal-body">
-              {settingsTab === "look" && (
-                <>
-              <label className="modal-field">
-                终端字体大小：{settings.fontSize}px（也可直接 Ctrl + 滚轮 或 Ctrl + ＋ / －）
-                <input
-                  type="range"
-                  min={8}
-                  max={26}
-                  value={settings.fontSize}
-                  onChange={(e) => applyFontSize(Number(e.target.value))}
-                />
-              </label>
-
-              <label className="modal-field">
-                终端回滚行数：{settings.scrollback.toLocaleString()} 行
-                <input
-                  type="range"
-                  min={1000}
-                  max={200000}
-                  step={1000}
-                  value={settings.scrollback}
-                  onChange={(e) => void updateSettings({ scrollback: Number(e.target.value) })}
-                />
-              </label>
-              <div className="modal-inline-action" style={{ paddingBottom: 10 }}>
-                {[2000, 10000, 50000, 200000].map((n) => (
-                  <button
-                    key={n}
-                    type="button"
-                    className="mini-btn"
-                    style={{ marginRight: 6 }}
-                    onClick={() => void updateSettings({ scrollback: n })}
-                  >
-                    {n >= 1000 ? `${n / 1000}k` : n}
-                  </button>
-                ))}
-                <span className="hint">
-                  往上能翻多少行历史。超出后最老的行会被丢掉（不会崩，只是看不到更早的）；
-                  要长期留存就开终端日志。
-                </span>
-              </div>
-                </>
-              )}
-
-              {settingsTab === "log" && (
-                <>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.autoLog}
-                  onChange={(e) => void updateSettings({ autoLog: e.target.checked })}
-                />
-                <span>
-                  新建会话时自动记录终端日志（标签上会出现红点，右键标签可以停止或打开日志）
-                </span>
-              </label>
-
-              <label className="modal-field">
-                会话日志目录（留空 = 默认 %APPDATA%\ZeeAI-Terminal\logs\sessions）
-                <input
-                  value={settings.logDir}
-                  placeholder="例如 D:\zeeai-logs"
-                  onChange={(e) => void updateSettings({ logDir: e.target.value })}
-                />
-              </label>
-              <div className="modal-inline-action">
-                <button type="button" className="mini-btn" onClick={() => void pickLogDir()}>
-                  选择目录…
-                </button>
-                <button type="button" className="mini-btn" onClick={() => void openLogDir()}>
-                  打开目录
-                </button>
-                {settings.logDir.trim() !== "" && (
-                  <button
-                    type="button"
-                    className="mini-btn"
-                    onClick={() => {
-                      void updateSettings({ logDir: "" });
-                      notify("日志目录已恢复为默认位置");
-                    }}
-                  >
-                    恢复默认
-                  </button>
-                )}
-              </div>
-                </>
-              )}
-
-              {settingsTab === "term" && (
-                <>
-              <label className="modal-field">
-                默认终端
-                <select
-                  value={settings.defaultShell}
-                  onChange={(e) =>
-                    void updateSettings({
-                      defaultShell: e.target.value as AppSettings["defaultShell"],
-                    })
-                  }
-                >
-                  <option value="powershell">PowerShell</option>
-                  <option value="cmd">CMD</option>
-                  <option value="wsl">WSL</option>
-                </select>
-              </label>
-
-                </>
-              )}
-
-              {settingsTab === "look" && (
-                <>
-              <label className="modal-field">
-                主题配色
-                <select
-                  value={settings.theme}
-                  onChange={(e) => void updateSettings({ theme: e.target.value })}
-                >
-                  {THEMES.map((t) => (
-                    <option key={t.key} value={t.key}>
-                      {t.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <div className="modal-inline-action">
-                <button type="button" className="btn" onClick={() => setShowTermTheme(true)}>
-                  终端配色与关键字高亮…
-                </button>
-                <span className="hint" style={{ padding: "0 0 0 8px" }}>
-                  当前配色：{currentTermSchemeName()}（可在里面按"终端类型"分别设置）
-                </span>
-              </div>
-                </>
-              )}
-
-              {settingsTab === "app" && (
-                <>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.restoreWorkspace}
-                  onChange={(e) => void updateSettings({ restoreWorkspace: e.target.checked })}
-                />
-                <span>启动时恢复上次的会话（SSH / 本地终端 / 串口；只记"怎么开回来"，不存文件内容）</span>
-              </label>
-
-              <label className="modal-field">
-                关闭窗口时
-                <select
-                  value={settings.closeAction}
-                  onChange={(e) =>
-                    void updateSettings({
-                      closeAction: e.target.value as AppSettings["closeAction"],
-                    })
-                  }
-                >
-                  <option value="exit">退出应用</option>
-                  <option value="tray">收进系统托盘（后台继续运行）</option>
-                </select>
-              </label>
-
-              <div className="hint" style={{ padding: "2px 14px 8px" }}>
-                这两条是应用级行为，跟"终端怎么跑"无关。
-              </div>
-                </>
-              )}
-
-              {settingsTab === "notify" && (
-                <>
-              <div className="tree-group">什么时候提醒我</div>
-              <div className="hint" style={{ padding: "0 14px 6px" }}>
-                AI 跑的小任务很多，默认不为"跑完了"打扰你，只报下面这两类要你动手的事。
-              </div>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyDocs}
-                  onChange={(e) => void updateSettings({ aiNotifyDocs: e.target.checked })}
-                />
-                <span>产出了文档（HTML / Markdown）就告诉我 —— 推荐</span>
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyNeedsYou}
-                  onChange={(e) => void updateSettings({ aiNotifyNeedsYou: e.target.checked })}
-                />
-                <span>AI 等我做选择题（要批准 / 等回话）就告诉我 —— 推荐</span>
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyComplete}
-                  onChange={(e) => void updateSettings({ aiNotifyComplete: e.target.checked })}
-                />
-                <span>每一轮跑完都告诉我（小任务多的话会很吵，默认关）</span>
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyAllArtifacts}
-                  onChange={(e) =>
-                    void updateSettings({ aiNotifyAllArtifacts: e.target.checked })
-                  }
-                />
-                <span>所有新文件都算"产物"（关 = 只算 HTML / Markdown，默认）</span>
-              </label>
-              <div className="tree-group" style={{ marginTop: 8 }}>
-                用哪种方式提醒
-              </div>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyTaskbar}
-                  onChange={(e) => void updateSettings({ aiNotifyTaskbar: e.target.checked })}
-                />
-                <span>
-                  窗口不在前台时闪 Windows 任务栏
-                </span>
-              </label>
-              {/* 红点只为两种情况亮（docs/design-ai-board-v2.md §10.6）。
-                  以前这里是一条"跑完了就点红点"的总开关 —— 那样每次轮询都可能让它冒出来，
-                  用户的原话是"红点别吵"，所以拆成下面两条独立规则。 */}
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyNeedsYouBadge}
-                  onChange={(e) =>
-                    void updateSettings({ aiNotifyNeedsYouBadge: e.target.checked })
-                  }
-                />
-                <span>需要你处理时提醒（红点亮到你处理为止）</span>
-              </label>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.aiNotifyFinishedBadge}
-                  onChange={(e) =>
-                    void updateSettings({ aiNotifyFinishedBadge: e.target.checked })
-                  }
-                />
-                <span>跑完一轮并停下时提醒（点开面板就消，当未读）</span>
-              </label>
-              <div className="hint" style={{ padding: "2px 14px 8px" }}>
-                红点规则：<b>需要你 → 亮到你处理；跑完停下 → 点开就消</b>。
-                <br />
-                其它情况不提醒：运行中、空闲、超过 10 分钟没动静、只产出文件但还在跑、探测不到
-                —— 一个都不点红点。
-              </div>
-              <div className="hint" style={{ padding: "2px 14px 8px" }}>
-                提醒只进底部状态栏（不会在窗口中间弹浮层）；点状态栏那条可以直接切过去。
-              </div>
-                </>
-              )}
-
-              {settingsTab === "term" && (
-                <>
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.tmuxDefault}
-                  onChange={(e) => void updateSettings({ tmuxDefault: e.target.checked })}
-                />
-                <span>新建连接时默认启用 tmux</span>
-              </label>
-
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.recordHistory}
-                  onChange={(e) => void updateSettings({ recordHistory: e.target.checked })}
-                />
-                <span>记录会话历史</span>
-              </label>
-
-              <label className="form-check">
-                <input
-                  type="checkbox"
-                  checked={settings.autoReconnect}
-                  onChange={(e) => void updateSettings({ autoReconnect: e.target.checked })}
-                />
-                <span>SSH 断开后自动重连（会重新附加 tmux，最多重试 5 次）</span>
-              </label>
-
-              {/* ---------- 发给 AI：图片与文件 ----------
-                  这 5 项是一件事的五个开关（落地目录 / 粘贴键 / 右键 / 复制 / 直粘走哪条路），
-                  所以收在一个分组里；正文只回答"这条是干什么的"，"为什么这么设计"一律进 title。
-                  提示一律纯文本 —— 这个界面不渲染 markdown，别写 ** 或反引号。 */}
-              <div className="tree-group" style={{ marginTop: 4 }}>
-                发给 AI（图片与文件）
-              </div>
-
-              <label
-                className="modal-field"
-                title="粘贴 / 拖进来的图片与文件会先传到服务器上，再把「远端路径」交给 AI —— CLI agent 只认路径，它自己会去读这个文件。"
-              >
-                图片 / 文件传到远端哪个目录
-                <input
-                  type="text"
-                  value={settings.pasteDir}
-                  placeholder="~/.zeeai/paste"
-                  onChange={(e) => void updateSettings({ pasteDir: e.target.value })}
-                />
-                <span className="hint">默认 ~/.zeeai/paste；填 . = 跟随终端当前目录</span>
-              </label>
-
-              {/* 终端的三个"习惯项"：老终端用户各有各的肌肉记忆，做成可配比替他决定强 */}
-              <label
-                className="modal-field"
-                title="没被选中的那个键会原样交给终端里的程序：Ctrl+V 变成 ^V（readline 的 quoted-insert、vim 的块选择），Shift+Insert 变成 Insert 键。选中的那个键走浏览器原生粘贴，图片也能直接粘。"
-              >
-                粘贴用哪个键
-                <select
-                  value={settings.pasteKey}
-                  onChange={(e) => void updateSettings({ pasteKey: e.target.value })}
-                >
-                  <option value="both">Ctrl+V 和 Shift+Insert 都能粘（默认）</option>
-                  <option value="ctrl-v">只用 Ctrl+V（Shift+Insert 送给远端）</option>
-                  <option value="shift-insert">只用 Shift+Insert（Ctrl+V 送 ^V 给远端）</option>
-                </select>
-                <span className="hint">默认两个键都能粘；没被选中的那个原样送给远端</span>
-              </label>
-
-              <label
-                className="modal-field"
-                title="选「直接粘贴」时 Shift+右键仍然弹菜单（想用菜单时不用改设置）；万一系统拒绝读剪贴板，会自动退回菜单并给一句提示。图片请用 Ctrl+V / Shift+Insert。"
-              >
-                终端里点右键
-                <select
-                  value={settings.rightClick}
-                  onChange={(e) => void updateSettings({ rightClick: e.target.value })}
-                >
-                  <option value="menu">弹菜单（默认）</option>
-                  <option value="paste">直接粘贴剪贴板文本</option>
-                </select>
-                <span className="hint">默认弹菜单；Shift+右键始终弹菜单</span>
-              </label>
-
-              <label
-                className="modal-field"
-                title="三种口径下 Ctrl+Shift+C 都是复制。「选中即复制」跟 X11 一个脾气：鼠标一划就走剪贴板（选中就写，不用按键）。"
-              >
-                怎么复制
-                <select
-                  value={settings.copyKey}
-                  onChange={(e) => void updateSettings({ copyKey: e.target.value })}
-                >
-                  <option value="ctrl-shift-c">Ctrl+Shift+C（默认；Ctrl+C 始终是中断）</option>
-                  <option value="ctrl-c-smart">Ctrl+C：有选中就复制，没选中才是中断</option>
-                  <option value="select">选中即复制（不用按键）</option>
-                </select>
-                <span className="hint">默认 Ctrl+Shift+C；选中即复制 = 划一下就走剪贴板</span>
-              </label>
-
-              <label
-                className="form-check"
-                title="不勾（默认）：图片先进输入窗，能确认粘对了没有、还能补一句话再发。勾上：快路径 —— 立刻把远端路径插进终端输入行，并弹几秒缩略图。纯文本粘贴两种情况下都按光标所在位置走。"
-              >
-                <input
-                  type="checkbox"
-                  checked={settings.pasteToast}
-                  onChange={(e) => void updateSettings({ pasteToast: e.target.checked })}
-                />
-                <span>在终端里直接粘图片：放进输入窗（勾上 = 直接插路径）</span>
-              </label>
-
-                </>
-              )}
-
-              {settingsTab === "update" && (
-                <>
-                  {renderUpdateSection()}
-                  <div className="hint">
-                    设置立即生效，保存在 %APPDATA%\ZeeAI-Terminal\settings.json。
-                  </div>
-                </>
-              )}
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn primary" onClick={() => setShowSettings(false)}>
-                完成
-              </button>
-            </div>
-          </div>
-        </div>
+        <SettingsPanel
+          settings={settings}
+          settingsTab={settingsTab}
+          setSettingsTab={setSettingsTab}
+          setShowSettings={setShowSettings}
+          updateSettings={updateSettings}
+          applyFontSize={applyFontSize}
+          pickLogDir={pickLogDir}
+          openLogDir={openLogDir}
+          setShowTermTheme={setShowTermTheme}
+          currentTermSchemeName={currentTermSchemeName}
+          renderUpdateSection={renderUpdateSection}
+          notify={notify}
+        />
       )}
 
       {paletteOpen && (
-        <div className="modal-backdrop palette-backdrop" onClick={() => setPaletteOpen(false)}>
-          <div className="palette" onClick={(e) => e.stopPropagation()}>
-            <input
-              autoFocus
-              className="palette-input"
-              placeholder="输入命令名，回车执行（Esc 关闭）"
-              value={paletteQuery}
-              onChange={(e) => setPaletteQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") setPaletteOpen(false);
-                if (e.key === "Enter") {
-                  const first = paletteItems[0];
-                  if (first) {
-                    setPaletteOpen(false);
-                    first.run();
-                  }
-                }
-              }}
-            />
-            <div className="palette-list">
-              {paletteItems.length === 0 && (
-                <div className="hint" style={{ padding: "8px 12px" }}>
-                  没有匹配的命令。
-                </div>
-              )}
-              {paletteItems.slice(0, 40).map((c, i) => (
-                <button
-                  key={c.group + c.label}
-                  type="button"
-                  className={"palette-item" + (i === 0 ? " first" : "")}
-                  onClick={() => {
-                    setPaletteOpen(false);
-                    c.run();
-                  }}
-                >
-                  <span className="grow ellipsis">{c.label}</span>
-                  <span className="dim">{c.group}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+        <CommandPalette
+          setPaletteOpen={setPaletteOpen}
+          paletteQuery={paletteQuery}
+          setPaletteQuery={setPaletteQuery}
+          paletteItems={paletteItems}
+        />
       )}
 
       {showAbout && (
-        <div className="modal-backdrop" onClick={() => setShowAbout(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">关于 ZeeAI Term</div>
-            <div className="modal-body">
-              <div className="about-row">
-                <IconLogoRadio size={56} />
-              </div>
-              <div className="hint">
-                <b>ZeeAI Term</b> {APP_VERSION}
-                <br />
-                Windows 多协议终端工作台：SSH（tmux 持久化）、远程文件与预览、本地终端。
-                <br />
-                <br />
-                技术栈：Tauri 2 + Rust + React + xterm.js
-              </div>
-              <div className="about-sep" />
-              {renderUpdateSection()}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setShowAbout(false)}>
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>
+        <AboutDialog
+          setShowAbout={setShowAbout}
+          renderUpdateSection={renderUpdateSection}
+        />
       )}
 
       {showTermTheme && (
@@ -11891,579 +6877,30 @@ export default function App() {
       )}
 
       {newDialog && (
-        <div className="modal-backdrop">
-          {/* 输入型对话框：点外面不关（填了一半被手滑点掉很难受），只认右上角 ✕ / 取消 */}
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              新建会话
-              <button
-                type="button"
-                className="mini-x"
-                style={{ float: "right", opacity: 1 }}
-                title="关闭"
-                onClick={() => setNewDialog(null)}
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="modal-field">
-                服务器
-                <select
-                  value={newDialog.profileId}
-                  onChange={(e) => {
-                    const picked = profiles.find((x) => x.id === e.target.value);
-                    // 换服务器时，登录用户要跟着换成"这台服务器自己的用户"，
-                    // 不能沿用上一台的值（否则 tmux 名也会拿旧用户去拼 —— 实测就是这样错的）
-                    const nextUser = picked?.ssh?.user ?? "";
-                    setNewDialog({
-                      ...newDialog,
-                      profileId: e.target.value,
-                      user: nextUser,
-                      tmuxName: picked ? defaultTmuxName(picked, nextUser) : "",
-                      attachTarget: "",
-                    });
-                    if (newDialog.useTmux)
-                      void loadDialogTmux(e.target.value, nextUser);
-                  }}
-                >
-                  {sshProfiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}（{p.ssh?.user}@{p.ssh?.host}）
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <div className="modal-inline-action">
-                <button
-                  type="button"
-                  className="mini-btn"
-                  onClick={() => {
-                    setNewDialog(null);
-                    setReopenNewAfterSave(true);
-                    openEditDialog();
-                  }}
-                >
-                  ＋ 新建服务器
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  style={{ marginLeft: 6 }}
-                  onClick={() => {
-                    const cur = profiles.find((p) => p.id === newDialog.profileId);
-                    setNewDialog(null);
-                    openEditDialog(cur);
-                  }}
-                >
-                  编辑当前服务器
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  style={{ marginLeft: 6 }}
-                  onClick={() => {
-                    setNewDialog(null);
-                    setShowServers(true);
-                  }}
-                >
-                  服务器管理
-                </button>
-              </div>
-
-              <label className="modal-field">
-                登录用户
-                <input
-                  value={newDialog.user}
-                  placeholder="例如 root / ubuntu"
-                  onChange={(e) => {
-                    const nextUser = e.target.value;
-                    const picked = profiles.find((x) => x.id === newDialog.profileId);
-                    // tmux 名里带用户名（模板 {host}-{user}），所以改用户时跟着更新；
-                    // 只有当它还是"自动生成的那个"或为空时才覆盖，尊重手动改过的名字
-                    const auto = picked ? defaultTmuxName(picked, newDialog.user) : "";
-                    const keepManual =
-                      newDialog.tmuxName.trim() !== "" && newDialog.tmuxName !== auto;
-                    setNewDialog({
-                      ...newDialog,
-                      user: nextUser,
-                      tmuxName:
-                        picked && !keepManual ? defaultTmuxName(picked, nextUser) : newDialog.tmuxName,
-                    });
-                  }}
-                />
-              </label>
-              <div className="hint" style={{ padding: "0 0 8px 14px" }}>
-                登录用户只对这次会话生效，不会改动服务器配置（要改配置请用「服务器管理」）
-              </div>
-              {/* 会话名字：留空 = 自动命名（普通 shell 会自动编号 1、2、3…），
-                  这样同一台机器开多个普通会话，历史列表里也能一一对应、不会互相覆盖 */}
-              <label className="modal-field">
-                会话名字（可留空）
-                <input
-                  value={newDialog.title ?? ""}
-                  placeholder="留空 = 自动命名（普通 shell 会自动编号，不会重名）"
-                  onChange={(e) => setNewDialog({ ...newDialog, title: e.target.value })}
-                />
-              </label>
-
-              {/* tmux 那条：勾了 herdr 就不再显示（两条是"用哪种方式开"，同时开没有意义） */}
-              {!newDialog.useHerdr && (
-                <label className="form-check">
-                  <input
-                    type="checkbox"
-                    checked={newDialog.useTmux}
-                    onChange={(e) => {
-                      setNewDialog({ ...newDialog, useTmux: e.target.checked });
-                      if (e.target.checked)
-                        void loadDialogTmux(newDialog.profileId, newDialog.user);
-                    }}
-                  />
-                  <span>使用 tmux（断网后可回到同一个会话）</span>
-                </label>
-              )}
-
-              {/* 用 herdr 打开这次会话。
-                  勾选默认值来自**这台服务器**的配置（「服务器管理」里那个"默认用 herdr 打开"），
-                  勾过一次就不用每次再点 —— 用户原话："我勾了默认打开就别再让我勾"。
-                  勾上就直接进她的环境（可读可写那条 control 流），不跑她自己的 TUI（会花屏）。 */}
-              <label
-                className="form-check"
-                title={
-                  newDialogCanHerdr
-                    ? `${newDialogHerdr?.herdrPath || ""}\n协议 ${newDialogHerdr?.protocol} · schema v${newDialogHerdr?.schemaVersion}\n当前她在管 ${newDialogHerdr?.agents} 个 agent\n\n勾上 = 直接进她的环境（可读可写）；关掉标签时窗格留在服务器上，随时能回来`
-                    : newDialogHerdr === undefined
-                      ? probingHerdr[newDialog.profileId]
-                        ? "正在探测这台机器有没有 herdr…"
-                        : "还没探测这台机器。点一下这行即可探测。"
-                      : "这台机器上没有 herdr。没有它也能正常用 tmux 或普通 shell，只是看板少一路更准的状态。"
-                }
-                onClick={() => {
-                  if (newDialogHerdr === undefined) {
-                    void probeHerdrFor(newDialog.profileId, newDialog.user);
-                  }
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={newDialog.useHerdr}
-                  // **只有"确实探到没装"才禁**（`!!newDialogHerdr` 就是这道闸）：
-                  //   - undefined = 还没探 → 允许勾
-                  //   - null      = 探测失败（可以重试）→ 允许勾
-                  //   - {} 无版本 = 探到了、这台机器没装 → 才禁用
-                  // 以前是"探测没返回就禁用"，用户想勾也点不动，点连接就悄悄开了个普通 shell
-                  //（实测反馈"herdr 一直建不开"）。勾上之后点连接会强制再确认一次。
-                  disabled={!!newDialogHerdr && !newDialogCanHerdr}
-                  onChange={(e) => {
-                    setNewDialog({ ...newDialog, useHerdr: e.target.checked });
-                    // 只有"接管已有窗格"才需要列表；新建窗格不用拉
-                    if (e.target.checked && newDialog.herdrKind === "attach") {
-                      void loadDialogHerdr(newDialog.profileId, newDialog.user);
-                    }
-                  }}
-                />
-                <span>
-                  用 herdr 打开
-                  {newDialogCanHerdr
-                    ? `（已装 ${newDialogHerdr?.herdrVersion} · 协议 ${newDialogHerdr?.protocol}）`
-                    : newDialogHerdr === undefined
-                      ? probingHerdr[newDialog.profileId]
-                        ? "（正在探测…可以先勾上）"
-                        : "（未探测 · 点这行探测）"
-                      // 探到"没装"和"探测失败"要分开说：前者是结论，后者是可以重试的
-                      : newDialogHerdr === null
-                        ? "（探测失败，可以先勾上，连接时会重试）"
-                      : "（这台机器没装）"}
-                </span>
-              </label>
-
-              {/* 探测结果是"没有 herdr"时，顺手给一个一键安装入口。
-                  安装过程由 Windows 侧下载 + 校验 sha256 后 scp 上去，不跑远端脚本、不要 root。 */}
-              {/* 安装入口只在"**确认**这台机器没装 herdr"时出现；
-                  探测失败（null）不给 —— 那多半是网络一时不通，装什么装。 */}
-              {!!newDialogHerdr && !newDialogCanHerdr ? (
-                <div className="modal-inline-action" style={{ paddingLeft: 14 }}>
-                  {herdrInstalling[newDialog.profileId] ? (
-                    <span className="hint">
-                      正在装 herdr：{herdrInstalling[newDialog.profileId]}
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      title="从 herdr.dev 拿官方版本号与 sha256，Windows 侧下载并校验后上传到 ~/.local/bin/herdr（不需要 root）"
-                      onClick={() => void installHerdrFor(newDialog.profileId, newDialog.user)}
-                    >
-                      一键安装 herdr
-                    </button>
-                  )}
-                </div>
-              ) : null}
-
-              {/* herdr 勾上之后：新开一个窗格，还是接管已有的（和 tmux 的"新建/附加"一个道理） */}
-              {newDialog.useHerdr && newDialogCanHerdr && (
-                <div className="tmux-choice">
-                  <label className="form-check">
-                    <input
-                      type="radio"
-                      checked={newDialog.herdrKind === "new"}
-                      onChange={() => setNewDialog({ ...newDialog, herdrKind: "new" })}
-                    />
-                    <span>新建一个 herdr 窗格</span>
-                  </label>
-                  <label className="form-check">
-                    <input
-                      type="radio"
-                      checked={newDialog.herdrKind === "attach"}
-                      onChange={() => {
-                        setNewDialog({ ...newDialog, herdrKind: "attach" });
-                        void loadDialogHerdr(newDialog.profileId, newDialog.user);
-                      }}
-                    />
-                    <span>接管已有窗格</span>
-                  </label>
-                  {newDialog.herdrKind === "attach" && (
-                    <div className="attach-list">
-                      {dialogBusy && <div className="hint">正在读取…</div>}
-                      {!dialogBusy && dialogHerdr.length === 0 && (
-                        <div className="hint">这台机器上 herdr 还没认出 agent。</div>
-                      )}
-                      {dialogHerdr.map((a) => (
-                        <label
-                          key={a.paneId}
-                          className="form-check"
-                          title={`${a.paneId}${a.cwd ? `　${a.cwd}` : ""}`}
-                        >
-                          <input
-                            type="radio"
-                            checked={newDialog.herdrTarget === a.paneId}
-                            onChange={() =>
-                              setNewDialog({ ...newDialog, herdrTarget: a.paneId })
-                            }
-                          />
-                          <span>
-                            {a.agent || "shell"} · {a.paneId} · {herdrStateLabel(a.status)}
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {!newDialog.useHerdr && newDialog.useTmux && (
-                <div className="tmux-choice">
-                  <label className="form-check">
-                    <input
-                      type="radio"
-                      checked={newDialog.tmuxKind === "new"}
-                      onChange={() => setNewDialog({ ...newDialog, tmuxKind: "new" })}
-                    />
-                    <span>新建 tmux 会话</span>
-                  </label>
-                  {newDialog.tmuxKind === "new" && (
-                    <input
-                      className="modal-input"
-                      value={newDialog.tmuxName}
-                      onChange={(e) =>
-                        setNewDialog({ ...newDialog, tmuxName: e.target.value })
-                      }
-                      placeholder="会话名，例如 {host}-{user}"
-                    />
-                  )}
-
-                  <label className="form-check">
-                    <input
-                      type="radio"
-                      checked={newDialog.tmuxKind === "attach"}
-                      onChange={() => {
-                        setNewDialog({ ...newDialog, tmuxKind: "attach" });
-                        void loadDialogTmux(newDialog.profileId, newDialog.user);
-                      }}
-                    />
-                    <span>附加到已有 tmux 会话</span>
-                  </label>
-                  {newDialog.tmuxKind === "attach" && (
-                    <div className="attach-list">
-                      {dialogBusy && <div className="hint">正在读取…</div>}
-                      {!dialogBusy && dialogTmux.length === 0 && (
-                        <div className="hint">这台服务器上还没有 tmux 会话。</div>
-                      )}
-                      {dialogTmux.map((t) => (
-                        <label
-                          key={t.name}
-                          className={
-                            "attach-item" + (newDialog.attachTarget === t.name ? " active" : "")
-                          }
-                        >
-                          <input
-                            type="radio"
-                            checked={newDialog.attachTarget === t.name}
-                            onChange={() =>
-                              setNewDialog({ ...newDialog, attachTarget: t.name })
-                            }
-                          />
-                          <IconTerminal size={14} />
-                          <span className="grow">{t.name}</span>
-                          <span className="dim">{t.windows} 窗口</span>
-                          {t.attached && <span className="tag">已连接</span>}
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setNewDialog(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="btn primary"
-                disabled={dialogBusy}
-                onClick={() => void confirmNewSession()}
-              >
-                连接
-              </button>
-            </div>
-          </div>
-        </div>
+        <NewSessionDialog
+          newDialog={newDialog}
+          setNewDialog={setNewDialog}
+          profiles={profiles}
+          dialogTmux={dialogTmux}
+          dialogBusy={dialogBusy}
+          dialogHerdr={dialogHerdr}
+          setReopenNewAfterSave={setReopenNewAfterSave}
+          herdrInstalling={herdrInstalling}
+          probingHerdr={probingHerdr}
+          newDialogHerdr={newDialogHerdr}
+          newDialogCanHerdr={newDialogCanHerdr}
+          probeHerdrFor={probeHerdrFor}
+          installHerdrFor={installHerdrFor}
+          openEditDialog={openEditDialog}
+          defaultTmuxName={defaultTmuxName}
+          loadDialogTmux={loadDialogTmux}
+          loadDialogHerdr={loadDialogHerdr}
+          confirmNewSession={confirmNewSession}
+          sshProfiles={sshProfiles}
+          setShowServers={setShowServers}
+        />
       )}
     </div>
   );
 }
 
-function stateText(s: SessionState): string {
-  switch (s) {
-    case "connecting":
-      return "连接中";
-    case "connected":
-      return "已连接";
-    case "reconnecting":
-      return "重连中";
-    case "closed":
-      return "已关闭";
-    default:
-      return "错误";
-  }
-}
-
-/**
- * 本地终端模块（PowerShell / CMD / WSL）的侧栏。
- * 关键点：这里要**列出这个模块已经打开的会话**，点一下就切过去，
- * 不用去顶部标签栏一个个找。
- */
-function LocalModule({
-  label,
-  sessions,
-  activeId,
-  onOpen,
-  secondary,
-  onActivate,
-  onClose,
-}: {
-  label: string;
-  sessions: OpenSession[];
-  activeId: string | null;
-  onOpen: () => void;
-  /** 并排的第二个"新建"按钮（目前只有 PowerShell 7 用得上） */
-  secondary?: { label: string; title?: string; onClick: () => void };
-  onActivate: (id: string) => void;
-  onClose: (id: string) => void;
-}) {
-  return (
-    <div className="local-module">
-      {/* 有第二个按钮时改成竖排：两个按钮同宽同高、各占一行（并排会挤到折行，很难看） */}
-      <div className={"side-actions" + (secondary ? " stack" : "")}>
-        <button type="button" className="btn primary grow" onClick={onOpen}>
-          <IconPlus size={14} /> 新建 {label}
-        </button>
-        {secondary && (
-          <button
-            type="button"
-            className="btn"
-            title={secondary.title}
-            onClick={secondary.onClick}
-          >
-            <IconPlus size={14} /> 新建 {secondary.label}
-          </button>
-        )}
-      </div>
-      <div className="tree-group">已打开的 {label}（{sessions.length}）</div>
-      {sessions.length === 0 && <div className="hint">还没有打开</div>}
-      {sessions.map((s) => (
-        <div
-          key={s.id}
-          className={"tree-item" + (s.id === activeId ? " current" : "")}
-          onClick={() => onActivate(s.id)}
-          title={`${s.title}　点击切换到该会话`}
-        >
-          <IconTerminal size={14} />
-          <span className="grow ellipsis">{s.title}</span>
-          <span className={"status-dot " + s.state} />
-          <button
-            type="button"
-            className="mini-x"
-            title="关闭这个会话"
-            onClick={(e) => {
-              e.stopPropagation();
-              onClose(s.id);
-            }}
-          >
-            <IconClose size={11} />
-          </button>
-        </div>
-      ))}
-      <div className="hint">本地终端可以开多个，各自是独立的工作区。</div>
-    </div>
-  );
-}
-
-const MD_STYLES: { key: MdStyle; label: string }[] = [
-  { key: "github", label: "GitHub" },
-  { key: "minimal", label: "简洁" },
-  { key: "dark", label: "深色" },
-  { key: "paper", label: "文档" },
-];
-
-function FileView({
-  file,
-  profileId,
-  userOverride,
-  onNotice,
-}: {
-  file: OpenFile;
-  /** 这个文件在哪台服务器上（本地文件没有，就不显示下载按钮） */
-  profileId?: string;
-  userOverride?: string | null;
-  onNotice?: (text: string) => void;
-}) {
-  const [preview, setPreview] = useState(true);
-  const [mdStyle, setMdStyle] = useState<MdStyle>("github");
-  const [saving, setSaving] = useState(false);
-
-  /** 把远端文件下载到本机（选一个目录，文件名保持原样） */
-  async function download() {
-    if (!profileId) return;
-    const dir = await openLocalDialog({ directory: true, multiple: false, title: "下载到哪个目录" });
-    if (!dir || typeof dir !== "string") return;
-    setSaving(true);
-    try {
-      const saved = await fsDownload(profileId, [file.path], dir, userOverride ?? null);
-      onNotice?.(`已下载：${saved || file.name}`);
-    } catch (e) {
-      onNotice?.("下载失败：" + String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const isMd = file.kind === "md";
-  const isHtml = file.kind === "html";
-  const isImg = file.kind === "img";
-  const text = isImg ? "" : decodeB64Text(file.b64);
-
-  const mdHtml = useMemo(
-    () => (isMd ? DOMPurify.sanitize(md.render(text)) : ""),
-    [isMd, text],
-  );
-  const htmlDoc = useMemo(() => {
-    if (!isHtml) return "";
-    const clean = DOMPurify.sanitize(text, { FORBID_TAGS: ["script"], FORBID_ATTR: ["srcdoc"] });
-    return `<!doctype html><html><head><meta charset="utf-8"><style>
-      body{margin:16px;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#222;background:#fff;}
-      pre{background:#f5f5f5;padding:10px;border-radius:6px;overflow:auto;}
-      a{color:#0b6cff;} img{max-width:100%;}
-    </style></head><body>${clean}</body></html>`;
-  }, [isHtml, text]);
-
-  return (
-    <div className="file-view">
-      <div className="file-toolbar">
-        <span className="file-name" title={file.path}>
-          {file.name}
-        </span>
-        <span className="grow" />
-        {isMd && preview && (
-          <span className="md-styles">
-            {MD_STYLES.map((s) => (
-              <button
-                key={s.key}
-                type="button"
-                className={"md-style" + (mdStyle === s.key ? " active" : "")}
-                onClick={() => setMdStyle(s.key)}
-              >
-                {s.label}
-              </button>
-            ))}
-          </span>
-        )}
-        {(isMd || isHtml) && (
-          <button
-            type="button"
-            className={"mini-btn" + (preview ? " active" : "")}
-            onClick={() => setPreview((v) => !v)}
-          >
-            {preview ? "预览" : "源码"}
-          </button>
-        )}
-        {/* 远端文件：直接在这里下载，不用去文件面板里找 */}
-        {profileId && (
-          <button
-            type="button"
-            className="mini-btn primary"
-            style={{ marginLeft: 6 }}
-            disabled={saving}
-            title="把这个文件下载到本机（选目标目录，文件名不变）"
-            onClick={() => void download()}
-          >
-            {saving ? "下载中…" : "⬇ 下载"}
-          </button>
-        )}
-        <span className="file-kind">{kindLabel(file.kind)}</span>
-      </div>
-
-      <div className="file-body">
-        {isImg && (
-          <div className="img-preview">
-            <img src={`data:${imgMime(file.name)};base64,${file.b64}`} alt={file.name} />
-          </div>
-        )}
-
-        {isMd &&
-          (preview ? (
-            <div className={"md-preview md-" + mdStyle} dangerouslySetInnerHTML={{ __html: mdHtml }} />
-          ) : (
-            <pre className="src-view">{text}</pre>
-          ))}
-
-        {isHtml &&
-          (preview ? (
-            <iframe className="html-preview" sandbox="" srcDoc={htmlDoc} title={file.name} />
-          ) : (
-            <pre className="src-view">{text}</pre>
-          ))}
-
-        {(file.kind === "code" || file.kind === "text") && (
-          <pre className="src-view">{text}</pre>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function kindLabel(kind: FileKind): string {
-  switch (kind) {
-    case "md":
-      return "Markdown";
-    case "html":
-      return "HTML";
-    case "img":
-      return "图片";
-    case "code":
-      return "代码";
-    default:
-      return "文本";
-  }
-}
