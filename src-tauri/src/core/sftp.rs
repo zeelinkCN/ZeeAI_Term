@@ -678,6 +678,11 @@ pub async fn exists(conn: &SftpConn, path: &str) -> bool {
 /// 借这条连接背后的 SSH 会话跑一条一次性命令，拿 stdout。
 /// 用途：只能用密码登录的服务器上，系统 `ssh.exe` 没法从命令行喂密码，
 /// 但我们已经通过密码建好了这条连接，就在这里直接 exec。
+///
+/// **失败必须变成 Err**（架构审查 minor-14）：这里以前把 stderr 也并进 stdout 一起返回
+/// `Ok`，还完全不看远端的退出码 —— 上游（herdr 安装 / 探针）会把一句英文报错当成
+/// 正常输出继续解析。现在把 stderr 单独收着，退出码非 0 就按 `friendly_ssh_error_context`
+/// 的格式（中文短句 + 原始信息）返回错误。
 pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
     use russh::ChannelMsg;
 
@@ -691,15 +696,33 @@ pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
         .map_err(|e| sftp_err("执行远端命令失败", e))?;
 
     let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let mut exit: Option<u32> = None;
     loop {
         match ch.wait().await {
             Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
-            Some(ChannelMsg::ExtendedData { data, .. }) => out.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => err.extend_from_slice(&data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
             _ => {}
         }
     }
-    Ok(String::from_utf8_lossy(&out).to_string())
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    if matches!(exit, Some(code) if code != 0) {
+        let stderr = String::from_utf8_lossy(&err).trim().to_string();
+        let raw = if stderr.is_empty() {
+            let fallback = stdout.trim();
+            if fallback.is_empty() {
+                format!("远端命令退出码 {}", exit.unwrap_or(0))
+            } else {
+                fallback.to_string()
+            }
+        } else {
+            stderr
+        };
+        return Err(sftp_err("远端命令失败", raw));
+    }
+    Ok(stdout)
 }
 
 #[cfg(test)]

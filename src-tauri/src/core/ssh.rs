@@ -293,6 +293,15 @@ pub fn shell_with_cwd_report() -> String {
 /// 组装一次非交互式 `ssh <host> "<cmd>"` 调用（用于 tmux 列表 / kill 这类一次性命令）。
 ///
 /// 端口 0 / 用户名空 = "没说"，不传 `-p` / 不写 `user@`（口径同 [`ssh_args`]）。
+///
+/// **连接超时 + 心跳**（架构审查 minor-02）：这条链路是红点轮询 / 看板探针在用的，
+/// 一台黑洞服务器（包被丢弃、sshd 排队）能让 `ConnectTimeout` 之前一直挂着；
+/// 外层虽然还有 20 秒的 `REMOTE_CAPTURE_TIMEOUT`，但那是"整条命令"，而且超时只是
+/// 丢掉 future。加上这组参数的意义是让 **ssh 自己**尽早失败：
+/// - `ConnectTimeout=8`：连不上 8 秒就报错（而不是等系统的 TCP 超时）；
+/// - `ServerAliveInterval=15` / `ServerAliveCountMax=2`：连上之后对端没响应
+///   30 秒内也会断开，不会永远挂着一条"半死"的连接。
+/// 这些都是 OpenSSH 的标准选项，Windows 自带的 ssh.exe（Win10 1809+）同样支持。
 pub fn ssh_exec_args(
     host: &str,
     port: u16,
@@ -306,6 +315,12 @@ pub fn ssh_exec_args(
         "BatchMode=yes".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=2".into(),
     ];
     if port != 0 {
         args.push("-p".into());
@@ -851,6 +866,19 @@ mod tests {
         assert!(!has(&a, "-tt"), "{a:?}");
         assert!(has(&a, "h") && has(&a, "cmd"), "{a:?}");
         assert!(!has(&a, "-p"), "{a:?}");
+    }
+
+    /// 一次性远端命令必须带**连接超时 + 心跳**（红点轮询不能用"黑洞=永远等"）。
+    #[test]
+    fn one_shot_exec_args_carry_connect_timeout_and_keepalive() {
+        let a = ssh_exec_args("h", 22, "root", None, "ls", None);
+        let joined = a.join(" ");
+        assert!(has(&a, "ConnectTimeout=8"), "{a:?}");
+        assert!(joined.contains("-o ConnectTimeout=8"), "{a:?}");
+        assert!(joined.contains("-o ServerAliveInterval=15"), "{a:?}");
+        assert!(joined.contains("-o ServerAliveCountMax=2"), "{a:?}");
+        // 远端命令仍然只有一个参数、仍然是最后一个（别把 -o 拼进命令里）
+        assert_eq!(a.last().unwrap(), "ls", "{a:?}");
     }
 
     /// russh 的英文报错要分类成中文，但**原文必须留着**（否则没法排查）

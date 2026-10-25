@@ -12,14 +12,19 @@
 //! 本模块只读本机文件，**不启动任何子进程**，两件事不要混在一起。
 //!
 //! 实现刻意做到最轻（用户对"影响电脑性能"很敏感）：
-//! - 每 [`LOG_POLL_MS`]（2.5 秒）`std::fs::metadata` 一遍 `~/.codex/sessions`，只看最近
-//!   [`MAX_TRACKED_FILES`] 份 rollout；
+//! - 每 [`LOG_POLL_MS`]（2.5 秒）看一遍 `~/.codex/sessions`；
+//! - **目录 mtime 缓存**（架构审查 minor-03）：只有 mtime 变了的目录才重新 read_dir，
+//!   没变化的目录直接用上一轮的清单 —— rollout 攒到几千个之后，这一轮就是
+//!   "几个目录 stat"，而不是"几千个文件 stat"；
+//! - 候选文件只对最近 [`MAX_TRACKED_FILES`] 份 rollout 做 stat；
 //! - 只读**上次 offset 之后新增的字节**（每次最多 [`MAX_READ_PER_TICK`]），不重解析整份日志；
 //! - 解析复用 `ai_sessions::RolloutParser` —— 和看板、快照是**同一套**判定；
 //! - 本模块**没有任何 `std::process` / `Command`**：它不启动子进程。
 //!   `ai_log_watch_starts_no_process` 那条单测就是拿源码钉这件事的（防止以后有人加回来）。
 //!
-//! 去重：同一 `文件 + 轮次` 只发一次（Rust 侧 `announced`；前端还有一道）。
+//! 去重：同一 `文件 + 轮次` 只发一次（Rust 侧 [`AnnouncedSet`]；前端还有一道）。
+//! 去重集合**按插入顺序淘汰最旧的**（不是淘汰后 `clear()` 整个集合 —— 那会让
+//! 仍然在等你的一条 needs-you 重复点亮，见架构审查 minor-07）。
 //!
 //! **2026-10-20 补充：信号现在还带"卡片级"三个字段**（`instanceKey` / `state` / `activity`）。
 //! 用户要的是"没点刷新也能看到正在跑的本地 AI" —— 卡片和红点是两件事：
@@ -61,8 +66,211 @@ pub const MAX_TRACKED_FILES: usize = 8;
 pub const NEEDS_FRESH_MS: i64 = 10 * 60 * 1000;
 /// 去重集合上限（长跑应用也不会无限涨）。
 const MAX_ANNOUNCED: usize = 1_000;
+/// 单行缓冲上限（架构审查 minor-08）。
+///
+/// `pending` 存的是"读到一半、还没等到换行"的那段。正常情况下它最多一条日志行（几 KB），
+/// 但如果日志里出现一个**没有换行的超长行**（异常写入 / 二进制垃圾 / 巨型单行 JSON），
+/// 它会一直追加、无界增长。超过这个上限就整段丢弃（极端行截断策略）：
+/// 那条行反正也解析不出合法 JSON，丢掉比把内存吃光好。
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+/// 目录树最多往下走几层（`sessions/年/月/日/` = 3 层；和原来 `collect_rollouts` 一致）
+const MAX_SCAN_DEPTH: u32 = 3;
 /// 判断"这份日志是谁写的"要读文件开头这么多字节（和 `ai_sessions` 保持一致）。
 const HEAD_BYTES: u64 = 64 * 1024;
+
+/// 已经发过的去重键集合：**按插入顺序淘汰最旧的**。
+///
+/// 为什么不能像以前那样"满了就 `clear()`"（架构审查 minor-07）：`clear()` 会把**所有**
+/// 去重记忆一次清空，包括那条仍然停在"需要你"的信号 —— 下一轮 scan 会认为它没发过，
+/// 于是同一个 needs-you 被重复点亮。现在只淘汰最旧的那几个，正在等的那些（最近才插入）
+/// 自然不会被淘汰。
+#[derive(Default)]
+struct AnnouncedSet {
+    seen: HashSet<String>,
+    /// 插入顺序（淘汰时从队首取）
+    order: std::collections::VecDeque<String>,
+}
+
+impl AnnouncedSet {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 插入；返回 `true` = 以前没发过（调用方该发）。
+    fn insert(&mut self, key: String) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        while self.seen.len() >= MAX_ANNOUNCED {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.seen.remove(&old);
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        let removed = self.seen.remove(key);
+        if removed {
+            // 保持 order 和 seen 一致：否则以后淘汰到这条时会把"重新插进来的同键"误删
+            self.order.retain(|k| k != key);
+        }
+        removed
+    }
+}
+
+/// 一层目录上次扫描的结果（[`RolloutIndex`] 用）。
+#[derive(Clone, Debug, Default)]
+struct DirSnapshot {
+    /// 上次看到的目录 mtime（None = 当时读不到，例如目录还不存在）
+    mtime: Option<SystemTime>,
+    /// 这一层里的 rollout 文件（mtime, 路径）
+    files: Vec<(SystemTime, PathBuf)>,
+    /// 这一层的子目录
+    subdirs: Vec<PathBuf>,
+}
+
+/// 一轮扫描实际做了多少工作（单测用它证明"没变化就不重扫"）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanPass {
+    /// 实际 stat 过的目录数（每层一次 metadata）
+    pub dirs_checked: usize,
+    /// 实际 read_dir 过的目录数
+    pub dirs_read: usize,
+    /// 实际 stat 过的 rollout 文件数
+    pub files_stat: usize,
+}
+
+/// rollout 目录索引：**只在目录 mtime 变化时**重新列那一层。
+///
+/// 为什么需要（架构审查 minor-03）：`~/.codex/sessions` 按 年/月/日 分层，rollout 攒到
+/// 几千个之后，"每 2.5 秒全树 read_dir + 每个文件 stat 一次"是稳定的 IO/CPU 开销
+///（Windows Defender 还会对每次 stat 做实时检查）。现在每层目录先看自己的 mtime：
+/// - 没变 → 直接用上一轮的清单（**0 次 read_dir、0 次文件 stat**）；
+/// - 变了 → 只重扫这一层（新建/删除/改名才会改目录 mtime）。
+///
+/// 目录 mtime **不随"文件内容追加"变化**，所以正在写的那个会话不会让整棵树反复重扫；
+/// 那个文件的 size/mtime 由 `LogWatcher::scan` 单独 stat（最多 8 + 跟踪中的几个）。
+///
+/// 缓存不会主动清理失效目录（用户删掉的老日期目录会留一条空记录）：一年 365 个日目录
+/// 也就几百条，可以忽略；真要做清理的那天再说。
+#[derive(Default)]
+pub struct RolloutIndex {
+    dirs: HashMap<PathBuf, DirSnapshot>,
+    /// 上一次扫描的工作量（单测用）
+    pub last_pass: ScanPass,
+}
+
+impl RolloutIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 找最近 `keep` 份 rollout（按缓存里的 mtime 从新到旧）。
+    ///
+    /// `must_keep` 是**正在跟踪的文件**：它们必须留在结果里，否则会被当成"消失"而
+    /// 误发一条 `resolved`。缓存里的 mtime 可能是上一轮的（文件正在追加时目录 mtime 不变），
+    /// 所以光按缓存的 mtime 排序可能把活跃文件挤出前几名 —— 这一条兜住它。
+    pub fn recent(
+        &mut self,
+        root: &Path,
+        keep: usize,
+        must_keep: &HashSet<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut pass = ScanPass::default();
+        let mut all: Vec<(SystemTime, PathBuf)> = Vec::new();
+        self.walk(root, 0, &mut all, &mut pass);
+        self.last_pass = pass;
+        // 新的在前；mtime 相同按路径排，保证结果稳定（测试可复现）
+        all.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out: Vec<PathBuf> = Vec::with_capacity(keep + must_keep.len());
+        for (_, path) in &all {
+            if out.len() >= keep {
+                break;
+            }
+            if !out.contains(path) {
+                out.push(path.clone());
+            }
+        }
+        for path in must_keep {
+            // 已经删掉的文件不算"还在视野里"：否则它会永远留在 `tracks` 里，
+            // 那条还没收的 needs_key 也就永远发不出一条 `resolved`（红点挂着一条不存在的事）。
+            if std::fs::metadata(path).is_err() {
+                continue;
+            }
+            if !out.contains(path) {
+                out.push(path.clone());
+            }
+        }
+        out
+    }
+
+    fn walk(
+        &mut self,
+        dir: &Path,
+        depth: u32,
+        out: &mut Vec<(SystemTime, PathBuf)>,
+        pass: &mut ScanPass,
+    ) {
+        pass.dirs_checked += 1;
+        let mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+        let cached = self.dirs.get(dir).cloned();
+        if let (Some(c), Some(m)) = (&cached, mtime) {
+            if c.mtime == Some(m) {
+                // 这一层没动过：不 read_dir、不 stat 文件，直接用上一轮的清单
+                out.extend(c.files.iter().cloned());
+                if depth < MAX_SCAN_DEPTH {
+                    for sub in &c.subdirs {
+                        self.walk(sub, depth + 1, out, pass);
+                    }
+                }
+                return;
+            }
+        }
+        // 变了（或第一次见）：重新列这一层
+        pass.dirs_read += 1;
+        let mut snap = DirSnapshot {
+            mtime,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+        };
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for e in read.flatten() {
+                let path = e.path();
+                let Ok(ft) = e.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    snap.subdirs.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+                    continue;
+                }
+                pass.files_stat += 1;
+                let t = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                snap.files.push((t, path));
+            }
+        }
+        out.extend(snap.files.iter().cloned());
+        if depth < MAX_SCAN_DEPTH {
+            for sub in &snap.subdirs {
+                self.walk(sub, depth + 1, out, pass);
+            }
+        }
+        self.dirs.insert(dir.to_path_buf(), snap);
+    }
+}
 
 /// 一条要发给前端的信号。
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -277,15 +485,26 @@ pub struct LogWatcher {
     root: PathBuf,
     tracks: HashMap<PathBuf, Track>,
     /// 已经发过的 `kind|key`（同一轮同一类事件只发一次）
-    announced: HashSet<String>,
+    announced: AnnouncedSet,
+    /// 目录 mtime 缓存：没变化的目录不重扫
+    index: RolloutIndex,
+    /// 单行缓冲上限（测试会调小，默认 [`MAX_PENDING_BYTES`]）
+    pending_max: usize,
 }
 
 impl LogWatcher {
     pub fn new(root: PathBuf) -> Self {
+        Self::with_pending_limit(root, MAX_PENDING_BYTES)
+    }
+
+    /// 测试用：可以给一个很小的单行上限，这样不用真造一个 4MB 的日志文件
+    fn with_pending_limit(root: PathBuf, pending_max: usize) -> Self {
         Self {
             root,
             tracks: HashMap::new(),
-            announced: HashSet::new(),
+            announced: AnnouncedSet::new(),
+            index: RolloutIndex::new(),
+            pending_max: pending_max.max(16),
         }
     }
 
@@ -299,9 +518,6 @@ impl LogWatcher {
     }
 
     fn announce(&mut self, kind: &str, key: &str) -> bool {
-        if self.announced.len() > MAX_ANNOUNCED {
-            self.announced.clear();
-        }
         self.announced.insert(format!("{kind}|{key}"))
     }
 
@@ -316,7 +532,11 @@ impl LogWatcher {
     /// `now_ms` 由调用方传进来（单测可以给固定值，不依赖真实时钟）。
     pub fn scan(&mut self, now_ms: i64) -> Vec<AiLogSignal> {
         let mut out: Vec<AiLogSignal> = Vec::new();
-        let files = ai_sessions::rollouts_by_mtime(&self.root, MAX_TRACKED_FILES);
+        // 正在跟踪的文件必须留在视野里（否则会被当成"消失"，误发 resolved）
+        let tracked: HashSet<PathBuf> = self.tracks.keys().cloned().collect();
+        let files = self
+            .index
+            .recent(&self.root, MAX_TRACKED_FILES, &tracked);
         let keep: HashSet<&Path> = files.iter().map(|p| p.as_path()).collect();
 
         // 掉出视野的文件：如果它还在"等你"，发一条 resolved —— 别让红点亮着一条
@@ -448,6 +668,17 @@ impl LogWatcher {
                         }
                     }
                     track.parser.feed(&line);
+                }
+                // **极端行截断**（架构审查 minor-08）：一个没有换行的超长行会让 pending
+                // 无界增长（异常写入 / 二进制垃圾 / 巨型单行 JSON）。超过上限就整段丢弃 ——
+                // 那条行本来就解析不出合法 JSON，丢掉比把内存吃光好。
+                if track.pending.len() > self.pending_max {
+                    log::warn!(
+                        "ai-log: {} 里有超过 {} 字节没有换行，已丢弃这段（极端行截断）",
+                        path.display(),
+                        self.pending_max
+                    );
+                    track.pending.clear();
                 }
             }
             track.parser.finish();
@@ -956,5 +1187,185 @@ mod tests {
         assert_eq!(got[0].state, "finished");
         assert_eq!(got[0].activity, "报告写好了");
         assert_eq!(got[0].at_ms, 1_790_000_400_000, "完成时间用日志里的 completed_at");
+    }
+
+    // ---------- 性能 / 去重（架构审查 minor-03 / 07 / 08） ----------
+
+    /// 目录 mtime 缓存：这一轮什么都没改 → **一次目录 read_dir、一次文件 stat 都不做**；
+    /// 新建/删除文件（只有这时目录 mtime 才会变）→ 只重扫那一层。
+    #[test]
+    fn directory_cache_skips_rescan_when_nothing_changed() {
+        let root = TempRoot::new("dircache");
+        let day = root.0.join("2026").join("10").join("26");
+        fs::create_dir_all(&day).unwrap();
+        let file = day.join("rollout-2026-10-26-a.jsonl");
+        fs::write(&file, meta("s-dc", "codex_cli_rs") + &started("tdc")).unwrap();
+
+        let mut w = LogWatcher::new(root.0.clone());
+        let t0 = later();
+        assert!(w.scan(t0).is_empty(), "seed 不补报历史");
+        let first = w.index.last_pass;
+        assert_eq!(first.dirs_read, 4, "第一次要逐层列：root/年/月/日 = {first:?}");
+        assert_eq!(first.files_stat, 1, "只 stat 一个 rollout：{first:?}");
+
+        // 预热一轮：把"可能被系统延迟更新"的目录 mtime 记成稳定值
+        //（NTFS 的目录时间戳不是每次都立刻落定，不预热的话第二轮可能正好赶上更新）
+        assert!(w.scan(t0 + 500).is_empty());
+        w.index.last_pass = ScanPass::default();
+
+        // 什么都不改：目录 mtime 一样 → 直接用缓存
+        assert!(w.scan(t0 + 1_000).is_empty());
+        let second = w.index.last_pass;
+        assert_eq!(second.dirs_read, 0, "没变化就不该重扫目录：{second:?}");
+        assert_eq!(second.files_stat, 0, "没变化就不该 stat 文件：{second:?}");
+        assert_eq!(second.dirs_checked, 4, "每层目录仍要看一眼 mtime：{second:?}");
+        assert!(
+            w.index.dirs.contains_key(&day),
+            "缓存里要留着这一层，下一轮才能短路"
+        );
+
+        // 往**已知**文件追加：目录 mtime 不变 → 仍然不重扫目录，但内容照样读到
+        root.append(
+            "2026/10/26/rollout-2026-10-26-a.jsonl",
+            &completed("tdc", 1_790_002_000, "写完了"),
+        );
+        let got = w.scan(t0 + 2_000);
+        assert_eq!(got.len(), 1, "追加的内容不能被缓存吞掉：{got:?}");
+        assert_eq!(got[0].kind, "finished");
+        assert_eq!(
+            w.index.last_pass.dirs_read, 0,
+            "文件追加不该触发目录重扫：{:?}",
+            w.index.last_pass
+        );
+
+        // 新建一个文件（目录 mtime 变了）→ 只重扫这一层，新文件也在候选里
+        let second_file = day.join("rollout-2026-10-26-b.jsonl");
+        fs::write(
+            &second_file,
+            meta("s-dc2", "codex_cli_rs") + &started("tdc2"),
+        )
+        .unwrap();
+        let got = w.scan(t0 + 3_000);
+        assert!(got.is_empty(), "新文件只 seed，不补报：{got:?}");
+        let third = w.index.last_pass;
+        assert!(third.dirs_read >= 1, "变了的那一层必须重扫：{third:?}");
+        assert_eq!(third.files_stat, 2, "这一层两个 rollout 都要 stat：{third:?}");
+        assert!(w.tracks.contains_key(&second_file), "新文件要进入跟踪");
+    }
+
+    /// 去重集合满了：只淘汰最旧的那条，**不能把整张表清空**
+    ///（以前 `clear()` 会让仍然停在"等你"的信号重复点亮）。
+    #[test]
+    fn announced_evicts_oldest_only() {
+        let mut set = AnnouncedSet::new();
+        for i in 0..MAX_ANNOUNCED {
+            assert!(set.insert(format!("needs-you|k{i}")), "第 {i} 条应该是新的");
+        }
+        assert_eq!(set.seen.len(), MAX_ANNOUNCED);
+        assert!(!set.insert("needs-you|k0".into()), "老键还在表里，不该重复发");
+
+        // 再来一条新的：只淘汰最旧的 k0，其余的（尤其最近的那些）必须全部保留
+        assert!(set.insert("needs-you|new".into()));
+        assert_eq!(set.seen.len(), MAX_ANNOUNCED);
+        assert!(
+            !set.insert(format!("needs-you|k{}", MAX_ANNOUNCED - 1)),
+            "最近插入的键不能被连带清掉"
+        );
+        assert!(!set.insert("needs-you|new".into()), "刚插入的也在表里");
+        assert!(set.insert("needs-you|k0".into()), "被淘汰的那条可以重新点亮");
+    }
+
+    /// `remove` 之后重新插入，序号队列必须和集合保持一致
+    ///（否则以后淘汰到这条时会把"重新插进来的同键"误删）。
+    #[test]
+    fn announced_remove_keeps_order_in_sync() {
+        let mut set = AnnouncedSet::new();
+        set.insert("a".into());
+        set.insert("b".into());
+        assert!(set.remove("a"));
+        assert!(set.insert("a".into()), "清掉之后可以重新亮");
+        assert_eq!(set.order.len(), set.seen.len(), "队列和集合必须一一对应");
+        let order: HashSet<String> = set.order.iter().cloned().collect();
+        assert_eq!(order, set.seen, "队列里不该残留已删除的键");
+
+        // 塞到上限：最早插入的 b 在 `order` 队首
+        for i in 0..MAX_ANNOUNCED - 2 {
+            set.insert(format!("n{i}"));
+        }
+        // 淘汰只发生在"插入新键"时：先拿一个新键触发一次
+        assert!(set.insert("trigger".into()), "新键应该能插进去");
+        assert!(!set.insert("a".into()), "a 还在表里（它是后来插入的）");
+        assert!(set.insert("b".into()), "b 是最旧的，应该已经被淘汰");
+    }
+
+    /// 超长"没有换行"的行：整段丢弃，`pending` 不能无界增长（极端行截断）。
+    #[test]
+    fn oversized_pending_is_dropped() {
+        let root = TempRoot::new("pendcap");
+        root.write(
+            "rollout-2026-10-20-p1.jsonl",
+            &(meta("s-p1", "codex_cli_rs") + &started("tp1")),
+        );
+        let mut w = LogWatcher::with_pending_limit(root.0.clone(), 64);
+        let t0 = later();
+        assert!(w.scan(t0).is_empty());
+
+        // 追加一条"永远不换行"的超长垃圾（5000 字节，远超 64 的上限）
+        root.append("rollout-2026-10-20-p1.jsonl", &"x".repeat(5_000));
+        assert!(w.scan(t0 + 1_000).is_empty(), "垃圾行不该产生信号");
+        let track = w
+            .tracks
+            .get(&root.path("rollout-2026-10-20-p1.jsonl"))
+            .expect("文件应该还在跟踪");
+        assert!(
+            track.pending.len() <= 64,
+            "pending 必须有上限（现在 {} 字节）",
+            track.pending.len()
+        );
+
+        // 截断之后还能正常继续读：随后的完整行照样被处理
+        root.append(
+            "rollout-2026-10-20-p1.jsonl",
+            &("\n".to_string() + &completed("tp1", 1_790_005_000, "继续干活")),
+        );
+        let got = w.scan(t0 + 2_000);
+        assert!(
+            got.iter().any(|s| s.kind == "finished"),
+            "截断只丢那一行，后面的正常行还要能读：{got:?}"
+        );
+    }
+
+    /// 已经被删掉的日志文件不能靠"还在跟踪"赖在视野里：
+    /// 那会永远留着一条 needs-you，前端红点挂在一条不存在的事上。
+    #[test]
+    fn deleted_tracked_file_resolves_and_is_dropped() {
+        let root = TempRoot::new("deleted");
+        root.write(
+            "rollout-2026-10-20-d1.jsonl",
+            &(meta("s-d1", "codex_cli_rs") + &started("td1")),
+        );
+        let mut w = LogWatcher::new(root.0.clone());
+        let t0 = later();
+        assert!(w.scan(t0).is_empty(), "seed 不补报历史");
+
+        // 让它进到"等你"的状态
+        root.append("rollout-2026-10-20-d1.jsonl", &approval("td1"));
+        let got = w.scan(t0 + 1_000);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].kind, "needs-you");
+        let tracked = root.path("rollout-2026-10-20-d1.jsonl");
+        assert!(w.tracks.contains_key(&tracked));
+
+        // 文件被删（会话被清理 / codex 轮转）：必须收掉红点，并且不再跟踪
+        fs::remove_file(&tracked).unwrap();
+        let got = w.scan(t0 + 2_000);
+        assert!(
+            got.iter().any(|s| s.kind == "resolved"),
+            "删掉的文件要把等你的红点清掉：{got:?}"
+        );
+        assert!(
+            !w.tracks.contains_key(&tracked),
+            "删掉的文件不该继续留在跟踪表里"
+        );
     }
 }

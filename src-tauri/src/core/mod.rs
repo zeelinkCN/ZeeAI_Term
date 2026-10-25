@@ -27,9 +27,13 @@ pub mod secret;
 pub mod serial;
 pub mod session;
 pub mod session_log;
+/// 进程内 SHA-256（**不再调 PATH 上的 certutil**：更新包校验会被 PATH 劫持）。
+pub mod sha256;
 pub mod sftp;
 pub mod ssh;
 pub mod tmux;
+/// 升级辅助进程：等主程序退出 → 静默跑安装器 → 重启（**没有 .cmd、没有 shell**）。
+pub mod update;
 
 pub use ai_tasks::AiTaskRegistry;
-pub use session::{HerdrPaneRegistry, SessionEvent, SessionRegistry};
+pub use session::{HerdrInputPump, HerdrPaneRegistry, SessionEvent, SessionRegistry};

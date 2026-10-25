@@ -9,13 +9,22 @@
 //! 然后自己安静退出。名字里**不带 exe 路径**：便携版与安装版要互相挡住；
 //! 找窗口时按"可执行文件名"匹配（两边都叫 `ZeeAI_Term.exe`）。
 
+/// 单实例互斥体的名字。
+///
+/// 升级辅助进程（`core::update`）也用它判断"应用起来了没有"：装完之后 NSIS `/R` /
+/// MSI `AUTOLAUNCHAPP=1` 会拉起应用，辅助进程就看这个名字在不在 —— 比 `tasklist`
+/// 找进程更准（不用起子进程、也不会把同名的旧进程认错）。
+pub(crate) const SINGLE_INSTANCE_MUTEX: &str = "Local\\ZeeAI_Term_SingleInstance";
+
 #[cfg(windows)]
 pub fn ensure_single_instance() -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
-    const NAME: &str = "Local\\ZeeAI_Term_SingleInstance";
-    let name: Vec<u16> = NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     // 句柄**故意不关**：它要活到进程退出（关掉就等于放弃"我在跑"这个声明）
     let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if handle.is_null() {
@@ -31,6 +40,26 @@ pub fn ensure_single_instance() -> bool {
         if focused { "成功" } else { "失败（它可能被最小化到托盘了）" }
     );
     false
+}
+
+/// 现在有没有 ZeeAI Term 在跑（= 那个单实例互斥体还在）。
+///
+/// 用途：升级辅助进程判断"安装完应用自己起来了没有"。**不起子进程**（不用 tasklist）。
+#[cfg(windows)]
+pub fn app_running() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+
+    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 /// 找到"另一个自己"的顶层窗口并把它叫到前面；找不到返回 false

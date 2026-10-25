@@ -78,6 +78,21 @@ pub struct HerdrPaneMeta {
     pub close_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// 一条常驻的 herdr「输入泵」：一个 ssh 子进程 + 它的 stdin（指令通道）。
+///
+/// **为什么要留着 `Child`**（架构审查 minor-01）：以前只把 stdin 存进表里、把 `Child`
+/// 直接 drop 了。问题是远端 ssh 死掉（网络断、服务器踢人、herdr 退出）时我们**根本不知道**
+/// —— 管道这一端还开着，写进去不报错，只是没人读。界面表现就是"能打字，字进不去"。
+///
+/// 现在 `Child` 和 stdin 存在一起：
+/// - 写入前先 `try_wait()` 判活（见 `commands::herdr_write_input`），死了就报错 + 清表，
+///   下一次输入会自动重开一条；
+/// - 会话关闭时显式 `kill()`（不再只靠"关 stdin → 远端 read 拿到 EOF"）。
+pub struct HerdrInputPump {
+    pub child: Mutex<std::process::Child>,
+    pub stdin: Mutex<std::process::ChildStdin>,
+}
+
 #[derive(Default)]
 pub struct HerdrPaneRegistry {
     pub panes: Mutex<HashMap<String, HerdrPaneMeta>>,
@@ -86,5 +101,5 @@ pub struct HerdrPaneRegistry {
     ///
     /// 为什么再套一层 `Arc<Mutex<..>>`：`ChildStdin` 不能克隆，而写入是**阻塞**操作，
     /// 必须能把它挪到阻塞线程里去写（不能占着主线程，也不能占着这张表）。
-    pub inputs: Mutex<HashMap<String, Arc<Mutex<std::process::ChildStdin>>>>,
+    pub inputs: Mutex<HashMap<String, Arc<HerdrInputPump>>>,
 }

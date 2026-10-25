@@ -14,6 +14,8 @@
 //! - 全局 `logs` 锁里**只克隆 `Arc<Mutex<OpenLog>>`**，拿完立刻放锁；
 //!   `write_all` / `flush` / 轮转都在锁外（每个日志自己的互斥锁内）做；
 //! - 单文件 64MB 后轮转，文件名 `...-1.log`、`...-2.log`，长会话不会无限长；
+//!   轮转后**只保留最近 [`ROTATE_KEEP`] 个**（同一个会话前缀），否则一个跑一天的
+//!   `tail -f` 能攒出几十个 64MB 文件，把用户的盘悄悄吃光；
 //! - 关日志时没有日志的会话完全不碰互斥锁（`active` 原子计数短路）。
 
 use std::collections::HashMap;
@@ -32,6 +34,65 @@ const FLUSH_BYTES: usize = 64 * 1024;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// 单个日志文件上限；到了就自动换新文件（防止长会话无限增长）
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// 轮转之后，同一个会话最多保留这么多个文件（当前的 + 旧的）。
+///
+/// 为什么必须清（架构审查 minor-15）：64MB 一轮转，一个长跑会话（`tail -f`、
+/// 编译循环、`npm run dev` 开一天）能攒出几十个文件；以前只轮转不清理，
+/// 磁盘就被自己的日志吃掉了，而且用户完全看不见（在 `%APPDATA%` 里）。
+/// 5 个 = 320MB 上限，够事后翻，也不至于失控。
+const ROTATE_KEEP: usize = 5;
+
+/// 从一堆文件名里挑出"该删的"：只认 `{stem}.log` / `{stem}-<数字>.log`，
+/// 保留编号最大的 `keep` 个（`stem.log` 算 0 号）。
+///
+/// 抽成纯函数是为了能单测"删得对、别误删别的会话的日志"（见 tests）。
+fn stale_parts(names: &[String], stem: &str, keep: usize) -> Vec<String> {
+    let mut mine: Vec<(u32, String)> = Vec::new();
+    for name in names {
+        let Some(rest) = name.strip_prefix(stem) else {
+            continue;
+        };
+        let part = if rest == ".log" {
+            0
+        } else if let Some(num) = rest
+            .strip_prefix('-')
+            .and_then(|r| r.strip_suffix(".log"))
+        {
+            // 后缀里必须是纯数字，否则不是我们轮转出来的文件
+            match num.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+        mine.push((part, name.clone()));
+    }
+    if mine.len() <= keep {
+        return Vec::new();
+    }
+    // 编号大的更新（轮转时递增）：按编号从大到小，保留前 keep 个
+    mine.sort_by(|a, b| b.0.cmp(&a.0));
+    mine.into_iter().skip(keep).map(|(_, name)| name).collect()
+}
+
+/// 把同一个会话里超额的旧文件删掉（失败只记日志，不影响正在写的那个）。
+fn prune_old_parts(dir: &Path, stem: &str, keep: usize) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let names: Vec<String> = read
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    for name in stale_parts(&names, stem, keep) {
+        let path = dir.join(&name);
+        match fs::remove_file(&path) {
+            Ok(()) => log::info!("session_log: 清掉过旧的轮转文件 {}", path.display()),
+            Err(e) => log::warn!("session_log: 清理旧轮转文件失败（忽略）{}: {e}", path.display()),
+        }
+    }
+}
 
 /// ANSI/控制序列过滤器。
 #[derive(Default)]
@@ -161,6 +222,10 @@ impl OpenLog {
             old.display(),
             path.display()
         );
+        // 轮转之后顺手清掉这个会话过旧的旧文件（保留最近 ROTATE_KEEP 个）。
+        // 放在新文件已经打开之后做：即使删除失败（例如被杀毒软件占着），
+        // 正在写的那个文件也一定还在。
+        prune_old_parts(&self.dir, &self.stem, ROTATE_KEEP);
         Ok(())
     }
 
@@ -543,6 +608,79 @@ mod tests {
         assert!(first.iter().all(|b| *b == b'a'));
         assert!(second.iter().all(|b| *b == b'b'));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 轮转后只保留最近 ROTATE_KEEP 个文件（老版本只轮转不清理，长会话能把盘吃光）。
+    #[test]
+    fn rotation_keeps_only_the_newest_files() {
+        let dir = unique_dir("prune");
+        let reg = LogRegistry::with_limits(dir.clone(), 100);
+        reg.start("long", Some("long")).unwrap();
+        // 每次写 80 字节、上限 100：第 2 次起每次写都会轮转一次 → 共 9 个文件
+        for _ in 0..9 {
+            reg.write("long", &vec![b'x'; 80]);
+        }
+        let current = reg.status("long").unwrap();
+        reg.stop("long");
+
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names.len(),
+            ROTATE_KEEP,
+            "只该留 {ROTATE_KEEP} 个（当前 + 4 个旧的）：{names:?}"
+        );
+        // 正在写的那个文件当然还在
+        let current_name = std::path::Path::new(&current)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(names.contains(&current_name), "当前文件不能被清掉：{current}");
+        // 0 号文件（`long-<8 位 hash>.log`，没有 `-N` 后缀）已经被清掉
+        let oldest_left = names.iter().find(|n| {
+            let Some(rest) = n.strip_prefix("long-").and_then(|r| r.strip_suffix(".log")) else {
+                return false;
+            };
+            rest.len() == 8 && rest.chars().all(|c| c.is_ascii_hexdigit())
+        });
+        assert!(oldest_left.is_none(), "最老的那个文件应该被清掉：{names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 纯函数：只删"这个会话"的轮转文件，别动别人的、别动不认识的。
+    #[test]
+    fn stale_parts_only_matches_our_own_rotation_files() {
+        let stem = "build-1a2b3c4d";
+        let names: Vec<String> = vec![
+            "build-1a2b3c4d.log".into(),
+            "build-1a2b3c4d-1.log".into(),
+            "build-1a2b3c4d-2.log".into(),
+            "build-1a2b3c4d-3.log".into(),
+            "build-1a2b3c4d-4.log".into(),
+            "build-1a2b3c4d-5.log".into(),
+            // 别的会话（前缀相同的另一个 hash）不能被误伤
+            "build-99999999-9.log".into(),
+            // 不像我们轮转出来的东西
+            "build-1a2b3c4d-abc.log".into(),
+            "build-1a2b3c4d.log.bak".into(),
+            "我的笔记.txt".into(),
+        ];
+        let doomed = stale_parts(&names, stem, 5);
+        assert_eq!(
+            doomed,
+            vec!["build-1a2b3c4d.log".to_string()],
+            "只有编号最小的那个该删：{doomed:?}"
+        );
+
+        // 没超过上限就一个都不删
+        assert!(stale_parts(&names[..5], stem, 5).is_empty());
+        // 上限为 0 也不会 panic（极端参数）
+        assert_eq!(stale_parts(&names[..2], stem, 0).len(), 2);
     }
 
     #[test]

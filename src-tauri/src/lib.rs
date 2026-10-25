@@ -86,8 +86,106 @@ fn startup_mark(name: String) {
   mark_startup(&name);
 }
 
+/// 启动失败时给用户看的文案（纯函数，单测钉着"一定要有原因 + 日志位置"）。
+fn bootstrap_failure_text(err: &str, log_hint: &str) -> String {
+    format!(
+        "ZeeAI Term 启动失败，已退出。\n\n原因：{err}\n\n\
+         详细信息已写入：{log_hint}\n\
+         如果反复出现，请把这个文件发给开发者。"
+    )
+}
+
+/// 把启动失败写进文件（**不依赖日志插件**）。
+///
+/// 为什么不用 `log::error!`：走到这一步说明 `tauri::Builder::build()` 已经失败了，
+/// 而 `tauri_plugin_log` 是在 builder 上挂的 —— 它还没生效，`log::error!` 只会落进
+/// 一个没人接的宏里（用户什么都看不到，就"闪退"了）。
+fn write_bootstrap_error(dir: &std::path::Path, text: &str) -> Option<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join("bootstrap-error.log");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let _ = writeln!(
+        f,
+        "==== {} pid={} ====",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    let _ = writeln!(f, "{text}");
+    let _ = f.flush();
+    Some(path)
+}
+
+/// 启动失败的兜底严重错误处理：写日志 + 弹一个系统错误框 + 退出。
+///
+/// 以前这里是 `.expect("error while building tauri application")`（架构审查 minor-13）：
+/// release 构建带 `panic = "abort"`，于是**用户只看到窗口一闪就没了**，日志里什么都没有。
+/// 现在至少做到：日志里有一行原因、`%LOCALAPPDATA%` 下有一个错误文件、
+/// 屏幕上有一个说明"为什么没起来"的对话框。
+fn report_bootstrap_failure(err: &str) -> ! {
+    let dir = std::env::var("LOCALAPPDATA")
+        .map(|base| {
+            std::path::Path::new(&base)
+                .join("com.zeeai.terminal")
+                .join("logs")
+        })
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let log_hint = dir.join("bootstrap-error.log").display().to_string();
+    let text = bootstrap_failure_text(err, &log_hint);
+    log::error!("startup: 启动失败：{err}");
+    let _ = write_bootstrap_error(&dir, &text);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let body = wide(&text);
+        let caption = wide("ZeeAI Term 启动失败");
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{text}");
+    std::process::exit(1);
+}
+
+/// # 关于 `tauri.conf.json` 的 `app.security.csp`（由前端/配置那边维护）
+///
+/// JSON 里写不了注释，所以把"为什么是现在这条 CSP"记在这里：
+///
+/// - `style-src 'self' 'unsafe-inline'`：**必须**允许内联样式 —— `index.html` 里那块
+///   启动首屏是不依赖 JS 的 `<style>`，而 xterm/主题/弹层大量用 `style={{…}}` 内联属性；
+/// - `connect-src` 里的 `ipc: http://ipc.localhost`：Tauri 的 invoke 走自定义协议
+///   （Tauri 官方示例的 CSP 也是这两个）；`ws:` + `http://localhost:*` 是 `tauri dev`
+///   的 Vite HMR 用的（只在开发时真的会连）；
+/// - `connect-src` 还带 `https: http:`：**这条是待验证的放宽**。前端 `checkForUpdates`
+///   会 `fetch(settings.updateUrl)`（默认 GitHub API，用户可自己改），CSP 里不放开
+///   就会把"检查更新"整条打断。以后若要收紧，应改成固定的 `https://api.github.com`
+///   + 用户自定义域名白名单（需要前端配合，不是这次的范围）；
+/// - `img-src data: blob:`：粘贴的图片缩略图是 Rust 侧返回的 data URL；
+/// - `worker-src blob:`：预留给 xterm 的 worker（当前版本没用到，但收紧会留坑）。
+///
+/// 改动这张配置时请同时跑 `npm run build` 和真机启动一次（配置 schema 只能保证
+/// 语法对，保证不了 WebView 的行为）。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // 升级辅助进程（`--apply-update …`，见 core::update）：必须在**单实例检查与建窗口之前**
+  // 处理 —— 它不该弹窗，也不该因为"已经有一个实例在跑"就退出。
+  if let Some(code) = crate::core::update::maybe_run() {
+    std::process::exit(code);
+  }
   // 单实例：便携版和安装版**共用**同一份配置目录，两个实例同时跑会互相覆盖
   // settings / history / workspace（后写的赢），通知也会各弹一遍。
   // 第二个实例只把已有窗口叫到前面来，然后自己退出。见 instance.rs。
@@ -95,7 +193,8 @@ pub fn run() {
   if !instance::ensure_single_instance() {
     return;
   }
-  tauri::Builder::default()
+  // 构建结果先落进 `built`：失败要走报告路径，而不是 panic（panic = abort → 用户只看到闪退）。
+  let built = tauri::Builder::default()
     .plugin(
       tauri_plugin_log::Builder::default()
         .level(log::LevelFilter::Info)
@@ -165,7 +264,18 @@ pub fn run() {
       // （那会弹控制台窗口、耗 CPU）；读自己的日志文件不属于探测，而且这也是用户
       // 2026-10-20 亲口确认的口径（"本地 codex 的日志文件也算可以直接读"）。
       // ⚠️ 别往这条线程里加任何命令；要加探测必须先问用户（见 docs/design-ai-board-v2.md §10.8）。
-      crate::core::ai_log_watch::spawn(app.handle().clone());
+      //
+      // **AI 面板这一版暂停，所以这两条被动监视线程默认不启动**（架构审查 minor-16）。
+      // 以前前端的 `AI_PANEL_DISABLED` 只挡住界面，后端照样每 2.5 秒扫日志树、
+      // 每 60 秒对每台服务器起 ssh —— 面板看不见的时候这些全是白烧。
+      // 开关在设置里（`aiWatchEnabled`，默认 **false**）：前端将来恢复面板时把它打开，
+      // 下次启动生效。**别把这里的判断改成写死**。
+      let ai_watch_enabled = crate::store::load_settings().ai_watch_enabled;
+      if ai_watch_enabled {
+        crate::core::ai_log_watch::spawn(app.handle().clone());
+      } else {
+        log::info!("ai-log: aiWatchEnabled=false（AI 面板暂停中），本机日志监视没有启动");
+      }
       // herdr 红点轮询（用户 2026-10-20 明确批准）：每台**勾了 herdr 的**服务器
       // 每 60 秒查一次 `herdr agent list`，只用来驱动红点。
       //
@@ -175,7 +285,11 @@ pub fn run() {
       // 探测本身复用 `commands::herdr_agents`（→ `run_remote_capture` →
       // `proc::hidden_command_async`，带 CREATE_NO_WINDOW），不会弹黑框。
       // ⚠️ 不要往这条线程里塞第二个探测 / 改小间隔；见 core/ai_herdr_dots.rs 模块头。
-      crate::core::ai_herdr_dots::spawn(app.handle().clone());
+      if ai_watch_enabled {
+        crate::core::ai_herdr_dots::spawn(app.handle().clone());
+      } else {
+        log::info!("herdr 红点: aiWatchEnabled=false（AI 面板暂停中），轮询没有启动");
+      }
       // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
       // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
       //
@@ -743,9 +857,15 @@ pub fn run() {
         }
       }
     })
-    .build(tauri::generate_context!())
-    .expect("error while building tauri application")
-    .run(|app_handle, event| {
+    .build(tauri::generate_context!());
+  // 以前这里是 `.expect("error while building tauri application")`（架构审查 minor-13）。
+  // release 是 `panic = "abort"`，于是启动失败 = **窗口一闪、日志空白、用户什么都不知道**。
+  // 现在：写一行原因到日志 + 落一个 bootstrap-error.log + 弹一个系统错误框，然后退出。
+  let app = match built {
+    Ok(app) => app,
+    Err(e) => report_bootstrap_failure(&e.to_string()),
+  };
+  app.run(|app_handle, event| {
       // 退出前把所有会话进程收干净（Job Object 也会兜底，但显式做更清晰）
       if let tauri::RunEvent::Exit = event {
         // herdr 红点轮询：先置停止位，让它在下一个分片睡眠（≤500ms）里收尾，
@@ -766,4 +886,50 @@ pub fn run() {
         }
       }
     });
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    /// 启动失败的文案必须三件事都有：**为什么**、**日志在哪**、**下一步怎么办**。
+    /// （以前 `.expect(...)` 只留一个 panic 消息，release 是 abort，用户什么都看不到。）
+    #[test]
+    fn failure_text_tells_reason_and_log_location() {
+        let text = bootstrap_failure_text("窗口创建失败", r"C:\logs\bootstrap-error.log");
+        assert!(text.contains("启动失败"), "{text}");
+        assert!(text.contains("窗口创建失败"), "要带原因：{text}");
+        assert!(text.contains(r"C:\logs\bootstrap-error.log"), "要带日志位置：{text}");
+        assert!(text.contains("发给开发者"), "要给下一步：{text}");
+    }
+
+    /// 错误文件要真的落盘、可读、并且是**追加**（保留上一次的痕迹）。
+    #[test]
+    fn write_bootstrap_error_appends_readable_lines() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zeeai-boot-{}-{nanos}",
+            std::process::id()
+        ));
+        let path = write_bootstrap_error(&dir, "原因：xxx").expect("错误文件应该能写");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("bootstrap-error.log")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("原因：xxx"), "{text}");
+        assert!(
+            text.contains(&format!("pid={}", std::process::id())),
+            "要带 pid 便于排查：{text}"
+        );
+
+        // 第二次是追加，不是覆盖
+        let _ = write_bootstrap_error(&dir, "第二次");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("原因：xxx") && text.contains("第二次"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

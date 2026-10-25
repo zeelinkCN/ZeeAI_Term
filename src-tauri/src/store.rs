@@ -320,14 +320,48 @@ pub fn load_workspace() -> Option<String> {
 }
 
 /// 会话日志目录：%APPDATA%\ZeeAI-Terminal\logs\sessions
-pub fn log_dir() -> PathBuf {
-    // 设置里指定了自定义目录就用它（比如放到 D:\zeeai-logs 或网络盘），
-    // 空字符串 = 用默认位置。
-    let custom = load_settings().log_dir.trim().to_string();
+///
+/// **结果缓存**（架构审查 minor-12）：这里原来是"每个会话都读一次 settings.json 并解析"，
+/// 而 `session_log.rs` 每开一个会话就要一次目录 —— 几十个标签页就是几十次同步读盘。
+/// 现在第一次算完就缓存，`save_settings()` 里把缓存清掉（用户改过设置才需要重算）。
+///
+/// 锁序：缓存锁里**只取 clone 就放**，真正读 settings 是在锁外做的；
+/// 而 `load_settings()` 那条路完全不碰这把锁，所以不存在 ABBA。
+static LOG_DIR_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn log_dir_cache() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    LOG_DIR_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 纯计算部分（单测直接喂参数，不碰真实配置目录）
+fn resolve_log_dir(custom: &str) -> PathBuf {
+    let custom = custom.trim();
     if !custom.is_empty() {
         return PathBuf::from(custom);
     }
     store_dir().join("logs").join("sessions")
+}
+
+pub fn log_dir() -> PathBuf {
+    // 不把锁带到 load_settings 里去：先 clone 出来，拿不到再算
+    if let Ok(guard) = log_dir_cache().lock() {
+        if let Some(hit) = guard.as_ref() {
+            return hit.clone();
+        }
+    }
+    let computed = resolve_log_dir(&load_settings().log_dir);
+    if let Ok(mut guard) = log_dir_cache().lock() {
+        *guard = Some(computed.clone());
+    }
+    computed
+}
+
+/// 设置变了（或测试要重置）：让 [`log_dir`] 下次重新算。
+fn invalidate_log_dir_cache() {
+    if let Ok(mut guard) = log_dir_cache().lock() {
+        *guard = None;
+    }
 }
 
 /// 应用设置。所有字段都有默认值，方便版本升级时兼容旧文件。
@@ -438,6 +472,18 @@ pub struct Settings {
     /// 默认开：那样"我粘对了没有"不用靠猜 —— 粘贴的语义就是"现在就发"，
     /// 发错了得能立刻看出来。走输入窗时不需要它（那边附件是常驻缩略图）。
     pub paste_toast: bool,
+    /// **两条被动监视线程**（本机 codex rollout 日志 / herdr 红点轮询）的总开关。
+    ///
+    /// 默认 **false**（架构审查 minor-16）：AI 面板这一版整体暂停（前端的
+    /// `AI_PANEL_DISABLED`），但后端的两个线程以前照跑 —— 一条每 2.5 秒扫本机日志树，
+    /// 一条每 60 秒对每台勾了 herdr 的服务器起 ssh。面板不可见时这些全是白烧。
+    /// 现在由 `lib.rs` 在启动时读这个值，**没启用就一个线程都不起**。
+    ///
+    /// 为什么放在设置里、而不是写死 `false`：恢复面板时要能由**前端**打开（用户点开关 →
+    /// `settings_set` 落盘 → 下次启动生效）。老配置里没有这个字段，
+    /// 因为 `Settings` 是 `#[serde(default)]`，缺字段会取 [`Settings::default`] 的值 = false，
+    /// 不需要额外的迁移代码（`legacy_config_without_ai_watch_defaults_off` 钉着这一点）。
+    pub ai_watch_enabled: bool,
 }
 
 impl Default for Settings {
@@ -496,6 +542,9 @@ impl Default for Settings {
             // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
             // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
             paste_toast: false,
+            // **两条被动监视线程默认不启动**（AI 面板这一版暂停）。
+            // 恢复面板时由前端把这个开关打开（下次启动生效），别在代码里写死。
+            ai_watch_enabled: false,
         }
     }
 }
@@ -543,7 +592,13 @@ fn default_update_url() -> String {
 
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
     let text = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化失败: {e}"))?;
-    write_atomic(&settings_file(), &text)
+    let r = write_atomic(&settings_file(), &text);
+    // 只有真的写成功了才失效：不然用户改日志目录 → 写失败 → 缓存被清掉，
+    // 下一次 log_dir() 又会读回旧的 settings（行为看起来"改了没生效"）。
+    if r.is_ok() {
+        invalidate_log_dir_cache();
+    }
+    r
 }
 
 /// 一条会话历史：记录「用哪个配置、附加了哪个 tmux 会话、什么时候用过」。
@@ -765,6 +820,65 @@ mod settings_tests {
         let s: Settings = serde_json::from_str("{}").expect("空配置也要能读");
         assert!(s.ai_notify_needs_you_badge);
         assert!(s.ai_notify_finished_badge);
+    }
+
+    /// **AI 面板暂停**：两条被动态监视线程默认不启动。
+    ///
+    /// 老配置（没有 `aiWatchEnabled` 字段）读进来也必须是 false —— 靠容器的
+    /// `#[serde(default)]` 取 `Settings::default()`，不需要额外的迁移代码。
+    /// 将来恢复面板时由前端把它打开（所以这个值必须来自设置，不能写死）。
+    #[test]
+    fn legacy_config_without_ai_watch_defaults_off() {
+        assert!(
+            !Settings::default().ai_watch_enabled,
+            "出厂默认：不启动被动监视线程"
+        );
+        let legacy = r#"{"theme":"dark","fontSize":13,"autoLog":true}"#;
+        let s: Settings = serde_json::from_str(legacy).expect("老配置也要能读");
+        assert!(
+            !s.ai_watch_enabled,
+            "老配置缺 aiWatchEnabled → 默认关（AI 面板这一版是暂停的）"
+        );
+        // 前端打开后能存下来、能读回来（恢复面板时前端要用的那条路）
+        let mut on = Settings::default();
+        on.ai_watch_enabled = true;
+        let text = serde_json::to_string(&on).unwrap();
+        assert!(text.contains("\"aiWatchEnabled\":true"), "{text}");
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.ai_watch_enabled);
+    }
+
+    // ---------- 日志目录（缓存 + 纯计算） ----------
+
+    /// 空/空白 = 默认目录；填了就用填的那个（去空白）。
+    #[test]
+    fn log_dir_resolution_prefers_custom_and_falls_back() {
+        let default_like = resolve_log_dir("");
+        assert!(
+            default_like.ends_with("logs/sessions") || default_like.ends_with("logs\\sessions")
+        );
+        assert_eq!(resolve_log_dir("   "), default_like, "全是空格也算没填");
+        assert_eq!(
+            resolve_log_dir(r"D:\zeeai-logs"),
+            PathBuf::from(r"D:\zeeai-logs")
+        );
+        assert_eq!(
+            resolve_log_dir("  /mnt/logs  "),
+            PathBuf::from("/mnt/logs"),
+            "两边的空白要去掉"
+        );
+    }
+
+    /// 缓存：两次调用拿到同一个值；失效之后重新算（这里只验行为，不碰真实配置）。
+    #[test]
+    fn log_dir_is_cached_and_invalidated() {
+        invalidate_log_dir_cache();
+        let a = log_dir();
+        let b = log_dir();
+        assert_eq!(a, b);
+        // 失效之后仍然是同一个路径（因为 settings.json 没变），但走的是"重新算"那条路
+        invalidate_log_dir_cache();
+        assert_eq!(log_dir(), a);
     }
 
     /// 服务器可以绑定规则集；不绑就是 None

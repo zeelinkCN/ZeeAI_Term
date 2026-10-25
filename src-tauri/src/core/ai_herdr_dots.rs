@@ -21,6 +21,17 @@
 //! - 间隔 [`HERDR_DOT_POLL_MS`]（60 秒，**不许更密**）；启动后再等
 //!   [`HERDR_DOT_STARTUP_DELAY_MS`]（12 秒）才跑第一轮，不和首屏/恢复会话抢那几秒。
 //!
+//! **并发 + 退避**（架构审查 minor-02）：以前是**串行**逐台探测，每台最多 20 秒超时 ——
+//! 一台黑洞服务器就能把整轮拖成 N×20 秒，而且下一轮照样立刻再试，等于一直在起 ssh。
+//! 现在：
+//! - 每台一个 `tokio::spawn`，用 `JoinSet` 聚合：慢的那台不妨碍别的台出结果；
+//! - 失败按 60s → 120s → 300s 退避（[`FailureBook`]），成功一次就清零；
+//! - 连接参数在 `ssh::ssh_exec_args` 里加了 `ConnectTimeout=8` + 心跳（见那里的说明）。
+//!
+//! **快照变了才发**（架构审查 minor-09）：卡片快照本来是每轮无条件 emit 一次，
+//! 60 秒一包"什么都没变"的 JSON 纯属噪音。现在按"内容指纹"（不含 `at_ms`）比较，
+//! 只有真的变了才发；前端拿到的仍是全量快照（语义没变）。
+//!
 //! **不裸起进程**：每次探测都走**已有的** `commands::herdr_agents` —— 它内部是
 //! `run_remote_capture`（20 秒超时）→ `ssh::ssh_exec_args` + `run_ssh_capture` →
 //! `proc::hidden_command_async`（Windows 上带 `CREATE_NO_WINDOW`，用户看不到黑框），
@@ -221,6 +232,121 @@ pub struct HerdrAgentsSnapshot {
 pub struct PollOutcome {
     pub signals: Vec<HerdrDotSignal>,
     pub snapshots: Vec<HerdrAgentsSnapshot>,
+    /// 这一轮**真的拿到了状态**的服务器（给退避账本用）
+    pub ok: Vec<String>,
+    /// 这一轮失败的服务器（给退避账本用）
+    pub failed: Vec<String>,
+}
+
+/// 连续失败 n 次之后，下一次尝试要等多久（毫秒）。
+///
+/// 60s → 120s → 300s（然后一直是 300s）。为什么要有：一台黑洞服务器每轮都要起一条
+/// 20 秒超时的 ssh，60 秒一轮就是"永远在起 ssh"；退避之后最坏情况 5 分钟才试一次，
+/// 而正常服务器永远走不到这里（成功一次就清零）。
+pub fn backoff_ms(failures: u32) -> u64 {
+    match failures {
+        0 => 0,
+        1 => 60_000,
+        2 => 120_000,
+        _ => 300_000,
+    }
+}
+
+/// 一台服务器上一次成功的时间 —— 0 = 从没成功过（只用于日志/排查）。
+#[derive(Clone, Debug, Default)]
+struct Failure {
+    failures: u32,
+    /// 下次允许尝试的时间（Unix 毫秒；0 = 现在就可以）
+    next_at_ms: i64,
+    last_ok_ms: i64,
+}
+
+/// 每台服务器的退避账本。
+///
+/// **纯逻辑、不连网**：单测直接喂时间戳就能验"失败 → 退避 → 到期才再试 → 成功清零"。
+///
+/// 为什么记 `last_ok`：排查"这台为什么一直没红点"时，一眼能看出"它最后一次成功是什么时候"
+///（而不是只知道"这一轮失败了"）。
+#[derive(Default)]
+pub struct FailureBook {
+    entries: HashMap<String, Failure>,
+}
+
+impl FailureBook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 这台现在该不该探？
+    pub fn due(&self, profile_id: &str, now_ms: i64) -> bool {
+        match self.entries.get(profile_id) {
+            None => true,
+            Some(f) => now_ms >= f.next_at_ms,
+        }
+    }
+
+    /// 成功了：清掉退避，下一轮立刻可以再探。
+    pub fn record_ok(&mut self, profile_id: &str, now_ms: i64) {
+        let e = self.entries.entry(profile_id.to_string()).or_default();
+        e.failures = 0;
+        e.next_at_ms = 0;
+        e.last_ok_ms = now_ms;
+    }
+
+    /// 失败了：累加次数，按 60/120/300 秒退避；返回这次的等待毫秒（给日志用）。
+    pub fn record_err(&mut self, profile_id: &str, now_ms: i64) -> u64 {
+        let e = self.entries.entry(profile_id.to_string()).or_default();
+        e.failures = e.failures.saturating_add(1);
+        let wait = backoff_ms(e.failures);
+        e.next_at_ms = now_ms.saturating_add(wait as i64);
+        wait
+    }
+
+    /// 连续失败次数（日志/单测用）
+    pub fn failures(&self, profile_id: &str) -> u32 {
+        self.entries.get(profile_id).map(|f| f.failures).unwrap_or(0)
+    }
+
+    /// 上一次成功的时间（0 = 从没成功过）
+    pub fn last_ok_ms(&self, profile_id: &str) -> i64 {
+        self.entries
+            .get(profile_id)
+            .map(|f| f.last_ok_ms)
+            .unwrap_or(0)
+    }
+}
+
+/// 快照"变了才发"的闸门（架构审查 minor-09）。
+///
+/// 比较的是**内容指纹**：把 `at_ms` 抹掉再序列化 —— 那个字段每轮都变，拿它比永远"变了"。
+#[derive(Default)]
+pub struct SnapshotGate {
+    last: HashMap<String, String>,
+}
+
+impl SnapshotGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 返回 `true` = 和上一轮比有内容变化（该 emit）；第一次见到某台服务器也算变化。
+    pub fn changed(&mut self, snap: &HerdrAgentsSnapshot) -> bool {
+        let fingerprint = snapshot_fingerprint(snap);
+        match self.last.get(&snap.server) {
+            Some(prev) if *prev == fingerprint => false,
+            _ => {
+                self.last.insert(snap.server.clone(), fingerprint);
+                true
+            }
+        }
+    }
+}
+
+/// 快照的内容指纹：**不含 `at_ms`**（时间每轮都变，那是元数据不是内容）。
+pub fn snapshot_fingerprint(snap: &HerdrAgentsSnapshot) -> String {
+    let mut copy = snap.clone();
+    copy.at_ms = 0;
+    serde_json::to_string(&copy).unwrap_or_default()
 }
 
 /// 一个窗格上一轮的样子（边沿检测 + 清红点都要用到）
@@ -508,27 +634,62 @@ pub fn snapshot_of(target: &DotTarget, agents: &[HerdrAgent], at_ms: i64) -> Her
     }
 }
 
-/// 跑一轮：逐台调 `commands::herdr_agents`（已有的那条路，隐藏窗口、20 秒超时），
+/// 跑一轮：**并发**逐台调 `commands::herdr_agents`（已有的那条路，隐藏窗口、20 秒超时），
 /// 返回这一轮该发给前端的**红点信号 + 卡片快照**。
 ///
-/// 为什么串行不并发：一轮里同时开 N 条 ssh 会在网络差的时候挤在一起，
-/// 而且这个轮询本来就不赶时间（60 秒一轮）。单台失败只影响它自己。
+/// - `all`：这一轮**全部**目标（用来判断"某台服务器被取消勾选了没有" → prune 清红点）。
+///   不能只传"真要探的"：被退避挡住的那台并没有被用户取消勾选，不能清它的红点；
+/// - `due`：真正要探的（`all` 里过了退避时间的那些）。
+///
+/// 每台一个 `tokio::spawn` + `JoinSet` 聚合：以前是串行，一台黑洞服务器（20 秒超时）
+/// 会把整轮拖成 N×20 秒。
 ///
 /// **失败静默**：只 `log::warn` 一行，这一轮跳过 —— 网络抖一下不代表"它不再等你了"，
 /// 所以**不补发** `resolved`；**也不发快照**（前端拿不到这一轮的数据就保留上一张卡，
 /// 而不是把"没看见"当成"没了"去删卡）。等下一轮真的拿到状态再对齐。
-pub async fn poll_once(tracker: &mut DotTracker, targets: &[DotTarget]) -> PollOutcome {
+pub async fn poll_once(
+    tracker: &mut DotTracker,
+    all: &[DotTarget],
+    due: &[DotTarget],
+) -> PollOutcome {
     let at = now_ms();
     let mut out = PollOutcome {
-        signals: tracker.prune(targets, at),
+        // 用**全部**目标做 prune：被退避挡住 ≠ 被用户取消勾选
+        signals: tracker.prune(all, at),
         snapshots: Vec::new(),
+        ok: Vec::new(),
+        failed: Vec::new(),
     };
-    for t in targets {
-        match crate::commands::herdr_agents(t.profile_id.clone(), None).await {
+    if due.is_empty() {
+        return out;
+    }
+
+    // 并发探测：一台慢的不挡别的台
+    let mut set = tokio::task::JoinSet::new();
+    for t in due {
+        let target = t.clone();
+        set.spawn(async move {
+            let r = crate::commands::herdr_agents(target.profile_id.clone(), None).await;
+            (target, r)
+        });
+    }
+    let mut results: Vec<(DotTarget, Result<Vec<HerdrAgent>, String>)> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(pair) => results.push(pair),
+            // 任务 panic / 被取消：算这一台失败，但不影响其他台
+            Err(e) => log::warn!("herdr 红点: 有一台探测任务异常结束：{e}"),
+        }
+    }
+    // 固定顺序处理（按服务器 id）：日志 / 信号顺序可复现；前端按 key 去重，不依赖顺序
+    results.sort_by(|a, b| a.0.profile_id.cmp(&b.0.profile_id));
+
+    for (t, r) in results {
+        match r {
             Ok(agents) => {
                 // 一次取"现在"给两份产出用：同一轮的红点和快照时间对得上。
                 let now = now_ms();
-                let sigs = tracker.observe(t, &agents, now);
+                let sigs = tracker.observe(&t, &agents, now);
                 if !sigs.is_empty() {
                     log::info!(
                         "herdr 红点: {} 这一轮 {} 条信号（{} 个 agent）",
@@ -538,16 +699,17 @@ pub async fn poll_once(tracker: &mut DotTracker, targets: &[DotTarget]) -> PollO
                     );
                 }
                 out.signals.extend(sigs);
-                // 卡片快照是**每轮都发**的（哪怕一条红点信号都没有）：卡片是状态，
-                // 不是"变了才提醒"的事件 —— 首次启动、状态从 blocked 回到 working
-                // 这些都不一定产生边沿信号，但卡片必须跟着变。
-                out.snapshots.push(snapshot_of(t, &agents, now));
+                // 卡片快照每轮都算（哪怕一条红点信号都没有）：卡片是状态，不是"变了才提醒"
+                // 的事件。**要不要 emit** 由 `SnapshotGate` 决定（内容没变就不发，minor-09）。
+                out.snapshots.push(snapshot_of(&t, &agents, now));
+                out.ok.push(t.profile_id.clone());
             }
             Err(e) => {
                 log::warn!(
                     "herdr 红点: 查 {} 的 agent 列表失败（这一轮跳过，不亮也不清）：{e}",
                     t.name
                 );
+                out.failed.push(t.profile_id.clone());
             }
         }
     }
@@ -574,6 +736,10 @@ pub fn spawn(app: tauri::AppHandle) {
             HERDR_DOT_POLL_MS / 1000
         );
         let mut tracker = DotTracker::new();
+        // 失败退避账本：60s → 120s → 300s（成功一次清零）
+        let mut book = FailureBook::new();
+        // 快照"变了才发"的闸门
+        let mut gate = SnapshotGate::new();
         loop {
             if STOP.load(Ordering::SeqCst) {
                 log::info!("herdr 红点: 应用退出，轮询结束（没有残留请求）");
@@ -586,12 +752,46 @@ pub fn spawn(app: tauri::AppHandle) {
             match crate::store::load() {
                 Ok(profiles) => {
                     let targets = targets_from(&profiles);
-                    let outcome = poll_once(&mut tracker, &targets).await;
-                    // 先发卡片快照（全量、每轮都发），再发红点边沿信号。两个事件各管一件事：
-                    // 前端不需要在同一个监听里猜"这条是快照还是边沿"。
-                    for snap in outcome.snapshots {
+                    let now = now_ms();
+                    // 退避到期的才探；被挡住的那些仍然参与 prune（见 poll_once 的说明）
+                    let due: Vec<DotTarget> = targets
+                        .iter()
+                        .filter(|t| book.due(&t.profile_id, now))
+                        .cloned()
+                        .collect();
+                    if due.len() < targets.len() {
                         log::info!(
-                            "herdr 卡片快照: {} 这一轮 {} 个 agent",
+                            "herdr 红点: {} 台里有 {} 台在退避中，这一轮跳过它们",
+                            targets.len(),
+                            targets.len() - due.len()
+                        );
+                    }
+                    let outcome = poll_once(&mut tracker, &targets, &due).await;
+                    // 记账：成功的清零、失败的按 60/120/300 秒退避
+                    for id in &outcome.ok {
+                        book.record_ok(id, now_ms());
+                    }
+                    for id in &outcome.failed {
+                        let wait = book.record_err(id, now_ms());
+                        log::info!(
+                            "herdr 红点: {id} 连续失败 {} 次，{} 秒后再试（上次成功 {}）",
+                            book.failures(id),
+                            wait / 1000,
+                            book.last_ok_ms(id)
+                        );
+                    }
+                    // 先发卡片快照（全量，但**内容没变就不发**），再发红点边沿信号。
+                    // 两个事件各管一件事：前端不需要在同一个监听里猜"这条是快照还是边沿"。
+                    for snap in outcome.snapshots {
+                        if !gate.changed(&snap) {
+                            log::debug!(
+                                "herdr 卡片快照: {} 和上一轮一样，跳过 emit",
+                                snap.server_name
+                            );
+                            continue;
+                        }
+                        log::info!(
+                            "herdr 卡片快照: {} 这一轮 {} 个 agent（有变化，已发）",
                             snap.server_name,
                             snap.agents.len()
                         );
@@ -819,7 +1019,7 @@ mod tests {
 
         // 这几行就是轮询线程每一轮真正走的路径：目标为空 => 不发请求、也不产出信号/快照。
         let mut tracker = DotTracker::new();
-        let got = poll_once(&mut tracker, &targets).await;
+        let got = poll_once(&mut tracker, &targets, &targets).await;
         assert!(
             got.signals.is_empty() && got.snapshots.is_empty(),
             "没有目标就不该有任何红点信号 / 卡片快照：{:?}",
@@ -977,5 +1177,98 @@ mod tests {
         let snap = snapshot_of(&t, &[a], 43);
         assert_eq!(snap.agents[0].activity, "", "目录名不能当「最后动作」");
         assert_eq!(snap.agents[0].state, "idle");
+    }
+
+    // ---------- 并发退避（minor-02） / 快照变了才发（minor-09） ----------
+
+    /// 退避阶梯：60s → 120s → 300s（之后一直 300s）。
+    #[test]
+    fn backoff_ladder_is_60_120_then_300() {
+        assert_eq!(backoff_ms(0), 0);
+        assert_eq!(backoff_ms(1), 60_000);
+        assert_eq!(backoff_ms(2), 120_000);
+        assert_eq!(backoff_ms(3), 300_000);
+        assert_eq!(backoff_ms(99), 300_000);
+    }
+
+    /// 退避状态机：失败累计 → 到期才允许再试 → 成功清零并记 last_ok。
+    #[test]
+    fn failure_book_backs_off_and_recovers() {
+        let mut book = FailureBook::new();
+        let t0 = 1_000_000i64;
+        assert!(book.due("srv", t0), "从没试过 → 立刻可以试");
+        assert_eq!(book.last_ok_ms("srv"), 0, "还没成功过");
+
+        // 第一次失败：60 秒内不再试
+        let wait = book.record_err("srv", t0);
+        assert_eq!(wait, 60_000);
+        assert_eq!(book.failures("srv"), 1);
+        assert!(!book.due("srv", t0 + 59_999), "退避期内不该再起 ssh");
+        assert!(book.due("srv", t0 + 60_000), "到点就能再试");
+
+        // 第二次失败：120 秒
+        let wait = book.record_err("srv", t0 + 60_000);
+        assert_eq!(wait, 120_000);
+        assert!(!book.due("srv", t0 + 60_000 + 119_999));
+        assert!(book.due("srv", t0 + 60_000 + 120_000));
+
+        // 第三次失败：300 秒
+        let wait = book.record_err("srv", t0 + 180_000);
+        assert_eq!(wait, 300_000);
+
+        // 成功：清零、记下时间，下一轮立刻可探
+        book.record_ok("srv", t0 + 400_000);
+        assert_eq!(book.failures("srv"), 0);
+        assert!(book.due("srv", t0 + 400_000));
+        assert_eq!(book.last_ok_ms("srv"), t0 + 400_000);
+        // 再失败又从 60 秒重新开始
+        assert_eq!(book.record_err("srv", t0 + 400_000), 60_000);
+    }
+
+    /// 每台服务器的退避互不影响（一台黑洞不能拖累别的机器）。
+    #[test]
+    fn failure_book_is_per_server() {
+        let mut book = FailureBook::new();
+        let now = 5_000_000i64;
+        for _ in 0..3 {
+            book.record_err("bad", now);
+        }
+        assert!(!book.due("bad", now + 1));
+        assert!(book.due("good", now), "别的机器照常轮询");
+        assert_eq!(book.failures("good"), 0);
+    }
+
+    /// 快照指纹：**不含 at_ms**（时间每轮都变），内容一变就不同。
+    #[test]
+    fn snapshot_gate_only_emits_on_content_change() {
+        let t = target("srv-1", "lz");
+        let mut gate = SnapshotGate::new();
+        let first = snapshot_of(&t, &[agent("w1:p1", "working")], 1_000);
+        assert!(gate.changed(&first), "第一次见到这台 → 要发");
+
+        // 同样的内容、只有时间不同 → 不发（这条就是 minor-09 的核心）
+        let same = snapshot_of(&t, &[agent("w1:p1", "working")], 61_000);
+        assert_eq!(snapshot_fingerprint(&first), snapshot_fingerprint(&same));
+        assert!(!gate.changed(&same), "内容没变就不该再发一包 JSON");
+
+        // 状态变了 → 要发
+        let changed = snapshot_of(&t, &[agent("w1:p1", "blocked")], 121_000);
+        assert!(gate.changed(&changed), "状态变了必须发");
+
+        // 窗格多了/少了 → 也要发
+        let more = snapshot_of(
+            &t,
+            &[agent("w1:p1", "blocked"), agent("w1:p2", "idle")],
+            181_000,
+        );
+        assert!(gate.changed(&more), "窗格变了必须发");
+        assert!(!gate.changed(&more.clone()), "同一份再比一次就不发了");
+
+        // 另一台服务器各自独立（互不覆盖）
+        let other = target("srv-2", "hk");
+        assert!(
+            gate.changed(&snapshot_of(&other, &[agent("w2:p1", "idle")], 200_000)),
+            "另一个服务器第一次也要发"
+        );
     }
 }
