@@ -1,7 +1,4 @@
-// 窗口标题栏：左边自定义菜单（文件/视图/帮助…），中间标题，右边三个装饰按钮。
-//
-// 为什么不用系统菜单：窗口是无边框自绘的（tauri.conf.json 里 decorations: false），
-// 菜单必须自己画；菜单项本身由 App 的 buildMenus() 生成（里面全是动作闭包）。
+// 应用菜单与会话标题。窗口控制由系统标题栏提供，不再显示没有功能的仿窗口按钮。
 
 import type { MenuItem, OpenSession } from "../lib/ui-model";
 
@@ -58,11 +55,6 @@ export function TitleBar(props: TitleBarProps) {
       </div>
       <div className="title">
         ZeeAI Term{activeSession ? " — " + activeSession.title : ""}
-      </div>
-      <div className="win-controls" aria-hidden="true">
-        <span className="wbtn" />
-        <span className="wbtn" />
-        <span className="wbtn" />
       </div>
     </div>
 

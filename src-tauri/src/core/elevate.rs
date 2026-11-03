@@ -94,7 +94,8 @@ mod imp {
         if is_elevated() {
             return Err("当前已经是管理员模式，不用再提权".into());
         }
-        shell_execute_runas(&exe.to_string_lossy(), None)
+        let params = format!("--relaunch-after {}", std::process::id());
+        shell_execute_runas(&exe.to_string_lossy(), Some(&params))
     }
 
     /// 以管理员身份单独开一个 shell 窗口（powershell / cmd）
@@ -111,6 +112,30 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{is_elevated, open_elevated_shell, relaunch_self_elevated};
+
+/// The elevated replacement must wait for the old process to release the
+/// single-instance mutex before checking it, otherwise both instances exit.
+#[cfg(windows)]
+pub fn wait_for_relaunch_parent() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    let args: Vec<String> = std::env::args().collect();
+    let Some(pid) = relaunch_parent(&args)? else { return Ok(()) };
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() { return Ok(()); } // The parent may already have exited.
+    let result = unsafe { WaitForSingleObject(handle, 30_000) };
+    unsafe { CloseHandle(handle); }
+    if result == WAIT_OBJECT_0 { Ok(()) } else { Err("等待旧实例退出超时，请关闭旧窗口后重新以管理员身份启动".into()) }
+}
+
+#[cfg(any(windows, test))]
+fn relaunch_parent(args: &[String]) -> Result<Option<u32>, String> {
+    let Some(index) = args.iter().position(|arg| arg == "--relaunch-after") else { return Ok(None) };
+    let pid = args.get(index + 1).and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && *pid != std::process::id())
+        .ok_or_else(|| "管理员重启参数无效".to_string())?;
+    Ok(Some(pid))
+}
 
 #[cfg(not(windows))]
 pub fn is_elevated() -> bool {
@@ -130,6 +155,18 @@ pub fn open_elevated_shell(_shell: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_handoff_requires_a_valid_parent() {
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(relaunch_parent(&args(&["app"])).unwrap(), None);
+        let parent = std::process::id() + 1;
+        assert_eq!(relaunch_parent(&args(&["app", "--relaunch-after", &parent.to_string()])).unwrap(), Some(parent));
+        for invalid in ["0", "-1", "oops"] {
+            assert!(relaunch_parent(&args(&["app", "--relaunch-after", invalid])).is_err());
+        }
+        assert!(relaunch_parent(&args(&["app", "--relaunch-after"])).is_err());
+    }
 
     #[test]
     fn elevation_state_is_queryable() {

@@ -570,8 +570,16 @@ mod herdr_pump_tests {
     /// 判定必须是"死"，而且真的去写也必须报错 —— 这就是"能打字、字进不去"的回归点。
     #[tokio::test]
     async fn writing_to_an_exited_pump_fails_instead_of_silently_succeeding() {
+        #[cfg(windows)]
         let mut cmd = proc::hidden_command("cmd");
+        #[cfg(windows)]
         cmd.args(["/C", "exit", "3"]);
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut cmd = proc::hidden_command("/bin/sh");
+            cmd.args(["-c", "exit 3"]);
+            cmd
+        };
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());

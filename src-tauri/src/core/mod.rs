@@ -20,6 +20,7 @@ pub mod job;
 /// SSH 主机密钥的 TOFU 记录（防中间人）；sftp 的 `check_server_key` 走它校验。
 pub mod known_hosts;
 pub mod paste;
+pub mod platform;
 pub mod proc;
 pub mod pty;
 pub mod remote_fs;

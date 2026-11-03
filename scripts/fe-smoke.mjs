@@ -468,6 +468,7 @@ const resolveCmd = (cmd, args, opts) => {
       );
     case "workspace_save": return null;
     case "update_install_kind": return "portable";
+    case "runtime_info": return { os: "windows", arch: "x86_64" };
     case "update_take_result": return null;
     case "is_admin": return false;
     case "session_log_dir": return "C:\\\\Temp\\\\zeeai-logs";

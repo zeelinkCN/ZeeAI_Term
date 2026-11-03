@@ -136,6 +136,19 @@ pub(super) fn human_size(n: u64) -> String {
 /// 为什么需要：很多用户是靠 Clash / v2ray 这类本地代理访问 GitHub 的，而 `curl.exe`
 /// **不会**自动读这些设置，不显式告诉它就会走直连 —— 直连 GitHub 的下载 CDN 在国内
 /// 经常慢到几乎下不动。这里用 `reg query` 读一下（不引任何新依赖），有代理就带上。
+#[cfg(target_os = "macos")]
+pub(super) fn system_proxy() -> Option<String> {
+        // curl already honors explicitly configured environment proxies.
+        if ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"].iter()
+            .any(|key| std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)) { return None; }
+        let output = proc::hidden_command("/usr/sbin/scutil").arg("--proxy").output().ok()?;
+        if output.status.success() { macos_proxy(&String::from_utf8_lossy(&output.stdout)) } else { None }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn system_proxy() -> Option<String> { None }
+
+#[cfg(windows)]
 pub(super) fn system_proxy() -> Option<String> {
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     let enable = reg_value(KEY, "ProxyEnable")?;
@@ -173,9 +186,25 @@ pub(super) fn system_proxy() -> Option<String> {
     Some(url)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_proxy(text: &str) -> Option<String> {
+    let value = |key: &str| text.lines().filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| (name.trim() == key).then(|| value.trim()));
+    for protocol in ["HTTPS", "HTTP"] {
+        if value(&format!("{protocol}Enable")) != Some("1") { continue; }
+        let host = value(&format!("{protocol}Proxy"))?;
+        let port = value(&format!("{protocol}Port"))?.parse::<u16>().ok()?;
+        if host.is_empty() || port == 0 { continue; }
+        let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.into() };
+        return Some(format!("http://{host}:{port}"));
+    }
+    None
+}
+
 /// `reg query <key> /v <name>` 取最后一个字段（值）
 ///
 /// 后台查询，统一走 `proc::hidden_command`（否则注册表探测会闪控制台）。
+#[cfg(windows)]
 pub(super) fn reg_value(key: &str, name: &str) -> Option<String> {
     let out = proc::hidden_command("reg")
         .args(["query", key, "/v", name])
@@ -196,20 +225,7 @@ pub(super) fn reg_value(key: &str, name: &str) -> Option<String> {
     None
 }
 
-/// 这个程序在不在 PATH 上（用系统自带的 `where`，不引任何库）。
-///
-/// 用它的场景：用户点了「PowerShell 7」但我们本机没装 `pwsh.exe` —— 那种情况下
-/// ConPTY 只会甩一句 "spawn failed"，不如提前说清"你没装 PowerShell 7"。
-pub(super) fn program_on_path(name: &str) -> bool {
-    // 后台查询，统一走 `proc::hidden_command_quiet`（stdout/stderr 也丢掉，不闪控制台）
-    proc::hidden_command_quiet("where")
-        .arg(name)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// 找系统的 curl.exe：先看 System32，再看 PATH。
+/// Find the native curl executable: System32 on Windows, otherwise PATH.
 pub(super) fn find_curl() -> Option<std::path::PathBuf> {
     if let Ok(sys) = std::env::var("SystemRoot") {
         let p = std::path::Path::new(&sys).join("System32").join("curl.exe");
@@ -217,7 +233,7 @@ pub(super) fn find_curl() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    Some(std::path::PathBuf::from("curl.exe"))
+    crate::core::platform::find_program(&crate::core::platform::executable_name("curl"))
 }
 
 /// 调一次 curl：**整包一次下完**（不分片），可选从已有字节续传，支持代理。
@@ -336,20 +352,37 @@ pub(super) fn short_sha(s: &str, n: usize) -> String {
 mod capture_tests {
     use super::*;
 
+    #[test]
+    fn macos_downloads_use_enabled_https_proxy_and_ignore_disabled_settings() {
+        let settings = "<dictionary> {\n HTTPEnable : 1\n HTTPProxy : 127.0.0.1\n HTTPPort : 7890\n HTTPSEnable : 1\n HTTPSProxy : 127.0.0.1\n HTTPSPort : 7897\n}";
+        assert_eq!(macos_proxy(settings).as_deref(), Some("http://127.0.0.1:7897"));
+        assert_eq!(macos_proxy("HTTPEnable : 0\nHTTPProxy : 127.0.0.1\nHTTPPort : 7890"), None);
+        assert_eq!(macos_proxy("HTTPSEnable : 1\nHTTPSProxy : ::1\nHTTPSPort : 7897").as_deref(), Some("http://[::1]:7897"));
+    }
+
     /// 架构审查 minor-10：`run_capture` 必须把**成/败**交出来，
     /// `capture_text` 必须把失败变成 Err —— 不能再让调用方把 stderr 当数据。
     #[tokio::test]
     async fn run_capture_reports_failure_instead_of_returning_ok() {
+        #[cfg(windows)]
         let exe = std::path::Path::new("cmd");
+        #[cfg(not(windows))]
+        let exe = std::path::Path::new("/bin/sh");
+        #[cfg(windows)]
         let ok_args = vec!["/C".to_string(), "echo hello".to_string()];
+        #[cfg(not(windows))]
+        let ok_args = vec!["-c".to_string(), "echo hello".to_string()];
         let (ok, text) = run_capture(exe, &ok_args).await.expect("能起进程");
         assert!(ok, "成功的命令应该报 true：{text:?}");
         assert!(text.to_lowercase().contains("hello"), "{text:?}");
 
+        #[cfg(windows)]
         let bad_args = vec![
             "/C".to_string(),
             "echo boom 1>&2 & exit 3".to_string(),
         ];
+        #[cfg(not(windows))]
+        let bad_args = vec!["-c".to_string(), "echo boom >&2; exit 3".to_string()];
         let (ok, text) = run_capture(exe, &bad_args).await.expect("能起进程");
         assert!(!ok, "非零退出必须报 false（以前这里是 Ok）");
         assert!(text.contains("boom"), "失败时 stderr 要带在文本里：{text:?}");

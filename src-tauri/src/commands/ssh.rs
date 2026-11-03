@@ -213,7 +213,7 @@ pub async fn tmux_action(
 
 /// 打开一条 SFTP 连接（几个文件操作命令共用）
 pub(super) async fn sftp_for(profile_id: &str, user_override: Option<String>) -> Result<sftp::SftpConn, String> {
-    let cfg = ssh_config_for(profile_id, user_override)?;
+    let cfg = sftp_config(&ssh_config_for(profile_id, user_override)?).await?;
     let pw = password_for(profile_id, &cfg);
     sftp::connect(
         &cfg.host,
@@ -224,6 +224,27 @@ pub(super) async fn sftp_for(profile_id: &str, user_override: Option<String>) ->
         cfg.jump.as_deref(),
     )
     .await
+}
+
+async fn sftp_config(cfg: &store::SshConfig) -> Result<store::SshConfig, String> {
+    let diagnosis = ssh::diagnose(&cfg.host, cfg.port, &cfg.user, cfg.key_path.as_deref(), cfg.jump.as_deref()).await?;
+    resolved_sftp_config(cfg, &diagnosis)
+}
+
+fn resolved_sftp_config(cfg: &store::SshConfig, diagnosis: &ssh::SshDiagnosis) -> Result<store::SshConfig, String> {
+    let effective = &diagnosis.effective;
+    if effective.proxycommand.as_deref().is_some_and(|s| !s.is_empty() && s != "none") {
+        return Err("SFTP 暂不支持自定义 ProxyCommand，请改用单级 ProxyJump 或直接连接；SSH 终端仍可使用原配置".into());
+    }
+    let mut resolved = cfg.clone();
+    resolved.host = effective.hostname.clone();
+    resolved.port = if effective.port == 0 { 22 } else { effective.port };
+    resolved.user = effective.user.clone();
+    resolved.jump = effective.proxyjump.clone().filter(|s| !s.is_empty() && s != "none");
+    if let Some(key) = diagnosis.key_files.iter().find(|key| key.exists) {
+        resolved.key_path = Some(key.path.clone());
+    }
+    Ok(resolved)
 }
 
 /// 这个配置要不要用凭据管理器里的密码（只有显式开了「允许输入密码」才取）
@@ -256,6 +277,7 @@ pub(super) async fn run_remote_capture(
 ) -> Result<String, String> {
     let inner = async {
         if let Some(pw) = password_for(profile_id, cfg) {
+            let cfg = sftp_config(cfg).await?;
             let conn = sftp::connect(
                 &cfg.host,
                 cfg.port,
@@ -304,4 +326,24 @@ pub fn secret_has(profile_id: String) -> bool {
 pub fn secret_delete(profile_id: String) -> Result<(), String> {
     log::info!("ipc: secret_delete profile={profile_id}");
     crate::core::secret::delete_password(&profile_id)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn sftp_uses_the_same_alias_host_port_and_user_as_the_terminal() {
+        let cfg: store::SshConfig = serde_json::from_value(serde_json::json!({
+            "host": "work", "port": 0, "user": ""
+        })).unwrap();
+        let diagnosis = ssh::diagnosis_from_output("hostname server.example\nport 2222\nuser alice\nproxyjump bastion@203.0.113.10:2200\n", None);
+        let resolved = resolved_sftp_config(&cfg, &diagnosis).unwrap();
+        assert_eq!(resolved.host, "server.example");
+        assert_eq!(resolved.port, 2222);
+        assert_eq!(resolved.user, "alice");
+        assert_eq!(resolved.jump.as_deref(), Some("bastion@203.0.113.10:2200"));
+        let unsupported = ssh::diagnosis_from_output("hostname server.example\nport 22\nuser alice\nproxycommand custom-proxy\n", None);
+        assert!(resolved_sftp_config(&cfg, &unsupported).err().unwrap().contains("ProxyCommand"));
+    }
 }

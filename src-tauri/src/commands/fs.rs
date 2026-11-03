@@ -192,7 +192,10 @@ pub async fn fs_download(
             .next()
             .unwrap_or("download")
             .to_string();
-        let target = std::path::Path::new(&local_dir).join(&name);
+        let target = match sftp::download_target(std::path::Path::new(&local_dir), &name) {
+            Ok(target) => target,
+            Err(err) => { failed.push(err); continue; }
+        };
         emit(TransferEvent::Start {
             task: task.clone(),
             name: name.clone(),

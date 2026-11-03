@@ -45,11 +45,11 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `Command::new` —— 改回去的那一天，用户马上就会重新看到黑框。
 pub fn hidden_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.stdin(std::process::Stdio::null());
     }
     cmd
 }
@@ -72,11 +72,11 @@ pub fn hidden_command_quiet<S: AsRef<OsStr>>(program: S) -> std::process::Comman
 /// 两条路径都必须带上同一个 `CREATE_NO_WINDOW`，否则异步探测照样会闪窗。
 pub fn hidden_command_async<S: AsRef<OsStr>>(program: S) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         // tokio::process::Command 自己提供了 Windows 的 creation_flags（内部转给 std）
         cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.stdin(std::process::Stdio::null());
     }
     cmd
 }

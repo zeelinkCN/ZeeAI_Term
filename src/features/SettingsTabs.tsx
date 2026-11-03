@@ -6,6 +6,7 @@
 // 只把 updateSettings / notify 这些回调改成从 props 拿。
 
 import { THEMES } from "../lib/app-consts";
+import { IS_MAC, LOCAL_SHELLS } from "../lib/platform";
 import type { AppSettings } from "../types";
 
 export interface SettingsLookFontTabProps {
@@ -147,9 +148,7 @@ export function SettingsTermShellTab(props: SettingsTermShellTabProps) {
           })
         }
       >
-        <option value="powershell">PowerShell</option>
-        <option value="cmd">CMD</option>
-        <option value="wsl">WSL</option>
+        {LOCAL_SHELLS.map((shell) => <option key={shell.key} value={shell.key}>{shell.label}</option>)}
       </select>
     </label>
 
@@ -301,7 +300,7 @@ export function SettingsNotifyTab(props: SettingsNotifyTabProps) {
         onChange={(e) => void updateSettings({ aiNotifyTaskbar: e.target.checked })}
       />
       <span>
-        窗口不在前台时闪 Windows 任务栏
+        {IS_MAC ? "窗口不在前台时通过 Dock 提醒" : "窗口不在前台时闪 Windows 任务栏"}
       </span>
     </label>
     {/* 红点只为两种情况亮（docs/design-ai-board-v2.md §10.6）。
@@ -446,7 +445,7 @@ export function SettingsTermHabitTab(props: SettingsTermHabitTabProps) {
         <option value="ctrl-c-smart">Ctrl+C：有选中就复制，没选中才是中断</option>
         <option value="select">选中即复制（不用按键）</option>
       </select>
-      <span className="hint">默认 Ctrl+Shift+C；选中即复制 = 划一下就走剪贴板</span>
+      <span className="hint">{IS_MAC ? "支持 ⌘C 复制、⌘V 粘贴；Ctrl+C 仍用于中断命令。" : "默认 Ctrl+Shift+C；选中即复制 = 划一下就走剪贴板"}</span>
     </label>
 
     <label

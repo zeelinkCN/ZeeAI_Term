@@ -4,6 +4,7 @@
 // 而它们只是数据（改一行不该牵动任何逻辑）。
 
 import type { AppSettings } from "../types";
+import { DEFAULT_LOCAL_SHELL } from "./platform";
 
 export const EMPTY_PROFILE = {
   name: "",
@@ -96,7 +97,7 @@ export const HERDR_ACTIONS: { key: string; label: string; title: string }[] = [
 
 export const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
-  defaultShell: "powershell",
+  defaultShell: DEFAULT_LOCAL_SHELL,
   recordHistory: true,
   tmuxDefault: true,
   theme: "dark",
@@ -211,8 +212,11 @@ export function themeKind(key: string): "dark" | "light" {
 
 export const SHELL_LABEL: Record<AppSettings["defaultShell"], string> = {
   powershell: "PowerShell",
+  pwsh: "PowerShell 7",
   cmd: "CMD",
   wsl: "WSL",
+  zsh: "zsh",
+  bash: "bash",
 };
 
 

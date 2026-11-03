@@ -7,6 +7,11 @@ use crate::core::{elevate, highlight, paste as paste_core};
 use crate::store::{self, ConnectionProfile, HistoryEntry, Settings};
 
 #[tauri::command]
+pub fn runtime_info() -> serde_json::Value {
+    serde_json::json!({ "os": std::env::consts::OS, "arch": std::env::consts::ARCH })
+}
+
+#[tauri::command]
 pub fn list_profiles() -> Result<Vec<ConnectionProfile>, String> {
     log::info!("ipc: list_profiles");
     let profiles = store::load()?;
@@ -152,7 +157,15 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
             .map_err(|e| format!("打开失败: {e}"))?;
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let target = std::fs::canonicalize(&path).map_err(|e| format!("打开失败: {e}"))?;
+        let mut cmd = crate::core::proc::hidden_command_quiet("/usr/bin/open");
+        if target.is_file() { cmd.arg("-R"); }
+        cmd.arg(target).spawn().map_err(|e| format!("打开 Finder 失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
         Err("只支持 Windows".into())
@@ -161,28 +174,21 @@ pub fn open_in_explorer(path: String) -> Result<(), String> {
 
 /// 校验「用系统默认浏览器打开」的 URL。
 ///
-/// 以前是 `cmd /C start "" <url>`：URL 里只要带 `&` / `|` / `"` / `%VAR%` 就能
-/// 拼出额外的 cmd 命令（经典命令注入）。现在两层防护：
-/// 1. 只允许 http/https（`javascript:` / `file:` 直接拒）；
-/// 2. 拒绝 shell 元字符与换行（命中即返回错误，**不静默**）——
-///    即使将来启动方式退回 cmd，这层也拦得住。
-fn validate_external_url(url: &str) -> Result<&str, String> {
+/// URL is passed directly to ShellExecuteW / open, never through a command shell.
+/// Query separators and percent-encoded filenames are valid URL syntax.
+fn validate_external_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("链接为空".into());
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    if trimmed.chars().any(char::is_control) {
+        return Err("链接含有换行或控制字符，已拒绝打开".into());
+    }
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "链接格式不正确".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("只允许打开 http/https 链接".into());
     }
-    for ch in trimmed.chars() {
-        if matches!(ch, '&' | '|' | '<' | '>' | '^' | '"' | '%') || ch.is_control() {
-            return Err(format!(
-                "链接里含有不允许的字符 {ch:?}（可能导致命令注入），已拒绝打开"
-            ));
-        }
-    }
-    Ok(trimmed)
+    Ok(parsed.to_string())
 }
 
 /// 用系统默认浏览器打开一个 http/https 链接（用于「检查更新 → 下载新版」）
@@ -207,7 +213,7 @@ pub fn open_external_url(url: String) -> Result<(), String> {
         // 直接 ShellExecuteW("open")：不经过 cmd，URL 不再有被 shell 解释的机会。
         // 浏览器窗口该出来（这是用户主动点链接），不需要隐藏窗口。
         let op = wide("open");
-        let file = wide(trimmed);
+        let file = wide(&trimmed);
         let rc: HINSTANCE = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
@@ -228,7 +234,13 @@ pub fn open_external_url(url: String) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::core::proc::hidden_command_quiet("/usr/bin/open")
+            .arg(trimmed).spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = trimmed;
         Err("只支持 Windows".into())
@@ -304,18 +316,14 @@ pub fn settings_set(settings: Settings) -> Result<(), String> {
 mod security_tests {
     use super::*;
 
-    /// `open_external_url` 的输入白名单：命令注入字符、非 http(s) 协议一律拒绝。
+    /// Non-web schemes and control characters remain rejected; normal download URLs work.
     #[test]
     fn external_url_rejects_injection_and_non_http() {
         for bad in [
-            "https://x/&calc",
-            "https://x/a%PATH%",
             "javascript:alert(1)",
             "file:///C:/Windows/System32/calc.exe",
-            "https://x/\" & calc & \"",
             "https://x/a\ncalc",
-            "https://x/|calc",
-            "https://x/^calc",
+            "https://",
             "ftp://example.com/file",
             "",
         ] {
@@ -330,5 +338,7 @@ mod security_tests {
             "https://github.com/zeelinkCN/ZeeAI_Term"
         );
         assert!(validate_external_url("http://127.0.0.1:64502/").is_ok());
+        assert_eq!(validate_external_url("https://example.com/a%20b?os=mac&arch=arm64").unwrap(),
+            "https://example.com/a%20b?os=mac&arch=arm64");
     }
 }

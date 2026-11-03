@@ -2,7 +2,7 @@
 
 # ZeeAI Term
 
-**Windows 上的多协议终端工作台**
+**Windows / macOS 多协议终端工作台**
 一台机器管住 SSH / tmux / herdr、串口、ADB、本地终端，还有一块 AI 任务看板。
 
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4?style=flat-square)](#下载)
@@ -18,7 +18,7 @@
 
 ## 它是什么
 
-给同时要摸好几台机器的人用的终端工具：**远端**连着服务器（SSH + tmux/herdr 持久会话、SFTP 文件、AI 在跑什么一目了然），**本地**开着 PowerShell / CMD / WSL，**手边**还挂着串口和 ADB 设备。
+给同时要摸好几台机器的人用的终端工具：**远端**连着服务器（SSH + tmux/herdr 持久会话、SFTP 文件、AI 在跑什么一目了然），**本地**在 Windows 开 PowerShell / CMD / WSL，在 macOS 开 zsh / bash，**手边**还挂着串口和 ADB 设备。
 
 和普通终端不一样的地方：会话是**留在服务器上**的（关掉窗口明天回来还在）；AI 任务的产物能在应用里直接预览、下载；关键字高亮只影响界面，**落盘的日志永远是纯文本**。
 
@@ -34,8 +34,8 @@
 | **持久会话** | tmux 与 **herdr** 两种多路复用器，可接管可只读观察；关掉标签，会话仍留在服务器上 |
 | **herdr 专治"忘了关"** | 侧栏 `H` 标 + 终端上方状态条；服务器右键可管理工作区（接管 / 观察 / 回收）；只清理"空壳" |
 | **远端文件** | 真 SFTP：浏览 / 上传（多选、目录递归）/ 下载（断点续传）/ 重命名 / 删除；MD、HTML、图片、代码直接预览 |
-| **本地终端** | PowerShell 5.1 / PowerShell 7 / CMD / WSL，可单开管理员窗口或整个应用提权 |
-| **设备侧** | 串口（每条连接独立参数）、ADB logcat + 文件管理 + Fastboot 设备探测（看设备与版本，**不刷机**；内置 platform-tools，免装） |
+| **本地终端** | Windows：PowerShell 5.1 / PowerShell 7 / CMD / WSL，可单开管理员窗口或整个应用提权；macOS：zsh / bash 登录 shell |
+| **设备侧** | 串口（每条连接独立参数）、ADB logcat + 文件管理 + Fastboot 设备探测（看设备与版本，**不刷机**；Windows 内置 platform-tools，macOS 使用已安装的 Android Platform Tools） |
 | **Git** | 打开本地仓库、暂存 / 提交 / 历史与 diff / 分支切换；每个工作空间可单独开终端 |
 | **AI 面板** | **本版暂停用**：点活动栏星号只打开一块灰色空容器，面板内容不渲染（看板 v2 的代码原样保留，已拆到 `src/features/AiPanel.tsx` 等文件；恢复要两步：把 `src/lib/ai-labels.ts` 的 `AI_PANEL_DISABLED` 改成 `false`，再把设置 JSON 里的 `aiWatchEnabled` 打开 —— 它默认 `false`，本机日志与 herdr 状态的后台监视不启动） |
 | **连接诊断** | 编辑服务器或连接失败提示里点「连接诊断」：只读跑一次 `ssh -G`，显示**实际生效的**主机 / 端口 / 用户 / 每个候选密钥是否存在 / 跳板机，并给一句人话结论 |
@@ -45,7 +45,7 @@
 
 ## 下载
 
-到 [**Releases**](https://github.com/zeelinkCN/ZeeAI_Term/releases/latest) 取最新版，四个产物任选一个：
+到 [**Releases**](https://github.com/zeelinkCN/ZeeAI_Term/releases/latest) 取已发布版本。现有 0.1.14 Windows 产物如下：
 
 | 产物（当前 **0.1.14**） | 适合谁 | 体积 |
 |---|---|---|
@@ -61,13 +61,21 @@
 
 **系统要求**：Windows 10 / 11（x64）。需要 WebView2 运行时 —— Win11 自带，安装包会处理。
 
+macOS 初版已加入源码，要求 macOS 13.3 或更高版本。云端构建生成兼容 Apple Silicon 与 Intel 的 `*_universal.dmg`；是否已有正式发布包，以发布页实际附件为准。开发测试包使用临时签名，正式对外分发还需要 Developer ID 签名和 Apple 公证。
+
+Windows 与 Mac 共用更新检查地址，但分别选择当前系统和 CPU 对应的安装包。macOS 打开 DMG 后将应用拖进 Applications，更新时退出旧版并替换应用。应用设置和服务器列表保存在用户目录，替换应用后仍保留。
+
 ## 开发
 
 ```powershell
-npm install
+npm ci                # Node.js 22.18+、Rust stable；Windows 还需要 MSVC，Mac 需要 Xcode Command Line Tools
 npm run tauri dev      # 开发模式（热更新）
 npm run tauri build    # 出 exe + NSIS + MSI
 ```
+
+macOS 同样运行 `npm run tauri dev` / `npm run tauri build`，会自动使用 macOS 配置并生成 `.app` / `.dmg`，不会打入 Windows 的 adb.exe。需要 Universal 包时先运行 `rustup target add aarch64-apple-darwin x86_64-apple-darwin`，再运行 `npm run tauri build -- --target universal-apple-darwin`。
+
+**没有 Windows 编译环境也可以开发**：推送分支或提交 PR 后，[Desktop checks and packages](.github/workflows/desktop.yml) 会在 GitHub 的 Windows / macOS 环境测试和打包。在 Actions 对应运行的 Artifacts 中下载安装包，无需在本机安装 Windows。工作流只生成测试产物，正式 Release 仍需单独发布。
 
 > **打包必须走 `npm run tauri build`。** 只跑 `cargo build --release` 不会把前端资源嵌进二进制，
 > 得到的 exe 一打开就是「localhost 拒绝连接」。
@@ -76,16 +84,21 @@ npm run tauri build    # 出 exe + NSIS + MSI
 
 ```powershell
 cd src-tauri ; cargo test --lib      # 后端单测（解析、消毒、状态机）
+npm run test:platform                # 平台设置迁移与更新包选择
+npm run check:docs                   # 文档承诺与代码检查
 npm run fe:smoke                     # 界面功能测试：无头 Edge 真点按钮 + 出截图
 ```
 
-**技术栈**：Tauri 2（Rust + WebView2）· React + TypeScript + xterm.js · `portable-pty` / `russh` / `serialport` / `tokio`
+`fe:smoke` 使用 Windows Edge，由 Windows 云端任务执行；Mac 本机可运行其余测试与构建。
+
+**技术栈**：Tauri 2（Rust；Windows 使用 WebView2、macOS 使用 WKWebView）· React + TypeScript + xterm.js · `portable-pty` / `russh` / `serialport` / `tokio`
 
 ## 文档
 
 - [技术设计与里程碑](docs/design.md) · [决策与待确认事项](docs/decisions.md)
 - [发版说明](docs/release-notes-v0.1.14.md) —— 每版都写清改了什么、为什么、已知限制（上一版：[v0.1.13](docs/release-notes-v0.1.13.md)）
 - [架构审查](docs/architecture-review.md) —— 选型评价、主要债、问题清单与路线（v0.1.13 基线）
+- [Windows 修复与 macOS 适配审查](docs/cross-platform-review.md) —— 更新地址、安装包、配置目录与验证范围
 - [AI 看板 v2 设计口径](docs/design-ai-board-v2.md)（§10 是最终口径）· [样品页](docs/mockups/ai-board-v2.html)
 - 实现日志：[herdr](docs/impl-log-2026-09-29-herdr.md) · [herdr 会话](docs/impl-log-2026-09-29-herdr-session.md) · [其它](docs/impl-log-2026-09-27.md)
 

@@ -26,12 +26,7 @@ fn startup_ms() -> u128 {
 fn mark_startup(stage: &str) {
   let ms = startup_ms();
   log::info!("startup: {} at {} ms", stage, ms);
-  let Some(base) = std::env::var("LOCALAPPDATA").ok() else {
-    return;
-  };
-  let dir = std::path::Path::new(&base)
-    .join("com.zeeai.terminal")
-    .join("logs");
+  let dir = crate::core::platform::log_dir();
   if std::fs::create_dir_all(&dir).is_err() {
     return;
   }
@@ -130,13 +125,7 @@ fn write_bootstrap_error(dir: &std::path::Path, text: &str) -> Option<std::path:
 /// 现在至少做到：日志里有一行原因、`%LOCALAPPDATA%` 下有一个错误文件、
 /// 屏幕上有一个说明"为什么没起来"的对话框。
 fn report_bootstrap_failure(err: &str) -> ! {
-    let dir = std::env::var("LOCALAPPDATA")
-        .map(|base| {
-            std::path::Path::new(&base)
-                .join("com.zeeai.terminal")
-                .join("logs")
-        })
-        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = crate::core::platform::log_dir();
     let log_hint = dir.join("bootstrap-error.log").display().to_string();
     let text = bootstrap_failure_text(err, &log_hint);
     log::error!("startup: 启动失败：{err}");
@@ -181,10 +170,15 @@ fn report_bootstrap_failure(err: &str) -> ! {
 /// 语法对，保证不了 WebView 的行为）。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  crate::core::platform::init_environment();
   // 升级辅助进程（`--apply-update …`，见 core::update）：必须在**单实例检查与建窗口之前**
   // 处理 —— 它不该弹窗，也不该因为"已经有一个实例在跑"就退出。
   if let Some(code) = crate::core::update::maybe_run() {
     std::process::exit(code);
+  }
+  #[cfg(windows)]
+  if let Err(err) = crate::core::elevate::wait_for_relaunch_parent() {
+    report_bootstrap_failure(&err);
   }
   // 单实例：便携版和安装版**共用**同一份配置目录，两个实例同时跑会互相覆盖
   // settings / history / workspace（后写的赢），通知也会各弹一遍。
@@ -194,7 +188,16 @@ pub fn run() {
     return;
   }
   // 构建结果先落进 `built`：失败要走报告路径，而不是 panic（panic = abort → 用户只看到闪退）。
-  let built = tauri::Builder::default()
+  let builder = tauri::Builder::default();
+  #[cfg(target_os = "macos")]
+  let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+    if let Some(window) = app.get_webview_window("main") {
+      let _ = window.show();
+      let _ = window.unminimize();
+      let _ = window.set_focus();
+    }
+  }));
+  let built = builder
     .plugin(
       tauri_plugin_log::Builder::default()
         .level(log::LevelFilter::Info)
@@ -816,6 +819,7 @@ pub fn run() {
       commands::ai_probe,
       commands::highlight_presets,
       commands::is_admin,
+      commands::runtime_info,
       commands::restart_as_admin,
       commands::open_admin_shell,
       commands::ai_task_note_start,
@@ -866,6 +870,14 @@ pub fn run() {
     Err(e) => report_bootstrap_failure(&e.to_string()),
   };
   app.run(|app_handle, event| {
+      #[cfg(target_os = "macos")]
+      if let tauri::RunEvent::Reopen { .. } = &event {
+        if let Some(window) = app_handle.get_webview_window("main") {
+          let _ = window.show();
+          let _ = window.unminimize();
+          let _ = window.set_focus();
+        }
+      }
       // 退出前把所有会话进程收干净（Job Object 也会兜底，但显式做更清晰）
       if let tauri::RunEvent::Exit = event {
         // herdr 红点轮询：先置停止位，让它在下一个分片睡眠（≤500ms）里收尾，

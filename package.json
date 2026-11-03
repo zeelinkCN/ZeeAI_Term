@@ -3,14 +3,16 @@
   "private": true,
   "version": "0.1.14",
   "type": "module",
-  "description": "Windows multi-protocol terminal workbench",
+  "description": "Windows and macOS multi-protocol terminal workbench",
   "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "fe:smoke": "node scripts/fe-smoke.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:platform": "node --experimental-strip-types --test scripts/platform.test.mjs scripts/updates.test.mjs",
+    "check:docs": "node scripts/check-docs.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -21,8 +23,8 @@
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/addon-webgl": "^0.18.0",
     "@xterm/xterm": "^5.5.0",
-    "dompurify": "^3.4.16",
-    "markdown-it": "^15.0.2",
+    "dompurify": "^3.4.17",
+    "markdown-it": "^15.0.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -31,8 +33,11 @@
     "@types/markdown-it": "^14.2.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^4.7.0",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11"
+    "vite": "^6.4.5"
+  },
+  "engines": {
+    "node": ">=22.18.0"
   }
 }

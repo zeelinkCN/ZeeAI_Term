@@ -4,7 +4,7 @@ use tauri::ipc::Channel;
 
 use crate::core::{herdr, proc, ssh};
 
-use super::ssh::{run_remote_capture, run_scp, ssh_config_for};
+use super::ssh::{password_for, run_remote_capture, run_scp, sftp_for, ssh_config_for};
 use super::util::{
     find_curl, run_curl_download, sha256_of, short_sha, system_proxy,
 };
@@ -101,7 +101,7 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
     // ---- 2) 官方清单 ----
     say.say("正在读取 herdr 官方版本清单（herdr.dev）…");
     let curl = find_curl()
-        .ok_or_else(|| "找不到系统自带的 curl.exe，请手动下载安装".to_string())?;
+        .ok_or_else(|| "找不到系统 curl，请手动下载安装".to_string())?;
     let manifest_text = curl_text(&curl, herdr::LATEST_MANIFEST_URL, 30)?;
     let manifest = herdr::parse_manifest(&manifest_text)?;
     let asset = manifest
@@ -213,15 +213,13 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let tmp = format!("/tmp/zeeai-herdr-{stamp}");
-    say.say("正在上传到服务器（scp → /tmp）…");
-    let scp_args = ssh::scp_args(
-        cfg.port,
-        cfg.key_path.as_deref(),
-        false,
-        &dest.to_string_lossy(),
-        &ssh::scp_remote(&cfg.host, &effective_user, &tmp),
-    );
-    run_scp(&scp_args).await?;
+    say.say("正在上传到服务器临时目录…");
+    if password_for(&profile_id, &cfg).is_some() {
+        let conn = sftp_for(&profile_id, user_override.clone()).await?;
+        crate::core::sftp::upload(&conn, &dest, &tmp, &crate::core::sftp::no_progress).await?;
+    } else {
+        run_scp(&install_scp_args(&cfg, &effective_user, &dest, &tmp)?).await?;
+    }
 
     say.say("正在安装到 ~/.local/bin/herdr（不需要 root）…");
     let install_cmd = format!(
@@ -273,8 +271,9 @@ pub(crate) async fn herdr_install_inner<F: Fn(&str) + Send + Sync + 'static>(
 /// 注意：curl 的报错本身是英文，这里统一加一句中文动作前缀（架构审查 minor-14：
 /// 界面上不该突然蹦出一整行英文），原文保留在后面方便排查。
 fn curl_text(curl: &std::path::Path, url: &str, timeout_secs: u64) -> Result<String, String> {
-    let out = proc::hidden_command(curl)
-        .args([
+    let mut cmd = proc::hidden_command(curl);
+    if let Some(proxy) = system_proxy() { cmd.args(["--proxy", &proxy]); }
+    let out = cmd.args([
             "-fsSL",
             "--connect-timeout",
             "15",
@@ -294,4 +293,36 @@ fn curl_text(curl: &std::path::Path, url: &str, timeout_secs: u64) -> Result<Str
     } else {
         format!("下载 {url} 失败（curl 原话：{err}）")
     })
+}
+
+fn install_scp_args(cfg: &crate::store::SshConfig, user: &str, local: &std::path::Path, remote: &str) -> Result<Vec<String>, String> {
+    let suffix = remote.strip_prefix("/tmp/zeeai-herdr-").unwrap_or("");
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("远端安装临时路径无效".into());
+    }
+    // This generated ASCII path needs no shell quotes. OpenSSH 8's SCP and
+    // OpenSSH 9's SFTP mode both interpret it identically.
+    let host = if cfg.host.contains(':') && !cfg.host.starts_with('[') { format!("[{}]", cfg.host) } else { cfg.host.clone() };
+    let target = format!("{}:{remote}", ssh::ssh_target(&host, user));
+    let mut args = ssh::scp_args(cfg.port, cfg.key_path.as_deref(), false, &local.to_string_lossy(), &target);
+    if let Some(jump) = cfg.jump.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.splice(0..0, ["-J".into(), jump.into()]);
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn remote_install_path_works_with_both_scp_protocols_and_keeps_proxy_jump() {
+        let cfg: crate::store::SshConfig = serde_json::from_value(serde_json::json!({
+            "host": "server", "port": 2222, "user": "alice", "jump": "bastion:2200"
+        })).unwrap();
+        let args = install_scp_args(&cfg, "alice", std::path::Path::new("local file"), "/tmp/zeeai-herdr-123").unwrap();
+        assert_eq!(&args[..2], ["-J", "bastion:2200"]);
+        assert_eq!(args.last().unwrap(), "alice@server:/tmp/zeeai-herdr-123");
+        assert!(install_scp_args(&cfg, "alice", std::path::Path::new("local"), "/tmp/escape;command").is_err());
+    }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "zeeai-terminal"
 version = "0.1.14"
-description = "ZeeAI Terminal - Windows multi-protocol terminal workbench"
+description = "ZeeAI Terminal - cross-platform multi-protocol terminal workbench"
 authors = ["ZeeAI"]
 license = "GPL-3.0-or-later"
 repository = ""
@@ -46,9 +46,15 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-m
 serialport = "4.10.1"
 russh = { version = "0.53", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "3.0"
-keyring = { version = "3.6", features = ["windows-native"] }
+keyring = "3.6"
+dirs = "6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

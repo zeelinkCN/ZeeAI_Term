@@ -122,8 +122,7 @@ fn default_group() -> String {
 }
 
 pub(crate) fn store_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("ZeeAI-Terminal")
+    crate::core::platform::config_dir()
 }
 
 fn store_file() -> PathBuf {
@@ -206,30 +205,10 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// 非 Windows 的兜底：先把旧目标改名备份，再 rename 新的上去；
-/// 新文件替换失败时把备份改回来，保证原文件还在。
+/// Unix rename replaces an existing destination atomically on the same filesystem.
 #[cfg(not(windows))]
 fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        return fs::rename(tmp, dst);
-    }
-    let name = dst
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "config".to_string());
-    let backup = dst.with_file_name(format!("{name}.old-{}.bak", unique_save_suffix()));
-    fs::rename(dst, &backup)?;
-    match fs::rename(tmp, dst) {
-        Ok(()) => {
-            let _ = fs::remove_file(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            // 尽力恢复原文件；即使恢复失败也把真实错误返回，不静默丢数据
-            let _ = fs::rename(&backup, dst);
-            Err(e)
-        }
-    }
+    fs::rename(tmp, dst)
 }
 
 /// **原子写**：先写同目录的唯一 `.tmp`，`sync_all` 落盘，再整体替换目标。
@@ -490,7 +469,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: 13,
-            default_shell: "powershell".into(),
+            default_shell: crate::core::platform::default_shell().into(),
             record_history: true,
             tmux_default: true,
             theme: "dark".into(),

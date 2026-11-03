@@ -12,6 +12,7 @@ import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "..
 import { runAfterFirstPaint, startupMark } from "../startup";
 import { bytesToB64 } from "../util";
 import { rememberTerminalSize } from "./terminalSize";
+import { IS_MAC } from "../lib/platform";
 import { clearOutput, markOutput } from "../activity";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
@@ -810,6 +811,10 @@ export default function TerminalView({
       if (e.type !== "keydown") return true;
       const ctrlOnly = e.ctrlKey && !e.altKey && !e.metaKey;
       const key = e.key.toLowerCase();
+      if (IS_MAC && e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (key === "v") return false;
+        if (key === "c") { void copySelection(); return false; }
+      }
       if (ctrlOnly && !e.shiftKey && key === "v") {
         const paste = pasteKeyRef.current;
         return !(paste === "both" || paste === "ctrl-v");

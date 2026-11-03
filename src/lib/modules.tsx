@@ -5,12 +5,18 @@
 
 import { IconAndroid, IconCmd, IconGit, IconPowerShell, IconSerial, IconServer, IconTerminal, IconWsl } from "../components/Icons";
 import type { ModuleKey } from "./ui-model";
+import { IS_WINDOWS } from "./platform";
 
 export const MODULES: { key: ModuleKey; label: string; node: JSX.Element }[] = [
   { key: "remote", label: "远程", node: <IconServer size={22} /> },
-  { key: "powershell", label: "PowerShell", node: <IconPowerShell size={22} /> },
-  { key: "cmd", label: "CMD", node: <IconCmd size={22} /> },
-  { key: "wsl", label: "WSL", node: <IconWsl size={22} /> },
+  ...(IS_WINDOWS ? [
+    { key: "powershell" as const, label: "PowerShell", node: <IconPowerShell size={22} /> },
+    { key: "cmd" as const, label: "CMD", node: <IconCmd size={22} /> },
+    { key: "wsl" as const, label: "WSL", node: <IconWsl size={22} /> },
+  ] : [
+    { key: "zsh" as const, label: "zsh", node: <IconTerminal size={22} /> },
+    { key: "bash" as const, label: "bash", node: <IconTerminal size={22} /> },
+  ]),
   { key: "git", label: "Git", node: <IconGit size={22} /> },
   { key: "serial", label: "串口", node: <IconSerial size={22} /> },
   { key: "adb", label: "ADB", node: <IconAndroid size={22} /> },
@@ -21,6 +27,8 @@ export const MODULE_LABEL: Record<ModuleKey, string> = {
   powershell: "PowerShell",
   cmd: "CMD",
   wsl: "WSL",
+  zsh: "zsh",
+  bash: "bash",
   git: "Git",
   serial: "串口",
   adb: "ADB",

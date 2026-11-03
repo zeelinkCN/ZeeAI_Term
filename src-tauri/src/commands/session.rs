@@ -13,7 +13,7 @@ use crate::core::{
 };
 use crate::store;
 
-use super::util::{friendly_herdr_event, program_on_path};
+use super::util::friendly_herdr_event;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,38 +49,9 @@ pub fn open_local(
         distro,
         cwd
     );
-    let (program, args, title) = match shell.as_str() {
-        "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
-        // PowerShell 7（pwsh.exe）和系统自带的 Windows PowerShell 5.1（powershell.exe）
-        // 是两个不同的程序，语法/编码都不一样，所以让用户自己挑（面板上是两个并排按钮）。
-        "pwsh" => {
-            if !program_on_path("pwsh.exe") {
-                return Err(
-                    "本机没找到 pwsh.exe（PowerShell 7）——先装 PowerShell 7 再用这个按钮；\
-                     想用系统自带的那个请点「新建 PowerShell」"
-                        .into(),
-                );
-            }
-            (
-                "pwsh.exe".to_string(),
-                vec!["-NoLogo".to_string()],
-                "PowerShell 7".to_string(),
-            )
-        }
-        "wsl" => {
-            let mut args: Vec<String> = vec![];
-            if let Some(d) = distro.as_ref().filter(|d| !d.trim().is_empty()) {
-                args.push("-d".into());
-                args.push(d.clone());
-            }
-            ("wsl.exe".to_string(), args, "WSL".to_string())
-        }
-        _ => (
-            "powershell.exe".to_string(),
-            vec!["-NoLogo".to_string()],
-            "PowerShell".to_string(),
-        ),
-    };
+    let (program, args, title) = crate::core::platform::local_shell(&shell, distro.as_deref())?;
+    let cwd = cwd.filter(|d| !d.trim().is_empty())
+        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()));
 
     let handle = pty::spawn(
         &id,

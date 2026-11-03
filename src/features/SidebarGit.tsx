@@ -1,7 +1,8 @@
 // 侧栏「Git」页：工作空间 / 分支 / 改动列表 / 提交历史。
 
 import { IconGit, IconPlus } from "../components/Icons";
-import type { AppSettings, ConnectionProfile, GitBranch, GitCommit, GitStatus } from "../types";
+import type { AppSettings, ConnectionProfile, GitBranch, GitCommit, GitStatus, LocalShell } from "../types";
+import { IS_WINDOWS } from "../lib/platform";
 
 export interface SidebarGitProps {
   settings: AppSettings;
@@ -27,7 +28,7 @@ export interface SidebarGitProps {
   removeGitWorkspace: (p: ConnectionProfile) => Promise<unknown>;
   openGitTerminal: (dir: string, title?: string) => Promise<unknown>;
   openLocalSession: (
-    shell: "powershell" | "pwsh" | "cmd" | "wsl",
+    shell: LocalShell,
     distro?: string,
     cwd?: string,
     titleOverride?: string,
@@ -123,7 +124,7 @@ export function SidebarGit(props: SidebarGitProps) {
         仓库路径
         <input
           value={gitPath}
-          placeholder="D:\AI\ZeeAI_term"
+          placeholder={IS_WINDOWS ? "D:\\AI\\ZeeAI_term" : "/Users/you/Projects/ZeeAI_Term"}
           onChange={(e) => setGitPath(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") void refreshGitAll();
