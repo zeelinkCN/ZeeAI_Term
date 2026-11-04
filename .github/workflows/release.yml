@@ -4,6 +4,11 @@ name: Release Windows and macOS
 # gh workflow run release.yml --ref main -f tag=v0.1.15 -f publish=true
 # Without publish=true, the same checks and uploads leave a reviewable draft.
 on:
+  # Register this manual workflow when it is first added to the default branch.
+  # Push runs do not build or publish anything.
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
   workflow_dispatch:
     inputs:
       tag:
@@ -37,6 +42,7 @@ concurrency:
 
 jobs:
   validate:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
