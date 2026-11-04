@@ -14,8 +14,17 @@ export class SessionBus {
    * 转义序列 —— 直接写 PTY 的话，多行提示词会被 codex/claude 的界面当成连按回车。
    */
   private inputs = new Map<string, InputSink>();
+  private focusHandlers = new Map<string, () => void>();
+  private observers = new Set<(id: string, bytes: Uint8Array) => void>();
+
+  /** Observe new wire bytes once, before rendering/buffering; attaching a view never replays status. */
+  observeOutput(observer: (id: string, bytes: Uint8Array) => void): () => void {
+    this.observers.add(observer);
+    return () => { this.observers.delete(observer); };
+  }
 
   push(id: string, bytes: Uint8Array) {
+    for (const observer of this.observers) observer(id, bytes);
     const sink = this.sinks.get(id);
     if (sink) {
       sink(bytes);
@@ -55,9 +64,19 @@ export class SessionBus {
     this.inputs.delete(id);
   }
 
+  attachFocus(id: string, focus: () => void) { this.focusHandlers.set(id, focus); }
+  detachFocus(id: string) { this.focusHandlers.delete(id); }
+  focus(id: string): boolean {
+    const handler = this.focusHandlers.get(id);
+    if (!handler) return false;
+    handler();
+    return true;
+  }
+
   drop(id: string) {
     this.sinks.delete(id);
     this.buffers.delete(id);
     this.inputs.delete(id);
+    this.focusHandlers.delete(id);
   }
 }

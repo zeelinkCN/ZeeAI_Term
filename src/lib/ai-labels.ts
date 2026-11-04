@@ -17,32 +17,10 @@ export function aiToolLabel(name: string): string {
   return AI_TOOL_LABEL[name] ?? name;
 }
 
-/**
- * ⚠️ AI 助手面板总开关（2026-10-24 用户要求暂时停用）。
- *
- * 用户原话：「AI 助手面板太鸡肋，先关闭；点星号打开只显示个 AI 任务面板」，
- * 追问后明确：「整个面板都停用，只留灰色容器」。
- *
- * 现在保留的是：右侧面板容器、活动栏星号按钮的开合、面板宽度（268px）、
- * 看板数据采集 / 红点逻辑 / 卡片代码 —— 只是**一条内容都不渲染**，
- * 面板里只有一块灰色背景（`.ai-panel.off`，用主题变量）。
- *
- * 为什么用开关位而不是删代码：用户说后续重构还要用这些代码（看板 v2 的
- * 两区、折叠行、承载健康、时间线、通知都在下面原样留着）。
- *
- * 恢复方法：把 `AI_PANEL_DISABLED` 改成 `false` 即可 —— 不需要动任何 JSX /
- * 逻辑 / 样式；面板体量/开合行为都还是原来的。
- */
-export const AI_PANEL_DISABLED = true;
+/** v0.1.15 restores the scoped remote monitor; old discovery is not re-enabled. */
+export const AI_PANEL_DISABLED = false;
 
-/**
- * 仅供无头回归测试的"临时把内容渲出来"开关（正常构建 / 正常启动**不存在**）。
- *
- * 为什么留这个口子：面板里那套看板有 50+ 条无头断言，是这些代码唯一的回归网；
- * 如果一刀切成空面板，它们会全部变红、被删掉，等以后重构时就没有任何东西兜底了。
- * `scripts/fe-smoke.mjs` 会在页面启动前设 `window.__ZEEAI_TEST_AI_PANEL__ = true`，
- * 只在那轮测试里渲染；用户打开应用时这个全局永远是 undefined → 面板仍是灰容器。
- */
+/** Retained legacy-board regression fixture; normal builds render AiMonitorPanel. */
 export const AI_PANEL_TEST_ONLY_SHOW =
   typeof window !== "undefined" &&
   (window as Window & { __ZEEAI_TEST_AI_PANEL__?: boolean }).__ZEEAI_TEST_AI_PANEL__ === true;

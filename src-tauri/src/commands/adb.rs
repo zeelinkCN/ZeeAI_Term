@@ -9,14 +9,14 @@ use super::util::{capture_text, run_capture};
 
 #[tauri::command]
 pub async fn fastboot_version(app: tauri::AppHandle) -> Result<String, String> {
-    let exe = adb_exe(&app).with_file_name("fastboot.exe");
+    let exe = tool_exe(&app, "fastboot");
     let out = capture_text(&exe, &["--version".into()], "读取 fastboot 版本").await?;
     Ok(out.lines().next().unwrap_or("").trim().to_string())
 }
 
 #[tauri::command]
 pub async fn fastboot_devices(app: tauri::AppHandle) -> Result<Vec<adb::AdbDevice>, String> {
-    let exe = adb_exe(&app).with_file_name("fastboot.exe");
+    let exe = tool_exe(&app, "fastboot");
     let out = capture_text(&exe, &["devices".into()], "列出 fastboot 设备").await?;
     let devices = adb::parse_fastboot_devices(&out);
     log::info!("ipc: fastboot_devices -> {} devices", devices.len());
@@ -177,17 +177,22 @@ pub async fn adb_mkdir(
 
 /// 优先用随应用内置的 platform-tools，其次用 PATH 里的 adb。
 fn adb_exe(app: &tauri::AppHandle) -> std::path::PathBuf {
+    tool_exe(app, "adb")
+}
+
+fn tool_exe(app: &tauri::AppHandle, name: &str) -> std::path::PathBuf {
     use tauri::Manager;
+    let exe = crate::core::platform::executable_name(name);
     if let Ok(dir) = app.path().resource_dir() {
         let bundled = dir
             .join("resources")
             .join("platform-tools")
-            .join("adb.exe");
+            .join(&exe);
         if bundled.exists() {
             return bundled;
         }
     }
-    std::path::PathBuf::from("adb")
+    crate::core::platform::find_program(&exe).unwrap_or_else(|| exe.into())
 }
 
 #[tauri::command]

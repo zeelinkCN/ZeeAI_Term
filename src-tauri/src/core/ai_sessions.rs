@@ -907,8 +907,7 @@ pub fn parse_script_output(text: &str) -> Option<AiSessionSnapshot> {
 /// 而旧实现只认"最新的那份" —— 于是把助手自己在桌面端干的活，当成了"用户在本机 PowerShell
 /// 里跑的任务"报出来（连它改过的文件都顺着 `cwd` 挂成了"任务产物"）。
 pub fn local_snapshot() -> Option<AiSessionSnapshot> {
-    let home = std::env::var("USERPROFILE").ok()?;
-    let root = std::path::Path::new(&home).join(".codex").join("sessions");
+    let root = dirs::home_dir()?.join(".codex").join("sessions");
     let newest = newest_user_rollout(&root)?;
     // 读窗口内的记录、按类型各取最后几条。窗口 4MB，实测那次"被挤出 40 万字节窗口"的
     // 情况在这里有十几倍余量；而真正喂给解析器的只有十几行。

@@ -60,6 +60,7 @@ pub async fn git_status(path: String) -> Result<git::GitStatus, String> {
         "status".to_string(),
         "--porcelain=v1".to_string(),
         "-b".to_string(),
+        "-z".to_string(),
     ];
     // 一个"不是仓库 / 没装 git"的 GitStatus，message 由调用方给
     let failed = |message: String| git::GitStatus {
@@ -104,7 +105,7 @@ pub async fn git_status(path: String) -> Result<git::GitStatus, String> {
 
 /// 跑一条 git 子命令；失败时把 git 的报错原样抛出去（前端直接显示）。
 async fn git_run(repo: &str, args: &[&str]) -> Result<String, String> {
-    let mut full: Vec<String> = vec!["-C".into(), repo.to_string()];
+    let mut full: Vec<String> = vec!["-C".into(), repo.to_string(), "--literal-pathspecs".into()];
     full.extend(args.iter().map(|s| s.to_string()));
     let (ok, text) = run_capture(std::path::Path::new("git"), &full).await?;
     if ok {
@@ -126,7 +127,7 @@ pub async fn git_add(path: String, files: Option<Vec<String>>) -> Result<(), Str
     match files.filter(|f| !f.is_empty()) {
         Some(files) => {
             let mut args: Vec<String> =
-                vec!["-C".into(), path.clone(), "add".into(), "--".into()];
+                vec!["-C".into(), path.clone(), "--literal-pathspecs".into(), "add".into(), "--".into()];
             args.extend(files);
             let (ok, text) = run_capture(std::path::Path::new("git"), &args).await?;
             if ok {

@@ -36,3 +36,6 @@ Thumbs.db
 /portable/*.zip
 /portable/ZeeAI-Terminal/
 /portable/ZeeAI_Term/
+
+# Local deliverables (cloud installers / macOS app and DMG)
+/artifacts/

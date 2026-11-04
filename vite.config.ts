@@ -11,7 +11,7 @@ export default defineConfig({
     watch: { ignored: ["**/src-tauri/**"] },
   },
   build: {
-    target: "chrome110",
+    target: ["chrome110", "safari16.4"],
     sourcemap: false,
   },
 });

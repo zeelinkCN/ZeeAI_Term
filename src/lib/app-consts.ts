@@ -4,6 +4,7 @@
 // 而它们只是数据（改一行不该牵动任何逻辑）。
 
 import type { AppSettings } from "../types";
+import { DEFAULT_LOCAL_SHELL } from "./platform";
 
 export const EMPTY_PROFILE = {
   name: "",
@@ -96,7 +97,7 @@ export const HERDR_ACTIONS: { key: string; label: string; title: string }[] = [
 
 export const DEFAULT_SETTINGS: AppSettings = {
   fontSize: 13,
-  defaultShell: "powershell",
+  defaultShell: DEFAULT_LOCAL_SHELL,
   recordHistory: true,
   tmuxDefault: true,
   theme: "dark",
@@ -137,6 +138,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // AI 面板暂停中：后端两条被动监视线程（本机日志 / herdr 红点轮询）默认都不起。
   // 前端不由这个开关控制任何界面，只负责把它**原样带回去**（见 types.ts 的说明）。
   aiWatchEnabled: false,
+  aiMonitorEnabled: true,
   // 粘贴/拖进来的图片、文件在远端落到哪个目录；`.` = 跟随终端当前目录
   pasteDir: "~/.zeeai/paste",
   // 终端的三个习惯项（和后端 store.rs 的默认值保持一致）：
@@ -150,7 +152,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pasteToast: false,
 };
 
-export const APP_VERSION = "0.1.14";
+export const APP_VERSION = "0.1.15";
 /** 本机进程表扫描的最小间隔：这个探针要起 PowerShell 枚举进程，比远端探针贵得多 */
 export const LOCAL_SCAN_MIN_INTERVAL_MS = 60_000;
 
@@ -211,8 +213,11 @@ export function themeKind(key: string): "dark" | "light" {
 
 export const SHELL_LABEL: Record<AppSettings["defaultShell"], string> = {
   powershell: "PowerShell",
+  pwsh: "PowerShell 7",
   cmd: "CMD",
   wsl: "WSL",
+  zsh: "zsh",
+  bash: "bash",
 };
 
 

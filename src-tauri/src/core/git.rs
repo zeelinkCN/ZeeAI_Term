@@ -85,7 +85,8 @@ pub fn parse_branches(output: &str) -> Vec<GitBranch> {
         .collect()
 }
 
-/// 解析 `git status --porcelain=v1 -b` 的输出。
+/// Parse `git status --porcelain=v1 -b -z`. NUL records preserve Unicode,
+/// whitespace and literal arrows; rename records contain destination then source.
 pub fn parse_status(output: &str) -> GitStatus {
     let mut branch = String::new();
     let mut upstream = String::new();
@@ -93,7 +94,8 @@ pub fn parse_status(output: &str) -> GitStatus {
     let mut behind = 0u32;
     let mut files = Vec::new();
 
-    for line in output.lines() {
+    let mut records = output.split('\0');
+    while let Some(line) = records.next() {
         if let Some(rest) = line.strip_prefix("## ") {
             // 形如：main...origin/main [ahead 1, behind 2]  或  No commits yet on main
             let head = rest.split(" [").next().unwrap_or(rest);
@@ -120,14 +122,13 @@ pub fn parse_status(output: &str) -> GitStatus {
         if line.trim().is_empty() {
             continue;
         }
-        // XY path（重命名是 "R  old -> new"）
-        if line.len() > 3 {
-            let status = line[..2].trim().to_string();
-            let path = line[3..].trim().to_string();
-            let path = match path.split_once(" -> ") {
-                Some((_, to)) => to.to_string(),
-                None => path,
-            };
+        if let (Some(xy), Some(path)) = (line.get(..2), line.get(3..)) {
+            let status = xy.trim().to_string();
+            let path = path.to_string();
+            if xy.contains(['R', 'C']) {
+                // The old path belongs to this record, not a second changed file.
+                records.next();
+            }
             files.push(GitFile { status, path });
         }
     }
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn parses_branch_and_files() {
-        let out = "## main...origin/main [ahead 1, behind 2]\n M src/App.tsx\n?? new.txt\n";
+        let out = "## main...origin/main [ahead 1, behind 2]\0 M src/App.tsx\0?? new.txt\0";
         let s = parse_status(out);
         assert_eq!(s.branch, "main");
         assert_eq!(s.upstream, "origin/main");
@@ -163,8 +164,35 @@ mod tests {
 
     #[test]
     fn handles_clean_repo() {
-        let s = parse_status("## main\n");
+        let s = parse_status("## main\0");
         assert!(s.files.is_empty());
         assert_eq!(s.branch, "main");
+    }
+
+    #[test]
+    fn preserves_unicode_arrows_whitespace_and_rename_destination() {
+        let s = parse_status("## main\0??  中文 -> 文件.txt \0R  新名.txt\0旧名.txt\0 M next.txt\0");
+        assert_eq!(s.files.len(), 3);
+        assert_eq!(s.files[0].path, " 中文 -> 文件.txt ");
+        assert_eq!(s.files[1].path, "新名.txt");
+        assert_eq!(s.files[2].path, "next.txt");
+    }
+
+    #[test]
+    fn parses_real_git_status_with_unicode_and_spaces() {
+        let dir = std::env::temp_dir().join(format!("zeeai-git-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = crate::core::proc::hidden_command("git").args(["init", "-b", "main"]).arg(&dir).output().unwrap();
+        assert!(init.status.success());
+        let name = "中文 文件.txt";
+        std::fs::write(dir.join(name), "regression").unwrap();
+        let output = crate::core::proc::hidden_command("git").arg("-C").arg(&dir)
+            .args(["status", "--porcelain=v1", "-b", "-z"]).output().unwrap();
+        assert!(output.status.success());
+        let status = parse_status(&String::from_utf8_lossy(&output.stdout));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].path, name);
     }
 }

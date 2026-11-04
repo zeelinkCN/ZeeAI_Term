@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "ZeeAI_Term",
   "mainBinaryName": "ZeeAI_Term",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "identifier": "com.zeeai.terminal",
   "build": {
     "frontendDist": "../dist",
@@ -30,10 +30,8 @@
   },
   "bundle": {
     "active": true,
-    "resources": ["resources/platform-tools/*"],
-    "targets": ["nsis", "msi"],
+    "targets": "all",
     "icon": [
-      "icons/icon.ico",
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png"

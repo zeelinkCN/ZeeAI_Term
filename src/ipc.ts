@@ -109,6 +109,10 @@ export async function sshDiagnose(profileId: string): Promise<SshDiagnosis> {
 }
 
 /** 打开本地终端（powershell / cmd / wsl）。id 由前端生成，便于事件在终端挂载前就能正确路由。 */
+export function runtimeInfo() {
+  return invoke<import("./lib/updates").RuntimeInfo>("runtime_info");
+}
+
 export async function openLocal(
   id: string,
   shell: string,

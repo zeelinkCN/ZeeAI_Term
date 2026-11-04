@@ -8,7 +8,7 @@
 //!     https://github.com/zeelinkCN/ZeeAI_Term/releases/download/v0.1.2/ZeeAI_Term_0.1.2_x64-setup.exe \
 //!     9013703 exe 0.1.2 sha256:...
 //!
-//! sha256 就是 GitHub Release API 里每个附件的 `digest` 字段（不带也行，就只做大小 + 文件头校验）。
+//! sha256 就是 GitHub Release API 里每个附件的 `digest` 字段；缺少摘要时拒绝下载和安装。
 //!
 //! 走的是和界面里「一键升级」完全相同的代码路径（`fetch_update_package`），
 //! 所以它能下下来并校验通过，界面里的按钮就能用。
@@ -30,7 +30,7 @@ fn main() {
     println!("URL      : {url}");
     println!("期望大小 : {expected} 字节");
     println!("类型/版本: {ext} / {version}");
-    println!("期望 sha : {}", sha.clone().unwrap_or_else(|| "（没给，只查大小和文件头）".into()));
+    println!("期望 sha : {}", sha.clone().unwrap_or_else(|| "（缺少校验信息，下载会被拒绝）".into()));
     println!("开始下载…");
 
     let mut last_shown = 0u64;

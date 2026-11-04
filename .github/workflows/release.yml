@@ -1,0 +1,341 @@
+name: Release Windows and macOS
+
+# Merge this workflow into main, push an annotated vX.Y.Z tag on main, then run:
+# gh workflow run release.yml --ref main -f tag=v0.1.15 -f publish=true
+# Without publish=true, the same checks and uploads leave a reviewable draft.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag on main (vX.Y.Z)
+        required: true
+        default: v0.1.15
+        type: string
+      publish:
+        description: Publish the verified draft and mark it as latest
+        required: true
+        default: false
+        type: boolean
+      macos_cloud:
+        description: Build macOS in the cloud (disable for Windows artifacts only; local Mac publishing is manual)
+        required: true
+        default: true
+        type: boolean
+      title:
+        description: Optional Release title (defaults to ZeeAI_Term and tag)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize all versions so two manual releases cannot race to become latest.
+concurrency:
+  group: desktop-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.source.outputs.version }}
+      notes: ${{ steps.versions.outputs.notes }}
+      matrix: ${{ steps.versions.outputs.matrix }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      MACOS_CLOUD: ${{ inputs.macos_cloud }}
+      RELEASE_PUBLISH: ${{ inputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve release tag on main
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != 'zeelinkCN/ZeeAI_Term' || "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo '::error::Run this workflow from main in zeelinkCN/ZeeAI_Term.'
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo '::error::The release tag must have the form vX.Y.Z without a prerelease suffix.'
+            exit 1
+          fi
+          sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo '::error::The release commit must already be merged into main.'
+            exit 1
+          fi
+          git checkout --detach "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Check versions and release notes
+        id: versions
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+          const read = (path) => readFileSync(path, 'utf8');
+          const json = (path) => JSON.parse(read(path));
+          const version = process.env.RELEASE_TAG.slice(1);
+          if (process.env.MACOS_CLOUD !== 'true' && process.env.RELEASE_PUBLISH === 'true') {
+            throw new Error('Windows-only builds cannot publish. Set publish=false, then verify and combine the local Mac package manually.');
+          }
+          const cargo = read('src-tauri/Cargo.toml').split(/^\[package\]\s*$/m)[1]?.split(/^\[/m)[0];
+          const cargoLock = read('src-tauri/Cargo.lock').split('[[package]]')
+            .find((entry) => /^name = "zeeai-terminal"$/m.test(entry));
+          const values = {
+            'package.json': json('package.json').version,
+            'package-lock.json': json('package-lock.json').version,
+            'package-lock.json root package': json('package-lock.json').packages?.['']?.version,
+            'src-tauri/tauri.conf.json': json('src-tauri/tauri.conf.json').version,
+            'src-tauri/Cargo.toml': /^version = "([^"]+)"$/m.exec(cargo ?? '')?.[1],
+            'src-tauri/Cargo.lock': /^version = "([^"]+)"$/m.exec(cargoLock ?? '')?.[1],
+            'src/lib/app-consts.ts': /export const APP_VERSION = "([^"]+)"/.exec(read('src/lib/app-consts.ts'))?.[1],
+            'portable/README-portable.txt': /^ZeeAI Terminal ([\d.]+) /m.exec(read('portable/README-portable.txt'))?.[1],
+          };
+          for (const [path, actual] of Object.entries(values)) {
+            if (actual !== version) throw new Error(`${path}: expected ${version}, found ${actual}`);
+          }
+          const notes = [`docs/releases/${process.env.RELEASE_TAG}.md`, `docs/release-notes-${process.env.RELEASE_TAG}.md`]
+            .find((path) => existsSync(path) && read(path).trim());
+          if (!notes) throw new Error('Release notes are missing or empty.');
+          appendFileSync(process.env.GITHUB_OUTPUT, `notes=${notes}\n`);
+          const include = [{ name: 'windows-x64', os: 'windows-latest', target: 'x86_64-pc-windows-msvc', 'rust-targets': 'x86_64-pc-windows-msvc' }];
+          if (process.env.MACOS_CLOUD === 'true') {
+            include.push({ name: 'macos-universal', os: 'macos-15-intel', target: 'universal-apple-darwin', 'rust-targets': 'aarch64-apple-darwin,x86_64-apple-darwin' });
+          } else {
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, 'Windows artifacts only. Build and verify the Universal DMG locally from the same tag; this run will not create or publish a Release.\n');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`);
+          console.log(`All version sources match ${version}; notes: ${notes}`);
+          NODE
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm run test:platform
+      - run: npm run test:ai
+      - run: npm run check:docs
+      - run: npm run build
+
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-targets }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+          shared-key: desktop-${{ matrix.name }}
+      - run: npm ci
+      - name: Backend regression tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib
+      - name: Build frontend for UI tests
+        run: npm run build
+      - name: Windows UI smoke tests
+        if: runner.os == 'Windows'
+        env:
+          ZEEAI_FE_OUT: ${{ runner.temp }}/zeeai-fe-test
+        run: npm run fe:smoke
+      - name: macOS AI monitor UI smoke tests
+        if: runner.os == 'macOS'
+        env:
+          ZEEAI_FE_OUT: ${{ runner.temp }}/zeeai-fe-test
+        run: node scripts/ai-monitor-smoke.mjs
+      - name: Rebuild Windows application and installers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo clean --manifest-path src-tauri/Cargo.toml -p zeeai-terminal --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'cargo clean failed' }
+          npm run tauri build -- --ci --target x86_64-pc-windows-msvc --bundles 'nsis,msi' -- --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed' }
+      - name: Assemble Windows portable packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          $releaseDir = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          $exe = Join-Path $releaseDir 'ZeeAI_Term.exe'
+          # The existing portable script expects this non-target-qualified path.
+          New-Item -ItemType Directory -Force 'src-tauri/target/release' | Out-Null
+          Copy-Item -LiteralPath $exe -Destination 'src-tauri/target/release/ZeeAI_Term.exe'
+          & ./scripts/build-portable.ps1 -Version $version
+          if ($LASTEXITCODE -ne 0) { throw 'Portable packaging failed' }
+          New-Item -ItemType Directory -Force 'release-assets' | Out-Null
+          Copy-Item -LiteralPath "$releaseDir/bundle/nsis/ZeeAI_Term_${version}_x64-setup.exe" -Destination 'release-assets/'
+          Copy-Item -LiteralPath "$releaseDir/bundle/msi/ZeeAI_Term_${version}_x64_en-US.msi" -Destination 'release-assets/'
+          Copy-Item -LiteralPath $exe -Destination 'release-assets/ZeeAI_Term.exe'
+          Copy-Item -LiteralPath "portable/ZeeAI_Term-$version-portable.zip" -Destination "release-assets/ZeeAI_Term-$version-windows-x64-portable.zip"
+          # Verify that the portable zip contains both the new exe and its tools.
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "release-assets/ZeeAI_Term-$version-windows-x64-portable.zip").Path)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($required in @('ZeeAI_Term.exe', 'README-portable.txt', 'conpty.dll', 'OpenConsole.exe', 'LICENSE-ConPTY.txt', 'ConPTY-UPSTREAM.md', 'resources/platform-tools/adb.exe', 'resources/platform-tools/fastboot.exe', 'resources/platform-tools/AdbWinApi.dll', 'resources/platform-tools/AdbWinUsbApi.dll', 'resources/platform-tools/NOTICE.txt')) {
+              if ($entries -notcontains $required) { throw "Portable zip is missing $required" }
+            }
+          } finally { $zip.Dispose() }
+      - name: Rebuild macOS Universal DMG with ad-hoc signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: |
+          set -euo pipefail
+          cargo clean --manifest-path src-tauri/Cargo.toml -p zeeai-terminal --release --target aarch64-apple-darwin
+          cargo clean --manifest-path src-tauri/Cargo.toml -p zeeai-terminal --release --target x86_64-apple-darwin
+          npm run tauri build -- --ci --target universal-apple-darwin --bundles app,dmg -- --locked
+          app='src-tauri/target/universal-apple-darwin/release/bundle/macos/ZeeAI_Term.app'
+          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/ZeeAI_Term"
+          codesign --verify --deep --strict "$app"
+          mkdir -p release-assets
+          cp "src-tauri/target/universal-apple-darwin/release/bundle/dmg/ZeeAI_Term_${RELEASE_VERSION}_universal.dmg" release-assets/
+      - name: Upload release packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Upload UI smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-smoke-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/zeeai-fe-test/*.png
+            ${{ runner.temp }}/zeeai-fe-test/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    if: ${{ inputs.macos_cloud }}
+    needs: [validate, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Build jobs only have read access; this job never runs app/package scripts.
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+      RELEASE_NOTES: ${{ needs.validate.outputs.notes }}
+      RELEASE_TITLE: ${{ inputs.title }}
+      RELEASE_PUBLISH: ${{ inputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
+          digest-mismatch: error
+      - name: Verify all assets, create draft, and optionally publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          const { RELEASE_TAG: tag, RELEASE_VERSION: version, RELEASE_SHA: sha, GH_REPO: repo } = process.env;
+          const run = (command, args) => execFileSync(command, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim();
+          const api = (path, args = []) => JSON.parse(run('gh', ['api', path, ...args]));
+          const expected = [
+            `ZeeAI_Term_${version}_x64-setup.exe`,
+            `ZeeAI_Term_${version}_x64_en-US.msi`,
+            'ZeeAI_Term.exe',
+            `ZeeAI_Term-${version}-windows-x64-portable.zip`,
+            `ZeeAI_Term_${version}_universal.dmg`,
+          ].sort();
+          if (JSON.stringify(readdirSync('release-assets').sort()) !== JSON.stringify(expected)) {
+            throw new Error('Expected exactly the Windows installer/portable packages and macOS Universal DMG.');
+          }
+          for (const name of expected) {
+            const file = statSync(`release-assets/${name}`);
+            if (!file.isFile() || file.size === 0) throw new Error(`Empty or invalid asset: ${name}`);
+          }
+          const digest = (name) => createHash('sha256').update(readFileSync(`release-assets/${name}`)).digest('hex');
+          writeFileSync('release-assets/SHA256SUMS', expected.map((name) => `${digest(name)}  ${name}\n`).join(''));
+          const names = [...expected, 'SHA256SUMS'];
+          const verifyTag = () => {
+            run('git', ['fetch', '--no-tags', 'origin', `refs/tags/${tag}`]);
+            if (run('git', ['rev-parse', 'FETCH_HEAD^{commit}']) !== sha) throw new Error('Remote tag moved after validation.');
+          };
+          const compare = (a, b) => {
+            const left = a.replace(/^v/, '').split('.').map(Number);
+            const right = b.replace(/^v/, '').split('.').map(Number);
+            if (![left, right].every((v) => v.length === 3 && v.every(Number.isSafeInteger))) throw new Error('Cannot compare stable release versions.');
+            return left.reduce((result, part, index) => result || Math.sign(part - right[index]), 0);
+          };
+          const pages = api(`repos/${repo}/releases?per_page=100`, ['--paginate', '--slurp']).flat();
+          if (pages.some((release) => release.tag_name === tag)) throw new Error('A release or draft for this tag already exists; inspect it instead of overwriting it.');
+          const stable = pages.filter((release) => !release.draft && !release.prerelease);
+          if (stable.some((release) => compare(tag, release.tag_name) <= 0)) throw new Error('A stable release with this version or a newer version already exists.');
+          verifyTag();
+          console.log(run('gh', ['release', 'create', tag, ...names.map((name) => `release-assets/${name}`),
+            '--repo', repo, '--verify-tag', '--draft', '--target', sha,
+            '--title', process.env.RELEASE_TITLE || `ZeeAI_Term ${tag}`, '--notes-file', process.env.RELEASE_NOTES]));
+          const drafts = api(`repos/${repo}/releases?per_page=100`, ['--paginate', '--slurp']).flat()
+            .filter((release) => release.tag_name === tag);
+          if (drafts.length !== 1 || !drafts[0].draft) throw new Error('Expected a single unpublished draft.');
+          const draft = api(`repos/${repo}/releases/${drafts[0].id}`);
+          const verifyAssets = (release) => {
+            if (release.tag_name !== tag || release.prerelease || release.assets.length !== names.length) throw new Error('Release metadata does not match the expected stable release.');
+            for (const name of names) {
+              const matches = release.assets.filter((asset) => asset.name === name);
+              if (matches.length !== 1) throw new Error(`Missing or duplicate Release asset: ${name}`);
+              const asset = matches[0];
+              if (asset.state !== 'uploaded' || asset.size !== statSync(`release-assets/${name}`).size || asset.digest !== `sha256:${digest(name)}`) {
+                throw new Error(`GitHub size/SHA-256 validation failed for ${name}; inspect the Release metadata.`);
+              }
+            }
+          };
+          verifyAssets(draft);
+          let release = draft;
+          if (process.env.RELEASE_PUBLISH === 'true') {
+            verifyTag();
+            release = api(`repos/${repo}/releases/${draft.id}`, ['--method', 'PATCH', '-F', 'draft=false', '-F', 'prerelease=false', '-f', 'make_latest=true']);
+            const latest = api(`repos/${repo}/releases/latest`);
+            if (release.draft || latest.id !== draft.id || latest.draft) throw new Error('Published release is not the expected latest release; inspect GitHub metadata.');
+            verifyAssets(latest);
+          }
+          const state = release.draft ? 'Draft (not visible to the app updater)' : 'Published as latest';
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${state}: [${tag}](${release.html_url})\n\nSource commit: \`${sha}\`\n\nAll five packages and SHA256SUMS match GitHub asset digests.\n`);
+          console.log(`${state}: ${release.html_url}`);
+          NODE

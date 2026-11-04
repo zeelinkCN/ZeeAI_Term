@@ -14,6 +14,7 @@
 /// 升级辅助进程（`core::update`）也用它判断"应用起来了没有"：装完之后 NSIS `/R` /
 /// MSI `AUTOLAUNCHAPP=1` 会拉起应用，辅助进程就看这个名字在不在 —— 比 `tasklist`
 /// 找进程更准（不用起子进程、也不会把同名的旧进程认错）。
+#[cfg(windows)]
 pub(crate) const SINGLE_INSTANCE_MUTEX: &str = "Local\\ZeeAI_Term_SingleInstance";
 
 #[cfg(windows)]

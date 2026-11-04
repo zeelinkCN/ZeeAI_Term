@@ -510,11 +510,7 @@ impl LogWatcher {
 
     /// 默认目录：`%USERPROFILE%\.codex\sessions`（和 `ai_sessions::local_snapshot` 一致）。
     pub fn default_root() -> Option<PathBuf> {
-        let home = std::env::var("USERPROFILE").ok()?;
-        if home.trim().is_empty() {
-            return None;
-        }
-        Some(Path::new(&home).join(".codex").join("sessions"))
+        Some(dirs::home_dir()?.join(".codex").join("sessions"))
     }
 
     fn announce(&mut self, kind: &str, key: &str) -> bool {

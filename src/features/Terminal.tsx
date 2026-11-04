@@ -12,6 +12,7 @@ import { herdrPaneInput, herdrPaneKey, herdrPaneResize, herdrPaneType } from "..
 import { runAfterFirstPaint, startupMark } from "../startup";
 import { bytesToB64 } from "../util";
 import { rememberTerminalSize } from "./terminalSize";
+import { IS_MAC } from "../lib/platform";
 import { clearOutput, markOutput } from "../activity";
 import { Highlighter } from "../highlight";
 import type { SessionBus } from "../sessionBus";
@@ -66,6 +67,8 @@ interface Props {
   herdrPane?: { paneId: string; mode?: "observe" | "control" };
   /** 输入通道还没建好/断了时，让上层去建（同一个会话只会建一次） */
   onHerdrInputNeeded?: () => void;
+  /** A replacement observer stream is registered and ready for resubscription. */
+  onTransportReady?: () => void;
   /**
    * 终端里按 Ctrl+V 时，剪贴板里是**文件**（图片 / 从资源管理器复制的文件）就走这里。
    *
@@ -304,6 +307,7 @@ export default function TerminalView({
   highlightRules,
   herdrPane,
   onHerdrInputNeeded,
+  onTransportReady,
   onPasteFiles,
   pasteKey = "both",
   rightClick = "menu",
@@ -341,6 +345,8 @@ export default function TerminalView({
   herdrPaneRef.current = herdrPane;
   const needHerdrInputRef = useRef<Props["onHerdrInputNeeded"]>(onHerdrInputNeeded);
   needHerdrInputRef.current = onHerdrInputNeeded;
+  const transportReadyRef = useRef(onTransportReady);
+  transportReadyRef.current = onTransportReady;
   // 粘贴进来的文件（图片/复制的文件）交给上层去上传 + 插路径；同样用 ref 存
   const onPasteFilesRef = useRef<Props["onPasteFiles"]>(onPasteFiles);
   onPasteFilesRef.current = onPasteFiles;
@@ -544,7 +550,11 @@ export default function TerminalView({
         if (herdrPaneRef.current) {
           // herdr 观察窗：行列数是在"开流时"声明的，所以这里让后端把流按新尺寸重开一次
           // （重开**不会**去改窗格本身的尺寸，也不会影响别的客户端）
-          void herdrPaneResize(sessionId, cols, rows);
+          void herdrPaneResize(sessionId, cols, rows).then(() => {
+            if (!disposed) transportReadyRef.current?.();
+          }).catch((e) => {
+            if (!disposed) onNotice?.("调整 herdr 观察窗口失败：" + String(e));
+          });
           return;
         }
         void sessionResize(sessionId, cols, rows);
@@ -753,6 +763,7 @@ export default function TerminalView({
      * 否则连发两条时，第 2 条的正文可能插到第 1 条的回车之前。
      */
     let inputChain: Promise<void> = Promise.resolve();
+    bus.attachFocus(sessionId, () => term.focus());
     bus.attachInput(sessionId, (text, submit) => {
       inputChain = inputChain.then(async () => {
         try {
@@ -810,6 +821,10 @@ export default function TerminalView({
       if (e.type !== "keydown") return true;
       const ctrlOnly = e.ctrlKey && !e.altKey && !e.metaKey;
       const key = e.key.toLowerCase();
+      if (IS_MAC && e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (key === "v") return false;
+        if (key === "c") { void copySelection(); return false; }
+      }
       if (ctrlOnly && !e.shiftKey && key === "v") {
         const paste = pasteKeyRef.current;
         return !(paste === "both" || paste === "ctrl-v");
@@ -975,6 +990,7 @@ export default function TerminalView({
       osc133.dispose();
       bus.detach(sessionId);
       bus.detachInput(sessionId);
+      bus.detachFocus(sessionId);
       hl.dispose();
       hlRef.current = null;
       webglRef.current = null;

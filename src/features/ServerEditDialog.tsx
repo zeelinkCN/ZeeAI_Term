@@ -7,6 +7,7 @@ import { secretDelete, secretSet } from "../ipc";
 import { TERM_SCHEMES } from "../termThemes";
 import { termSchemeFor } from "../lib/session-labels";
 import { portOrZero } from "../lib/ssh-text";
+import { SECRET_STORE_LABEL } from "../lib/platform";
 import type { EditDialogState, Notify } from "../lib/ui-model";
 import type { AppSettings, ConnectionProfile } from "../types";
 
@@ -226,7 +227,7 @@ export function ServerEditDialog(props: ServerEditDialogProps) {
           </label>
           {/* 密码存 Windows 凭据管理器：这样「只能用密码」的服务器也能读远程文件 / 列 tmux */}
           <label className="modal-field">
-            密码（存在 Windows 凭据管理器，不会写进配置文件）
+            密码（存在{SECRET_STORE_LABEL}，不会写进配置文件）
             <input
               type="password"
               value={editPassword}
@@ -245,7 +246,7 @@ export function ServerEditDialog(props: ServerEditDialogProps) {
               disabled={!editPassword || !editDialog.draft.id}
               title={
                 editDialog.draft.id
-                  ? "存进 Windows 凭据管理器（控制面板 → 凭据管理器里可以看到并删除）"
+                  ? `存进${SECRET_STORE_LABEL}，可在系统中查看或删除`
                   : "先保存这台服务器，再设置密码"
               }
               onClick={() => {
@@ -259,7 +260,7 @@ export function ServerEditDialog(props: ServerEditDialogProps) {
                     await secretSet(id, editPassword);
                     setEditHasPassword(true);
                     setEditPassword("");
-                    notify("密码已存进 Windows 凭据管理器");
+                    notify(`密码已存进${SECRET_STORE_LABEL}`);
                   } catch (e) {
                     notify("保存密码失败：" + String(e));
                   }

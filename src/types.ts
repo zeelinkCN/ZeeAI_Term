@@ -1,4 +1,5 @@
 export type ConnType = "ssh" | "serial" | "adb" | "local";
+export type LocalShell = "powershell" | "pwsh" | "cmd" | "wsl" | "zsh" | "bash";
 
 export interface SshConfig {
   host: string;
@@ -33,7 +34,7 @@ export interface ConnectionProfile {
   termSchemeCustom?: string | null;
   ssh?: SshConfig;
   serial?: SerialConfig;
-  local?: { shell: "powershell" | "cmd" | "wsl"; distro?: string; cwd?: string };
+  local?: { shell: LocalShell; distro?: string; cwd?: string };
 }
 
 /** 串口连接参数：每个串口自己一套，不再是全局共用一个波特率 */
@@ -603,7 +604,7 @@ export interface AiSourceInfo {
 
 export interface AppSettings {
   fontSize: number;
-  defaultShell: "powershell" | "cmd" | "wsl";
+  defaultShell: LocalShell;
   recordHistory: boolean;
   tmuxDefault: boolean;
   theme: string;
@@ -693,6 +694,8 @@ export interface AppSettings {
    * 每次保存设置都会把它写回默认 false，用户之前打开过的等于白开。
    */
   aiWatchEnabled: boolean;
+  /** Only observe remote sessions currently open in ZeeAI; takes effect immediately. */
+  aiMonitorEnabled: boolean;
 }
 
 export interface GitFile {

@@ -4,9 +4,9 @@
 // 让组件反过来 import App 会成环（App import 组件、组件 import App），
 // 一组循环依赖在打包后就是"某个模块初始化时拿到 undefined"。
 
-import type { AiAgentKind, AiCarrier, AiState, ConnectionProfile, HerdrPane, HerdrServerStatus, HerdrWorkspaceScan, HistoryEntry, SessionState, SshDiagnosis } from "../types";
+import type { AiAgentKind, AiCarrier, AiState, ConnectionProfile, HerdrPane, HerdrServerStatus, HerdrWorkspaceScan, HistoryEntry, LocalShell, SessionState, SshDiagnosis } from "../types";
 
-export type ModuleKey = "remote" | "powershell" | "cmd" | "wsl" | "git" | "serial" | "adb";
+export type ModuleKey = "remote" | "powershell" | "cmd" | "wsl" | "zsh" | "bash" | "git" | "serial" | "adb";
 export type FileKind = "md" | "html" | "img" | "code" | "text";
 export type MdStyle = "github" | "minimal" | "dark" | "paper";
 
@@ -21,6 +21,7 @@ export interface OpenSession {
   id: string;
   title: string;
   kind: ModuleKey;
+  shell?: LocalShell;
   profileId?: string;
   /** 这个会话临时选的高亮规则集（空 = 跟着服务器绑定走） */
   highlightSetId?: string | null;
@@ -61,6 +62,7 @@ export interface ComposerDraft {
 
 export interface SavedSession {
   kind: ModuleKey;
+  shell?: LocalShell;
   title: string;
   profileId?: string;
   user?: string;

@@ -173,10 +173,23 @@ pub async fn herdr_pane_resize(
                 x.rows,
                 x.channel.clone(),
                 x.close_flag.clone(),
+                x.connection_fingerprint.clone(),
+                x.effective_connection_fingerprint.clone(),
             )
         })
     };
-    let Some((profile_id, user, pane_id, old_cols, old_rows, channel, close_flag)) = meta else {
+    let Some((
+        profile_id,
+        user,
+        pane_id,
+        old_cols,
+        old_rows,
+        channel,
+        close_flag,
+        fingerprint,
+        effective_fingerprint,
+    )) = meta
+    else {
         return Ok(()); // 不是观察窗会话（普通 ssh/tmux），交给原来的 session_resize
     };
     if old_cols == cols && old_rows == rows {
@@ -217,12 +230,16 @@ pub async fn herdr_pane_resize(
             }
         }
     }
-    let effective_user = user
-        .as_ref()
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty());
-    let cfg = ssh_config_for(&profile_id, user)?;
-    let effective_user = effective_user.unwrap_or_else(|| cfg.user.clone());
+    let mut cfg = ssh_config_for(&profile_id, None)?;
+    if let Some(user) = user {
+        // Preserve the connected account, including SSH-config resolution ("").
+        cfg.user = user.trim().to_string();
+    }
+    let effective_user = cfg.user.clone();
+    crate::core::ai_monitor::verify_connection(&cfg, &effective_user, &[fingerprint])?;
+    let effective =
+        crate::core::ai_monitor::resolve_connection_fingerprint(&cfg, &effective_user).await?;
+    crate::core::ai_monitor::verify_effective_connection(&effective, &[effective_fingerprint])?;
 
     // 1) 先让旧线程别再报 "closed"，再把旧进程收掉
     close_flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -291,6 +308,7 @@ pub async fn herdr_pane_resize(
         if let Some(x) = m.get_mut(&id) {
             x.cols = cols;
             x.rows = rows;
+            x.user = Some(effective_user);
             x.close_flag = new_flag;
         }
     }
@@ -570,8 +588,16 @@ mod herdr_pump_tests {
     /// 判定必须是"死"，而且真的去写也必须报错 —— 这就是"能打字、字进不去"的回归点。
     #[tokio::test]
     async fn writing_to_an_exited_pump_fails_instead_of_silently_succeeding() {
+        #[cfg(windows)]
         let mut cmd = proc::hidden_command("cmd");
+        #[cfg(windows)]
         cmd.args(["/C", "exit", "3"]);
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut cmd = proc::hidden_command("/bin/sh");
+            cmd.args(["-c", "exit 3"]);
+            cmd
+        };
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());

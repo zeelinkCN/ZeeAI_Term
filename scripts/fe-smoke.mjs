@@ -3,8 +3,8 @@
 // 为什么这么写：
 // - 界面是 React + Tauri IPC。要"不打扰用户地测界面"，就得把真实构建产物（dist/）
 //   放到无头浏览器里跑，并且把 Tauri 的 invoke 换成一份可控的假后端；
-// - 不引第三方依赖：静态服务用 node:http，浏览器用系统自带的 Edge（--headless=new），
-//   驱动走 CDP（Node 24 自带 WebSocket）；
+// - 不引第三方依赖：静态服务用 node:http，浏览器用 Edge / Chrome（--headless=new），
+//   驱动走 CDP（Node 22.18+ 自带 WebSocket）；
 // - 断言用"页面里真实渲染出来的文字/元素"，不是看代码——测的是用户看到的东西。
 //
 // 用法：
@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSyn
 import { join, extname, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { runAiMonitorSmoke } from "./ai-monitor-smoke.mjs";
 
 // 仓库根目录 = 本文件的上一级（这样从任何目录调用都能跑）
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -39,7 +40,14 @@ const PORT = Number(process.env.ZEEAI_FE_PORT || 8791);
 // 并行跑时用 ZEEAI_FE_CDP_PORT 固定一个 —— 否则两轮撞进同一个浏览器，会互相抢页面
 //（表现为窗口尺寸变成另一轮的值、甚至 Page.navigate 到对方端口）。
 const CDP_PORT = Number(process.env.ZEEAI_FE_CDP_PORT || (9300 + Math.floor(Math.random() * 650)));
-const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const browserOverride = process.env.ZEEAI_FE_BROWSER || process.env.ZEEAI_FE_BROWSER_PATH;
+const browserCandidates = process.platform === "darwin"
+  ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+  : process.platform === "win32"
+    ? ["C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"]
+    : ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"];
+const EDGE = browserOverride || browserCandidates.find(existsSync);
+if (!EDGE || !existsSync(EDGE)) throw new Error("找不到 Chrome / Edge；请用 ZEEAI_FE_BROWSER 指定浏览器可执行文件的绝对路径");
 
 const appData = join(process.env.APPDATA ?? "", "ZeeAI-Terminal");
 const readJson = (name, fallback) => {
@@ -89,7 +97,7 @@ if (USE_REAL_PROFILES) {
     if (p.ssh) p.ssh.herdrEnabled = true;
   }
 }
-const settings = readJson("settings.json", {});
+const settings = USE_REAL_PROFILES ? readJson("settings.json", {}) : {};
 // 测试必须能"启动即恢复会话"，否则后面几十条都会假失败（我踩过：用户在设置里把
 // 「启动时恢复上次的工作空间」关掉之后，整轮 41/67 —— 看着像代码坏了，其实是设置变了）。
 // 和上面给合成服务器打开 herdrEnabled 是一个道理：只改测试用的这份副本，不动用户的文件。
@@ -132,8 +140,7 @@ function copyDir(from, to) {
 }
 
 const mockScript = `
-// 面板停用了，但看板那 50+ 条断言还得继续盯着"没删掉的代码"（用户说后续还要重构）。
-// 这个全局是 App.tsx 里 AI_PANEL_TEST_ONLY_SHOW 认的唯一豁免口；生产里没人设。
+// 老看板那 50+ 条断言保留为显式 fixture；生产监控场景会覆盖此标志为 false。
 window.__ZEEAI_TEST_AI_PANEL__ = true;
 window.__ZEEAI_CALLS__ = [];
 window.__ZEEAI_CALLARGS__ = [];
@@ -468,6 +475,7 @@ const resolveCmd = (cmd, args, opts) => {
       );
     case "workspace_save": return null;
     case "update_install_kind": return "portable";
+    case "runtime_info": return { os: "windows", arch: "x86_64" };
     case "update_take_result": return null;
     case "is_admin": return false;
     case "session_log_dir": return "C:\\\\Temp\\\\zeeai-logs";
@@ -528,6 +536,9 @@ const resolveCmd = (cmd, args, opts) => {
         source: "官方·直连", sha256: "2a02fed1", bytes: 26207464, path: "$HOME/.local/bin/herdr",
       };
     case "settings_set": return null;
+    case "ai_monitor_sessions_set":
+      window.__ZEEAI_MONITOR_SCOPE__ = { sessionIds: [...(args?.sessionIds || [])], enabled: !!args?.enabled };
+      return null;
     // 看板 v2 的场景任务（herdrTasks）：假的"远端 tmux+ps 扫描结果"。
     // 真后端那两条路是 ssh 出去跑 tmux/ps，无头测试里没法真跑，所以用场景数据代替；
     // 它们走的仍然是**同一条链路**（前端采集 → BoardSources → ai_instances）。
@@ -714,7 +725,7 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(PORT, r));
 
-// ---------- 3) 无头 Edge + CDP ----------
+// ---------- 3) 无头 Chromium 浏览器 + CDP ----------
 const profileDir = join(OUT, "edge-profile-" + Date.now());
 const edge = spawn(
   EDGE,
@@ -729,8 +740,9 @@ const edge = spawn(
     "--window-size=1400,900",
     "about:blank",
   ],
-  { stdio: "ignore" },
+  { stdio: "ignore", detached: process.platform !== "win32" },
 );
+edge.on("error", (error) => { console.error(`浏览器启动失败：${error.message}`); process.exit(1); });
 
 async function waitJson(path, tries = 60) {
   for (let i = 0; i < tries; i++) {
@@ -906,6 +918,32 @@ const check = (name, ok, extra = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  | " + extra : ""}`);
 };
 
+let cleanedUp = false;
+function cleanup() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  ws.close();
+  if (process.platform === "win32") {
+    const kill = spawn("taskkill", ["/PID", String(edge.pid), "/T", "/F"], { stdio: "ignore" });
+    kill.on("error", () => edge.kill());
+  } else {
+    try { process.kill(-edge.pid, "SIGTERM"); } catch { edge.kill(); }
+  }
+  server.close();
+}
+process.once("exit", cleanup);
+
+// 聚焦生产监控：复用同一份真实构建、假后端和 CDP，不跑整轮 legacy fixture。
+if (process.env.ZEEAI_FE_TEST_MONITOR_ONLY === "1") {
+  await runAiMonitorSmoke({ send, evaluate, reload, check, shot, sleep });
+  check("AI 监控：没有页面 JS 异常", pageErrors.length === 0, pageErrors.join(" | ").slice(0, 300));
+  const failed = results.filter((r) => !r.ok).length;
+  writeFileSync(join(OUT, "monitor-results.json"), JSON.stringify({ results, pageErrors, consoleMsgs }, null, 2));
+  console.log(`\n结果：${results.length - failed}/${results.length} 通过；产物 ${OUT}`);
+  cleanup();
+  process.exit(failed ? 1 : 0);
+}
+
 // ---------- 手动「刷新」小工具（这一轮把 AI 面板的定时探测全删了） ----------
 // 以前面板打开后数据是定时器自动刷进来的，测试只要 sleep 一下；现在必须自己点「刷新」。
 // 这样也顺便保证测试走的就是用户的那条路：打开面板 → 点刷新 → 看结果。
@@ -992,8 +1030,7 @@ const calls = await evaluate("window.__ZEEAI_CALLS__");
 check("启动时的后端调用都在预期内", calls.includes("list_profiles") && calls.includes("settings_get"), [...new Set(calls)].join(","));
 
 // ================= 测试数据卫生（审查 L11） =================
-// 断言假后端里只有合成值（alice@203.0.113.10 / demo-ssh），没有本机真实 profiles
-// 里的主机 / 用户名 / 密钥路径。真实值只在这个测试进程里读来比对，**不进页面**。
+// 默认只验证已知的合成值，不为测试再读取本机真实配置。
 const mockDataForHygiene = await evaluate(`(() => {
   const M = window.__ZEEAI_MOCK__ || {};
   const ps = M.profiles || [];
@@ -1009,32 +1046,18 @@ const mockDataForHygiene = await evaluate(`(() => {
   }
   return { profiles: JSON.stringify(ps), history: JSON.stringify(hs), values: vals };
 })()`);
-const realSensitiveValues = [];
-if (!USE_REAL_PROFILES) {
-  for (const p of readJson("profiles.json", [])) {
-    if (!p || !p.ssh) continue;
-    for (const k of ["host", "user", "keyPath", "jump"]) {
-      if (typeof p.ssh[k] === "string" && p.ssh[k].trim()) realSensitiveValues.push(p.ssh[k].trim());
-    }
-  }
-  for (const h of readJson("history.json", [])) {
-    if (!h) continue;
-    for (const k of ["host", "profileName"]) {
-      if (typeof h[k] === "string" && h[k].trim()) realSensitiveValues.push(h[k].trim());
-    }
-  }
-}
-const leakedValues = realSensitiveValues.filter((v) => mockDataForHygiene.values.includes(v));
+const syntheticOnly = mockDataForHygiene.values.every((value) =>
+  ["203.0.113.10", "alice", "bastion.example:2200"].includes(value)) && mockDataForHygiene.history === "[]";
 check(
   "测试数据卫生（L11）：假后端默认只用合成 profiles（alice@203.0.113.10 / demo-ssh），不含本机真实主机/用户名/密钥路径",
   USE_REAL_PROFILES ||
     (mockDataForHygiene.profiles.includes("203.0.113.10") &&
       mockDataForHygiene.profiles.includes("alice") &&
       mockDataForHygiene.profiles.includes("demo-ssh") &&
-      leakedValues.length === 0),
+      syntheticOnly),
   USE_REAL_PROFILES
     ? "ZEEAI_FE_TEST_REAL_PROFILES=1（显式真实模式，跳过）"
-    : `合成值=alice/203.0.113.10/demo-ssh 泄漏=${leakedValues.length}`,
+    : `合成值=alice/203.0.113.10/demo-ssh 隔离=${syntheticOnly}`,
 );
 
 // ================= 手动「刷新」：这一轮把 AI 面板的定时探测全删了 =================
@@ -4538,109 +4561,8 @@ check(
   `快捷键提示="${shortcutBar}" writes=${JSON.stringify(quiet.writes).slice(0, 160)}`,
 );
 
-console.log("\n--- 页面控制台里的 error/warning ---");
-// ================= (NEW) AI 面板停用：星号只开一块灰色空容器 =================
-// 用户 2026-10-24：「AI 助手面板太鸡肋，先关闭；点星号打开只显示个 AI 任务面板」，
-// 追问后明确：「整个面板都停用，只留灰色容器」。
-// mockScript 默认把测试豁免打开（保住上面那 50+ 条看板断言）；这一组先关掉它，
-// 钉住用户看到的那一面：内容**不挂 DOM**（不是 display:none），只有一块灰底。
-await send("Page.addScriptToEvaluateOnNewDocument", {
-  source: "window.__ZEEAI_TEST_AI_PANEL__ = false;",
-});
-await setScenario({ settingsPatch: { theme: "dark" } });
-await reload();
-const clickAiStar = () =>
-  evaluate(`(() => {
-    const b = [...document.querySelectorAll(".activitybar .act")].find((x) => (x.title || "").includes("AI"));
-    if (!b) return false;
-    b.click();
-    return true;
-  })()`);
-const probesBeforePanelOpen = await countAiProbes();
-const starOpened = await clickAiStar();
-await sleep(500);
-const readAiOffPanel = () =>
-  evaluate(`(() => {
-    const panel = document.querySelector(".ai-panel");
-    if (!panel) return null;
-    const probe = document.createElement("div");
-    probe.style.background = "var(--panel-2)";
-    // --panel-2 定义在 .app 上：探针必须挂进 .app，挂 body 上拿不到变量（会返回透明）
-    (document.querySelector(".app") || document.body).appendChild(probe);
-    const expectBg = getComputedStyle(probe).backgroundColor;
-    probe.remove();
-    const cs = getComputedStyle(panel);
-    return {
-      text: (panel.innerText || "").trim(),
-      descendants: panel.querySelectorAll("*").length,
-      buttons: panel.querySelectorAll("button").length,
-      bg: cs.backgroundColor,
-      expectBg: expectBg,
-      width: Math.round(panel.getBoundingClientRect().width),
-      off: panel.classList.contains("off"),
-      appLight: document.querySelector(".app").classList.contains("light"),
-    };
-  })()`);
-const rgbNums = (s) =>
-  String(s)
-    .slice(String(s).indexOf("(") + 1, String(s).indexOf(")"))
-    .split(",")
-    .map((x) => Number(x.trim()))
-    .slice(0, 3);
-const isGrey = (s) => {
-  const c = rgbNums(s);
-  return c.length === 3 && Math.max(...c) - Math.min(...c) <= 12;
-};
-const aiOff = await readAiOffPanel();
-const probesAfterPanelOpen = await countAiProbes();
-check(
-  "AI 面板停用：点星号打开的是一块空容器（没有一个字、没有子元素）",
-  starOpened && !!aiOff && aiOff.off && aiOff.text === "" && aiOff.descendants === 0,
-  JSON.stringify(aiOff),
-);
-check(
-  "AI 面板停用：看板卡片 / 按钮 / 提示文字 / 刷新入口都不渲染（DOM 里也找不到）",
-  !!aiOff && aiOff.buttons === 0 && aiOff.descendants === 0 && aiOff.text === "",
-  `buttons=${(aiOff || {}).buttons} descendants=${(aiOff || {}).descendants}`,
-);
-check(
-  "AI 面板停用：底色就是主题灰 --panel-2（不透明、三通道接近、不是写死颜色）",
-  !!aiOff && aiOff.bg === aiOff.expectBg && aiOff.bg !== "rgba(0, 0, 0, 0)" && isGrey(aiOff.bg),
-  `bg=${(aiOff || {}).bg} expect=${(aiOff || {}).expectBg}`,
-);
-check(
-  "AI 面板停用：容器宽度还是 268px（开合 / 宽度都保留，不是整块删掉）",
-  !!aiOff && aiOff.width >= 258 && aiOff.width <= 278,
-  `width=${(aiOff || {}).width}`,
-);
-check(
-  "AI 面板停用：打开面板不触发任何 AI 探测（看板逻辑没在背后偷跑）",
-  probesAfterPanelOpen === probesBeforePanelOpen,
-  `${probesBeforePanelOpen} → ${probesAfterPanelOpen}`,
-);
-await clickAiStar();
-await sleep(350);
-check(
-  "AI 面板停用：再点一次星号就收起（活动栏按钮照旧能开合）",
-  await evaluate(`!document.querySelector(".ai-panel")`),
-  "",
-);
-// 浅色主题：还是同一块「--panel-2」浅灰，不能变成刺眼的白 / 透明 / 深色
-await setScenario({ settingsPatch: { theme: "light" } });
-await reload();
-await clickAiStar();
-await sleep(450);
-const aiOffLight = await readAiOffPanel();
-check(
-  "AI 面板停用（浅色主题）：仍是 --panel-2 的浅灰、仍然一个字都不显示",
-  !!aiOffLight &&
-    aiOffLight.appLight &&
-    aiOffLight.bg === aiOffLight.expectBg &&
-    aiOffLight.text === "" &&
-    aiOffLight.descendants === 0 &&
-    rgbNums(aiOffLight.bg).every((v) => v >= 200),
-  JSON.stringify(aiOffLight),
-);
+// ================= 生产 AI 状态监控（不使用 legacy fixture） =================
+await runAiMonitorSmoke({ send, evaluate, reload, check, shot, sleep });
 
 // ================= (NEW) 会话承载徽标：T / H / S =================
 // T = tmux、H = herdr、S = 纯 SSH；本地终端不加。判定只看会话对象里的承载字段
@@ -5349,14 +5271,8 @@ check(
 for (const c of consoleMsgs.slice(0, 15)) console.log("  " + c.slice(0, 200));
 console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}\n${shotLight}（浅色主题·设置面板）\n${shotComposer}（AI 输入窗）\n${shotArrowZoom}（箭头放大 4×）\n${shotCollapsed}（收起态）\n${shotExpanded}（展开态）`);
 
-ws.close();
-// 结束整棵 Edge 进程树（只 kill 父进程会留下子进程占着 profile 目录和工作目录）
-try {
-  spawn("taskkill", ["/PID", String(edge.pid), "/T", "/F"], { stdio: "ignore" });
-} catch {
-  edge.kill();
-}
-server.close();
+cleanup();
 const failed = results.filter((r) => !r.ok).length;
+writeFileSync(join(OUT, "results.json"), JSON.stringify({ results, pageErrors }, null, 2));
 console.log(`\n结果：${results.length - failed}/${results.length} 通过`);
 process.exit(failed ? 1 : 0);

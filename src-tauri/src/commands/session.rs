@@ -13,7 +13,7 @@ use crate::core::{
 };
 use crate::store;
 
-use super::util::{friendly_herdr_event, program_on_path};
+use super::util::friendly_herdr_event;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,38 +49,9 @@ pub fn open_local(
         distro,
         cwd
     );
-    let (program, args, title) = match shell.as_str() {
-        "cmd" => ("cmd.exe".to_string(), vec![], "命令提示符".to_string()),
-        // PowerShell 7（pwsh.exe）和系统自带的 Windows PowerShell 5.1（powershell.exe）
-        // 是两个不同的程序，语法/编码都不一样，所以让用户自己挑（面板上是两个并排按钮）。
-        "pwsh" => {
-            if !program_on_path("pwsh.exe") {
-                return Err(
-                    "本机没找到 pwsh.exe（PowerShell 7）——先装 PowerShell 7 再用这个按钮；\
-                     想用系统自带的那个请点「新建 PowerShell」"
-                        .into(),
-                );
-            }
-            (
-                "pwsh.exe".to_string(),
-                vec!["-NoLogo".to_string()],
-                "PowerShell 7".to_string(),
-            )
-        }
-        "wsl" => {
-            let mut args: Vec<String> = vec![];
-            if let Some(d) = distro.as_ref().filter(|d| !d.trim().is_empty()) {
-                args.push("-d".into());
-                args.push(d.clone());
-            }
-            ("wsl.exe".to_string(), args, "WSL".to_string())
-        }
-        _ => (
-            "powershell.exe".to_string(),
-            vec!["-NoLogo".to_string()],
-            "PowerShell".to_string(),
-        ),
-    };
+    let (program, args, title) = crate::core::platform::local_shell(&shell, distro.as_deref())?;
+    let cwd = cwd.filter(|d| !d.trim().is_empty())
+        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()));
 
     let handle = pty::spawn(
         &id,
@@ -113,7 +84,7 @@ pub fn open_local(
 }
 
 #[tauri::command]
-pub fn open_ssh(
+pub async fn open_ssh(
     id: String,
     profile_id: String,
     tmux_mode: Option<String>,
@@ -170,6 +141,10 @@ pub fn open_ssh(
         if pane.trim().is_empty() {
             return Err("缺少 herdr 窗格号，无法打开观察窗".into());
         }
+        // Bind the stream to local OpenSSH alias resolution before it is opened.
+        // Only a digest is retained; diagnosis fields are not written to logs.
+        let effective_connection_fingerprint =
+            crate::core::ai_monitor::resolve_connection_fingerprint(&cfg, &effective_user).await?;
         let c = cols.unwrap_or(110);
         let r = rows.unwrap_or(30);
         let cmd = if mode == "control" {
@@ -214,10 +189,12 @@ pub fn open_ssh(
             id.clone(),
             crate::core::session::HerdrPaneMeta {
                 profile_id: profile_id.clone(),
-                user: user_override
-                    .as_ref()
-                    .map(|u| u.trim().to_string())
-                    .filter(|u| !u.is_empty()),
+                user: Some(effective_user.clone()),
+                connection_fingerprint: crate::core::ai_monitor::connection_fingerprint(
+                    &cfg,
+                    &effective_user,
+                ),
+                effective_connection_fingerprint,
                 pane_id: pane.clone(),
                 mode: mode.to_string(),
                 cols: c,
@@ -410,9 +387,13 @@ pub async fn session_close(
         sessions.remove(&id)
     };
     // herdr 观察窗还有两样东西要一起收：元信息，和那条常驻的「输入泵」。
-    if let Ok(mut m) = panes.panes.lock() {
-        m.remove(&id);
-    }
+    let is_control = panes.panes.lock().ok()
+        .and_then(|mut m| m.remove(&id))
+        .map(|meta| {
+            meta.close_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            meta.mode == "control"
+        })
+        .unwrap_or(false);
     // 输入泵：先摘出注册表，再**显式 kill**（架构审查 minor-01）。
     // 以前只把 stdin 丢掉、指望远端 `while read` 拿到 EOF 自己退出 —— 那个假设在 ssh
     // 已经卡住/半死时不成立，会在服务器上留一条挂着 `read` 的 ssh。现在主动收掉。
@@ -432,12 +413,6 @@ pub async fn session_close(
         // 为什么值得多做这一步：万一我们是被强杀/拔线，窗格那边会还以为控制端在；
         // 下次想接管就得 `--takeover`。主动 release 之后，下一次是"干净的接管"。
         // 失败也无所谓（进程可能早就没了），所以忽略结果。
-        let is_control = panes
-            .panes
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&id).map(|x| x.mode == "control"))
-            .unwrap_or(false);
         // 交还控制权 / 杀进程都是阻塞动作 → 丢到阻塞线程，别占主线程
         let _ = tokio::task::spawn_blocking(move || {
             if is_control {

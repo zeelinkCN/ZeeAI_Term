@@ -44,6 +44,7 @@ export interface TerminalAreaProps {
   ) => Promise<unknown>;
   notify: Notify;
   bumpFont: (delta: number) => void;
+  onTransportReady: () => void;
 }
 
 export function TerminalArea(props: TerminalAreaProps) {
@@ -51,7 +52,7 @@ export function TerminalArea(props: TerminalAreaProps) {
   activeSession, activeFile, sessions, profiles, settings, bus,
   activeId, setActiveId, paneLayout, paneSlots, focusedPane, setFocusedPane,
   setPanes, setCmdExit, herdrServer, termBgOf, handleTerminalCwd, handleIncomingFiles,
-  ensureHerdrInput, notify, bumpFont,
+  ensureHerdrInput, notify, bumpFont, onTransportReady,
   } = props;
   return (
     <div
@@ -125,6 +126,7 @@ export function TerminalArea(props: TerminalAreaProps) {
                         setCmdExit((prev) => ({ ...prev, [ps.id]: { exit: code, at: Date.now() } }))
                       }
                       onNotice={notify}
+                      onTransportReady={onTransportReady}
                       onZoom={bumpFont}
                       herdrPane={
                         ps.herdrPane
@@ -188,7 +190,11 @@ export function TerminalArea(props: TerminalAreaProps) {
                     ? herdrServer.running
                       ? `服务运行中 · ${herdrServer.panes} 个窗格`
                       : "服务没在跑"
-                    : ""}
+                    : s.state === "connected"
+                      ? "已连接"
+                      : s.state === "connecting" || s.state === "reconnecting"
+                        ? "正在连接…"
+                        : "连接已断开"}
                 </span>
               </div>
             )}
@@ -223,6 +229,7 @@ export function TerminalArea(props: TerminalAreaProps) {
                 setCmdExit((prev) => ({ ...prev, [s.id]: { exit: code, at: Date.now() } }))
               }
               onNotice={notify}
+              onTransportReady={onTransportReady}
               onZoom={bumpFont}
               herdrPane={
                 s.herdrPane

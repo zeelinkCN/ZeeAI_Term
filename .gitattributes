@@ -6,6 +6,10 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
+# Pinned resource hashes must be identical on Windows and macOS checkouts.
+src-tauri/resources/conpty/*.txt -text whitespace=cr-at-eol
+src-tauri/resources/conpty/*.md text eol=lf
+
 # 二进制
 *.png binary
 *.jpg binary

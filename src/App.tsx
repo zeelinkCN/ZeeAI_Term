@@ -9,6 +9,8 @@ import HighlightDialog from "./features/HighlightDialog";
 import { SessionBus } from "./sessionBus";
 import { activityEvidenceOf, withOutputActivity } from "./boardActivity";
 import { deferUntilIdle } from "./startup";
+import { IS_MAC, IS_WINDOWS, LOCAL_SHELLS, isLocalKind, primaryModifier, supportedShell } from "./lib/platform";
+import { hasUpdateDigest, selectUpdateAssets } from "./lib/updates";
 import {
   adbDevices,
   adbVersion,
@@ -42,6 +44,7 @@ import {
   isAdmin,
   openAdminShell,
   restartAsAdmin,
+  runtimeInfo,
   fastbootDevices,
   fastbootVersion,
   gitStatus,
@@ -134,6 +137,7 @@ import type {
   GitCommit,
   GitStatus,
   HistoryEntry,
+  LocalShell,
   RemoteEntry,
   SerialConfig,
   SerialPortInfo,
@@ -150,6 +154,8 @@ import { AboutDialog } from "./features/AboutDialog";
 import { ActivityBar } from "./features/ActivityBar";
 import { AdbFileDialog } from "./features/AdbFileDialog";
 import { AiPanel } from "./features/AiPanel";
+import { AiMonitorPanel, monitorStateText } from "./features/AiMonitorPanel";
+import { useAiMonitor } from "./lib/use-ai-monitor";
 import { AppErrorBoundary, TestOnlyCrashProbe } from "./features/AppErrorBoundary";
 import { CommandPalette } from "./features/CommandPalette";
 import { Composer } from "./features/Composer";
@@ -177,7 +183,7 @@ import { SessionRenameDialog, TabContextMenu } from "./features/TabContextMenu";
 import { TerminalArea } from "./features/TerminalArea";
 import { TitleBar } from "./features/TitleBar";
 import { TransfersDock } from "./features/TransfersDock";
-import { AI_PANEL_HIDDEN, aiAgentLabel, aiBadgeCoversSource, aiBadgeTitle, aiDurationText, aiEnvLabel, aiShorten, aiSourceLabelOf, aiStateLabel, aiStateLabelOf, aiToolLabel, herdrAgentLabel, herdrStateOf, isActiveInstance, tokenM } from "./lib/ai-labels";
+import { AI_PANEL_HIDDEN, AI_PANEL_TEST_ONLY_SHOW, aiAgentLabel, aiBadgeCoversSource, aiBadgeTitle, aiDurationText, aiEnvLabel, aiShorten, aiSourceLabelOf, aiStateLabel, aiStateLabelOf, aiToolLabel, herdrAgentLabel, herdrStateOf, isActiveInstance, tokenM } from "./lib/ai-labels";
 import { APP_VERSION, DEFAULT_SETTINGS, EMPTY_PROFILE, LOCAL_SCAN_MIN_INTERVAL_MS, SHELL_LABEL, compareVersion, paneCount, themeKind } from "./lib/app-consts";
 import { DRAFT_MAX_BYTES, DRAFT_SAVE_DEBOUNCE_MS, composerDraftIdentity, draftTextBytes, loadStoredDrafts, writeStoredDrafts } from "./lib/composer-draft";
 import { fileKind, humanSize, isDocName, joinPath } from "./lib/file-kind";
@@ -287,6 +293,18 @@ function AppBody() {
   const [paletteQuery, setPaletteQuery] = useState("");
   // 右侧 AI Agent 面板
   const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const monitor = useAiMonitor({ bus, sessions, enabled: settingsReady && settings.aiMonitorEnabled && !AI_PANEL_TEST_ONLY_SHOW,
+    panelOpen: aiPanelOpen, settings,
+    onNotice: (notice) => {
+      const session = sessions.find((s) => s.id === notice.sessionId);
+      const tool = notice.agent === "claude" ? "Claude Code" : "Codex";
+      const state = notice.kind === "blocked" ? "需要你处理" : notice.kind === "error" ? "运行出错" : "本轮已完成";
+      notify(`${session?.title ?? "远端会话"} · ${tool} ${state}`);
+      if (settings.aiNotifyTaskbar && !document.hasFocus()) {
+        void getCurrentWindow().requestUserAttention(UserAttentionType.Informational).catch(() => {});
+      }
+    },
+  });
   /**
    * 看板卡片的 1 秒重算时钟（只在面板打开时走）。
    *
@@ -297,7 +315,7 @@ function AppBody() {
    * 每秒 setState 纯属白烧主线程（审计要求：停用后前端不为它留任何定时器）。
    * 只有 fe-smoke 的测试豁免会把它打开。
    */
-  const aiUiNow = useUiClock(aiPanelOpen && !AI_PANEL_HIDDEN);
+  const aiUiNow = useUiClock(aiPanelOpen && AI_PANEL_TEST_ONLY_SHOW);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   // AI 任务看板（v2）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片。
   //
@@ -472,8 +490,9 @@ function AppBody() {
    * 运行中 / 空闲 / 陈旧 / 只产出文件 / 探测不到 —— **一个都不算**。
    */
   const aiBadgeCount =
-    (settings.aiNotifyNeedsYouBadge ? aiNeedIds.length : 0) +
-    (settings.aiNotifyFinishedBadge ? aiPendingFinish.length : 0);
+    AI_PANEL_TEST_ONLY_SHOW ?
+      (settings.aiNotifyNeedsYouBadge ? aiNeedIds.length : 0) +
+      (settings.aiNotifyFinishedBadge ? aiPendingFinish.length : 0) : monitor.badgeCount;
   /**
    * AI 输入窗（状态栏「✍ 发给 AI」拉出来的那个）：多行编辑 + 附件。
    *
@@ -647,6 +666,7 @@ function AppBody() {
     msiSha: string;
     zipUrl: string;
     pageUrl: string;
+    downloadHint: string;
   } | null>(null);
   /** 当前这份是怎么装上的：nsis / msi / portable */
   const [installKind, setInstallKind] = useState<string>("");
@@ -771,7 +791,9 @@ function AppBody() {
     void refresh();
     void (async () => {
       try {
-        setSettings({ ...DEFAULT_SETTINGS, ...(await settingsGet()) });
+        const loaded = { ...DEFAULT_SETTINGS, ...(await settingsGet()) };
+        loaded.defaultShell = supportedShell(loaded.defaultShell);
+        setSettings(loaded);
       } catch {
         /* 设置读取失败就用默认值 */
       } finally {
@@ -2314,13 +2336,13 @@ function AppBody() {
   // 命令面板：Ctrl+Shift+P 打开，输入过滤，回车执行
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === "P" || e.key === "p" || e.code === "KeyP")) {
+      if (primaryModifier(e) && e.shiftKey && (e.key === "P" || e.key === "p" || e.code === "KeyP")) {
         e.preventDefault();
         setPaletteQuery("");
         setPaletteOpen((v) => !v);
       } else if (e.key === "Escape") {
         setPaletteOpen(false);
-      } else if (e.ctrlKey && !e.altKey) {
+      } else if (primaryModifier(e) && !e.altKey) {
         // 字体缩放：Ctrl + ＋ / － / 0（和浏览器、VS Code 一个习惯）
         // 这几个组合键在 shell / tmux 里都没有含义，抢过来不会影响终端输入
         const k = e.key;
@@ -2479,8 +2501,8 @@ function AppBody() {
             if (s.herdrPane && s.herdrMode !== "control") {
               await ensureHerdrInput(id, p.id, s.user ?? null, s.herdrPane);
             }
-          } else if (s.kind === "powershell" || s.kind === "cmd" || s.kind === "wsl") {
-            const id = await openLocalSession(s.kind, undefined, s.cwd, s.title);
+          } else if (isLocalKind(s.kind)) {
+            const id = await openLocalSession(s.shell ?? s.kind, undefined, s.cwd, s.title);
             ids.push(id);
           } else if (s.kind === "serial") {
             const p = list.find((x) => x.type === "serial" && x.name === s.title);
@@ -2521,6 +2543,7 @@ function AppBody() {
       ),
       sessions: sessions.map((s) => ({
         kind: s.kind,
+        shell: s.shell,
         title: s.title,
         profileId: s.profileId,
         user: s.user,
@@ -3128,6 +3151,7 @@ function AppBody() {
         bus.push(sessionId, b64ToBytes(e.data));
         break;
       case "state":
+        monitor.connectionChanged(sessionId, e.state);
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, state: e.state } : s)),
         );
@@ -3139,6 +3163,7 @@ function AppBody() {
         );
         break;
       case "error":
+        monitor.connectionChanged(sessionId, "error");
         // 后端给的是「中文短句｜原始信息：<英文>」（见 core::ssh::friendly_ssh_error）：
         // 中文那半直接显示，英文原文自动进悬停（notify 里做），这里不用再加工。
         notify(e.message);
@@ -3833,11 +3858,12 @@ function AppBody() {
 
   async function openLocalSession(
     /** "pwsh" = PowerShell 7（pwsh.exe）；"powershell" = 系统自带的 Windows PowerShell 5.1 */
-    shell: "powershell" | "pwsh" | "cmd" | "wsl",
+    shell: LocalShell,
     distro?: string,
     cwd?: string,
     titleOverride?: string,
   ): Promise<string> {
+    shell = supportedShell(shell);
     const id = uid();
     // pwsh 归到「PowerShell」这个面板下（kind 还是 powershell），这样侧栏只多一个按钮、
     // 不多一个模块；但标题/编号按各自的口味分开算，不会出现两个都叫"PowerShell 2"。
@@ -3849,7 +3875,7 @@ function AppBody() {
           ? "命令提示符"
           : shell === "pwsh"
             ? "PowerShell 7"
-            : "PowerShell";
+            : SHELL_LABEL[shell];
     // 同一个模块开多个时编号，方便在侧栏/标签里区分（PowerShell、PowerShell 2、…）
     const sameKind =
       sessionsRef.current.filter((s) => s.kind === kind && (s.title ?? "").startsWith(base))
@@ -3859,6 +3885,7 @@ function AppBody() {
       id,
       title,
       kind,
+      shell,
       cwd,
       state: "connecting",
       openFiles: [],
@@ -3886,6 +3913,7 @@ function AppBody() {
       );
     } catch (e) {
       notify("打开本地终端失败：" + String(e));
+      setSessions((prev) => prev.map((s) => s.id === id ? { ...s, state: "error" } : s));
     }
     return id;
   }
@@ -3942,6 +3970,7 @@ function AppBody() {
         : explicitName ?? defaultTmuxName(profile, userOverride ?? undefined);
     const alreadyOpen = sessionsRef.current.find((s) => {
       if (s.profileId !== profile.id) return false;
+      if ((s.user ?? profile.ssh?.user ?? "").trim() !== (userOverride ?? profile.ssh?.user ?? "").trim()) return false;
       // herdr 窗格：同一个窗格、同一种打开方式只开一个
       //（只读观察和可写接管是两回事，允许各开一个）
       if (backend === "herdr-pane" || backend === "herdr-control") {
@@ -4004,6 +4033,9 @@ function AppBody() {
         userOverride ?? null,
         backend ?? "tmux",
       );
+      // The early connected event may precede registry insertion in open_ssh.
+      // Re-submit only after the IPC has completed and backend metadata exists.
+      monitor.connectionChanged();
       // 最终显示名算一次、两处都用：标签上显示什么，历史里就存什么。
       // （以前历史存的是 setSessions 之前的 title，于是 herdr 会话出现了两条记录：
       //   标签/后端叫 "lz · herdr w9:p1"，历史里却躺着 "lz · w9:p1" —— 用户实测踩到。）
@@ -4217,12 +4249,14 @@ function AppBody() {
         s.id,
         s.profileId,
         (e) => handleEvent(s.id, e),
-        s.tmuxMode ?? "default",
-        s.tmuxName ?? null,
+        s.herdrPane ? "name" : s.tmuxMode ?? "default",
+        s.herdrPane ?? s.tmuxName ?? null,
         undefined,
         undefined,
         s.user ?? null,
+        s.herdrPane ? s.herdrMode === "control" ? "herdr-control" : "herdr-pane" : "tmux",
       );
+      monitor.connectionChanged();
     } catch (e) {
       const profile = profiles.find((p) => p.id === s.profileId);
       const msg = connErrorText("重连失败", e, !!profile?.ssh?.allowPassword);
@@ -5033,11 +5067,13 @@ function AppBody() {
           s.user ?? null,
           s.herdrMode === "control" ? "herdr-control" : "herdr-pane",
         );
+        monitor.connectionChanged();
         if (s.herdrMode !== "control") {
           await ensureHerdrInput(sessionId, s.profileId, s.user ?? null, s.herdrPane);
         }
       } catch (e) {
         notify("重开这个 herdr 窗格失败：" + String(e));
+        setSessions((prev) => prev.map((x) => x.id === sessionId ? { ...x, state: "error" } : x));
       }
       return;
     }
@@ -5053,7 +5089,11 @@ function AppBody() {
         (e) => handleEvent(sessionId, e),
         s.tmuxMode ?? "default",
         s.tmuxName ?? null,
+        undefined,
+        undefined,
+        s.user ?? null,
       );
+      monitor.connectionChanged();
       reconnectTries.current[sessionId] = 0;
     } catch {
       scheduleReconnect(sessionId);
@@ -5264,8 +5304,10 @@ function AppBody() {
       setUpdateMsg("正在检查…");
     }
     setUpdateOffer(null);
+    const aborter = new AbortController();
+    const timeout = window.setTimeout(() => aborter.abort(), 20_000);
     try {
-      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      const res = await fetch(url, { headers: { Accept: "application/json" }, signal: aborter.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as Record<string, unknown>;
       const latest = String(data.tag_name ?? data.version ?? data.latest ?? "")
@@ -5286,12 +5328,10 @@ function AppBody() {
       // 从 release 里挑出三种产物：NSIS 安装包 / MSI / 便携版 zip。
       // 一键升级要用哪一个是按"当前这份是怎么装上的"决定的（见 update_install_kind）。
       const assets = (Array.isArray(data.assets) ? data.assets : []) as Asset[];
-      const find = (test: (n: string) => boolean) =>
-        assets.find((a) => test(String(a.name ?? "").toLowerCase()));
-      const setup =
-        find((n) => n.endsWith(".exe") && n.includes("setup")) ?? find((n) => n.endsWith(".exe"));
-      const msi = find((n) => n.endsWith(".msi"));
-      const zip = find((n) => n.endsWith(".zip"));
+      const runtime = await runtimeInfo();
+      const { installer: setup, msi, portable: zip } = selectUpdateAssets(assets, runtime);
+      const downloadHint = !setup && !msi && !zip
+        ? `此发布尚未提供适用于 ${runtime.os} / ${runtime.arch} 的安装包，请前往发布页查看。` : "";
       const pageUrl = String(data.html_url ?? url);
       setUpdateOffer({
         version: latest,
@@ -5303,12 +5343,14 @@ function AppBody() {
         msiSha: msi?.digest ?? "",
         zipUrl: zip?.browser_download_url ?? "",
         pageUrl,
+        downloadHint,
       });
-      setUpdateMsg(`发现新版本 ${latest}（当前 ${APP_VERSION}）`);
+      setUpdateMsg(`发现新版本 ${latest}（当前 ${APP_VERSION}）${downloadHint ? "，暂未提供当前平台安装包" : ""}`);
       if (silent) notify(`发现新版本 ${latest}，在「设置 → 检查更新」里可以一键下载`);
     } catch (e) {
-      if (!silent) setUpdateMsg("检查失败：" + String(e));
+      if (!silent) setUpdateMsg(aborter.signal.aborted ? "检查超时，请确认网络或代理后重试。" : "检查失败：" + String(e));
     } finally {
+      window.clearTimeout(timeout);
       if (!silent) setUpdateBusy(false);
     }
   }
@@ -5505,15 +5547,15 @@ function AppBody() {
   function renderUpdateSection() {
     // 只有"安装版"才能一键覆盖升级：NSIS 走 setup.exe，MSI 走 msiexec；便携版只能手动替换
     const canOneClick =
-      (installKind === "nsis" && !!updateOffer?.installerUrl) ||
-      (installKind === "msi" && !!updateOffer?.msiUrl);
+      (installKind === "nsis" && !!updateOffer?.installerUrl && hasUpdateDigest(updateOffer.installerSha)) ||
+      (installKind === "msi" && !!updateOffer?.msiUrl && hasUpdateDigest(updateOffer.msiSha));
     return (
       <>
         <label className="modal-field">
           更新源（返回 JSON 的地址，含 tag_name 或 version 字段）
           <input
             value={settings.updateUrl}
-            placeholder="https://api.github.com/repos/you/zeeai-terminal/releases/latest"
+            placeholder="https://api.github.com/repos/zeelinkCN/ZeeAI_Term/releases/latest"
             onChange={(e) => void updateSettings({ updateUrl: e.target.value })}
           />
         </label>
@@ -5584,7 +5626,12 @@ function AppBody() {
                     className="mini-btn"
                     onClick={() => void openUpdateLink(updateOffer.installerUrl, "安装包下载")}
                   >
-                    下载安装包
+                    {IS_MAC ? "下载 macOS 安装包" : "下载安装包"}
+                  </button>
+                )}
+                {IS_WINDOWS && updateOffer.msiUrl && (
+                  <button type="button" className="mini-btn" onClick={() => void openUpdateLink(updateOffer.msiUrl, "MSI 安装包下载")}>
+                    下载 MSI 安装包
                   </button>
                 )}
                 <button
@@ -5604,11 +5651,13 @@ function AppBody() {
               </div>
             )}
             <div className="hint">
-              {canOneClick
+              {updateOffer.downloadHint || (canOneClick
                 ? installKind === "msi"
                   ? "MSI 是给企业批量部署用的（装在 Program Files，需要管理员），所以升级时会弹一次 UAC 授权；升级过程会自动结束当前应用并在装完后重新打开。"
                   : "会静默完成覆盖安装并自动重启应用；tmux 会话不受影响，重开后可以重新附加。"
-                : "当前是便携版：解压在哪个目录就替换哪个目录里的文件即可，配置不会丢。"}
+                : IS_MAC ? "macOS：打开 DMG 后把应用拖入 Applications，更新时退出旧版并替换应用即可。"
+                : installKind === "portable" ? "当前是便携版：解压在哪个目录就替换哪个目录里的文件即可，配置不会丢。"
+                : "新版未提供可校验的匹配安装包，请手动下载安装或前往发布页查看。")}
             </div>
           </>
         )}
@@ -5758,14 +5807,10 @@ function AppBody() {
             label: `新建默认终端（${SHELL_LABEL[settings.defaultShell]}）`,
             action: () => void openLocalSession(settings.defaultShell),
           },
-          { sep: false, label: "新建 PowerShell", action: () => void openLocalSession("powershell") },
-          {
-            sep: false,
-            label: "新建 PowerShell 7（pwsh）",
-            action: () => void openLocalSession("pwsh"),
-          },
-          { sep: false, label: "新建 CMD", action: () => void openLocalSession("cmd") },
-          { sep: false, label: "新建 WSL", action: () => void openLocalSession("wsl") },
+          ...LOCAL_SHELLS.map((shell) => ({
+            sep: false, label: `新建 ${shell.label}`, action: () => void openLocalSession(shell.key),
+          })),
+          ...(IS_WINDOWS ? [
           { sep: true },
           {
             sep: false,
@@ -5785,6 +5830,7 @@ function AppBody() {
             action: () => void doOpenAdminShell("cmd"),
           },
           { sep: true },
+          ] : []),
           {
             sep: false,
             label: "关闭当前会话",
@@ -6102,7 +6148,7 @@ function AppBody() {
 
   /** 已经打开的本地终端（PowerShell / CMD / WSL） */
   const localTerminals = useMemo(
-    () => sessions.filter((s) => s.kind === "powershell" || s.kind === "cmd" || s.kind === "wsl"),
+    () => sessions.filter((s) => isLocalKind(s.kind)),
     [sessions],
   );
 
@@ -6347,10 +6393,11 @@ function AppBody() {
     return herdrMgrRows(profile, mgr).filter((r) => r.idle).length;
   }
 
-  // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
-  // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
-  // 同一台机器来回切标签不会反复 ssh。
+  // Legacy board fixture only. Production monitoring uses the scoped backend;
+  // switching a tab must not trigger a server-wide workspace/process scan.
+  // Explicit workspace management retains its own refresh action.
   useEffect(() => {
+    if (!AI_PANEL_TEST_ONLY_SHOW) return;
     const s = sessions.find((x) => x.id === activeId) ?? null;
     const pid = s?.herdrPane ? s.profileId : null;
     if (!pid || herdrProbedFor.current === pid) return;
@@ -6446,6 +6493,17 @@ function AppBody() {
               />
             )}
 
+            {(["zsh", "bash"] as const).map((shell) => module === shell && (
+              <LocalModule
+                key={shell}
+                label={shell}
+                sessions={sessions.filter((s) => s.kind === shell)}
+                activeId={activeId}
+                onOpen={() => void openLocalSession(shell)}
+                onActivate={setActiveId}
+                onClose={(id) => void closeSession(id)}
+              />
+            ))}
             {module === "powershell" && (
               <LocalModule
                 label="PowerShell"
@@ -6505,6 +6563,7 @@ function AppBody() {
             )}
             {module === "adb" && (
               <SidebarAdb
+                openToolHelp={() => void openUpdateLink("https://developer.android.com/tools/releases/platform-tools", "Android 工具说明")}
                 {...{
                   adbList, adbVer, adbLoading, fbList, fbVer, refreshAdb, openAdbSession,
                   setAdbSerial, refreshAdbFiles,
@@ -6560,6 +6619,7 @@ function AppBody() {
           )}
 
           <TerminalArea
+            onTransportReady={monitor.connectionChanged}
             {...{
               activeSession, activeFile, sessions, profiles, settings, bus, activeId,
               setActiveId, paneLayout, paneSlots, focusedPane, setFocusedPane, setPanes,
@@ -6598,7 +6658,17 @@ function AppBody() {
           )}
         </main>
 
-        {aiPanelOpen && (
+        {aiPanelOpen && !AI_PANEL_TEST_ONLY_SHOW && <AiMonitorPanel views={monitor.views} sessions={sessions} profiles={profiles}
+          settings={settings} transportError={monitor.transportError} onClose={() => setAiPanelOpen(false)}
+          onSettings={updateSettings} onSelect={(id) => {
+            const session = sessions.find((s) => s.id === id);
+            if (!session) return;
+            setActiveId(id);
+            setModule(session.kind);
+            setSessions((prev) => prev.map((s) => s.id === id ? { ...s, activeTab: "terminal" } : s));
+            window.requestAnimationFrame(() => bus.focus(id));
+          }} />}
+        {aiPanelOpen && AI_PANEL_TEST_ONLY_SHOW && (
           <AiPanel
             {...{
               activeSession, sessions, setActiveId, setAiPanelOpen,
@@ -6618,8 +6688,11 @@ function AppBody() {
       {/* 口径 docs/design-ai-board-v2.md §10.3：技术标识（编码 / 终端类型）收进悬停，
           状态栏只留：会话 · 连通性 · 需要你 · 传输 */}
       <StatusBar
+        aiNeedsSummary={AI_PANEL_TEST_ONLY_SHOW ? undefined : monitor.needs.map((view) =>
+          `${sessions.find((s) => s.id === view.sessionId)?.title ?? "远端会话"} · ${monitorStateText(view)}`).join("\n")}
         {...{
-          activeSession, activeFile, statusMsg, setStatusMsg, aiNeedIds, boardInstances,
+          activeSession, activeFile, statusMsg, setStatusMsg,
+          aiNeedIds: AI_PANEL_TEST_ONLY_SHOW ? aiNeedIds : monitor.needs.map((v) => v.sessionId), boardInstances,
           setAiPanelOpen, isAdminMode, openSshDiagnosis,
         }}
       />

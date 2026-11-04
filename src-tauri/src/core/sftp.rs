@@ -20,6 +20,49 @@ const CHUNK: usize = 64 * 1024;
 /// 传输进度回调：(已传字节, 总字节)。总字节可能是估算值（目录会边算边传）。
 pub type ProgressSink<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
 
+fn validate_download_name(name: &str, windows: bool) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".."
+        || name.chars().any(|c| c == '/' || c == '\\' || c.is_control()) {
+        return Err(format!("远端文件名不安全，已拒绝下载: {name:?}"));
+    }
+    if windows {
+        let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+        let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+            || ["COM", "LPT"].iter().any(|prefix| stem.strip_prefix(prefix)
+                .map(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")).unwrap_or(false));
+        if reserved || name.ends_with(['.', ' ']) || name.chars().any(|c| "<>:\"|?*".contains(c)) {
+            return Err(format!("远端文件名不能保存到 Windows，已拒绝下载: {name:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn reject_local_link(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            let linked = md.file_type().is_symlink();
+            #[cfg(windows)]
+            let linked = {
+                use std::os::windows::fs::MetadataExt;
+                linked || md.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT, including junctions
+            };
+            if linked { return Err(format!("下载目标是符号链接或目录联接，已拒绝写入: {}", path.display())); }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("检查下载目标失败: {e}")),
+    }
+}
+
+/// SFTP entry names are untrusted. Windows also treats backslashes, drive prefixes
+/// and ADS colons as path syntax even when the remote server treats them as names.
+pub fn download_target(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    validate_download_name(name, cfg!(windows))?;
+    let target = parent.join(name);
+    reject_local_link(&target)?;
+    Ok(target)
+}
+
 /// 什么都不做的回调（不需要进度时用）
 pub fn no_progress(_done: u64, _total: u64) {}
 
@@ -110,9 +153,9 @@ fn key_candidates(key_path: Option<&str>) -> Vec<PathBuf> {
     if let Some(k) = key_path.filter(|k| !k.trim().is_empty()) {
         out.push(PathBuf::from(k.trim()));
     }
-    if let Ok(home) = std::env::var("USERPROFILE") {
+    if let Some(home) = dirs::home_dir() {
         for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-            out.push(Path::new(&home).join(".ssh").join(name));
+            out.push(home.join(".ssh").join(name));
         }
     }
     out
@@ -462,7 +505,8 @@ async fn upload_inner(
     let mut offset = 0u64;
     if let Ok(md) = conn.sftp.metadata(remote).await {
         let remote_len = md.size.unwrap_or(0);
-        if remote_len > 0 && remote_len < local_len {
+        if remote_len > 0 && remote_len < local_len
+            && remote_prefix_matches(conn, remote, local, remote_len).await? {
             offset = remote_len;
             log::info!("sftp 续传 {remote}: 从 {offset} 字节继续");
         }
@@ -500,6 +544,7 @@ pub async fn download(
     local: &Path,
     sink: ProgressSink<'_>,
 ) -> Result<u64, String> {
+    reject_local_link(local)?;
     let total = remote_size(conn, remote).await;
     download_inner(conn, remote, local, total, 0, sink).await
 }
@@ -538,7 +583,7 @@ async fn download_inner(
             let n = Box::pin(download_inner(
                 conn,
                 &child_remote,
-                &local.join(&name),
+                &download_target(local, &name)?,
                 total,
                 acc,
                 sink,
@@ -556,10 +601,12 @@ async fn download_inner(
     // 断点续传：本地已有前缀就接着下
     let local_len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
     let remote_len = md.size.unwrap_or(0);
-    let offset = if local_len > 0 && local_len < remote_len {
+    let same_prefix = local_len > 0 && local_len <= remote_len
+        && remote_prefix_matches(conn, remote, local, local_len).await?;
+    let offset = if same_prefix && local_len < remote_len {
         log::info!("sftp 续传下载 {remote}: 从 {local_len} 字节继续");
         local_len
-    } else if local_len == remote_len && remote_len > 0 {
+    } else if same_prefix && local_len == remote_len {
         // 已经下完了，直接算完成
         sink(done + remote_len, total.max(done + remote_len));
         return Ok(0);
@@ -567,6 +614,34 @@ async fn download_inner(
         0
     };
     read_to_local(conn, remote, local, offset, done + offset, total, sink).await
+}
+
+/// Equal lengths do not imply equal content. Verify the entire existing prefix
+/// before continuing or skipping a transfer, otherwise unrelated files get spliced.
+async fn matching_prefix<R, L>(remote: &mut R, local: &mut L, len: u64) -> std::io::Result<bool>
+where R: tokio::io::AsyncRead + Unpin, L: tokio::io::AsyncRead + Unpin {
+    use tokio::io::AsyncReadExt;
+    let mut remote_buf = vec![0u8; CHUNK];
+    let mut local_buf = vec![0u8; CHUNK];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(CHUNK as u64) as usize;
+        for result in [remote.read_exact(&mut remote_buf[..n]).await, local.read_exact(&mut local_buf[..n]).await] {
+            if let Err(error) = result {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof { return Ok(false); }
+                return Err(error);
+            }
+        }
+        if remote_buf[..n] != local_buf[..n] { return Ok(false); }
+        left -= n as u64;
+    }
+    Ok(true)
+}
+
+async fn remote_prefix_matches(conn: &SftpConn, remote: &str, local: &Path, len: u64) -> Result<bool, String> {
+    let mut remote_file = conn.sftp.open(remote).await.map_err(|e| sftp_err("校验远端续传内容失败", e))?;
+    let mut local_file = tokio::fs::File::open(local).await.map_err(|e| sftp_err("校验本地续传内容失败", e))?;
+    matching_prefix(&mut remote_file, &mut local_file, len).await.map_err(|e| sftp_err("校验续传内容失败", e))
 }
 
 /// 从远端读一段并追加写到本地，边写边报进度
@@ -728,6 +803,42 @@ pub async fn exec(conn: &SftpConn, command: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resume_requires_matching_bytes_not_just_matching_lengths() {
+        let data = vec![b'a'; CHUNK + 17];
+        let mut changed = data.clone();
+        changed[CHUNK + 1] = b'b';
+        assert!(matching_prefix(&mut &data[..], &mut &data[..], data.len() as u64).await.unwrap());
+        assert!(!matching_prefix(&mut &data[..], &mut &changed[..], data.len() as u64).await.unwrap());
+        assert!(!matching_prefix(&mut &data[..], &mut &data[..3], data.len() as u64).await.unwrap());
+        assert!(matching_prefix(&mut &data[..], &mut &data[..3], 3).await.unwrap());
+    }
+
+    #[test]
+    fn rejects_path_traversal_drive_names_ads_and_windows_devices() {
+        for name in ["", ".", "..", "../escape", "..\\escape", "/absolute", "C:\\escape",
+            "file:stream", "CON", "nul.txt", "COM1.log", "LPT9", "LPT¹", "trailing.", "trailing ", "bad\nname"] {
+            assert!(validate_download_name(name, true).is_err(), "accepted {name:?}");
+        }
+        assert!(validate_download_name("中文 文件.txt", true).is_ok());
+        assert!(validate_download_name("COM10.txt", true).is_ok());
+        assert!(validate_download_name("file:stream", false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_overwrite_a_local_symlink() {
+        let root = std::env::temp_dir().join(format!("zeeai-download-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("keep.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("remote.txt")).unwrap();
+        assert!(download_target(&root, "remote.txt").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// 主机密钥变了时，UI 看到的必须是 known_hosts 给的具体原因，
     /// 而不是 russh 那个泛泛的 "unknown key"。

@@ -4,6 +4,7 @@
 // 分两个文件反而让侧栏的 import 更长。
 
 import { IconAndroid, IconPlus, IconSerial } from "../components/Icons";
+import { IS_MAC } from "../lib/platform";
 import type { SerialMenuState } from "../lib/ui-model";
 import type { AdbDevice, ConnectionProfile, SerialPortInfo } from "../types";
 
@@ -70,6 +71,7 @@ export function SidebarSerial(props: SidebarSerialProps) {
 }
 
 export interface SidebarAdbProps {
+  openToolHelp: () => void;
   adbList: AdbDevice[];
   adbVer: string;
   adbLoading: boolean;
@@ -85,7 +87,7 @@ export interface SidebarAdbProps {
 export function SidebarAdb(props: SidebarAdbProps) {
   const {
   adbList, adbVer, adbLoading, fbList, fbVer, refreshAdb,
-  openAdbSession, setAdbSerial, refreshAdbFiles,
+  openAdbSession, setAdbSerial, refreshAdbFiles, openToolHelp,
   } = props;
   return (
     <>
@@ -103,6 +105,12 @@ export function SidebarAdb(props: SidebarAdbProps) {
       </div>
       {!adbLoading && adbList.length === 0 && adbVer !== "" && (
         <div className="hint">没有已连接的设备</div>
+      )}
+      {IS_MAC && !adbLoading && !adbVer && (
+        <div className="hint">
+          请先安装 Android Platform Tools，再重新打开应用。
+          <button type="button" className="mini-btn" onClick={openToolHelp}>打开官方安装说明</button>
+        </div>
       )}
       {adbList.map((d) => (
         <div

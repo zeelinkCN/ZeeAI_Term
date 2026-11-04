@@ -21,9 +21,15 @@ pub enum SessionEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         seq: Option<u64>,
     },
-    State { state: String },
-    Error { message: String },
-    Title { title: String },
+    State {
+        state: String,
+    },
+    Error {
+        message: String,
+    },
+    Title {
+        title: String,
+    },
 }
 
 pub struct SessionHandle {
@@ -67,6 +73,12 @@ impl Default for SessionRegistry {
 pub struct HerdrPaneMeta {
     pub profile_id: String,
     pub user: Option<String>,
+    /// Digest of the SSH destination/auth options used to open this stream.
+    /// Monitoring must stop if an edited profile no longer matches it.
+    pub connection_fingerprint: String,
+    /// Digest of `ssh -G` resolution when the stream opened. A later change to
+    /// ~/.ssh/config must not redirect monitoring or an observe-stream resize.
+    pub effective_connection_fingerprint: String,
     pub pane_id: String,
     /// "observe"（只读观察窗）/ "control"（可读可写，就是"进到她的环境里"那条）
     pub mode: String,

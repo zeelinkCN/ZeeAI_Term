@@ -122,8 +122,7 @@ fn default_group() -> String {
 }
 
 pub(crate) fn store_dir() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("ZeeAI-Terminal")
+    crate::core::platform::config_dir()
 }
 
 fn store_file() -> PathBuf {
@@ -206,30 +205,10 @@ fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// 非 Windows 的兜底：先把旧目标改名备份，再 rename 新的上去；
-/// 新文件替换失败时把备份改回来，保证原文件还在。
+/// Unix rename replaces an existing destination atomically on the same filesystem.
 #[cfg(not(windows))]
 fn replace_file(tmp: &Path, dst: &Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        return fs::rename(tmp, dst);
-    }
-    let name = dst
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "config".to_string());
-    let backup = dst.with_file_name(format!("{name}.old-{}.bak", unique_save_suffix()));
-    fs::rename(dst, &backup)?;
-    match fs::rename(tmp, dst) {
-        Ok(()) => {
-            let _ = fs::remove_file(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            // 尽力恢复原文件；即使恢复失败也把真实错误返回，不静默丢数据
-            let _ = fs::rename(&backup, dst);
-            Err(e)
-        }
-    }
+    fs::rename(tmp, dst)
 }
 
 /// **原子写**：先写同目录的唯一 `.tmp`，`sync_all` 落盘，再整体替换目标。
@@ -481,16 +460,20 @@ pub struct Settings {
     ///
     /// 为什么放在设置里、而不是写死 `false`：恢复面板时要能由**前端**打开（用户点开关 →
     /// `settings_set` 落盘 → 下次启动生效）。老配置里没有这个字段，
+    /// Legacy field retained for configuration compatibility; it no longer starts watchers.
     /// 因为 `Settings` 是 `#[serde(default)]`，缺字段会取 [`Settings::default`] 的值 = false，
     /// 不需要额外的迁移代码（`legacy_config_without_ai_watch_defaults_off` 钉着这一点）。
     pub ai_watch_enabled: bool,
+    /// Observe only open ZeeAI remote sessions; legacy full-server/local watchers stay retired.
+    #[serde(default = "default_true")]
+    pub ai_monitor_enabled: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: 13,
-            default_shell: "powershell".into(),
+            default_shell: crate::core::platform::default_shell().into(),
             record_history: true,
             tmux_default: true,
             theme: "dark".into(),
@@ -542,9 +525,9 @@ impl Default for Settings {
             // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
             // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
             paste_toast: false,
-            // **两条被动监视线程默认不启动**（AI 面板这一版暂停）。
-            // 恢复面板时由前端把这个开关打开（下次启动生效），别在代码里写死。
+            // Retained for old config round-trips; the scoped monitor uses its own flag.
             ai_watch_enabled: false,
+            ai_monitor_enabled: true,
         }
     }
 }

@@ -23,6 +23,7 @@ const UPDATE_REPO_PREFIX: &str = "https://github.com/zeelinkCN/ZeeAI_Term/releas
 /// - `portable`：解压在任意目录，只能手动替换文件。
 #[tauri::command]
 pub fn update_install_kind() -> String {
+    if cfg!(target_os = "macos") { return "macos".into(); }
     let Ok(exe) = std::env::current_exe() else {
         return "portable".into();
     };
@@ -88,6 +89,7 @@ pub fn fetch_update_package(
     version: &str,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<std::path::PathBuf, String> {
+    let digest = update_digest(expected_sha)?;
     let curl = find_curl().ok_or_else(|| {
         "找不到系统自带的 curl.exe（Windows 10 1803 以上都自带），请改用手动下载".to_string()
     })?;
@@ -132,7 +134,7 @@ pub fn fetch_update_package(
         ) {
             // 网络层失败（断流 / 超时）：`.part` 留着，下一次接着下
             Err(e) => last_err = e,
-            Ok(()) => match package_problem(&part, ext, expected_size, expected_sha) {
+            Ok(()) => match package_problem(&part, ext, expected_size, Some(&digest)) {
                 None => {
                     // 校验全过 → 原子改名成正式包
                     let _ = std::fs::remove_file(&dest);
@@ -211,6 +213,17 @@ fn header_ok(path: &std::path::Path, ext: &str) -> bool {
     }
 }
 
+fn update_digest(expected_sha: Option<&str>) -> Result<String, String> {
+    let raw = expected_sha.map(str::trim).filter(|s| !s.is_empty())
+        .ok_or_else(|| "缺少官方 SHA-256 校验信息，请从发布页手动下载安装包".to_string())?;
+    let lower = raw.to_ascii_lowercase();
+    let digest = lower.strip_prefix("sha256:").unwrap_or(&lower);
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("官方 SHA-256 格式不正确，请从发布页手动下载安装包".into());
+    }
+    Ok(digest.to_string())
+}
+
 /// 校验下好的包：没问题返回 None，有问题返回原因。
 ///
 /// - 大小必须和 Release 标注一致（防半截）；
@@ -232,19 +245,11 @@ fn package_problem(
     if !header_ok(path, ext) {
         return Some("文件头不对（不是有效的安装程序）".to_string());
     }
-    if let Some(want) = expected_sha.map(str::trim).filter(|s| !s.is_empty()) {
-        let want = want
-            .strip_prefix("sha256:")
-            .unwrap_or(want)
-            .to_ascii_lowercase();
-        if want.len() != 64 || !want.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(format!("官方给的 sha256 格式不对：{want}"));
-        }
-        match sha256_of(path) {
-            Ok(got) if got == want => {}
-            Ok(got) => return Some(format!("sha256 对不上（下载 {got}，官方 {want}）")),
-            Err(e) => return Some(e),
-        }
+    let want = match update_digest(expected_sha) { Ok(want) => want, Err(e) => return Some(e) };
+    match sha256_of(path) {
+        Ok(got) if got == want => {}
+        Ok(got) => return Some(format!("sha256 对不上（下载 {got}，官方 {want}）")),
+        Err(e) => return Some(e),
     }
     None
 }
@@ -269,6 +274,7 @@ pub async fn update_download_install(
     expected_sha: Option<String>,
     version: String,
 ) -> Result<String, String> {
+    if !cfg!(windows) { return Err("当前平台请下载 DMG 手动更新应用".into()); }
     let u = url.trim().to_string();
     // 「不要下错」的第一道闸：**只认本项目自己的 Release**。
     // 以前只校验"是不是 github.com 的 release 下载地址"，等于任何仓库都放行；
@@ -437,12 +443,21 @@ mod update_tests {
         body.extend(std::iter::repeat(0u8).take(14));
         std::fs::write(&exe, &body).unwrap();
         let good = sha256_of(&exe).unwrap();
+        assert!(package_problem(&exe, "exe", 16, None).unwrap().contains("缺少官方 SHA-256"));
         assert_eq!(package_problem(&exe, "exe", 16, Some(&good)), None);
         let mut bad = good.clone();
         bad.replace_range(0..1, if good.starts_with('a') { "b" } else { "a" });
         let p = package_problem(&exe, "exe", 16, Some(&format!("sha256:{bad}"))).unwrap();
         assert!(p.contains("sha256 对不上"), "{p}");
         let _ = std::fs::remove_file(&exe);
+    }
+
+    #[test]
+    fn missing_or_malformed_digest_cannot_enable_unverified_install() {
+        for digest in [None, Some(""), Some("sha256:abcd")] {
+            assert!(update_digest(digest).is_err());
+        }
+        assert_eq!(update_digest(Some(&format!("SHA256:{}", "A".repeat(64)))).unwrap(), "a".repeat(64));
     }
 
     // 说明：原来的 `apply_update_script_has_bounded_wait_and_failure_feedback` 已删 ——

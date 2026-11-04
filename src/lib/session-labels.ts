@@ -9,6 +9,7 @@ import type { TermPalette } from "../termThemes";
 import type { AppSettings, ConnectionProfile, HighlightRule, SessionState } from "../types";
 
 export function shellLabelOf(kind: string): string {
+  if (kind === "zsh" || kind === "bash") return `本机 ${kind}`;
   if (kind === "wsl") return "WSL";
   if (kind === "cmd") return "本机 CMD（仅状态）";
   return "本机 PowerShell";

@@ -594,6 +594,8 @@ pub fn spawn_with_sink<F>(
 where
     F: Fn(SessionEvent) + Send + 'static,
 {
+    #[cfg(windows)]
+    super::conpty_runtime::ensure()?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -733,6 +735,259 @@ pub fn push_herdr_bytes(
 mod tests {
     use super::*;
     use crate::core::herdr::StreamLine;
+
+    #[test]
+    fn native_pty_round_trips_input_after_resize() {
+        use std::io::Write;
+        let id = format!("native-pty-test-{}", std::process::id());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        #[cfg(windows)]
+        let (program, args) = ("powershell.exe", vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(),
+            "[Console]::WriteLine('ZEEAI_PTY_READY'); [Console]::Out.Flush(); $line = [Console]::ReadLine(); [Console]::WriteLine('ZEEAI_PTY_REPLY:' + $line)".into()]);
+        #[cfg(not(windows))]
+        let (program, args) = ("/bin/sh", vec!["-c".into(),
+            "stty -echo; printf 'ZEEAI_PTY_READY\\n'; IFS= read -r line; printf '\\nZEEAI_PTY_REPLY:%s\\n' \"$line\"".into()]);
+        let handle = spawn_with_sink(&id, "local", "PTY test", program, &args, None, 80, 24,
+            move |event| { let _ = sender.send(event); },
+            Arc::new(super::super::session_log::LogRegistry::new()), SpawnOpts::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = Vec::new();
+        let mut cursor_reported = false;
+        let mut input_sent = false;
+        while Instant::now() < deadline {
+            if let Ok(SessionEvent::Data { data, seq }) = receiver.recv_timeout(Duration::from_millis(100)) {
+                bytes.extend(base64::engine::general_purpose::STANDARD.decode(data).unwrap());
+                if let Some(seq) = seq { ack_output(&id, seq); }
+
+                // ConPTY inherits the cursor position and waits for this reply.
+                // xterm.js answers in the app; this headless test must do so itself.
+                // Inspect the accumulated bytes in case the query spans two reads.
+                if !cursor_reported && bytes.windows(4).any(|w| w == b"\x1b[6n") {
+                    let mut writer = handle.writer.lock().unwrap();
+                    writer.write_all(b"\x1b[1;1R").unwrap();
+                    writer.flush().unwrap();
+                    cursor_reported = true;
+                }
+
+                // Early input can be consumed by the cursor handshake. Wait until
+                // the shell has started before exercising resize and line input.
+                if !input_sent && String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_READY") {
+                    handle.master.as_ref().unwrap().lock().unwrap().resize(PtySize {
+                        rows: 30, cols: 100, pixel_width: 0, pixel_height: 0,
+                    }).unwrap();
+                    let mut writer = handle.writer.lock().unwrap();
+                    writer.write_all(b"hello\r").unwrap();
+                    writer.flush().unwrap();
+                    input_sent = true;
+                }
+                if String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_REPLY:hello") { break; }
+            }
+        }
+        if let Some(child) = handle.child { let _ = child.lock().unwrap().kill(); }
+        assert!(String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_REPLY:hello"),
+            "PTY input/output failed (input_sent={input_sent}): {:?}", String::from_utf8_lossy(&bytes));
+    }
+
+    #[test]
+    fn native_pty_osc7501_negotiation_and_status_round_trip() {
+        use std::io::Write;
+
+        const QUERY_BEL: &[u8] = b"\x1b]7501;?\x07";
+        const QUERY_ST: &[u8] = b"\x1b]7501;?\x1b\\";
+        const WORKING_BEL: &[u8] = b"\x1b]7501;state=working:app=codex:id=pty-smoke\x07";
+        const BLOCKED_ST: &[u8] =
+            b"\x1b]7501;state=blocked:app=codex:id=pty-smoke:kind=permission\x1b\\";
+        const DONE_BEL: &[u8] = b"\x1b]7501;state=done:app=codex:id=pty-smoke\x07";
+
+        // Both children turn off input echo and report only the base64 of bytes
+        // they actually read. Seeing our own echoed reply cannot pass this test.
+        // On Windows VT output is explicitly enabled, like an SSH/CLI terminal;
+        // the test must exercise ConPTY's handling of unknown OSCs as well as IPC.
+        #[cfg(windows)]
+        let (program, script) = (
+            "powershell.exe",
+            r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ZeeAiOscPtyConsole { [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int id); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleMode(IntPtr handle, out uint mode); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleMode(IntPtr handle, uint mode); }'
+$inputHandle = [ZeeAiOscPtyConsole]::GetStdHandle(-10)
+$outputHandle = [ZeeAiOscPtyConsole]::GetStdHandle(-11)
+$inputMode = [uint32]0
+$outputMode = [uint32]0
+if (-not [ZeeAiOscPtyConsole]::GetConsoleMode($inputHandle, [ref]$inputMode)) { throw 'No PTY input console' }
+if (-not [ZeeAiOscPtyConsole]::GetConsoleMode($outputHandle, [ref]$outputMode)) { throw 'No PTY output console' }
+try {
+    if (-not [ZeeAiOscPtyConsole]::SetConsoleMode($inputHandle, 0x0280)) { throw 'Cannot enable raw VT input' }
+    if (-not [ZeeAiOscPtyConsole]::SetConsoleMode($outputHandle, ($outputMode -bor 0x0004))) { throw 'Cannot enable VT output' }
+    $stdin = [Console]::OpenStandardInput()
+    function Read-Reply([int]$length, [string]$label) {
+        $reply = New-Object byte[] $length
+        $offset = 0
+        while ($offset -lt $length) {
+            $count = $stdin.Read($reply, $offset, ($length - $offset))
+            if ($count -le 0) { throw 'PTY input closed before reply' }
+            $offset += $count
+        }
+        [Console]::WriteLine('ZEEAI_OSC7501_REPLY_' + $label + ':' + [Convert]::ToBase64String($reply))
+        [Console]::Out.Flush()
+    }
+    $esc = [string][char]27
+    $bel = [string][char]7
+    $st = $esc + '\'
+    [Console]::WriteLine('ZEEAI_OSC7501_READY')
+    [Console]::Write($esc + ']7501;?' + $bel)
+    [Console]::Out.Flush()
+    Read-Reply 9 'BEL'
+    [Console]::Write($esc + ']7501;state=working:app=codex:id=pty-smoke' + $bel)
+    [Console]::Write($esc + ']7501;?' + $st)
+    [Console]::Out.Flush()
+    Read-Reply 10 'ST'
+    [Console]::Write($esc + ']7501;state=blocked:app=codex:id=pty-smoke:kind=permission' + $st)
+    [Console]::Write($esc + ']7501;state=done:app=codex:id=pty-smoke' + $bel)
+    [Console]::WriteLine('ZEEAI_OSC7501_FINISHED')
+    [Console]::Out.Flush()
+} finally {
+    [void][ZeeAiOscPtyConsole]::SetConsoleMode($inputHandle, $inputMode)
+    [void][ZeeAiOscPtyConsole]::SetConsoleMode($outputHandle, $outputMode)
+}
+"#,
+        );
+        #[cfg(not(windows))]
+        let (program, script) = (
+            "/bin/sh",
+            r#"
+saved_mode=$(stty -g) || exit 1
+trap 'stty "$saved_mode"' EXIT
+stty raw -echo || exit 1
+printf 'ZEEAI_OSC7501_READY\r\n'
+printf '\033]7501;?\007'
+reply=$(dd bs=1 count=9 2>/dev/null | base64 | tr -d '\r\n')
+printf '\r\nZEEAI_OSC7501_REPLY_BEL:%s\r\n' "$reply"
+printf '\033]7501;state=working:app=codex:id=pty-smoke\007'
+printf '\033]7501;?\033\\'
+reply=$(dd bs=1 count=10 2>/dev/null | base64 | tr -d '\r\n')
+printf '\r\nZEEAI_OSC7501_REPLY_ST:%s\r\n' "$reply"
+printf '\033]7501;state=blocked:app=codex:id=pty-smoke:kind=permission\033\\'
+printf '\033]7501;state=done:app=codex:id=pty-smoke\007'
+printf 'ZEEAI_OSC7501_FINISHED\r\n'
+"#,
+        );
+        #[cfg(windows)]
+        let args = vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            script.into(),
+        ];
+        #[cfg(not(windows))]
+        let args = vec!["-c".into(), script.into()];
+
+        let id = format!("native-pty-osc7501-test-{}", std::process::id());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = spawn_with_sink(
+            &id,
+            "local",
+            "OSC 7501 PTY test",
+            program,
+            &args,
+            None,
+            120,
+            30,
+            move |event| {
+                let _ = sender.send(event);
+            },
+            Arc::new(super::super::session_log::LogRegistry::new()),
+            SpawnOpts::default(),
+        )
+        .unwrap();
+        let write_reply = |reply: &[u8]| -> Result<(), String> {
+            let mut writer = handle.writer.lock().map_err(|e| e.to_string())?;
+            writer.write_all(reply).map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())
+        };
+        let contains = |bytes: &[u8], frame: &[u8]| bytes.windows(frame.len()).any(|w| w == frame);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut bytes = Vec::new();
+        let mut cursor_replies = 0;
+        let mut bel_replied = false;
+        let mut st_replied = false;
+        let mut error = None;
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(SessionEvent::Data { data, seq }) => {
+                    bytes.extend(base64::engine::general_purpose::STANDARD.decode(data).unwrap());
+                    if let Some(seq) = seq {
+                        ack_output(&id, seq);
+                    }
+                    // Detect cursor queries across arbitrary read/IPC splits.
+                    // This handshake must finish before the child can run.
+                    let queries = bytes.windows(4).filter(|w| *w == b"\x1b[6n").count();
+                    while cursor_replies < queries {
+                        if let Err(message) = write_reply(b"\x1b[1;1R") {
+                            error = Some(message);
+                            break;
+                        }
+                        cursor_replies += 1;
+                    }
+                    if error.is_some() {
+                        break;
+                    }
+                    if !bel_replied && contains(&bytes, QUERY_BEL) {
+                        if let Err(message) = write_reply(QUERY_BEL) {
+                            error = Some(message);
+                            break;
+                        }
+                        bel_replied = true;
+                    }
+                    if !st_replied && contains(&bytes, QUERY_ST) {
+                        if let Err(message) = write_reply(QUERY_ST) {
+                            error = Some(message);
+                            break;
+                        }
+                        st_replied = true;
+                    }
+                    if contains(&bytes, b"ZEEAI_OSC7501_FINISHED") {
+                        break;
+                    }
+                }
+                Ok(SessionEvent::Error { message }) => {
+                    error = Some(message);
+                    break;
+                }
+                Ok(SessionEvent::State { state }) if state == "closed" => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+        }
+        // Always terminate/reap the real process before asserting on failure.
+        if let Some(child) = handle.child.as_ref() {
+            let mut child = child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let reply_bel = format!(
+            "ZEEAI_OSC7501_REPLY_BEL:{}",
+            base64::engine::general_purpose::STANDARD.encode(QUERY_BEL)
+        );
+        let reply_st = format!(
+            "ZEEAI_OSC7501_REPLY_ST:{}",
+            base64::engine::general_purpose::STANDARD.encode(QUERY_ST)
+        );
+        assert!(
+            error.is_none()
+                && bel_replied
+                && st_replied
+                && contains(&bytes, reply_bel.as_bytes())
+                && contains(&bytes, reply_st.as_bytes())
+                && contains(&bytes, WORKING_BEL)
+                && contains(&bytes, BLOCKED_ST)
+                && contains(&bytes, DONE_BEL)
+                && contains(&bytes, b"ZEEAI_OSC7501_FINISHED"),
+            "OSC 7501 did not survive the native PTY in both directions \
+             (BEL replied={bel_replied}, ST replied={st_replied}, error={error:?}): {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
 
     #[test]
     fn observe_line_decodes_base64_payload() {
