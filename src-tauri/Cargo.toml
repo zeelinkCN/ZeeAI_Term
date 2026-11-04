@@ -1,6 +1,6 @@
 [package]
 name = "zeeai-terminal"
-version = "0.1.14"
+version = "0.1.15"
 description = "ZeeAI Terminal - cross-platform multi-protocol terminal workbench"
 authors = ["ZeeAI"]
 license = "GPL-3.0-or-later"

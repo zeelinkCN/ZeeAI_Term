@@ -7,6 +7,7 @@
 
 import { THEMES } from "../lib/app-consts";
 import { IS_MAC, LOCAL_SHELLS } from "../lib/platform";
+import { AI_PANEL_TEST_ONLY_SHOW } from "../lib/ai-labels";
 import type { AppSettings } from "../types";
 
 export interface SettingsLookFontTabProps {
@@ -250,6 +251,19 @@ export function SettingsNotifyTab(props: SettingsNotifyTabProps) {
   const {
   settings, updateSettings,
   } = props;
+  if (!AI_PANEL_TEST_ONLY_SHOW) return <>
+    <div className="tree-group">AI 状态观察</div>
+    <label className="form-check"><input type="checkbox" checked={settings.aiMonitorEnabled} onChange={(e) => void updateSettings({ aiMonitorEnabled: e.target.checked })} /><span>观察 ZeeAI 内打开的远端 Claude Code / Codex 会话</span></label>
+    <div className="hint" style={{ padding: "0 14px 8px" }}>CLI 状态实时接收；herdr 每分钟查询一次已打开窗格。收起面板继续观察，关闭会话停止观察。</div>
+    <div className="tree-group">什么时候提醒</div>
+    <label className="form-check"><input type="checkbox" checked={settings.aiNotifyNeedsYou} onChange={(e) => void updateSettings({ aiNotifyNeedsYou: e.target.checked })} /><span>等待我批准、回答、登录或运行出错时提醒</span></label>
+    <label className="form-check"><input type="checkbox" checked={settings.aiNotifyComplete} onChange={(e) => void updateSettings({ aiNotifyComplete: e.target.checked })} /><span>每轮完成时提醒（默认关）</span></label>
+    <div className="tree-group">提醒方式</div>
+    <label className="form-check"><input type="checkbox" checked={settings.aiNotifyTaskbar} onChange={(e) => void updateSettings({ aiNotifyTaskbar: e.target.checked })} /><span>{IS_MAC ? "窗口不在前台时通过 Dock 提醒" : "窗口不在前台时闪 Windows 任务栏"}</span></label>
+    <label className="form-check"><input type="checkbox" checked={settings.aiNotifyNeedsYouBadge} onChange={(e) => void updateSettings({ aiNotifyNeedsYouBadge: e.target.checked })} /><span>需要处理时在 AI 图标显示数字</span></label>
+    <label className="form-check"><input type="checkbox" checked={settings.aiNotifyFinishedBadge} onChange={(e) => void updateSettings({ aiNotifyFinishedBadge: e.target.checked })} /><span>完成时显示未读数字，打开面板后清除</span></label>
+    <div className="hint" style={{ padding: "2px 14px 8px" }}>同一状态不重复提醒。打开面板不会清除仍需处理的状态；断线和检测失败不会被当作完成。</div>
+  </>;
   return (
       <>
     <div className="tree-group">什么时候提醒我</div>

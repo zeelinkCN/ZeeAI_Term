@@ -279,14 +279,15 @@ pub fn shell_with_cwd_report() -> String {
     // 除了 OSC 7（上报当前目录），这里捎带做 G-02：OSC 133 的 `D;<退出码>` ——
     // 每个命令结束时把**退出码**报上来，卡片就能显示"上一轮退出码 0"、并拿到精确的结束时刻。
     //
-    // 只发 D，不去改 PS1 / 不发 A/B/C：这条命令会被塞进 ssh 的远端命令里，
-    // 越短越不容易踩转义坑；而"命令结束 + 退出码"恰好是最有用的那一个信号。
+    // D preserves the exit code; A marks the shell prompt so the AI monitor can
+    // retire a live status after the foreground program exits without reporting done.
+    // No PS1 or server-side rc file is changed, and neither signal implies AI completion.
     // 注意 `$?` 必须是 PROMPT_COMMAND 里**第一个**被求值的东西，否则会被前面的命令覆盖。
     //
     // 已知限制（如实记录）：**tmux 会话上这条路走不通** —— tmux 里 shell 的环境来自
     // tmux server，而 server 可能是别的客户端先起的；这台服务器 tmux 还是 2.7，
     // 没有 `-e` 传环境变量，而模拟按键又被明确禁止。所以 tmux 会话拿不到退出码。
-    r#"if [ -n "$BASH_VERSION" ] || [ "$(basename "${SHELL:-bash}")" = "bash" ]; then PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; export PROMPT_COMMAND; fi; exec "${SHELL:-/bin/bash}""#
+    r#"if [ -n "$BASH_VERSION" ] || [ "$(basename "${SHELL:-bash}")" = "bash" ]; then PROMPT_COMMAND='printf "\033]133;D;%s\007\033]133;A\007" "$?"; printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; export PROMPT_COMMAND; fi; exec "${SHELL:-/bin/bash}""#
         .to_string()
 }
 

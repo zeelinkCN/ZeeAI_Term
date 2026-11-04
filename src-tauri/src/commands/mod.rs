@@ -7,6 +7,7 @@
 
 mod adb;
 mod ai;
+mod ai_monitor;
 mod fs;
 mod git;
 mod herdr;
@@ -19,6 +20,7 @@ mod util;
 
 pub use adb::*;
 pub use ai::*;
+pub use ai_monitor::*;
 pub use fs::*;
 pub use git::*;
 pub use herdr::*;

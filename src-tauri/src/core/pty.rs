@@ -741,29 +741,49 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         #[cfg(windows)]
         let (program, args) = ("powershell.exe", vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(),
-            "$line = [Console]::ReadLine(); [Console]::WriteLine('ZEEAI_PTY_REPLY:' + $line)".into()]);
+            "[Console]::WriteLine('ZEEAI_PTY_READY'); [Console]::Out.Flush(); $line = [Console]::ReadLine(); [Console]::WriteLine('ZEEAI_PTY_REPLY:' + $line)".into()]);
         #[cfg(not(windows))]
         let (program, args) = ("/bin/sh", vec!["-c".into(),
-            "stty -echo; IFS= read -r line; printf '\\nZEEAI_PTY_REPLY:%s\\n' \"$line\"".into()]);
+            "stty -echo; printf 'ZEEAI_PTY_READY\\n'; IFS= read -r line; printf '\\nZEEAI_PTY_REPLY:%s\\n' \"$line\"".into()]);
         let handle = spawn_with_sink(&id, "local", "PTY test", program, &args, None, 80, 24,
             move |event| { let _ = sender.send(event); },
             Arc::new(super::super::session_log::LogRegistry::new()), SpawnOpts::default()).unwrap();
-        handle.master.as_ref().unwrap().lock().unwrap().resize(PtySize {
-            rows: 30, cols: 100, pixel_width: 0, pixel_height: 0,
-        }).unwrap();
-        handle.writer.lock().unwrap().write_all(b"hello\r").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut bytes = Vec::new();
+        let mut cursor_reported = false;
+        let mut input_sent = false;
         while Instant::now() < deadline {
             if let Ok(SessionEvent::Data { data, seq }) = receiver.recv_timeout(Duration::from_millis(100)) {
                 bytes.extend(base64::engine::general_purpose::STANDARD.decode(data).unwrap());
                 if let Some(seq) = seq { ack_output(&id, seq); }
+
+                // ConPTY inherits the cursor position and waits for this reply.
+                // xterm.js answers in the app; this headless test must do so itself.
+                // Inspect the accumulated bytes in case the query spans two reads.
+                if !cursor_reported && bytes.windows(4).any(|w| w == b"\x1b[6n") {
+                    let mut writer = handle.writer.lock().unwrap();
+                    writer.write_all(b"\x1b[1;1R").unwrap();
+                    writer.flush().unwrap();
+                    cursor_reported = true;
+                }
+
+                // Early input can be consumed by the cursor handshake. Wait until
+                // the shell has started before exercising resize and line input.
+                if !input_sent && String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_READY") {
+                    handle.master.as_ref().unwrap().lock().unwrap().resize(PtySize {
+                        rows: 30, cols: 100, pixel_width: 0, pixel_height: 0,
+                    }).unwrap();
+                    let mut writer = handle.writer.lock().unwrap();
+                    writer.write_all(b"hello\r").unwrap();
+                    writer.flush().unwrap();
+                    input_sent = true;
+                }
                 if String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_REPLY:hello") { break; }
             }
         }
         if let Some(child) = handle.child { let _ = child.lock().unwrap().kill(); }
         assert!(String::from_utf8_lossy(&bytes).contains("ZEEAI_PTY_REPLY:hello"),
-            "PTY input/output failed: {}", String::from_utf8_lossy(&bytes));
+            "PTY input/output failed (input_sent={input_sent}): {:?}", String::from_utf8_lossy(&bytes));
     }
 
     #[test]

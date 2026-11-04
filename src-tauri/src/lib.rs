@@ -260,39 +260,9 @@ pub fn run() {
         }
         let _ = builder.build(app);
       }
-      // 本机 codex 日志 → 红点（§10.6 唯一允许"自动亮"的本机来源之一）。
-      //
-      // **只读文件、不起子进程**：线程里只有 `std::fs::metadata` + 读取新增字节，
-      // 没有任何 `Command` / `ssh` / `ps`。用户明确反对的是"短周期自动探测子进程"
-      // （那会弹控制台窗口、耗 CPU）；读自己的日志文件不属于探测，而且这也是用户
-      // 2026-10-20 亲口确认的口径（"本地 codex 的日志文件也算可以直接读"）。
-      // ⚠️ 别往这条线程里加任何命令；要加探测必须先问用户（见 docs/design-ai-board-v2.md §10.8）。
-      //
-      // **AI 面板这一版暂停，所以这两条被动监视线程默认不启动**（架构审查 minor-16）。
-      // 以前前端的 `AI_PANEL_DISABLED` 只挡住界面，后端照样每 2.5 秒扫日志树、
-      // 每 60 秒对每台服务器起 ssh —— 面板看不见的时候这些全是白烧。
-      // 开关在设置里（`aiWatchEnabled`，默认 **false**）：前端将来恢复面板时把它打开，
-      // 下次启动生效。**别把这里的判断改成写死**。
-      let ai_watch_enabled = crate::store::load_settings().ai_watch_enabled;
-      if ai_watch_enabled {
-        crate::core::ai_log_watch::spawn(app.handle().clone());
-      } else {
-        log::info!("ai-log: aiWatchEnabled=false（AI 面板暂停中），本机日志监视没有启动");
-      }
-      // herdr 红点轮询（用户 2026-10-20 明确批准）：每台**勾了 herdr 的**服务器
-      // 每 60 秒查一次 `herdr agent list`，只用来驱动红点。
-      //
-      // 为什么不和上面那条并在一起：这条**要起 ssh**（herdr 的状态只能这么拉），
-      // 所以它必须有自己的间隔（60 秒，用户批的下限）、自己的失败静默策略，
-      // 以及一个应用退出时能置位的停止位；读本机日志那条 2.5 秒一轮、不碰网络。
-      // 探测本身复用 `commands::herdr_agents`（→ `run_remote_capture` →
-      // `proc::hidden_command_async`，带 CREATE_NO_WINDOW），不会弹黑框。
-      // ⚠️ 不要往这条线程里塞第二个探测 / 改小间隔；见 core/ai_herdr_dots.rs 模块头。
-      if ai_watch_enabled {
-        crate::core::ai_herdr_dots::spawn(app.handle().clone());
-      } else {
-        log::info!("herdr 红点: aiWatchEnabled=false（AI 面板暂停中），轮询没有启动");
-      }
+      // The new watcher is idle until the UI submits connected herdr sessions.
+      // Legacy aiWatchEnabled never enables profile-wide or local log monitoring.
+      crate::core::ai_monitor::spawn(app.handle().clone());
       // 自动化演示：设置 ZEEAI_AUTODEMO=1 时，启动后通知前端按脚本走一遍流程
       // （连接 → 切文件 → 打开预览），便于无人值守截图验证界面。
       //
@@ -738,6 +708,7 @@ pub fn run() {
     .manage(SessionRegistry::new())
     // herdr 观察窗的元信息 + 输入泵
     .manage(crate::core::HerdrPaneRegistry::default())
+    .manage(std::sync::Arc::new(crate::core::ai_monitor::AiMonitor::default()))
     .manage(std::sync::Arc::new(
         crate::core::session_log::LogRegistry::new(),
     ))
@@ -817,6 +788,7 @@ pub fn run() {
       commands::update_take_result,
       commands::update_download_install,
       commands::ai_probe,
+      commands::ai_monitor_sessions_set,
       commands::highlight_presets,
       commands::is_admin,
       commands::runtime_info,
@@ -880,9 +852,7 @@ pub fn run() {
       }
       // 退出前把所有会话进程收干净（Job Object 也会兜底，但显式做更清晰）
       if let tauri::RunEvent::Exit = event {
-        // herdr 红点轮询：先置停止位，让它在下一个分片睡眠（≤500ms）里收尾，
-        // 不会在退出路径上再多发一次 ssh。
-        crate::core::ai_herdr_dots::stop();
+        app_handle.state::<std::sync::Arc<crate::core::ai_monitor::AiMonitor>>().stop();
         let registry = app_handle.state::<SessionRegistry>();
         // 先把句柄取出来再 kill，避免在持有 map 锁的同时去碰子进程
         let handles: Vec<_> = match registry.sessions.lock() {

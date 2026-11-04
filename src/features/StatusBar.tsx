@@ -17,6 +17,7 @@ export interface StatusBarProps {
   /** 需要你处理的实例 id（点一下开 AI 面板） */
   aiNeedIds: string[];
   boardInstances: AiInstance[];
+  aiNeedsSummary?: string;
   setAiPanelOpen: (v: boolean) => void;
   isAdminMode: boolean;
   /** 连接失败时状态栏上那个「诊断一下」 */
@@ -26,7 +27,7 @@ export interface StatusBarProps {
 export function StatusBar(props: StatusBarProps) {
   const {
   activeSession, activeFile, statusMsg, setStatusMsg, aiNeedIds, boardInstances,
-  setAiPanelOpen, isAdminMode, openSshDiagnosis,
+  setAiPanelOpen, isAdminMode, openSshDiagnosis, aiNeedsSummary,
   } = props;
   return (
     <div
@@ -80,7 +81,7 @@ export function StatusBar(props: StatusBarProps) {
         <button
           type="button"
           className="stat ai-need-chip"
-          title={`${boardInstances
+          title={`${aiNeedsSummary ?? boardInstances
             .filter((i) => i.state === "needs-you")
             .map((i) => `${aiAgentLabel(i.agent)} · ${aiInstanceWhere(i)} · ${i.badge}`)
             .join("\n")}\n\n点这里打开看板（红点亮到你处理为止）`}

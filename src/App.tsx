@@ -154,6 +154,8 @@ import { AboutDialog } from "./features/AboutDialog";
 import { ActivityBar } from "./features/ActivityBar";
 import { AdbFileDialog } from "./features/AdbFileDialog";
 import { AiPanel } from "./features/AiPanel";
+import { AiMonitorPanel, monitorStateText } from "./features/AiMonitorPanel";
+import { useAiMonitor } from "./lib/use-ai-monitor";
 import { AppErrorBoundary, TestOnlyCrashProbe } from "./features/AppErrorBoundary";
 import { CommandPalette } from "./features/CommandPalette";
 import { Composer } from "./features/Composer";
@@ -181,7 +183,7 @@ import { SessionRenameDialog, TabContextMenu } from "./features/TabContextMenu";
 import { TerminalArea } from "./features/TerminalArea";
 import { TitleBar } from "./features/TitleBar";
 import { TransfersDock } from "./features/TransfersDock";
-import { AI_PANEL_HIDDEN, aiAgentLabel, aiBadgeCoversSource, aiBadgeTitle, aiDurationText, aiEnvLabel, aiShorten, aiSourceLabelOf, aiStateLabel, aiStateLabelOf, aiToolLabel, herdrAgentLabel, herdrStateOf, isActiveInstance, tokenM } from "./lib/ai-labels";
+import { AI_PANEL_HIDDEN, AI_PANEL_TEST_ONLY_SHOW, aiAgentLabel, aiBadgeCoversSource, aiBadgeTitle, aiDurationText, aiEnvLabel, aiShorten, aiSourceLabelOf, aiStateLabel, aiStateLabelOf, aiToolLabel, herdrAgentLabel, herdrStateOf, isActiveInstance, tokenM } from "./lib/ai-labels";
 import { APP_VERSION, DEFAULT_SETTINGS, EMPTY_PROFILE, LOCAL_SCAN_MIN_INTERVAL_MS, SHELL_LABEL, compareVersion, paneCount, themeKind } from "./lib/app-consts";
 import { DRAFT_MAX_BYTES, DRAFT_SAVE_DEBOUNCE_MS, composerDraftIdentity, draftTextBytes, loadStoredDrafts, writeStoredDrafts } from "./lib/composer-draft";
 import { fileKind, humanSize, isDocName, joinPath } from "./lib/file-kind";
@@ -291,6 +293,18 @@ function AppBody() {
   const [paletteQuery, setPaletteQuery] = useState("");
   // 右侧 AI Agent 面板
   const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const monitor = useAiMonitor({ bus, sessions, enabled: settingsReady && settings.aiMonitorEnabled && !AI_PANEL_TEST_ONLY_SHOW,
+    panelOpen: aiPanelOpen, settings,
+    onNotice: (notice) => {
+      const session = sessions.find((s) => s.id === notice.sessionId);
+      const tool = notice.agent === "claude" ? "Claude Code" : "Codex";
+      const state = notice.kind === "blocked" ? "需要你处理" : notice.kind === "error" ? "运行出错" : "本轮已完成";
+      notify(`${session?.title ?? "远端会话"} · ${tool} ${state}`);
+      if (settings.aiNotifyTaskbar && !document.hasFocus()) {
+        void getCurrentWindow().requestUserAttention(UserAttentionType.Informational).catch(() => {});
+      }
+    },
+  });
   /**
    * 看板卡片的 1 秒重算时钟（只在面板打开时走）。
    *
@@ -301,7 +315,7 @@ function AppBody() {
    * 每秒 setState 纯属白烧主线程（审计要求：停用后前端不为它留任何定时器）。
    * 只有 fe-smoke 的测试豁免会把它打开。
    */
-  const aiUiNow = useUiClock(aiPanelOpen && !AI_PANEL_HIDDEN);
+  const aiUiNow = useUiClock(aiPanelOpen && AI_PANEL_TEST_ONLY_SHOW);
   const [aiNotices, setAiNotices] = useState<{ id: string; text: string; time: number }[]>([]);
   // AI 任务看板（v2）：本地 / WSL / 远端正在跑（或刚跑完）的 AI 汇总成卡片。
   //
@@ -476,8 +490,9 @@ function AppBody() {
    * 运行中 / 空闲 / 陈旧 / 只产出文件 / 探测不到 —— **一个都不算**。
    */
   const aiBadgeCount =
-    (settings.aiNotifyNeedsYouBadge ? aiNeedIds.length : 0) +
-    (settings.aiNotifyFinishedBadge ? aiPendingFinish.length : 0);
+    AI_PANEL_TEST_ONLY_SHOW ?
+      (settings.aiNotifyNeedsYouBadge ? aiNeedIds.length : 0) +
+      (settings.aiNotifyFinishedBadge ? aiPendingFinish.length : 0) : monitor.badgeCount;
   /**
    * AI 输入窗（状态栏「✍ 发给 AI」拉出来的那个）：多行编辑 + 附件。
    *
@@ -3136,6 +3151,7 @@ function AppBody() {
         bus.push(sessionId, b64ToBytes(e.data));
         break;
       case "state":
+        monitor.connectionChanged(sessionId, e.state);
         setSessions((prev) =>
           prev.map((s) => (s.id === sessionId ? { ...s, state: e.state } : s)),
         );
@@ -3147,6 +3163,7 @@ function AppBody() {
         );
         break;
       case "error":
+        monitor.connectionChanged(sessionId, "error");
         // 后端给的是「中文短句｜原始信息：<英文>」（见 core::ssh::friendly_ssh_error）：
         // 中文那半直接显示，英文原文自动进悬停（notify 里做），这里不用再加工。
         notify(e.message);
@@ -3953,6 +3970,7 @@ function AppBody() {
         : explicitName ?? defaultTmuxName(profile, userOverride ?? undefined);
     const alreadyOpen = sessionsRef.current.find((s) => {
       if (s.profileId !== profile.id) return false;
+      if ((s.user ?? profile.ssh?.user ?? "").trim() !== (userOverride ?? profile.ssh?.user ?? "").trim()) return false;
       // herdr 窗格：同一个窗格、同一种打开方式只开一个
       //（只读观察和可写接管是两回事，允许各开一个）
       if (backend === "herdr-pane" || backend === "herdr-control") {
@@ -4015,6 +4033,9 @@ function AppBody() {
         userOverride ?? null,
         backend ?? "tmux",
       );
+      // The early connected event may precede registry insertion in open_ssh.
+      // Re-submit only after the IPC has completed and backend metadata exists.
+      monitor.connectionChanged();
       // 最终显示名算一次、两处都用：标签上显示什么，历史里就存什么。
       // （以前历史存的是 setSessions 之前的 title，于是 herdr 会话出现了两条记录：
       //   标签/后端叫 "lz · herdr w9:p1"，历史里却躺着 "lz · w9:p1" —— 用户实测踩到。）
@@ -4228,12 +4249,14 @@ function AppBody() {
         s.id,
         s.profileId,
         (e) => handleEvent(s.id, e),
-        s.tmuxMode ?? "default",
-        s.tmuxName ?? null,
+        s.herdrPane ? "name" : s.tmuxMode ?? "default",
+        s.herdrPane ?? s.tmuxName ?? null,
         undefined,
         undefined,
         s.user ?? null,
+        s.herdrPane ? s.herdrMode === "control" ? "herdr-control" : "herdr-pane" : "tmux",
       );
+      monitor.connectionChanged();
     } catch (e) {
       const profile = profiles.find((p) => p.id === s.profileId);
       const msg = connErrorText("重连失败", e, !!profile?.ssh?.allowPassword);
@@ -5044,11 +5067,13 @@ function AppBody() {
           s.user ?? null,
           s.herdrMode === "control" ? "herdr-control" : "herdr-pane",
         );
+        monitor.connectionChanged();
         if (s.herdrMode !== "control") {
           await ensureHerdrInput(sessionId, s.profileId, s.user ?? null, s.herdrPane);
         }
       } catch (e) {
         notify("重开这个 herdr 窗格失败：" + String(e));
+        setSessions((prev) => prev.map((x) => x.id === sessionId ? { ...x, state: "error" } : x));
       }
       return;
     }
@@ -5064,7 +5089,11 @@ function AppBody() {
         (e) => handleEvent(sessionId, e),
         s.tmuxMode ?? "default",
         s.tmuxName ?? null,
+        undefined,
+        undefined,
+        s.user ?? null,
       );
+      monitor.connectionChanged();
       reconnectTries.current[sessionId] = 0;
     } catch {
       scheduleReconnect(sessionId);
@@ -6364,10 +6393,11 @@ function AppBody() {
     return herdrMgrRows(profile, mgr).filter((r) => r.idle).length;
   }
 
-  // 切到 herdr 会话时顺手探一次**那台机器**的服务状态：这样状态条上那句
-  // 「服务运行中 · N 个窗格」不用先打开 AI 面板就有。只在换了服务器时才探，
-  // 同一台机器来回切标签不会反复 ssh。
+  // Legacy board fixture only. Production monitoring uses the scoped backend;
+  // switching a tab must not trigger a server-wide workspace/process scan.
+  // Explicit workspace management retains its own refresh action.
   useEffect(() => {
+    if (!AI_PANEL_TEST_ONLY_SHOW) return;
     const s = sessions.find((x) => x.id === activeId) ?? null;
     const pid = s?.herdrPane ? s.profileId : null;
     if (!pid || herdrProbedFor.current === pid) return;
@@ -6589,6 +6619,7 @@ function AppBody() {
           )}
 
           <TerminalArea
+            onTransportReady={monitor.connectionChanged}
             {...{
               activeSession, activeFile, sessions, profiles, settings, bus, activeId,
               setActiveId, paneLayout, paneSlots, focusedPane, setFocusedPane, setPanes,
@@ -6627,7 +6658,17 @@ function AppBody() {
           )}
         </main>
 
-        {aiPanelOpen && (
+        {aiPanelOpen && !AI_PANEL_TEST_ONLY_SHOW && <AiMonitorPanel views={monitor.views} sessions={sessions} profiles={profiles}
+          settings={settings} transportError={monitor.transportError} onClose={() => setAiPanelOpen(false)}
+          onSettings={updateSettings} onSelect={(id) => {
+            const session = sessions.find((s) => s.id === id);
+            if (!session) return;
+            setActiveId(id);
+            setModule(session.kind);
+            setSessions((prev) => prev.map((s) => s.id === id ? { ...s, activeTab: "terminal" } : s));
+            window.requestAnimationFrame(() => bus.focus(id));
+          }} />}
+        {aiPanelOpen && AI_PANEL_TEST_ONLY_SHOW && (
           <AiPanel
             {...{
               activeSession, sessions, setActiveId, setAiPanelOpen,
@@ -6647,8 +6688,11 @@ function AppBody() {
       {/* 口径 docs/design-ai-board-v2.md §10.3：技术标识（编码 / 终端类型）收进悬停，
           状态栏只留：会话 · 连通性 · 需要你 · 传输 */}
       <StatusBar
+        aiNeedsSummary={AI_PANEL_TEST_ONLY_SHOW ? undefined : monitor.needs.map((view) =>
+          `${sessions.find((s) => s.id === view.sessionId)?.title ?? "远端会话"} · ${monitorStateText(view)}`).join("\n")}
         {...{
-          activeSession, activeFile, statusMsg, setStatusMsg, aiNeedIds, boardInstances,
+          activeSession, activeFile, statusMsg, setStatusMsg,
+          aiNeedIds: AI_PANEL_TEST_ONLY_SHOW ? aiNeedIds : monitor.needs.map((v) => v.sessionId), boardInstances,
           setAiPanelOpen, isAdminMode, openSshDiagnosis,
         }}
       />

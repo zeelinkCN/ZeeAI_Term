@@ -1,6 +1,6 @@
 # Windows 修复与 macOS 适配审查
 
-日期：2026-11-04。基线：`733769b` / 0.1.14。当前工作属于未发布的改进分支，不代表现有 Release 已包含这些修改。
+日期：2026-11-04。基线：`733769b` / 0.1.14。本文记录纳入 0.1.15 的跨平台改进与验证边界。
 
 ## 已修复的问题
 
@@ -45,8 +45,10 @@ Windows 资源和安装目标独立放在 `tauri.windows.conf.json`，Mac 使用
 ```sh
 npm ci
 npm run test:platform
+npm run test:ai
 npm run check:docs
 npm run build
+node scripts/ai-monitor-smoke.mjs
 cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
@@ -54,10 +56,10 @@ npm run tauri build
 ## 验证边界与后续事项
 
 - 本地验证包括前端构建/依赖审计、跨平台更新包选择、后端单元测试，以及真实 PTY 的启动、输入输出和尺寸调整。Mac `.app` 已构建并通过启动日志确认前端加载。
-- 已通过 221 项后端测试、6 项平台/更新选择测试及文档检查，npm 审计为 0 项漏洞。
+- 本地已通过 238 项后端测试、33 项 AI 协议/状态测试、6 项平台/更新选择测试、44 项监控界面测试及 5 项文档检查，npm 审计为 0 项漏洞。双平台云端结果见 Actions。
 - 已在获得授权的真实 Linux 测试机验证应用 PTY SSH 的输入输出/尺寸调整，以及 SFTP 中文路径、列目录、上传下载、重命名、正确续传、错误前缀恢复与危险文件名拦截。只创建并清理独立临时目录，没有安装远端软件。服务器地址和凭据不写入源码、公共日志或 CI。
 - Windows 的 UAC 交互、串口和 Android 硬件仍需对应环境验收；云端测试使用合成数据，不访问用户服务器和手机。
-- Mac 测试包使用 ad-hoc 签名；正式对外分发需要 Apple Developer ID 证书与公证。本次不发布正式版本。
+- Mac 包使用 ad-hoc 签名，尚无 Apple Developer ID 证书与公证，首次打开可能需要系统隐私与安全性许可。
 - SFTP 使用 russh，尚不完整支持系统 OpenSSH 的所有认证/代理组合，例如自定义 ProxyCommand、多级跳板链、仅代理持有的加密私钥；SSH 终端本身仍使用系统 OpenSSH。递归符号链接尚需单独设计防循环策略。
-- AI 看板按原版本约定保持暂停；本次没有把 Windows 的进程扫描功能宣称为 Mac 已支持。
+- AI 面板恢复为只观察 ZeeAI 内远端 Claude/Codex 的状态监控。OSC 7501 与 scoped herdr 使用同一前端体验，不启动旧本机日志/全服务器进程扫描。详见 [AI 状态观察设计](ai-monitor.md)。
 - 前端主文件和构建后的主 JS 仍较大，后续可按功能拆分并延迟载入。此次不做大规模架构重写。

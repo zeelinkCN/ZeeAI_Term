@@ -694,6 +694,8 @@ export interface AppSettings {
    * 每次保存设置都会把它写回默认 false，用户之前打开过的等于白开。
    */
   aiWatchEnabled: boolean;
+  /** Only observe remote sessions currently open in ZeeAI; takes effect immediately. */
+  aiMonitorEnabled: boolean;
 }
 
 export interface GitFile {

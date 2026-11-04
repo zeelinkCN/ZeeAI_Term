@@ -1,7 +1,7 @@
 {
   "name": "zeeai-terminal",
   "private": true,
-  "version": "0.1.14",
+  "version": "0.1.15",
   "type": "module",
   "description": "Windows and macOS multi-protocol terminal workbench",
   "license": "GPL-3.0-or-later",
@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test:platform": "node --experimental-strip-types --test scripts/platform.test.mjs scripts/updates.test.mjs",
+    "test:ai": "node --experimental-strip-types --test scripts/program-status.test.mjs scripts/ai-monitor.test.mjs",
     "check:docs": "node scripts/check-docs.mjs"
   },
   "dependencies": {

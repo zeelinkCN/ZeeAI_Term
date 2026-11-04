@@ -460,9 +460,13 @@ pub struct Settings {
     ///
     /// 为什么放在设置里、而不是写死 `false`：恢复面板时要能由**前端**打开（用户点开关 →
     /// `settings_set` 落盘 → 下次启动生效）。老配置里没有这个字段，
+    /// Legacy field retained for configuration compatibility; it no longer starts watchers.
     /// 因为 `Settings` 是 `#[serde(default)]`，缺字段会取 [`Settings::default`] 的值 = false，
     /// 不需要额外的迁移代码（`legacy_config_without_ai_watch_defaults_off` 钉着这一点）。
     pub ai_watch_enabled: bool,
+    /// Observe only open ZeeAI remote sessions; legacy full-server/local watchers stay retired.
+    #[serde(default = "default_true")]
+    pub ai_monitor_enabled: bool,
 }
 
 impl Default for Settings {
@@ -521,9 +525,9 @@ impl Default for Settings {
             // 直接粘进终端时是否给一眼缩略图。**默认关**：用户明确要求
             // "图片上传/粘贴不要在右下角弹消息"（想要的人在设置里打开）
             paste_toast: false,
-            // **两条被动监视线程默认不启动**（AI 面板这一版暂停）。
-            // 恢复面板时由前端把这个开关打开（下次启动生效），别在代码里写死。
+            // Retained for old config round-trips; the scoped monitor uses its own flag.
             ai_watch_enabled: false,
+            ai_monitor_enabled: true,
         }
     }
 }

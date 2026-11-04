@@ -1,5 +1,6 @@
 pub mod adb;
 pub mod ai;
+pub mod ai_monitor;
 /// 开了 herdr 的服务器 → 每 60 秒查一次 `herdr agent list`：驱动红点，并顺带把同一份结果
 /// 作为卡片快照发给前端（`zeeai://herdr-agents`，不额外起进程）。走 `commands::herdr_agents`
 /// 的隐藏窗口链路。口径见 §10.6。
