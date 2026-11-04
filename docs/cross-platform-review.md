@@ -53,10 +53,14 @@ cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
 
+若云端 Mac runner 无法分配，可从已推送且合入 main 的同一发布 tag 在本机 Mac 打包：安装 `aarch64-apple-darwin` 与 `x86_64-apple-darwin` Rust 目标，运行 `APPLE_SIGNING_IDENTITY=- npm run tauri build -- --ci --target universal-apple-darwin --bundles app,dmg -- --locked`。用 `lipo -verify_arch arm64 x86_64`、`codesign --verify --deep --strict` 检查 app，并实际启动确认前端加载。
+
+同时运行 `gh workflow run release.yml --ref main -f tag=v0.1.15 -f publish=false -f macos_cloud=false`，只在云端测试并生成 Windows 发布附件。此模式不会创建或发布 Release，也不允许 `publish=true`。人工合并同一 tag 的五个文件后，生成 `SHA256SUMS`；先上传为草稿，核对所有附件的 GitHub API 大小和 SHA-256 摘要、确认 tag 未移动，再发布为 latest。
+
 ## 验证边界与后续事项
 
 - 本地验证包括前端构建/依赖审计、跨平台更新包选择、后端单元测试，以及真实 PTY 的启动、输入输出和尺寸调整。Mac `.app` 已构建并通过启动日志确认前端加载。
-- 本地验证包括后端、33 项 AI 协议/状态、6 项平台/更新选择、44 项监控界面测试及 5 项文档检查，npm 审计为 0 项漏洞。新增真实 PTY 双向 OSC 协商测试，Windows 使用固定版本微软 ConPTY 组件，Mac 使用系统 PTY；双平台最终测试数与构建结果见 Actions。
+- Mac 本地通过 243 项后端、33 项 AI 协议/状态、6 项平台/更新选择、44 项监控界面测试及 5 项文档检查，npm 审计为 0 项漏洞；Universal app 通过双架构、签名与原生 WKWebView 启动检查。Windows 云端通过 241 项后端和 235 项完整界面测试并生成 NSIS / MSI；包含真实 PTY 双向 OSC 协商和无配套文件的独立 exe 回归。云端 Mac 未取得 runner 时采用上述本地发布路径，不将未执行的云端任务计为通过。
 - 已在获得授权的真实 Linux 测试机验证应用 PTY SSH 的输入输出/尺寸调整，以及 SFTP 中文路径、列目录、上传下载、重命名、正确续传、错误前缀恢复与危险文件名拦截。只创建并清理独立临时目录，没有安装远端软件。服务器地址和凭据不写入源码、公共日志或 CI。
 - Windows 的 UAC 交互、串口和 Android 硬件仍需对应环境验收；云端测试使用合成数据，不访问用户服务器和手机。
 - Mac 包使用 ad-hoc 签名，尚无 Apple Developer ID 证书与公证，首次打开可能需要系统隐私与安全性许可。

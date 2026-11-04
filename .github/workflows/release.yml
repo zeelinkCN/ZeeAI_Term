@@ -16,6 +16,11 @@ on:
         required: true
         default: false
         type: boolean
+      macos_cloud:
+        description: Build macOS in the cloud (disable for Windows artifacts only; local Mac publishing is manual)
+        required: true
+        default: true
+        type: boolean
       title:
         description: Optional Release title (defaults to ZeeAI_Term and tag)
         required: false
@@ -38,8 +43,11 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       version: ${{ steps.source.outputs.version }}
       notes: ${{ steps.versions.outputs.notes }}
+      matrix: ${{ steps.versions.outputs.matrix }}
     env:
       RELEASE_TAG: ${{ inputs.tag }}
+      MACOS_CLOUD: ${{ inputs.macos_cloud }}
+      RELEASE_PUBLISH: ${{ inputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -79,6 +87,9 @@ jobs:
           const read = (path) => readFileSync(path, 'utf8');
           const json = (path) => JSON.parse(read(path));
           const version = process.env.RELEASE_TAG.slice(1);
+          if (process.env.MACOS_CLOUD !== 'true' && process.env.RELEASE_PUBLISH === 'true') {
+            throw new Error('Windows-only builds cannot publish. Set publish=false, then verify and combine the local Mac package manually.');
+          }
           const cargo = read('src-tauri/Cargo.toml').split(/^\[package\]\s*$/m)[1]?.split(/^\[/m)[0];
           const cargoLock = read('src-tauri/Cargo.lock').split('[[package]]')
             .find((entry) => /^name = "zeeai-terminal"$/m.test(entry));
@@ -99,6 +110,13 @@ jobs:
             .find((path) => existsSync(path) && read(path).trim());
           if (!notes) throw new Error('Release notes are missing or empty.');
           appendFileSync(process.env.GITHUB_OUTPUT, `notes=${notes}\n`);
+          const include = [{ name: 'windows-x64', os: 'windows-latest', target: 'x86_64-pc-windows-msvc', 'rust-targets': 'x86_64-pc-windows-msvc' }];
+          if (process.env.MACOS_CLOUD === 'true') {
+            include.push({ name: 'macos-universal', os: 'macos-15-intel', target: 'universal-apple-darwin', 'rust-targets': 'aarch64-apple-darwin,x86_64-apple-darwin' });
+          } else {
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, 'Windows artifacts only. Build and verify the Universal DMG locally from the same tag; this run will not create or publish a Release.\n');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ include })}\n`);
           console.log(`All version sources match ${version}; notes: ${notes}`);
           NODE
       - run: npm ci
@@ -112,16 +130,7 @@ jobs:
     needs: validate
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            rust-targets: x86_64-pc-windows-msvc
-          - name: macos-universal
-            os: macos-15-intel
-            target: universal-apple-darwin
-            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -229,6 +238,7 @@ jobs:
           retention-days: 7
 
   release:
+    if: ${{ inputs.macos_cloud }}
     needs: [validate, package]
     runs-on: ubuntu-latest
     timeout-minutes: 20
