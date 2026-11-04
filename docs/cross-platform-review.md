@@ -53,7 +53,7 @@ cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
 npm run tauri build
 ```
 
-若云端 Mac runner 无法分配，可从已推送且合入 main 的同一发布 tag 在本机 Mac 打包：安装 `aarch64-apple-darwin` 与 `x86_64-apple-darwin` Rust 目标，运行 `APPLE_SIGNING_IDENTITY=- npm run tauri build -- --ci --target universal-apple-darwin --bundles app,dmg -- --locked`。用 `lipo -verify_arch arm64 x86_64`、`codesign --verify --deep --strict` 检查 app，并实际启动确认前端加载。
+若云端 Mac runner 无法分配，可从已推送且合入 main 的同一发布 tag 在本机 Mac 打包：安装 `aarch64-apple-darwin` 与 `x86_64-apple-darwin` Rust 目标，运行 `APPLE_SIGNING_IDENTITY=- npm run tauri build -- --ci --target universal-apple-darwin --bundles app,dmg -- --locked`。用 `lipo -archs <app>/Contents/MacOS/ZeeAI_Term` 确认同时包含 `arm64` 与 `x86_64`，用 `codesign --verify --deep --strict <app>` 检查签名，并实际启动确认前端加载。
 
 同时运行 `gh workflow run release.yml --ref main -f tag=v0.1.15 -f publish=false -f macos_cloud=false`，只在云端测试并生成 Windows 发布附件。此模式不会创建或发布 Release，也不允许 `publish=true`。人工合并同一 tag 的五个文件后，生成 `SHA256SUMS`；先上传为草稿，核对所有附件的 GitHub API 大小和 SHA-256 摘要、确认 tag 未移动，再发布为 latest。
 

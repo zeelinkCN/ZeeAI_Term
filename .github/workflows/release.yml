@@ -35,9 +35,9 @@ on:
 permissions:
   contents: read
 
-# Serialize all versions so two manual releases cannot race to become latest.
+# Serialize manual releases; registration runs must not displace a pending release.
 concurrency:
-  group: desktop-release-${{ github.repository }}
+  group: desktop-release-${{ github.repository }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -220,7 +220,8 @@ jobs:
           cargo clean --manifest-path src-tauri/Cargo.toml -p zeeai-terminal --release --target x86_64-apple-darwin
           npm run tauri build -- --ci --target universal-apple-darwin --bundles app,dmg -- --locked
           app='src-tauri/target/universal-apple-darwin/release/bundle/macos/ZeeAI_Term.app'
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/ZeeAI_Term"
+          archs="$(lipo -archs "$app/Contents/MacOS/ZeeAI_Term")"
+          [[ " $archs " == *' arm64 '* && " $archs " == *' x86_64 '* ]]
           codesign --verify --deep --strict "$app"
           mkdir -p release-assets
           cp "src-tauri/target/universal-apple-darwin/release/bundle/dmg/ZeeAI_Term_${RELEASE_VERSION}_universal.dmg" release-assets/
