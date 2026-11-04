@@ -42,7 +42,7 @@ jobs:
             rust-targets: x86_64-pc-windows-msvc
             bundles: nsis,msi
           - name: macos-universal
-            os: macos-latest
+            os: macos-15-intel
             target: universal-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             bundles: app,dmg
@@ -105,4 +105,6 @@ jobs:
           name: UI-smoke-${{ matrix.name }}-${{ github.sha }}
           if-no-files-found: ignore
           retention-days: 7
-          path: ${{ runner.temp }}/zeeai-fe-test/
+          path: |
+            ${{ runner.temp }}/zeeai-fe-test/*.png
+            ${{ runner.temp }}/zeeai-fe-test/*.json

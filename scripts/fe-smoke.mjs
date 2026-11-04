@@ -5273,5 +5273,6 @@ console.log(`\n截图：${shot1}\n${shot2}\n${shot3}\n${shot4}\n${shotLight}（�
 
 cleanup();
 const failed = results.filter((r) => !r.ok).length;
+writeFileSync(join(OUT, "results.json"), JSON.stringify({ results, pageErrors }, null, 2));
 console.log(`\n结果：${results.length - failed}/${results.length} 通过`);
 process.exit(failed ? 1 : 0);

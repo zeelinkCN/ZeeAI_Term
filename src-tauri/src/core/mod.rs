@@ -12,6 +12,8 @@ pub mod ai_log_watch;
 pub mod ai_instance;
 pub mod ai_sessions;
 pub mod ai_tasks;
+#[cfg(any(windows, test))]
+pub(crate) mod conpty_runtime;
 pub mod elevate;
 pub mod git;
 pub mod herdr;

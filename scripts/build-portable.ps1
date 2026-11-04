@@ -29,12 +29,41 @@ if (-not $Version) {
 
 $exe = 'src-tauri/target/release/ZeeAI_Term.exe'
 $resDir = 'src-tauri/resources/platform-tools'
+$conptyDir = 'src-tauri/resources/conpty'
 $readme = 'portable/README-portable.txt'
 $outDir = 'portable/ZeeAI_Term'
 $zip = "portable/ZeeAI_Term-$Version$Suffix-portable.zip"
 
-foreach ($need in @($exe, $resDir, $readme)) {
+foreach ($need in @($exe, $resDir, $readme, $conptyDir)) {
   if (-not (Test-Path $need)) { throw "缺少 $need —— 先跑 npm run tauri build" }
+}
+
+
+# Use the same pinned Microsoft runtime as the installer and embedded fallback.
+# A portable package must not silently depend on the older inbox ConPTY.
+$conptyFiles = [ordered]@{
+  'conpty.dll' = 'conpty.dll'
+  'OpenConsole.exe' = 'OpenConsole.exe'
+  'LICENSE-ConPTY.txt' = 'LICENSE-ConPTY.txt'
+  'UPSTREAM.md' = 'ConPTY-UPSTREAM.md'
+}
+$conptyHashes = @{
+  'conpty.dll' = 'feeef341d891643c62d30b6b07800bc70f0bc148f44cb8c3bee84aa557ae805a'
+  'OpenConsole.exe' = '3d66b23d0a71bb8eed2b77edc8b9df9bf54ce6c8fb74c863a30e760997f80586'
+  'LICENSE-ConPTY.txt' = '5d177f23ecfeb0ea8e050b6a5a16355e1ae9a0b286436ca8f83ed08b3795be6b'
+}
+foreach ($name in $conptyFiles.Keys) {
+  $source = Join-Path $conptyDir $name
+  if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing required Microsoft ConPTY resource: $source" }
+  if ($conptyHashes.ContainsKey($name)) {
+    $actual = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $conptyHashes[$name]) { throw "Microsoft ConPTY SHA-256 mismatch: $source" }
+  }
+}
+function Copy-ConPtyRuntime([string]$Destination) {
+  foreach ($entry in $conptyFiles.GetEnumerator()) {
+    Copy-Item -LiteralPath (Join-Path $conptyDir $entry.Key) -Destination (Join-Path $Destination $entry.Value) -Force
+  }
 }
 
 if ($Clean) {
@@ -60,6 +89,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stage 'resources') | Out-N
 
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZeeAI_Term.exe') -Force
 Copy-Item -LiteralPath $readme -Destination (Join-Path $stage 'README-portable.txt') -Force
+Copy-ConPtyRuntime $stage
 # 复制**目录内容**而不是目录本身：目标是已存在的目录时，Copy-Item 会把源目录
 # "塞进去"变成 platform-tools/platform-tools（我踩过，多出一份 8MB 的 adb）。
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'resources/platform-tools') | Out-Null
@@ -88,6 +118,7 @@ try {
   New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources') | Out-Null
   Copy-Item -LiteralPath $exe -Destination (Join-Path $outDir 'ZeeAI_Term.exe') -Force
   Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
+  Copy-ConPtyRuntime $outDir
   New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources/platform-tools') | Out-Null
   Copy-Item -Path (Join-Path $resDir '*') -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
   Write-Host "   已刷新（解压即用的目录也是这一版了）"
@@ -111,6 +142,7 @@ try {
       Write-Host "   exe 正在运行，旧的那份改名成：$(Split-Path $staleExe -Leaf)（关掉窗口后删掉它）"
     }
     Copy-Item -LiteralPath $readme -Destination (Join-Path $outDir 'README-portable.txt') -Force
+    Copy-ConPtyRuntime $outDir
     New-Item -ItemType Directory -Force -Path (Join-Path $outDir 'resources/platform-tools') | Out-Null
     Copy-Item -Path (Join-Path $resDir '*') -Destination (Join-Path $outDir 'resources/platform-tools') -Recurse -Force
     # 顺手清掉能删的旧备份（删不掉的说明还被占着，留着就行）

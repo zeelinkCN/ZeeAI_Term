@@ -20,6 +20,8 @@
 
 流解析器处理任意分片、BEL/ST 结束、大小限制、base64 UTF-8、层级记录与清除；保持有界内存。只读 herdr 流不回答终端能力查询、不向观察对象注入按键。
 
+Windows 的 PTY 使用固定版本 Microsoft ConPTY / OpenConsole，确保不依赖旧系统宿主对新版 OSC 的处理。组件的官方来源、许可和哈希见 [`UPSTREAM.md`](../src-tauri/resources/conpty/UPSTREAM.md)。安装/便携包随附组件；独立 exe 在需要时将内嵌的相同字节写入版本化本地缓存、校验后以绝对路径加载，不做运行时下载。Mac 使用原生 PTY，不携带这些 Windows 组件。
+
 CLI 支持基础来自 [Claude Code 终端文档](https://code.claude.com/docs/en/terminal-config#see-session-status-in-your-terminal)、[Codex 0.163.0 变更记录](https://learn.chatgpt.com/docs/changelog?date=2026-10-15)、[OSC 7501 规范](https://www.superlogical.com/rex/docs/build/program-status)。支持协议不代表所有 tmux 版本都能传递；Claude 文档明确指出它会查询 tmux 自身，单纯开启 allow-passthrough 无法保证收到状态。无法接收时显示待确认，不通过屏幕关键字或输出安静时间猜测。
 
 ### herdr TUI 窗格
